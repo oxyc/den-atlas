@@ -4,7 +4,9 @@
 
 use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 pub struct Provider {
     pub code: &'static str, // JustWatch package short-code
@@ -27,14 +29,16 @@ pub const TRENDING_NAME: &str = "Trending Everywhere";
 const STREMIO_TYPES: [&str; 2] = ["movie", "series"];
 
 /// The providers actually served — the full table, or a subset selected by `JW_PROVIDERS` (codes).
-pub fn selected_providers() -> Vec<&'static Provider> {
-    match std::env::var("JW_PROVIDERS") {
+/// Resolved once (env is effectively static) so it's not re-parsed on every request.
+pub fn selected_providers() -> &'static [&'static Provider] {
+    static SELECTED: OnceLock<Vec<&'static Provider>> = OnceLock::new();
+    SELECTED.get_or_init(|| match std::env::var("JW_PROVIDERS") {
         Ok(v) if !v.trim().is_empty() => {
             let codes: Vec<String> = v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
             PROVIDERS.iter().filter(|p| codes.iter().any(|c| c == p.code)).collect()
         }
         _ => PROVIDERS.iter().collect(),
-    }
+    })
 }
 
 pub struct CatalogEntry {
@@ -48,7 +52,7 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
     let providers = selected_providers();
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
-        for p in &providers {
+        for p in providers {
             out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned() });
         }
         out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned() });
@@ -56,30 +60,39 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
     out
 }
 
+/// The rendered catalog body plus whether it's freshly-sourced data. `fresh == false` marks a
+/// stale-served or empty-degradation body so the handler can shorten its HTTP TTL (don't let a CDN
+/// pin an outage-empty row for the full max-age).
+pub struct CatalogResponse {
+    pub body: String,
+    pub fresh: bool,
+}
+
 pub struct CatalogState {
-    source: Box<dyn TrendingSource>,
+    source: Arc<dyn TrendingSource>,
     cache: TtlCache,
     country: String,
 }
 
 impl CatalogState {
-    pub fn new(source: Box<dyn TrendingSource>, ttl: Duration, country: String) -> Self {
+    pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration, country: String) -> Self {
         Self { source, cache: TtlCache::new(ttl), country }
     }
 
-    /// `{ "metas": [...] }` for a catalog id + Stremio type. `None` (→ 404) for an unknown id/type.
-    /// Always valid JSON otherwise; on a source failure it serves the last-good rows, or an empty list.
-    pub async fn metas_json(&self, catalog_id: &str, stremio_type: &str) -> Option<String> {
+    /// The `{ "metas": [...] }` body for a catalog id + Stremio type. `None` (→ 404) for an unknown
+    /// id/type. Otherwise always valid JSON; on a source failure it serves last-good rows, else empty —
+    /// both marked `fresh: false` so the handler can cache them briefly.
+    pub async fn metas_json(&self, catalog_id: &str, stremio_type: &str) -> Option<CatalogResponse> {
         let obj = ObjectType::from_stremio(stremio_type)?;
         let is_trending = catalog_id == TRENDING_ID;
-        let code = selected_providers().into_iter().find(|p| p.id == catalog_id).map(|p| p.code);
+        let code = selected_providers().iter().find(|p| p.id == catalog_id).map(|p| p.code);
         if !is_trending && code.is_none() {
             return None; // unknown catalog id
         }
 
         let key = format!("jw:{}:{}:{}", self.country, catalog_id, stremio_type);
         if let Lookup::Fresh(v) = self.cache.get(&key) {
-            return Some(v);
+            return Some(CatalogResponse { body: v, fresh: true });
         }
 
         let fetched = if is_trending {
@@ -92,25 +105,39 @@ impl CatalogState {
             Some(items) => {
                 let body = render_metas(&items, stremio_type);
                 self.cache.put(&key, body.clone());
-                Some(body)
+                Some(CatalogResponse { body, fresh: true })
             }
             // Refresh failed → serve stale if we have it, else an empty list (graceful degradation).
-            None => Some(match self.cache.get(&key) {
-                Lookup::Fresh(v) | Lookup::Stale(v) => v,
-                Lookup::Miss => render_metas(&[], stremio_type),
+            // Not fresh → the handler uses a short TTL so recovery isn't masked at the CDN.
+            None => Some(CatalogResponse {
+                body: match self.cache.get(&key) {
+                    Lookup::Fresh(v) | Lookup::Stale(v) => v,
+                    Lookup::Miss => render_metas(&[], stremio_type),
+                },
+                fresh: false,
             }),
         }
     }
 
-    /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. `None` only when
-    /// every provider fetch failed (so the caller can serve stale/empty).
+    /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. Providers are
+    /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` only when
+    /// every provider fetch failed (so the caller can serve stale/empty). Results are placed by provider
+    /// index to keep the dedupe representative deterministic regardless of completion order.
     async fn aggregate(&self, obj: ObjectType) -> Option<Vec<TrendingItem>> {
-        let mut lists = Vec::new();
-        for p in selected_providers() {
-            if let Ok(items) = self.source.popular(p.code, obj).await {
-                lists.push(items);
+        let providers = selected_providers();
+        let mut slots: Vec<Option<Vec<TrendingItem>>> = vec![None; providers.len()];
+        let mut set: JoinSet<(usize, Result<Vec<TrendingItem>, ()>)> = JoinSet::new();
+        for (i, p) in providers.iter().enumerate() {
+            let src = Arc::clone(&self.source);
+            let code = p.code;
+            set.spawn(async move { (i, src.popular(code, obj).await) });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((i, Ok(items))) = joined {
+                slots[i] = Some(items);
             }
         }
+        let lists: Vec<Vec<TrendingItem>> = slots.into_iter().flatten().collect();
         if lists.is_empty() {
             return None;
         }
@@ -167,6 +194,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
         TrendingItem { imdb: imdb.into(), title: title.into(), rank }
@@ -191,7 +219,7 @@ mod tests {
 
     fn state(data: Vec<TrendingItem>, ttl: Duration, fail_after: usize) -> CatalogState {
         CatalogState::new(
-            Box::new(Fake { data, calls: AtomicUsize::new(0), fail_after }),
+            Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after }),
             ttl,
             "US".to_owned(),
         )
@@ -200,10 +228,11 @@ mod tests {
     #[tokio::test]
     async fn renders_provider_row() {
         let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), usize::MAX);
-        let body = s.metas_json("jw-nfx", "movie").await.unwrap();
-        assert!(body.contains(r#""id":"tt1""#));
-        assert!(body.contains(r#""type":"movie""#));
-        assert!(body.contains("images.metahub.space/poster/medium/tt1/img"));
+        let r = s.metas_json("jw-nfx", "movie").await.unwrap();
+        assert!(r.fresh);
+        assert!(r.body.contains(r#""id":"tt1""#));
+        assert!(r.body.contains(r#""type":"movie""#));
+        assert!(r.body.contains("images.metahub.space/poster/medium/tt1/img"));
     }
 
     #[tokio::test]
@@ -214,10 +243,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_failure_degrades_to_empty() {
+    async fn source_failure_degrades_to_empty_and_not_fresh() {
         let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), 0); // fail immediately
-        let body = s.metas_json("jw-nfx", "movie").await.unwrap();
-        assert_eq!(body, r#"{"metas":[]}"#);
+        let r = s.metas_json("jw-nfx", "movie").await.unwrap();
+        assert_eq!(r.body, r#"{"metas":[]}"#);
+        assert!(!r.fresh, "empty degradation must be marked not-fresh for a short HTTP TTL");
     }
 
     #[tokio::test]
@@ -226,9 +256,10 @@ mod tests {
         // must return the stale last-good rows rather than going empty.
         let s = state(vec![item("tt1", "A", 0)], Duration::ZERO, 1); // Ok once, then Err
         let first = s.metas_json("jw-nfx", "movie").await.unwrap();
-        assert!(first.contains(r#""id":"tt1""#));
+        assert!(first.body.contains(r#""id":"tt1""#));
         let second = s.metas_json("jw-nfx", "movie").await.unwrap();
-        assert_eq!(second, first, "stale value served when refresh fails");
+        assert_eq!(second.body, first.body, "stale value served when refresh fails");
+        assert!(!second.fresh, "stale-served body must be marked not-fresh");
     }
 
     #[test]

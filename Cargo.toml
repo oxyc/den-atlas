@@ -22,7 +22,8 @@ httpdate = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 async-trait = "0.1"
 
-# Tiny, dependency-free static binary — the whole point of the rewrite.
+# Small static binary. The dataset serving layer is dependency-light; the catalog feature adds reqwest
+# (rustls, no OpenSSL) + async-trait for the JustWatch source.
 [profile.release]
 opt-level = "z"
 lto = true

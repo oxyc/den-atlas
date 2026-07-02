@@ -1,6 +1,6 @@
-//! The `dataset`-resource manifest — a byte-identical port of `src/manifest.ts`. Field order matters: the
-//! serialized JSON must match the TS `JSON.stringify` output exactly (same body → same fnv ETag; the app
-//! reads it). serde serializes struct fields in declaration order.
+//! The addon manifest: the `dataset` resource (the Den app's feature store) plus the `catalog` resource
+//! (JustWatch "most popular" rows, which depend on `JW_PROVIDERS`). serde serializes struct fields in
+//! declaration order; the body feeds the fnv ETag, so its bytes must be stable for a given config.
 
 use crate::catalog;
 use serde::Serialize;

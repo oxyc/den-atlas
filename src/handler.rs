@@ -70,7 +70,12 @@ async fn handle_catalog(
     let type_ = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("");
     match state.catalog.metas_json(id, type_).await {
-        Some(body) => serve_json(method, headers, body, "public, max-age=3600", None).await,
+        Some(r) => {
+            // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
+            // CDN doesn't pin a broken row past JustWatch's recovery.
+            let cc = if r.fresh { "public, max-age=3600" } else { "public, max-age=60" };
+            serve_json(method, headers, r.body, cc, None).await
+        }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
 }

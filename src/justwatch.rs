@@ -140,15 +140,20 @@ impl TrendingSource for JustWatchClient {
                 "objectTypes": [obj.as_jw()],
             },
         });
-        let resp = self.http.post(ENDPOINT).json(&payload).send().await.map_err(|_| ())?;
+        let mut resp = self.http.post(ENDPOINT).json(&payload).send().await.map_err(|_| ())?;
         if !resp.status().is_success() {
             return Err(());
         }
-        let bytes = resp.bytes().await.map_err(|_| ())?;
-        if bytes.len() > MAX_BODY {
-            return Err(());
+        // Bound the body as it streams — reqwest has no default size limit, so `.bytes()` would buffer a
+        // hostile/huge reply in full before any check. Bail once we exceed the cap.
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
+            if buf.len() + chunk.len() > MAX_BODY {
+                return Err(());
+            }
+            buf.extend_from_slice(&chunk);
         }
-        Ok(parse_popular(&String::from_utf8_lossy(&bytes)))
+        Ok(parse_popular(&String::from_utf8_lossy(&buf)))
     }
 }
 

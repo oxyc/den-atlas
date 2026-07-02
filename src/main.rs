@@ -41,7 +41,7 @@ async fn main() {
         std::env::var("JW_CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(21_600),
     );
     let catalog = catalog::CatalogState::new(
-        Box::new(justwatch::JustWatchClient::new(country.clone())),
+        Arc::new(justwatch::JustWatchClient::new(country.clone())),
         ttl,
         country,
     );
