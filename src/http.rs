@@ -111,9 +111,13 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
 fn build(status: StatusCode, headers: &[(&'static str, String)], body: Body) -> Response {
     let mut b = Response::builder().status(status);
     for (k, v) in headers {
-        b = b.header(*k, v);
+        // Skip a header whose value isn't a valid HTTP field value (e.g. a junk sha256/date from a bad
+        // meta with a newline/control byte) rather than letting `body().unwrap()` panic the task.
+        if let Ok(val) = header::HeaderValue::from_str(v) {
+            b = b.header(*k, val);
+        }
     }
-    b.body(body).unwrap()
+    b.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 async fn full_body(p: &Payload) -> Body {
@@ -197,6 +201,9 @@ pub fn parse_range(header: &str, size: u64) -> RangeResult {
         Some(r) => r,
         None => return RangeResult::None,
     };
+    if size == 0 {
+        return RangeResult::Unsatisfiable; // avoid `size - 1` underflow on an empty representation
+    }
     let parts: Vec<&str> = rest.split('-').collect();
     if parts.len() != 2 {
         return RangeResult::None; // multi-range or garbage

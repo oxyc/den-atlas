@@ -15,11 +15,14 @@ pub fn fnv1a(input: &str) -> String {
     format!("{:08x}", h)
 }
 
-/// A plain JSON response with no caching (matches the TS `json()` — used for /health, 404, 405).
+/// A plain JSON response, explicitly uncacheable (used for /health, 404, 405, and the 503
+/// dataset-unavailable body). `no-store` keeps a CDN from pinning a transient error/outage past its
+/// recovery — the same reason the catalog error path shortens its TTL.
 pub fn json_response(body: &'static str, status: StatusCode) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(body))
         .unwrap()
 }

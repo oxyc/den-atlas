@@ -102,8 +102,16 @@ fn resolve_blob(
     gz_file: Option<&str>,
 ) -> Result<Blob, String> {
     let path = dir.join(name);
-    if !path.exists() {
-        return Err(format!("missing blob {}", path.display()));
+    // Use the on-disk length, not the meta's declared size: if a refreshed/stale meta disagrees with the
+    // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
+    let actual = std::fs::metadata(&path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if actual != size {
+        eprintln!(
+            "den-atlas: {} is {actual} bytes but meta declares {size} — using the on-disk size",
+            path.display()
+        );
     }
     let gz = match gz_file {
         Some(gzname) => {
@@ -118,7 +126,7 @@ fn resolve_blob(
     Ok(Blob {
         name: name.to_owned(),
         path,
-        size,
+        size: actual,
         sha256: sha256.to_owned(),
         content_type,
         gz,

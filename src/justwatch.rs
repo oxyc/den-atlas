@@ -147,8 +147,15 @@ impl TrendingSource for JustWatchClient {
                 "objectTypes": [obj.as_jw()],
             },
         });
-        let mut resp = self.http.post(ENDPOINT).json(&payload).send().await.map_err(|_| ())?;
+        let mut resp = match self.http.post(ENDPOINT).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("den-atlas: justwatch request failed ({provider}/{}): {e}", obj.as_jw());
+                return Err(());
+            }
+        };
         if !resp.status().is_success() {
+            eprintln!("den-atlas: justwatch http {} ({provider}/{})", resp.status(), obj.as_jw());
             return Err(());
         }
         // Bound the body as it streams — reqwest has no default size limit, so `.bytes()` would buffer a
@@ -156,11 +163,18 @@ impl TrendingSource for JustWatchClient {
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
             if buf.len() + chunk.len() > MAX_BODY {
+                eprintln!("den-atlas: justwatch body exceeded {MAX_BODY} bytes ({provider}) — dropping");
                 return Err(());
             }
             buf.extend_from_slice(&chunk);
         }
-        Ok(parse_popular(&String::from_utf8_lossy(&buf)))
+        let items = parse_popular(&String::from_utf8_lossy(&buf));
+        // A non-empty body that yields zero usable items is the signal of a breaking GraphQL schema change
+        // (it would otherwise silently serve empty rows forever).
+        if items.is_empty() && !buf.is_empty() {
+            eprintln!("den-atlas: justwatch returned a non-empty body but 0 usable items ({provider}) — possible schema change");
+        }
+        Ok(items)
     }
 }
 
