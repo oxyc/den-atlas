@@ -54,7 +54,7 @@ export function makeBlob(name: string, bytes: Uint8Array, contentType: string, g
 
 /** Read `dataset.meta.json` + the two blobs from `dir`. Throws if anything is missing — a misconfigured
  * deploy should fail loudly at boot, not serve a half dataset. The labels JSON is gzipped once here (it
- * compresses ~4×); the int8 vectors are near-incompressible, so they're served identity. */
+ * compresses ~18×, 11 MB → ~0.6 MB); the int8 vectors are near-incompressible, so they're served identity. */
 export async function loadDataset(dir: string): Promise<DatasetArtifacts> {
   const meta = JSON.parse(await readFile(join(dir, "dataset.meta.json"), "utf8")) as DatasetMetaFile;
   const labels = new Uint8Array(await readFile(join(dir, meta.labelsFile)));

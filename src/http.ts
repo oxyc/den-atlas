@@ -30,8 +30,13 @@ export function serveBytes(request: Request, s: Servable): Response {
     etag,
     "cache-control": s.cacheControl,
     "accept-ranges": "bytes",
-    vary: "Accept-Encoding",
   };
+  // `Vary: Accept-Encoding` only when a gzip variant actually exists — otherwise a CDN would keep a
+  // separate cache entry per Accept-Encoding value for the identical 22 MB vectors blob / JSON, tripling
+  // storage and lowering hit-rate. The single strong ETag is shared across the identity + gzip variants of
+  // the labels blob; that's safe for compliant caches because `Vary` routes them, and the Den app validates
+  // the sha256 over the DECOMPRESSED bytes (not the ETag), so it's unaffected either way.
+  if (s.gzip !== undefined) headers.vary = "Accept-Encoding";
   if (s.lastModified) headers["last-modified"] = s.lastModified;
 
   if (isNotModified(request, etag, s.lastModified)) {
@@ -97,9 +102,9 @@ function acceptsGzip(request: Request): boolean {
   const ae = request.headers.get("accept-encoding") ?? "";
   return ae.split(",").some((part) => {
     const [enc, ...params] = part.trim().split(";");
-    if (enc !== "gzip") return false;
+    if (enc !== "gzip" && enc !== "*") return false; // `*` means "any encoding" (RFC 9110 §12.5.3)
     const q = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
-    return !q || Number(q.slice(2)) > 0; // honor `gzip;q=0` (explicit refusal)
+    return !q || Number(q.slice(2)) > 0; // honor `gzip;q=0` / `*;q=0` (explicit refusal)
   });
 }
 

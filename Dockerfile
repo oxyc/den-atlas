@@ -1,8 +1,9 @@
 # den-atlas — multi-stage: compile TS → run the plain-JS output as a non-root Node process.
-# No native deps (all I/O is fs + the built-in HTTP server), so the runtime image is node:slim + dist +
-# prod deps + the dataset blobs. Run `npm run import` BEFORE building so ./data holds the artifacts.
+# No native deps (all I/O is fs + the built-in HTTP server) and the deps are pure JS (~1.7 MB), so the
+# runtime is node:alpine (musl, ~40% smaller than bookworm-slim, still ships a shell + `node` user) + dist
+# + prod deps + the dataset blobs. Run `npm run import` BEFORE building so ./data holds the artifacts.
 
-FROM node:22-bookworm-slim AS build
+FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -10,7 +11,7 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-alpine AS runtime
 ENV NODE_ENV=production \
     PORT=8080 \
     ATLAS_DATA_DIR=/app/data

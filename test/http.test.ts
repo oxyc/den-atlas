@@ -71,6 +71,16 @@ describe("gzip negotiation", () => {
     expect(serveBytes(req({ "accept-encoding": "gzip;q=0" }), withGzip()).headers.get("content-encoding")).toBeNull();
     expect(serveBytes(req(), withGzip()).headers.get("content-encoding")).toBeNull();
   });
+
+  it("treats Accept-Encoding: * as gzip-acceptable (but honors *;q=0)", () => {
+    expect(serveBytes(req({ "accept-encoding": "*" }), withGzip()).headers.get("content-encoding")).toBe("gzip");
+    expect(serveBytes(req({ "accept-encoding": "*;q=0" }), withGzip()).headers.get("content-encoding")).toBeNull();
+  });
+
+  it("sets Vary only when a gzip variant exists (so a CDN doesn't split-cache identity blobs)", () => {
+    expect(serveBytes(req(), withGzip()).headers.get("vary")).toBe("Accept-Encoding");
+    expect(serveBytes(req(), servable()).headers.get("vary")).toBeNull(); // identity-only → no Vary
+  });
 });
 
 describe("range requests", () => {
