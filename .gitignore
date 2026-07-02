@@ -2,13 +2,12 @@
 /target
 dist/
 
-# (legacy Node — the TS server was removed at RUST-1; the import script still runs via `node`)
 node_modules/
 .env
 *.log
 
-# The dataset artifacts are large derived blobs, not source. They're imported from the Den repo (or a
-# published mirror) via `scripts/import-dataset.mjs` and baked into the Docker image at build — never committed.
+# The dataset artifacts are large derived blobs, not source. They're fetched from the den-dataset
+# `data-latest` release via `scripts/fetch-dataset.sh` and baked into / mounted on the image — never committed.
 data/*.json
 data/*.bin
 data/*.gz
