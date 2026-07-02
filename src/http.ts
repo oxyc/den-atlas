@@ -25,28 +25,30 @@ export interface Servable {
 }
 
 export function serveBytes(request: Request, s: Servable): Response {
-  const etag = `"${s.etag}"`;
+  const isHead = request.method.toUpperCase() === "HEAD";
+  const rangeHeader = request.headers.get("range");
+  // Range wins over gzip: byte ranges are defined on the identity representation, so a Range request is
+  // served uncompressed.
+  const useGzip = !rangeHeader && s.gzip !== undefined && acceptsGzip(request);
+  // A strong ETag must differ per content-coding (RFC 9110 §8.8.3), so the gzip variant gets a distinct tag.
+  // We decide the representation FIRST, then validate against that representation's ETag, so a conditional
+  // request is answered for the variant that would actually be served. `Vary` still routes compliant caches;
+  // the distinct tag protects any intermediary that ignores `Vary`. (The Den app validates the sha256 over
+  // the decompressed bytes, not the ETag, so it's unaffected regardless.)
+  const etag = useGzip ? `"${s.etag}-gzip"` : `"${s.etag}"`;
   const headers: Record<string, string> = {
     etag,
     "cache-control": s.cacheControl,
     "accept-ranges": "bytes",
   };
-  // `Vary: Accept-Encoding` only when a gzip variant actually exists — otherwise a CDN would keep a
-  // separate cache entry per Accept-Encoding value for the identical 22 MB vectors blob / JSON, tripling
-  // storage and lowering hit-rate. The single strong ETag is shared across the identity + gzip variants of
-  // the labels blob; that's safe for compliant caches because `Vary` routes them, and the Den app validates
-  // the sha256 over the DECOMPRESSED bytes (not the ETag), so it's unaffected either way.
+  // `Vary: Accept-Encoding` only when a gzip variant exists — otherwise a CDN keeps a separate cache entry
+  // per Accept-Encoding value for the identical 22 MB vectors blob / JSON, tripling storage + lowering hits.
   if (s.gzip !== undefined) headers.vary = "Accept-Encoding";
   if (s.lastModified) headers["last-modified"] = s.lastModified;
 
   if (isNotModified(request, etag, s.lastModified)) {
     return new Response(null, { status: 304, headers });
   }
-
-  const isHead = request.method.toUpperCase() === "HEAD";
-  const rangeHeader = request.headers.get("range");
-  // Range wins over gzip: byte ranges are defined on the identity representation.
-  const useGzip = !rangeHeader && s.gzip !== undefined && acceptsGzip(request);
 
   if (rangeHeader) {
     const range = parseRange(rangeHeader, s.bytes.length);

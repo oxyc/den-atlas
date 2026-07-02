@@ -57,13 +57,19 @@ describe("conditional requests → 304", () => {
 describe("gzip negotiation", () => {
   const withGzip = () => servable({ gzip: new Uint8Array(gzipSync(raw)), contentType: "application/json" });
 
-  it("serves gzip when accepted; body gunzips to the identity bytes and the ETag is unchanged", async () => {
+  it("serves gzip when accepted; body gunzips to the identity bytes; ETag is the distinct gzip variant", async () => {
     const res = serveBytes(req({ "accept-encoding": "gzip, deflate" }), withGzip());
     expect(res.headers.get("content-encoding")).toBe("gzip");
     expect(res.headers.get("vary")).toBe("Accept-Encoding");
-    expect(res.headers.get("etag")).toBe(`"${SHA}"`); // sha of the RAW bytes — what the app validates
+    expect(res.headers.get("etag")).toBe(`"${SHA}-gzip"`); // distinct per content-coding (RFC 9110 §8.8.3)
     const body = new Uint8Array(await res.arrayBuffer());
-    expect(new Uint8Array(gunzipSync(body))).toEqual(raw);
+    expect(new Uint8Array(gunzipSync(body))).toEqual(raw); // sha of the DECOMPRESSED bytes is what the app validates
+  });
+
+  it("304s a gzip client on its own ETag; the identity ETag does not match the gzip representation", () => {
+    const gz = withGzip();
+    expect(serveBytes(req({ "accept-encoding": "gzip", "if-none-match": `"${SHA}-gzip"` }), gz).status).toBe(304);
+    expect(serveBytes(req({ "accept-encoding": "gzip", "if-none-match": `"${SHA}"` }), gz).status).toBe(200);
   });
 
   it("serves identity when gzip is not accepted or refused (q=0)", () => {

@@ -49,3 +49,10 @@ from the on-device cache with no re-download. A future semantic re-embed just ch
 `src/worker.ts` is a reference Cloudflare Worker that streams the blobs from an R2 bucket bound as
 `ATLAS_BLOBS` (the 33 MB blobs don't fit a Worker bundle). It's excluded from the Node build/CI; the
 homelab path is `server.ts` + Docker above.
+
+**Caveat — the edge entry does NOT share the node path's caching layer** (`src/http.ts`). It serves R2's
+own `ETag` (not the descriptor's pinned sha256), unversioned blob URLs (no `?v=` → no `immutable`), and no
+`Range` or gzip. So the README's "range-resumable / immutable / gzipped" guarantees apply to the **node +
+Docker** deployment only. If you deploy the Worker, either put a CDN in front for range/immutable behavior
+or wire `serveBytes` into `worker.ts` (it's runtime-agnostic — the blobs would need to be read into memory
+or streamed from R2 with manual range handling).
