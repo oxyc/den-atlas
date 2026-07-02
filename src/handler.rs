@@ -1,0 +1,148 @@
+//! Routing — the port of `handleAtlas`. A single fallback handler matches on the path (exact, like the TS),
+//! so unknown paths 404 and non-GET/HEAD 405.
+
+use crate::dataset::{Blob, Dataset};
+use crate::descriptor::build_descriptor;
+use crate::http::{serve, Payload, Servable};
+use crate::manifest::manifest_json;
+use crate::util::{
+    escape_html, fnv1a, group_thousands, html_response, json_response, public_origin,
+};
+use crate::AppState;
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
+use axum::response::Response;
+use bytes::Bytes;
+use std::sync::Arc;
+
+pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let method = req.method().clone();
+    if method != Method::GET && method != Method::HEAD {
+        return json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let headers = req.headers().clone();
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let origin = public_origin(&headers, state.public_base.as_deref());
+    let ds = &state.dataset;
+
+    if path == "/" || path == "/configure" || path == "/configure/" {
+        return html_response(landing_page(&origin, ds));
+    }
+    if path == "/health" {
+        return json_response(r#"{"status":"ok"}"#, StatusCode::OK);
+    }
+    if path == "/manifest.json" {
+        return serve_json(&method, &headers, manifest_json(), "public, max-age=3600", None).await;
+    }
+    if path == "/dataset.json" {
+        return serve_json(
+            &method,
+            &headers,
+            build_descriptor(&origin, ds),
+            "public, max-age=300",
+            ds.last_modified.clone(),
+        )
+        .await;
+    }
+    if path == format!("/{}", ds.labels.name) {
+        return serve_blob(&method, &headers, &query, ds, &ds.labels).await;
+    }
+    if path == format!("/{}", ds.vectors.name) {
+        return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
+    }
+    json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+async fn serve_json(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    body: String,
+    cache_control: &str,
+    last_modified: Option<String>,
+) -> Response {
+    let etag = fnv1a(&body);
+    let bytes = Bytes::from(body.into_bytes());
+    let size = bytes.len() as u64;
+    serve(
+        method,
+        headers,
+        Servable {
+            etag_base: etag,
+            content_type: "application/json".to_owned(),
+            cache_control: cache_control.to_owned(),
+            last_modified,
+            size,
+            identity: Payload::Memory(bytes),
+            gzip: None,
+        },
+    )
+    .await
+}
+
+async fn serve_blob(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    query: &str,
+    ds: &Dataset,
+    blob: &Blob,
+) -> Response {
+    // `?v=<current datasetVersion>` ⇒ immutable for a year; a bare request revalidates.
+    let pinned = query_param(query, "v").as_deref() == Some(ds.meta.dataset_version.as_str());
+    let cache_control = if pinned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    }
+    .to_owned();
+    let gzip = blob
+        .gz
+        .as_ref()
+        .map(|g| (Payload::File(g.path.clone()), g.size));
+    serve(
+        method,
+        headers,
+        Servable {
+            etag_base: blob.sha256.clone(),
+            content_type: blob.content_type.to_owned(),
+            cache_control,
+            last_modified: ds.last_modified.clone(),
+            size: blob.size,
+            identity: Payload::File(blob.path.clone()),
+            gzip,
+        },
+    )
+    .await
+}
+
+/// First value of `key` in a `k=v&k2=v2` query string (the datasetVersion is hex, so no percent-decoding).
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|kv| {
+        let mut it = kv.splitn(2, '=');
+        (it.next()? == key).then(|| it.next().unwrap_or("").to_owned())
+    })
+}
+
+fn landing_page(origin: &str, ds: &Dataset) -> String {
+    let manifest_url = format!("{}/manifest.json", escape_html(origin));
+    let m = &ds.meta;
+    [
+        "<!doctype html><html><head><meta charset=utf-8>",
+        "<meta name=viewport content='width=device-width,initial-scale=1'>",
+        "<title>Den Atlas</title>",
+        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}",
+        "code{background:#f2f2f2;padding:.15rem .35rem;border-radius:4px;word-break:break-all}</style></head><body>",
+        "<h1>Den Atlas</h1>",
+        "<p>A self-hosted <b>dataset addon</b> for Den — derived labels + semantic vectors for the whole catalog.</p>",
+        &format!(
+            "<p>Currently serving <b>{}</b> titles (<code>{}</code> / <code>{}</code>).</p>",
+            group_thousands(m.count),
+            escape_html(&m.taxonomy_version),
+            escape_html(&m.embedding_model)
+        ),
+        "<p>Add this URL in Den → Settings → Plugins:</p>",
+        &format!("<p><code>{manifest_url}</code></p>"),
+        "</body></html>",
+    ]
+    .join("")
+}

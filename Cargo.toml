@@ -1,0 +1,27 @@
+[package]
+name = "den-atlas"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted dataset addon for Den — serves the derived feature store (labels + int8 vectors) the app syncs on-device. Rust serving layer (RUST-1)."
+license = "MIT"
+
+[[bin]]
+name = "den-atlas"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+httpdate = "1"
+
+# Tiny, dependency-free static binary — the whole point of the rewrite.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

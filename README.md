@@ -41,21 +41,26 @@ The blobs are the **same artifacts the Den app currently bundles** — `labels-t
 `embeddingModel` opaquely, so a future semantic re-embed (bge-m3) is a drop-in — publish new blobs, bump
 the version, and the app re-syncs. See `docs`/the Den EPIC for the FP-2 embedding upgrade.
 
+## Implementation
+A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** serving 33 MB of data.
+Blob bodies are **streamed from disk** (never loaded into RAM), gzip is precomputed to a file, and sha256 is
+read from the `dataset.meta.json` sidecar (no startup hashing). (The original TypeScript server is preserved
+at the `legacy-ts` git tag.)
+
 ## Caching
-Every response is cache-friendly (`src/http.ts`): a strong `ETag` (the blob's sha256) + `Last-Modified`,
-honoring `If-None-Match` and `If-Modified-Since` (→ `304`), plus `HEAD`. Blob URLs in the descriptor are
-version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable` for a year while a bare
-path revalidates. The 22 MB vectors blob is **range-resumable** (`Accept-Ranges` / `206`); the 11 MB labels
-JSON is **gzipped** (~18×, to ~0.6 MB) transparently — the ETag/checksum is over the raw bytes, so the Den
-app (which validates the decompressed payload) is unaffected. Sit a CDN in front and it caches everything
-by URL with correct revalidation.
+Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the blob's sha256, distinct `-gzip`
+variant) + `Last-Modified`, honoring `If-None-Match` and `If-Modified-Since` (→ `304`), plus `HEAD`. Blob
+URLs in the descriptor are version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable`
+for a year while a bare path revalidates. The 22 MB vectors blob is **range-resumable** (`Accept-Ranges` /
+`206`); the 11 MB labels JSON is **gzipped** (~18×, to ~0.5 MB) transparently — the ETag/checksum is over the
+raw bytes, so the Den app (which validates the decompressed payload) is unaffected. Sit a CDN in front and it
+caches everything by URL with correct revalidation.
 
 ## Develop
 ```sh
-npm install
-DEN_REPO=../den npm run import   # copy the blobs from the Den repo into ./data (gitignored)
-npm run dev                      # http://localhost:8080  (add /manifest.json in Den → Plugins)
-npm test                         # vitest (handler + descriptor contract)
+DEN_REPO=../den node scripts/import-dataset.mjs   # prep ./data: copy blobs + write gzip + per-blob sha meta
+cargo run                                         # http://localhost:8080  (add /manifest.json in Den → Plugins)
+cargo test                                        # the caching layer (ETag / Range / gzip / 304)
 ```
 
 ## Deploy

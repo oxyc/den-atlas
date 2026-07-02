@@ -11,6 +11,7 @@
  */
 import { readFile, writeFile, copyFile, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -52,13 +53,21 @@ if (labelsJson.count !== count) {
   throw new Error(`count mismatch: labels ${labelsJson.count} vs vectors ${count} — blobs are not aligned`);
 }
 
+const labelsSha = sha256(labels);
+const vectorsSha = sha256(vectors);
 const datasetVersion =
-  process.env.ATLAS_DATASET_VERSION ?? sha256(`${sha256(labels)}:${sha256(vectors)}`).slice(0, 12);
+  process.env.ATLAS_DATASET_VERSION ?? sha256(`${labelsSha}:${vectorsSha}`).slice(0, 12);
 
 await mkdir(dataDir, { recursive: true });
 await copyFile(labelsPath, join(dataDir, labelsFile));
 await copyFile(vectorsPath, join(dataDir, vectorsFile));
 
+// Precompute the labels gzip (the vectors are ~incompressible) so the server never compresses at runtime.
+const labelsGzFile = `${labelsFile}.gz`;
+const labelsGz = gzipSync(labels, { level: 9 });
+await writeFile(join(dataDir, labelsGzFile), labelsGz);
+
+const now = new Date();
 const meta = {
   datasetVersion,
   taxonomyVersion: TAXONOMY_VERSION,
@@ -68,12 +77,19 @@ const meta = {
   quantization: "int8-symmetric-x127",
   labelsFile,
   vectorsFile,
-  // For `Last-Modified`. The ETag (content sha) is the primary validator; this is a coarse secondary one.
-  builtAt: new Date().toISOString(),
+  labelsGzFile,
+  // Per-blob sha256 + byte size, so the server reads them from here instead of hashing 33 MB at boot.
+  labelsSha256: labelsSha,
+  labelsBytes: labels.length,
+  vectorsSha256: vectorsSha,
+  vectorsBytes: vectors.length,
+  builtAt: now.toISOString(),
+  // The HTTP-date form for `Last-Modified` / `If-Modified-Since` (so the server needs no date parsing).
+  lastModifiedHttp: now.toUTCString(),
 };
 await writeFile(join(dataDir, "dataset.meta.json"), JSON.stringify(meta, null, 2) + "\n");
 
 console.log(
-  `imported ${count} titles ×${dims}d — ${labelsFile} (${labels.length}B) + ${vectorsFile} (${vectors.length}B)\n` +
-    `datasetVersion ${datasetVersion}`,
+  `imported ${count} titles ×${dims}d — ${labelsFile} (${labels.length}B, gz ${labelsGz.length}B) + ` +
+    `${vectorsFile} (${vectors.length}B)\ndatasetVersion ${datasetVersion}`,
 );

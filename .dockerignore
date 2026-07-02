@@ -1,3 +1,4 @@
+target
 node_modules
 dist
 coverage
@@ -5,4 +6,5 @@ coverage
 .github
 *.log
 test
-# NB: data/ is NOT ignored — the dataset blobs must go into the image.
+docs
+# NB: data/ is NOT ignored — the dataset blobs go into the image (empty in CI → mounted at runtime).

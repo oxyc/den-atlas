@@ -1,33 +1,23 @@
-# den-atlas — multi-stage: compile TS → run the plain-JS output as a non-root Node process.
-# No native deps (all I/O is fs + the built-in HTTP server) and the deps are pure JS (~1.7 MB), so the
-# runtime is node:alpine (musl, ~40% smaller than bookworm-slim, still ships a shell + `node` user) + dist
-# + prod deps + the dataset blobs. Run `npm run import` BEFORE building so ./data holds the artifacts.
-
-FROM node:22-alpine AS build
+# den-atlas — the Rust serving layer. Multi-stage: a static musl binary built on Alpine, copied into
+# `scratch` → a ~few-MB, dependency-free image. No TLS / no outbound (it sits behind Caddy), so scratch is
+# enough. CI builds this with an empty data/ (blobs gitignored) → the published image is the SERVER ONLY;
+# mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
-COPY tsconfig.json tsconfig.build.json ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN npm run build && npm prune --omit=dev
+# rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
+RUN cargo build --release --locked
 
-FROM node:22-alpine AS runtime
-ENV NODE_ENV=production \
-    PORT=8080 \
-    ATLAS_DATA_DIR=/app/data
-WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
-# The derived dataset blobs (gitignored; produced by `npm run import`). ~33 MB.
-COPY data ./data
-
-# node:*-slim ships an unprivileged `node` user (uid 1000) — run as it, never root.
-USER node
+FROM scratch AS runtime
+ENV ATLAS_DATA_DIR=/app/data \
+    PORT=8080
+COPY --from=build /app/target/release/den-atlas /den-atlas
+# The dataset blobs (gitignored; produced by `npm run import` locally). Empty in CI → mount at runtime.
+COPY data /app/data
 EXPOSE 8080
-
-# curl isn't in the slim image; Node's global fetch does the healthcheck.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
-CMD ["node", "dist/server.js"]
+# scratch has no /etc/passwd; run as the numeric `nobody`. (No Docker HEALTHCHECK — scratch has no shell;
+# health is a plain `GET /health`, checked by the reverse proxy / compose.)
+USER 65534:65534
+ENTRYPOINT ["/den-atlas"]

@@ -6,10 +6,11 @@ terminates TLS. The Den app needs an **https** URL (or a LAN/private-range host 
 ## 1. Import the dataset
 The blobs are gitignored — pull them from the Den repo into `./data`:
 ```sh
-DEN_REPO=/path/to/den npm run import
+DEN_REPO=/path/to/den node scripts/import-dataset.mjs
 ```
-This copies `labels-t01.json` + `vectors-e02.bin` and writes `data/dataset.meta.json` (dims/count read
-from the blobs, `datasetVersion` content-addressed). Re-run to refresh when Den publishes new artifacts.
+This copies `labels-t01.json` + `vectors-e02.bin`, precomputes `labels-t01.json.gz`, and writes
+`data/dataset.meta.json` (dims/count + per-blob sha256/size + `datasetVersion` content-addressed + the
+HTTP-date). The Rust server reads all of that — it never hashes or compresses at boot. Re-run to refresh.
 
 ## 2. Run (Docker)
 Two options:
