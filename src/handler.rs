@@ -41,7 +41,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return html_response(landing_page(&origin, ds));
     }
     if path == "/health" {
-        return json_response(r#"{"status":"ok"}"#, StatusCode::OK);
+        // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` when the
+        // dataset couldn't load so the app's Plugins screen (and any monitor) can see it.
+        let body = if ds.is_some() {
+            r#"{"status":"ok"}"#
+        } else {
+            r#"{"status":"degraded","reason":"dataset_unavailable","detail":"dataset failed to load; refresh with scripts/fetch-dataset.sh"}"#
+        };
+        return json_response(body, StatusCode::OK);
     }
     if path == "/manifest.json" {
         return serve_json(&method, &headers, manifest_json(), "public, max-age=3600", None).await;
