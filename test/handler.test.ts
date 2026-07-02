@@ -17,8 +17,8 @@ function fakeDataset(): DatasetArtifacts {
 }
 
 const dataset = fakeDataset();
-function req(path: string, headers: Record<string, string> = {}) {
-  return new Request(`http://internal.local${path}`, { headers });
+function req(path: string, headers: Record<string, string> = {}, method = "GET") {
+  return new Request(`http://internal.local${path}`, { headers, method });
 }
 const proxied = { "x-forwarded-proto": "https", "x-forwarded-host": "atlas.example" };
 
@@ -38,8 +38,8 @@ describe("dataset.json descriptor", () => {
     const res = handleAtlas(req("/dataset.json", proxied), { dataset });
     expect(res.status).toBe(200);
     const d = (await res.json()) as DatasetDescriptor;
-    expect(d.labels.url).toBe("https://atlas.example/labels-t01.json");
-    expect(d.vectors.url).toBe("https://atlas.example/vectors-e02.bin");
+    expect(d.labels.url).toBe("https://atlas.example/labels-t01.json?v=abc123def456");
+    expect(d.vectors.url).toBe("https://atlas.example/vectors-e02.bin?v=abc123def456");
     expect(d.dims).toBe(4);
     expect(d.count).toBe(2);
     expect(d.embeddingModel).toBe("e02");
@@ -52,7 +52,14 @@ describe("dataset.json descriptor", () => {
   it("honors PUBLIC_BASE_URL override", async () => {
     const res = handleAtlas(req("/dataset.json", proxied), { dataset, publicBaseUrl: "https://cdn.example/atlas" });
     const d = (await res.json()) as DatasetDescriptor;
-    expect(d.vectors.url).toBe("https://cdn.example/atlas/vectors-e02.bin");
+    expect(d.vectors.url).toBe("https://cdn.example/atlas/vectors-e02.bin?v=abc123def456");
+  });
+
+  it("dataset.json 304s on a matching If-None-Match", () => {
+    const first = handleAtlas(req("/dataset.json", proxied), { dataset });
+    const etag = first.headers.get("etag")!;
+    const second = handleAtlas(req("/dataset.json", { ...proxied, "if-none-match": etag }), { dataset });
+    expect(second.status).toBe(304);
   });
 });
 
@@ -77,6 +84,26 @@ describe("blob serving", () => {
     const etag = `"${dataset.vectors.sha256}"`;
     const res = handleAtlas(req("/vectors-e02.bin", { "if-none-match": etag }), { dataset });
     expect(res.status).toBe(304);
+  });
+
+  it("is immutable when the version query matches, revalidatable otherwise", () => {
+    const pinned = handleAtlas(req("/vectors-e02.bin?v=abc123def456"), { dataset });
+    expect(pinned.headers.get("cache-control")).toContain("immutable");
+    const bare = handleAtlas(req("/vectors-e02.bin"), { dataset });
+    expect(bare.headers.get("cache-control")).toBe("public, max-age=3600");
+  });
+
+  it("HEAD returns headers with no body", async () => {
+    const res = handleAtlas(req("/vectors-e02.bin", {}, "HEAD"), { dataset });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe(String(dataset.vectors.size));
+    expect((await res.arrayBuffer()).byteLength).toBe(0);
+  });
+});
+
+describe("method handling", () => {
+  it("rejects non-GET/HEAD with 405", () => {
+    expect(handleAtlas(req("/manifest.json", {}, "POST"), { dataset }).status).toBe(405);
   });
 });
 

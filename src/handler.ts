@@ -6,18 +6,23 @@
  * Non-personal by design: Atlas serves ONE shared, derived, ToS-clean dataset to everyone — no per-user
  * state, no token, no config. The app downloads it, caches it on-device (checksum-gated), and refreshes.
  *
+ * Caching (see http.ts): every response carries a strong `ETag` and honors `If-None-Match` /
+ * `If-Modified-Since` (→ 304) + `HEAD`; blobs add `Range`/206 + gzip. Blob URLs from the descriptor are
+ * version-stamped, so a `?v=<current>` hit is served `immutable`; a bare hit revalidates.
+ *
  * Routes (served at the service root — no config prefix, unlike scout):
- *   GET /                     → a tiny landing page with the install URL
- *   GET /health               → { status: "ok" }
- *   GET /manifest.json        → the `dataset`-resource manifest
- *   GET /dataset.json         → the descriptor (absolute blob URLs from the request origin)
- *   GET /labels-<tax>.json    → the derived labels blob
- *   GET /vectors-<embed>.bin  → the quantized int8 vectors blob
+ *   GET|HEAD /                     → a tiny landing page with the install URL
+ *   GET|HEAD /health               → { status: "ok" }
+ *   GET|HEAD /manifest.json        → the `dataset`-resource manifest
+ *   GET|HEAD /dataset.json         → the descriptor (absolute, version-stamped blob URLs)
+ *   GET|HEAD /labels-<tax>.json    → the derived labels blob (gzip-negotiated)
+ *   GET|HEAD /vectors-<embed>.bin  → the quantized int8 vectors blob (range-resumable)
  */
 import { buildManifest } from "./manifest.js";
 import { buildDescriptor } from "./descriptor.js";
 import type { DatasetArtifacts, DatasetBlob } from "./dataset.js";
-import { json, html, publicOrigin } from "./util.js";
+import { json, html, publicOrigin, fnv1a } from "./util.js";
+import { serveBytes } from "./http.js";
 
 export interface AtlasDeps {
   dataset: DatasetArtifacts;
@@ -26,34 +31,50 @@ export interface AtlasDeps {
 }
 
 export function handleAtlas(request: Request, deps: AtlasDeps): Response {
-  const path = new URL(request.url).pathname;
+  const method = request.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    return json({ error: "method_not_allowed" }, 405);
+  }
+  const url = new URL(request.url);
+  const path = url.pathname;
   const origin = publicOrigin(request, deps.publicBaseUrl);
 
   if (path === "/" || path === "/configure" || path === "/configure/") return html(landingPage(origin, deps.dataset));
   if (path === "/health") return json({ status: "ok" });
-  if (path === "/manifest.json") return json(buildManifest());
-  if (path === "/dataset.json") return json(buildDescriptor(origin, deps.dataset));
-  if (path === `/${deps.dataset.labels.name}`) return blobResponse(request, deps.dataset.labels);
-  if (path === `/${deps.dataset.vectors.name}`) return blobResponse(request, deps.dataset.vectors);
+  if (path === "/manifest.json") return serveJson(request, buildManifest(), "public, max-age=3600");
+  if (path === "/dataset.json") {
+    // Short TTL + ETag: this is the freshness signal the app polls, so a revisit that finds nothing new is
+    // a cheap 304, but a new version is noticed within the window.
+    return serveJson(request, buildDescriptor(origin, deps.dataset), "public, max-age=300", deps.dataset.lastModified);
+  }
+  if (path === `/${deps.dataset.labels.name}`) return serveBlob(request, deps.dataset, deps.dataset.labels, url);
+  if (path === `/${deps.dataset.vectors.name}`) return serveBlob(request, deps.dataset, deps.dataset.vectors, url);
   return json({ error: "not_found" }, 404);
 }
 
-/** Serve a blob with a sha256 `ETag` + conditional-GET support. The Den app skips re-downloading via the
- * descriptor checksum, so a refresh usually costs nothing; `If-None-Match` is the belt for any client that
- * does re-request. */
-function blobResponse(request: Request, blob: DatasetBlob): Response {
-  const etag = `"${blob.sha256}"`;
-  if (request.headers.get("if-none-match") === etag) {
-    return new Response(null, { status: 304, headers: { etag } });
-  }
-  return new Response(blob.bytes, {
-    status: 200,
-    headers: {
-      "content-type": blob.contentType,
-      "content-length": String(blob.size),
-      etag,
-      "cache-control": "public, max-age=86400",
-    },
+/** A blob with full validators. `?v=<current datasetVersion>` ⇒ immutable for a year (the URL is unique to
+ * the content); a bare request revalidates (a republish reuses the path) — the ETag makes that a 304. */
+function serveBlob(request: Request, dataset: DatasetArtifacts, blob: DatasetBlob, url: URL): Response {
+  const pinned = url.searchParams.get("v") === dataset.meta.datasetVersion;
+  const cacheControl = pinned ? "public, max-age=31536000, immutable" : "public, max-age=3600";
+  return serveBytes(request, {
+    bytes: blob.bytes,
+    etag: blob.sha256,
+    contentType: blob.contentType,
+    cacheControl,
+    lastModified: dataset.lastModified,
+    gzip: blob.gzip,
+  });
+}
+
+function serveJson(request: Request, body: unknown, cacheControl: string, lastModified?: string): Response {
+  const text = JSON.stringify(body);
+  return serveBytes(request, {
+    bytes: new TextEncoder().encode(text),
+    etag: fnv1a(text),
+    contentType: "application/json",
+    cacheControl,
+    lastModified,
   });
 }
 

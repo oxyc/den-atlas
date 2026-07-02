@@ -28,6 +28,10 @@ export interface DatasetDescriptor {
 
 export function buildDescriptor(origin: string, dataset: DatasetArtifacts): DatasetDescriptor {
   const { meta, labels, vectors } = dataset;
+  // Version-stamp the blob URLs (`?v=<datasetVersion>`) so a CDN/proxy can cache them immutably: the same
+  // path with a new version is a new URL, so a republish never serves stale bytes. The Den app ignores the
+  // query (it keys its on-device cache by sha256), and `isSyncableUrl` still accepts it.
+  const v = encodeURIComponent(meta.datasetVersion);
   return {
     datasetVersion: meta.datasetVersion,
     taxonomyVersion: meta.taxonomyVersion,
@@ -35,8 +39,8 @@ export function buildDescriptor(origin: string, dataset: DatasetArtifacts): Data
     dims: meta.dims,
     count: meta.count,
     quantization: meta.quantization,
-    labels: { url: `${origin}/${labels.name}`, sha256: labels.sha256, bytes: labels.size },
-    vectors: { url: `${origin}/${vectors.name}`, sha256: vectors.sha256, bytes: vectors.size },
+    labels: { url: `${origin}/${labels.name}?v=${v}`, sha256: labels.sha256, bytes: labels.size },
+    vectors: { url: `${origin}/${vectors.name}?v=${v}`, sha256: vectors.sha256, bytes: vectors.size },
   };
 }
 

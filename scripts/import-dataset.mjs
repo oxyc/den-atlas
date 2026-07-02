@@ -68,6 +68,8 @@ const meta = {
   quantization: "int8-symmetric-x127",
   labelsFile,
   vectorsFile,
+  // For `Last-Modified`. The ETag (content sha) is the primary validator; this is a coarse secondary one.
+  builtAt: new Date().toISOString(),
 };
 await writeFile(join(dataDir, "dataset.meta.json"), JSON.stringify(meta, null, 2) + "\n");
 

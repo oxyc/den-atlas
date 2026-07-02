@@ -13,6 +13,17 @@ export function html(body: string): Response {
   return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+/** FNV-1a 32-bit → 8-char hex. A cheap, sync content fingerprint for the small JSON responses' ETags (the
+ * big blobs use their real sha256). Runtime-agnostic (no crypto import), so it works on Node and a Worker. */
+export function fnv1a(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 /**
  * The public origin to build absolute blob URLs from. Behind Caddy the socket is plain http on an
  * internal host, but Caddy forwards `X-Forwarded-Proto` + `Host`, so honor those to emit the correct

@@ -41,6 +41,15 @@ The blobs are the **same artifacts the Den app currently bundles** — `labels-t
 `embeddingModel` opaquely, so a future semantic re-embed (bge-m3) is a drop-in — publish new blobs, bump
 the version, and the app re-syncs. See `docs`/the Den EPIC for the FP-2 embedding upgrade.
 
+## Caching
+Every response is cache-friendly (`src/http.ts`): a strong `ETag` (the blob's sha256) + `Last-Modified`,
+honoring `If-None-Match` and `If-Modified-Since` (→ `304`), plus `HEAD`. Blob URLs in the descriptor are
+version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable` for a year while a bare
+path revalidates. The 22 MB vectors blob is **range-resumable** (`Accept-Ranges` / `206`); the 11 MB labels
+JSON is **gzipped** (~18×, to ~0.6 MB) transparently — the ETag/checksum is over the raw bytes, so the Den
+app (which validates the decompressed payload) is unaffected. Sit a CDN in front and it caches everything
+by URL with correct revalidation.
+
 ## Develop
 ```sh
 npm install
