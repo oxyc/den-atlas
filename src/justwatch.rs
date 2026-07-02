@@ -30,10 +30,13 @@ impl ObjectType {
     }
 }
 
-/// One trending title, keyed by a validated IMDb id. `rank` is the 0-based position in its source list.
+/// One trending title, keyed by a validated IMDb id, plus the TMDB id when JustWatch supplies one.
+/// `rank` is the 0-based position in its source list. The Den app maps catalog rows through TMDB, so
+/// `moviedb` is what lets a row actually render there; a plain Stremio client uses the IMDb id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrendingItem {
     pub imdb: String,
+    pub moviedb: Option<i64>,
     pub title: String,
     pub rank: usize,
 }
@@ -50,7 +53,7 @@ const MAX_BODY: usize = 4 << 20; // cap the response body (a hostile/huge reply 
 // Mirrors rleroi/Stremio-Streaming-Catalogs-Addon's GetPopularTitles (only the fields we use).
 const QUERY: &str = r#"query GetPopularTitles($country: Country!, $first: Int!, $popularTitlesSortBy: PopularTitlesSorting!, $packages: [String!], $objectTypes: [ObjectType!]) {
   popularTitles(country: $country, first: $first, sortBy: $popularTitlesSortBy, filter: { objectTypes: $objectTypes, packages: $packages }) {
-    edges { node { content(country: $country, language: "en") { title externalIds { imdbId } } } }
+    edges { node { content(country: $country, language: "en") { title externalIds { imdbId tmdbId } } } }
   }
 }"#;
 
@@ -101,6 +104,8 @@ struct Content {
 struct ExternalIds {
     #[serde(rename = "imdbId")]
     imdb_id: Option<String>,
+    #[serde(rename = "tmdbId")]
+    tmdb_id: Option<String>,
 }
 
 /// Parse a GraphQL response body into ranked items, dropping anything without a valid IMDb id (it
@@ -113,12 +118,14 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
     let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
     let mut out = Vec::with_capacity(edges.len());
     for e in edges {
-        let imdb = match e.node.content.external_ids.and_then(|x| x.imdb_id) {
+        let ext = e.node.content.external_ids;
+        let imdb = match ext.as_ref().and_then(|x| x.imdb_id.clone()) {
             Some(id) if is_imdb(&id) => id,
             _ => continue,
         };
+        let moviedb = ext.and_then(|x| x.tmdb_id).and_then(|s| s.parse::<i64>().ok());
         let rank = out.len();
-        out.push(TrendingItem { imdb, title: e.node.content.title, rank });
+        out.push(TrendingItem { imdb, moviedb, title: e.node.content.title, rank });
     }
     out
 }
@@ -162,18 +169,18 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{"data":{"popularTitles":{"edges":[
-      {"node":{"content":{"title":"Alpha","externalIds":{"imdbId":"tt0000001"}}}},
+      {"node":{"content":{"title":"Alpha","externalIds":{"imdbId":"tt0000001","tmdbId":"1397385"}}}},
       {"node":{"content":{"title":"NoId","externalIds":{"imdbId":null}}}},
       {"node":{"content":{"title":"Bad","externalIds":{"imdbId":"nope"}}}},
-      {"node":{"content":{"title":"Beta","externalIds":{"imdbId":"tt0000002"}}}}
+      {"node":{"content":{"title":"Beta","externalIds":{"imdbId":"tt0000002","tmdbId":null}}}}
     ]}}}"#;
 
     #[test]
-    fn parses_and_ranks_valid_imdb_only() {
+    fn parses_ranks_and_carries_tmdb() {
         let items = parse_popular(FIXTURE);
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
-        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), title: "Alpha".into(), rank: 0 });
-        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), title: "Beta".into(), rank: 1 });
+        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0 });
+        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1 });
     }
 
     #[test]

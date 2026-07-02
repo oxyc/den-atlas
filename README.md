@@ -47,10 +47,11 @@ Alongside the dataset, Atlas serves Stremio **catalog** rows of "most popular" t
 service — `Popular on Netflix`, `Max`, `Prime Video`, `Disney+`, `Apple TV+` — plus a headline
 **Trending Everywhere** row that unions the services and re-ranks by inverse-rank-sum (a title trending
 on several services floats up). Data is the unofficial **JustWatch** GraphQL API (public, tokenless),
-fetched server-side and cached in-process (~6h, serve-stale-on-error). Items are keyed by **IMDb id**, so
-Stremio's built-in Cinemeta fills the detail page and other addons resolve streams — no TMDB, no `meta`
-resource. The module is fully **isolated**: if JustWatch breaks, catalog rows go empty and the dataset
-resource is unaffected. Tunables: `JW_COUNTRY`, `JW_PROVIDERS`, `JW_CACHE_TTL_SECS`. Catalog data from
+fetched server-side and cached in-process (~6h, serve-stale-on-error). Each meta carries the **IMDb id**
+(a plain Stremio client + Cinemeta resolve the detail page from it) plus JustWatch's **TMDB id** as
+`moviedb_id` — the key the Den app maps rows through (it bridges everything via TMDB). No TMDB API calls,
+no `meta` resource. The module is fully **isolated**: if JustWatch breaks, catalog rows go empty and the
+dataset resource is unaffected. Tunables: `JW_COUNTRY`, `JW_PROVIDERS`, `JW_CACHE_TTL_SECS`. Catalog data from
 JustWatch.
 
 ## Implementation

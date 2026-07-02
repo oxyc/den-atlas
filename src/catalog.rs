@@ -167,23 +167,30 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
         .enumerate()
         .map(|(i, (imdb, _))| {
             let r = repr[imdb];
-            TrendingItem { imdb: r.imdb.clone(), title: r.title.clone(), rank: i }
+            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i }
         })
         .collect()
 }
 
-/// Render items as Stremio catalog metas. Poster is metahub-by-IMDb (Cinemeta's own source), so the
-/// grid is consistent and no TMDB is needed; Cinemeta fills the detail page from the tt id.
+/// Render items as Stremio catalog metas. `id` is the IMDb id (a plain Stremio client + Cinemeta resolve
+/// the detail page from it); `imdb_id` + `moviedb_id` are the extra keys the Den app maps rows through
+/// (it bridges everything via TMDB — an item without `moviedb_id` won't render there). Poster is
+/// metahub-by-IMDb (Cinemeta's own source), so no TMDB fetch is needed to draw the grid.
 pub fn render_metas(items: &[TrendingItem], stremio_type: &str) -> String {
     let metas: Vec<serde_json::Value> = items
         .iter()
         .map(|it| {
-            serde_json::json!({
+            let mut m = serde_json::json!({
                 "id": it.imdb,
+                "imdb_id": it.imdb,
                 "type": stremio_type,
                 "name": it.title,
                 "poster": format!("https://images.metahub.space/poster/medium/{}/img", it.imdb),
-            })
+            });
+            if let Some(tmdb) = it.moviedb {
+                m["moviedb_id"] = serde_json::json!(tmdb);
+            }
+            m
         })
         .collect();
     serde_json::json!({ "metas": metas }).to_string()
@@ -197,7 +204,7 @@ mod tests {
     use std::sync::Arc;
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
-        TrendingItem { imdb: imdb.into(), title: title.into(), rank }
+        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank }
     }
 
     struct Fake {
@@ -231,6 +238,8 @@ mod tests {
         let r = s.metas_json("jw-nfx", "movie").await.unwrap();
         assert!(r.fresh);
         assert!(r.body.contains(r#""id":"tt1""#));
+        assert!(r.body.contains(r#""imdb_id":"tt1""#));
+        assert!(r.body.contains(r#""moviedb_id":42"#), "emits moviedb_id so the Den app can map the row");
         assert!(r.body.contains(r#""type":"movie""#));
         assert!(r.body.contains("images.metahub.space/poster/medium/tt1/img"));
     }
