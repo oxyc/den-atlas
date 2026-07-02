@@ -4,7 +4,8 @@
 
 use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -72,11 +73,14 @@ pub struct CatalogState {
     source: Arc<dyn TrendingSource>,
     cache: TtlCache,
     country: String,
+    // Per-key refresh gate (single-flight): coalesces concurrent misses so a cold-cache burst makes one
+    // upstream fetch per key, not N. Keyspace is tiny + fixed (ids × types × country), so it isn't pruned.
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl CatalogState {
     pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration, country: String) -> Self {
-        Self { source, cache: TtlCache::new(ttl), country }
+        Self { source, cache: TtlCache::new(ttl), country, inflight: Mutex::new(HashMap::new()) }
     }
 
     /// The `{ "metas": [...] }` body for a catalog id + Stremio type. `None` (→ 404) for an unknown
@@ -93,6 +97,17 @@ impl CatalogState {
         let key = format!("jw:{}:{}:{}", self.country, catalog_id, stremio_type);
         if let Lookup::Fresh(v) = self.cache.get(&key) {
             return Some(CatalogResponse { body: v, fresh: true });
+        }
+
+        // Single-flight: one refresh per key runs; the rest wait and then hit the warm cache. The std
+        // lock is only held to fetch the per-key gate (never across the await).
+        let gate = {
+            let mut map = self.inflight.lock().unwrap();
+            Arc::clone(map.entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+        };
+        let _hold = gate.lock().await;
+        if let Lookup::Fresh(v) = self.cache.get(&key) {
+            return Some(CatalogResponse { body: v, fresh: true }); // filled while we waited
         }
 
         let fetched = if is_trending {

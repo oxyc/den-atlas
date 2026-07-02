@@ -23,6 +23,7 @@ pub fn json_response(body: &'static str, status: StatusCode) -> Response {
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*") // public data, no credentials
         .body(Body::from(body))
         .unwrap()
 }
@@ -31,6 +32,7 @@ pub fn json_response(body: &'static str, status: StatusCode) -> Response {
 pub fn html_response(body: String) -> Response {
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(Body::from(body))
         .unwrap()
 }

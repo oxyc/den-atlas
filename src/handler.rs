@@ -9,14 +9,25 @@ use crate::util::{
     escape_html, fnv1a, group_thousands, html_response, json_response, public_origin,
 };
 use crate::AppState;
+use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::sync::Arc;
 
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
+    // CORS preflight for browser-based Stremio clients (public, credential-free data).
+    if method == Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            .body(Body::empty())
+            .unwrap();
+    }
     if method != Method::GET && method != Method::HEAD {
         return json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED);
     }

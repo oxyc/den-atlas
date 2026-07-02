@@ -58,7 +58,9 @@ const QUERY: &str = r#"query GetPopularTitles($country: Country!, $first: Int!, 
 }"#;
 
 pub struct JustWatchClient {
-    http: reqwest::Client,
+    // None if the client couldn't be built (TLS backend init) — catalog then degrades to empty rows
+    // instead of `reqwest::Client::new()` panicking at startup.
+    http: Option<reqwest::Client>,
     country: String,
 }
 
@@ -68,7 +70,8 @@ impl JustWatchClient {
             .timeout(Duration::from_secs(8))
             .user_agent("den-atlas/0.1 (+https://github.com/oxyc/den)")
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
+            .ok();
         Self { http, country }
     }
 }
@@ -147,7 +150,11 @@ impl TrendingSource for JustWatchClient {
                 "objectTypes": [obj.as_jw()],
             },
         });
-        let mut resp = match self.http.post(ENDPOINT).json(&payload).send().await {
+        let http = match self.http.as_ref() {
+            Some(h) => h,
+            None => return Err(()),
+        };
+        let mut resp = match http.post(ENDPOINT).json(&payload).send().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("den-atlas: justwatch request failed ({provider}/{}): {e}", obj.as_jw());
