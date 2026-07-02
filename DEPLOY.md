@@ -11,12 +11,27 @@ DEN_REPO=/path/to/den npm run import
 This copies `labels-t01.json` + `vectors-e02.bin` and writes `data/dataset.meta.json` (dims/count read
 from the blobs, `datasetVersion` content-addressed). Re-run to refresh when Den publishes new artifacts.
 
-## 2. Build + run (Docker)
+## 2. Run (Docker)
+Two options:
+
+**A — pull the published image (GHCR).** The image built by CI is the **server only** (CI has no dataset
+blobs), so mount the data you imported in step 1:
+```sh
+docker run -d --name den-atlas -p 8080:8080 --restart unless-stopped \
+  -v "$PWD/data:/app/data:ro" ghcr.io/oxyc/den-atlas:latest
+```
+Published by `.github/workflows/publish.yml` on a `v*` tag (`git tag v0.1.0 && git push origin v0.1.0`) or a
+manual run. First publish: set the package to Public + link it to the repo in GitHub → Packages if you want
+it pullable anonymously. (Needs repo Settings → Actions → Workflow permissions = "Read and write".)
+
+**B — build a data-included image locally** (self-contained, no mount). `./data` is baked in, so step 1 must
+run first:
 ```sh
 docker build -t den-atlas .
 docker run -d --name den-atlas -p 8080:8080 --restart unless-stopped den-atlas
 ```
-The image bakes `./data` in, so step 1 must run first. Smoke-test:
+
+Smoke-test either way:
 ```sh
 curl -s localhost:8080/health                       # {"status":"ok"}
 curl -s localhost:8080/manifest.json | jq .resources # ["dataset"]
