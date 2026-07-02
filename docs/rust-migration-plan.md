@@ -7,10 +7,17 @@ Two coupled goals:
    Rust too lets it share the artifact-format types with the server (one source of truth). Go is a viable
    alternative for the producer alone.
 
-**Constraint from the owner:** the existing `t01`/`e02` labels+vectors are NOT being rebuilt — den-atlas keeps
-serving today's bytes. The producer is being *relocated* (and modernised), and only **minimally tested** end
-to end (a handful of titles), not run at 60k scale. A `.env` with `TMDB_KEY` is available; the classify step
-additionally needs an `ANTHROPIC_API_KEY`.
+**Constraints from the owner:**
+- The existing `t01`/`e02` labels+vectors are NOT being rebuilt — den-atlas keeps serving today's bytes. The
+  producer is *relocated* (and tidied), only **minimally tested** on a handful of titles, never run at 60k
+  scale.
+- **Classification stays agent-driven.** The labeling runs on the owner's **Claude Code** credit (Opus
+  orchestrates Haiku subagents) — NOT a server-side API key. So the producer is a set of **deterministic
+  scripts** the agent runs, with the LLM votes slotted in as JSON files between phases (exactly today's design,
+  relocated). The scripts need only `TMDB_KEY`; there is no `ANTHROPIC_API_KEY`.
+- **Don't couple TMDB too tightly.** A future taxonomy may enrich from **Wikipedia/Wikidata** instead of TMDB,
+  so the metadata source sits behind a trait (TMDB is just the first impl). Identity stays the `tmdbId` (the
+  app keys on it) — a future source draws the *text/signal* from elsewhere but still resolves to TMDB ids.
 
 ---
 
@@ -80,26 +87,37 @@ today; a direct port. What moves and what it becomes:
 
 | Swift (Den repo, producer-only) | Rust (`atlas-build`) | Notes |
 |---|---|---|
-| `tools/taxonomy-backfill/main.swift` (762) | the CLI + resumable phases | worklist → enrich → classify → embed → assemble → finalize, with checkpoints for a 24 h run |
-| `Backfill/TaxonomyClassifier.swift` (211) | `classifier.rs` | port EXACTLY: n=3 self-consistency, fused primary genre (majority + IDF rarity tie-break), per-family thresholds **0.70/0.55/0.60**, grounding bonus, off-vocab reject, top-3 |
+| `tools/taxonomy-backfill/main.swift` (762) | the CLI + resumable phases | `worklist → enrich →` **`[agent: Haiku votes]`** `→ assemble → embed → finalize`, checkpointed for a 24 h run |
+| `Backfill/TaxonomyClassifier.swift` (211) | `classifier.rs` (the `classify(rawVotes:)` aggregation, run by `assemble`) | port EXACTLY: n=3 self-consistency, fused primary genre (majority + IDF rarity tie-break), per-family thresholds **0.70/0.55/0.60**, grounding bonus, off-vocab reject, top-3. Reads the agent's vote JSON |
 | `Taxonomy/Taxonomy.swift` + `TaxonomyScorer.swift` | `taxonomy.rs` | the controlled vocab (`t01`) + IDF weights — data port |
 | `Backfill/Embedder.swift` (FNV + Quantizer) | `embed.rs` | FNV-1a signed feature hashing → 384-d, L2-norm; int8 ×127. Trivial, port **bit-exact** (golden test) |
 | `Backfill/BackfillPipeline.swift` | the orchestration in the CLI | |
 | producer half of `BackfillModels.swift` (WorklistEntry, EnrichedTitle, RunReport, Checkpoint, Worklist) | `model.rs` | the *format* half (IndexRecord/LabelsArtifact) stays in the app + lives in `atlas-format` |
-| `TMDBClient` (the bits the tool uses) | `tmdb.rs` (reqwest) | `/discover`, daily-export parse, `classificationRecord` (detail + `append_to_response=keywords`), vote-floor + anime filter |
+| `TMDBClient` (the bits the tool uses) | `sources/tmdb.rs` behind an `EnrichmentSource` trait (reqwest) | `/discover`, daily-export parse, `classificationRecord` (detail + `append_to_response=keywords`), vote-floor + anime filter — all TMDB-specific bits stay inside this impl |
 
-**The LLM step changes for the better.** Today classification is **agent-driven**: `main.swift` ships a
-`NoLLM` stub and an external "Opus loop spawns Haiku subagents" writes `out/votes/batch-N-passK.json`, which
-`classify(rawVotes:)` then aggregates. The port replaces that with a **direct Anthropic Messages API client**
-(`llm.rs`, Haiku, n=3, temp 0, the existing prompt) — fully reproducible from an `ANTHROPIC_API_KEY`, no
-Claude Code harness dependency. The calibrated aggregation is unchanged.
+**The LLM step stays agent-driven (by design).** The producer keeps today's contract: the deterministic
+phases are scripts the owner's **Claude Code** agent runs, and between `enrich` and `assemble` the agent spawns
+**Haiku subagents** that write `out/votes/batch-N-pass<K>.json` (the classification prompt lives in the repo
+for the agent to use). `assemble` reads those vote files and runs the **calibrated aggregation**
+(`classify(rawVotes:)`) — no server-side LLM key, the labeling runs on Claude Code credit. This is the current
+design, just relocated to den-atlas; the aggregation is a plain library function so it stays unit-tested
+against fixture votes.
 
-**CLI:** `atlas-build run` (resumable) or per-phase subcommands, reading `.env` (`TMDB_KEY`,
-`ANTHROPIC_API_KEY`). Output lands in `data/` → the server serves it + the producer also writes
-`labels-t01.json.gz` and `dataset.meta.json` (sha/size/builtAt) so the server needs zero startup work.
+**Pluggable metadata source (Wikipedia-ready).** Enrichment sits behind an `EnrichmentSource` trait producing
+a source-agnostic `EnrichedTitle` (title / year / overview / keywords / genres / origin). TMDB is the first
+impl; a future `sources/wikipedia.rs` (Wikidata → article → plot/themes) slots in **without touching** the
+classifier, embedder, or format. Identity stays the `tmdbId` the app keys on, so a Wikipedia source still
+resolves to TMDB ids — it just draws the *text/signal* from elsewhere. Keep TMDB-only concerns (vote-floor,
+keyword-id grounding) inside the TMDB impl, not the classifier core.
 
-**ToS invariant preserved:** the finalize step keeps the "no raw TMDB overview/text in the published
-artifact" assertion (derived labels + int8 vectors only).
+**CLI (what the agent runs):** `atlas-build worklist | enrich | assemble | embed | finalize` (resumable,
+checkpointed), reading `.env` (`TMDB_KEY` only). A run script + README document the loop the Claude Code agent
+drives: `enrich` a batch → the agent writes Haiku votes → `assemble` → `embed` + quantize → `finalize`. Output
+lands in `data/` with `labels-t01.json.gz` + `dataset.meta.json` (sha/size/builtAt) so the server needs zero
+startup work.
+
+**ToS invariant preserved:** `finalize` keeps the "no raw overview/text in the published artifact" assertion
+(derived labels + int8 vectors only).
 
 **Language note:** Rust for the DRY win (shares `atlas-format` with the server). **Go is acceptable** for
 `atlas-build` alone (reqwest→net/http, serde→encoding/json) — the cost is defining the artifact format a second
@@ -124,9 +142,8 @@ After: **`atlas-build` output is the master**; the app bundles a *snapshot* copi
 `make sync-dataset` that pulls atlas's `data/`, or a published release asset). Today's `t01`/`e02` bytes are
 just relocated — not rebuilt.
 
-**Open decision — the tvOS bundled fallback:** keep a bundled snapshot (app works offline / out-of-box, ~30
-MB) or drop it (slimmer app, degrades to recipes+TMDB until the first atlas sync). Recommend **keep**, sourced
-from atlas.
+**tvOS bundled fallback: keep** (decided). The app bundles a snapshot so it works offline / out-of-box; atlas
+is the fresh canonical copy, and the snapshot is sourced from atlas going forward.
 
 **Gate:** `make verify` stays green after the deletion (the app never used the deleted code).
 
@@ -152,10 +169,11 @@ fails a test.
    port). Serve the existing `data/`. Port the vitest suite. New musl/scratch Dockerfile + GHCR workflow.
    *Exit:* byte-identical descriptor, all caching probes pass, **RSS + image size measured** (prove the win),
    TS retired.
-2. **RUST-2 — producer port.** `atlas-build`: tmdb, taxonomy, classifier, Anthropic LLM, embed+quantize,
-   assemble/finalize, resumable CLI. Golden parity tests (embedder/quantizer bit-exact; a few classifier
-   cases). *Exit:* minimal end-to-end run on 3–5 titles from `.env` produces a valid chunk the conformance
-   fixture accepts.
+2. **RUST-2 — producer port.** `atlas-build`: `EnrichmentSource` (TMDB impl), taxonomy, the `classify(rawVotes:)`
+   aggregation, embed+quantize, assemble/finalize, resumable CLI + the agent run-book (vote-file contract +
+   prompt). Golden parity tests (embedder/quantizer bit-exact; a few classifier cases). *Exit:* the
+   deterministic phases on 3–5 titles (with fixture votes standing in for the agent's Haiku pass) emit a valid
+   chunk the conformance fixture accepts.
 3. **DEN-CLEANUP.** Delete the moved Swift + tests, trim `BackfillModels` to format-only, flip the
    source-of-truth, decide the bundled fallback. *Exit:* `make verify` green; Den repo carries no producer.
 4. **(later) FP-2 hook.** `atlas-build`'s `Embedder` trait leaves room for a real semantic model (bge-m3 via
@@ -169,10 +187,12 @@ fails a test.
   server (health, manifest, `dataset.json` behind proxy headers, `Range` 206, gzip round-trip whose gunzip
   sha matches the descriptor, `If-None-Match` 304, HEAD). Assert the descriptor is byte-identical to today.
   Measure RSS (`/proc` or `ps`) and image size to confirm the targets.
-- **Producer:** with `TMDB_KEY` (+ `ANTHROPIC_API_KEY` for classify), run `atlas-build` on **3–5 known
-  titles** end to end → assert the emitted labels+vectors pass the conformance fixture and the Swift parser.
-  Golden unit tests: the FNV embedder + int8 quantizer match the Swift output bit-for-bit on fixed inputs; a
-  couple of `classify(rawVotes:)` cases match the Swift calibrated result. **No 60k rebuild.**
+- **Producer (no Anthropic key needed):** with `TMDB_KEY`, run the deterministic phases on **3–5 known
+  titles** — `enrich` → feed **fixture vote JSON** (standing in for the agent's Haiku pass) → `assemble` →
+  `embed` → `finalize` → assert the emitted labels+vectors pass the conformance fixture + the Swift parser.
+  Golden unit tests: the FNV embedder + int8 quantizer match the Swift output bit-for-bit; a couple of
+  `classify(rawVotes:)` cases match the Swift calibrated result. The real Haiku labeling is exercised when the
+  owner runs it via Claude Code. **No 60k rebuild.**
 
 ---
 
@@ -183,9 +203,11 @@ fails a test.
 - **Format drift** — mitigated by the shared `atlas-format` crate + the cross-language conformance fixture.
 - **Toolchain** — adds cargo + musl cross-compile to the homelab (one-time); the image gets *smaller* and
   dependency-free.
-- **`ANTHROPIC_API_KEY`** — needed for the classify step; `TMDB_KEY` alone covers enrich/embed/format, so the
-  minimal test can exercise everything except classify (or classify a couple of titles with a key).
-- **Bundled-fallback decision** — product call (keep vs drop), independent of the rest.
+- **Agent-driven labeling** — the classify step runs on Claude Code credit (Haiku subagents write vote files);
+  the scripts themselves need only `TMDB_KEY`. Keep the classification prompt + the vote-file schema in the
+  repo so an agent run is reproducible, and keep `assemble` a pure library function tested against fixtures.
+- **Source coupling** — enrichment lives behind `EnrichmentSource` so a future Wikipedia/Wikidata source swaps
+  in; TMDB-specific bits (vote-floor, keyword-id grounding) stay in the TMDB impl, not the classifier core.
 
 ## Rough effort
 RUST-1 ~2–3 days (serving is small + well-spec'd). RUST-2 ~3–5 days (the classifier + LLM + TMDB port is the
