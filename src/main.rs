@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub struct AppState {
-    pub dataset: dataset::Dataset,
+    /// `None` when the dataset couldn't be loaded (old/missing meta) — the addon still serves manifest +
+    /// catalog and returns 503 on the dataset routes.
+    pub dataset: Option<dataset::Dataset>,
     /// Override the origin used in descriptor blob URLs (else derived from X-Forwarded-* / Host).
     pub public_base: Option<String>,
     /// JustWatch "most popular" catalog rows (public, isolated from the dataset resource).
@@ -25,16 +27,16 @@ pub struct AppState {
 #[tokio::main]
 async fn main() {
     let dir = std::env::var("ATLAS_DATA_DIR").unwrap_or_else(|_| "data".to_owned());
+    // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
+    // dataset.meta.json must not crash-loop the addon. Keep serving; the dataset routes report 503 and
+    // the app surfaces a real reason instead of a connection refusal.
     let dataset = match dataset::Dataset::load(std::path::Path::new(&dir)) {
-        Ok(d) => d,
+        Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("den-atlas: failed to load dataset from {dir}: {e}");
-            std::process::exit(1);
+            eprintln!("den-atlas: dataset unavailable ({e}) — serving manifest + catalog only until the data is refreshed (scripts/fetch-dataset.sh)");
+            None
         }
     };
-    let count = dataset.meta.count;
-    let em = dataset.meta.embedding_model.clone();
-    let tv = dataset.meta.taxonomy_version.clone();
 
     let country = std::env::var("JW_COUNTRY").unwrap_or_else(|_| "US".to_owned());
     let ttl = Duration::from_secs(
@@ -54,7 +56,7 @@ async fn main() {
 
     let app = axum::Router::new()
         .fallback(handler::handle)
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -66,7 +68,13 @@ async fn main() {
             eprintln!("den-atlas: bind :{port} failed: {e}");
             std::process::exit(1);
         });
-    eprintln!("den-atlas listening on :{port} — {count} titles ({em}/{tv})");
+    match &state.dataset {
+        Some(ds) => eprintln!(
+            "den-atlas listening on :{port} — {} titles ({}/{})",
+            ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version
+        ),
+        None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
+    }
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("den-atlas: serve error: {e}");
         std::process::exit(1);

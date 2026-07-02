@@ -24,7 +24,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
     let origin = public_origin(&headers, state.public_base.as_deref());
-    let ds = &state.dataset;
+    let ds = state.dataset.as_ref();
 
     if path == "/" || path == "/configure" || path == "/configure/" {
         return html_response(landing_page(&origin, ds));
@@ -36,20 +36,24 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return serve_json(&method, &headers, manifest_json(), "public, max-age=3600", None).await;
     }
     if path == "/dataset.json" {
-        return serve_json(
-            &method,
-            &headers,
-            build_descriptor(&origin, ds),
-            "public, max-age=300",
-            ds.last_modified.clone(),
-        )
-        .await;
+        return match ds {
+            Some(ds) => {
+                serve_json(&method, &headers, build_descriptor(&origin, ds), "public, max-age=300", ds.last_modified.clone()).await
+            }
+            None => json_response(
+                r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        };
     }
-    if path == format!("/{}", ds.labels.name) {
-        return serve_blob(&method, &headers, &query, ds, &ds.labels).await;
-    }
-    if path == format!("/{}", ds.vectors.name) {
-        return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
+    // Blob routes exist only when the dataset loaded (their names come from the meta).
+    if let Some(ds) = ds {
+        if path == format!("/{}", ds.labels.name) {
+            return serve_blob(&method, &headers, &query, ds, &ds.labels).await;
+        }
+        if path == format!("/{}", ds.vectors.name) {
+            return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
+        }
     }
     if let Some(rest) = path.strip_prefix("/catalog/") {
         return handle_catalog(&method, &headers, rest, &state).await;
@@ -149,9 +153,17 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-fn landing_page(origin: &str, ds: &Dataset) -> String {
+fn landing_page(origin: &str, ds: Option<&Dataset>) -> String {
     let manifest_url = format!("{}/manifest.json", escape_html(origin));
-    let m = &ds.meta;
+    let status = match ds {
+        Some(d) => format!(
+            "<p>Currently serving <b>{}</b> titles (<code>{}</code> / <code>{}</code>).</p>",
+            group_thousands(d.meta.count),
+            escape_html(&d.meta.taxonomy_version),
+            escape_html(&d.meta.embedding_model)
+        ),
+        None => "<p><b>Dataset unavailable</b> — the feature-store blobs failed to load (refresh with <code>scripts/fetch-dataset.sh</code>). Catalog rows still work.</p>".to_owned(),
+    };
     [
         "<!doctype html><html><head><meta charset=utf-8>",
         "<meta name=viewport content='width=device-width,initial-scale=1'>",
@@ -160,12 +172,7 @@ fn landing_page(origin: &str, ds: &Dataset) -> String {
         "code{background:#f2f2f2;padding:.15rem .35rem;border-radius:4px;word-break:break-all}</style></head><body>",
         "<h1>Den Atlas</h1>",
         "<p>A self-hosted <b>dataset addon</b> for Den — derived labels + semantic vectors for the whole catalog.</p>",
-        &format!(
-            "<p>Currently serving <b>{}</b> titles (<code>{}</code> / <code>{}</code>).</p>",
-            group_thousands(m.count),
-            escape_html(&m.taxonomy_version),
-            escape_html(&m.embedding_model)
-        ),
+        &status,
         "<p>Add this URL in Den → Settings → Plugins:</p>",
         &format!("<p><code>{manifest_url}</code></p>"),
         "<p>Also serves \u{201c}most popular\u{201d} streaming catalog rows. Catalog data from JustWatch.</p>",
