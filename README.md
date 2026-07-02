@@ -58,10 +58,13 @@ caches everything by URL with correct revalidation.
 
 ## Develop
 ```sh
-DEN_REPO=../den node scripts/import-dataset.mjs   # prep ./data: copy blobs + write gzip + per-blob sha meta
-cargo run                                         # http://localhost:8080  (add /manifest.json in Den → Plugins)
-cargo test                                        # the caching layer (ETag / Range / gzip / 304)
+scripts/fetch-dataset.sh   # prep ./data from the den-dataset `data-latest` release (labels + vectors + gzip + meta)
+cargo run                  # http://localhost:8080  (add /manifest.json in Den → Plugins)
+cargo test                 # the caching layer (ETag / Range / gzip / 304)
 ```
+The dataset is produced by [den-dataset](https://github.com/oxyc/den-dataset) (`taxonomy-backfill finalize`
+→ `publish-dataset.sh`) and published as a GitHub Release — the single source of truth this server and the
+Den app both fetch. den-atlas no longer reads the Den repo.
 
 ## Deploy
 Self-hosted, Docker, behind a reverse proxy (Caddy) that terminates TLS and forwards

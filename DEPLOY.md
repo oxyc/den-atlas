@@ -3,14 +3,16 @@
 Self-hosted, like `den-scout` and `den-trailer-service`: a small Node process behind a reverse proxy that
 terminates TLS. The Den app needs an **https** URL (or a LAN/private-range host over http).
 
-## 1. Import the dataset
-The blobs are gitignored — pull them from the Den repo into `./data`:
+## 1. Fetch the dataset
+The blobs are gitignored — fetch the published artifact from the [den-dataset](https://github.com/oxyc/den-dataset)
+`data-latest` release into `./data` (anonymous; needs only curl + python3):
 ```sh
-DEN_REPO=/path/to/den node scripts/import-dataset.mjs
+scripts/fetch-dataset.sh
 ```
-This copies `labels-t01.json` + `vectors-e02.bin`, precomputes `labels-t01.json.gz`, and writes
-`data/dataset.meta.json` (dims/count + per-blob sha256/size + `datasetVersion` content-addressed + the
-HTTP-date). The Rust server reads all of that — it never hashes or compresses at boot. Re-run to refresh.
+This downloads `labels-t01.json`, `vectors-e02.bin`, `labels-t01.json.gz`, and `dataset.meta.json` (per-blob
+sha256/size + `datasetVersion` + HTTP-date). The Rust server reads all of that — it never hashes or compresses
+at boot. **den-dataset's `finalize` + `publish-dataset.sh` is the source of truth** (not the Den repo);
+re-run this to refresh after a new dataset release.
 
 ## 2. Run (Docker)
 Two options:
@@ -56,7 +58,7 @@ dataset (sha256-gated, stale-while-revalidate) and the on-device feature store c
 the bundled copy. Removing the addon falls back to the bundled artifact — discovery never goes blank.
 
 ## Refreshing / new versions
-Re-run `npm run import` (bumps `datasetVersion` iff the bytes changed) → rebuild → redeploy. The app
+Re-run `scripts/fetch-dataset.sh` after a new den-dataset release (its `datasetVersion` bumps iff the bytes changed) → rebuild → redeploy. The app
 re-syncs only when `datasetVersion`/`embeddingModel`/`taxonomyVersion` moves; unchanged blobs are served
 from the on-device cache with no re-download. A future semantic re-embed just changes `embeddingModel`
 (e.g. `e02` → `bge-m3`), which forces a clean re-sync into the new vector space.

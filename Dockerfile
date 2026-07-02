@@ -14,7 +14,7 @@ FROM scratch AS runtime
 ENV ATLAS_DATA_DIR=/app/data \
     PORT=8080
 COPY --from=build /app/target/release/den-atlas /den-atlas
-# The dataset blobs (gitignored; produced by `npm run import` locally). Empty in CI → mount at runtime.
+# The dataset blobs (gitignored; fetched via scripts/fetch-dataset.sh). Empty in CI → mount at runtime.
 COPY data /app/data
 EXPOSE 8080
 # scratch has no /etc/passwd; run as the numeric `nobody`. (No Docker HEALTHCHECK — scratch has no shell;
