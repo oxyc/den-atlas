@@ -1,215 +1,208 @@
-# Plan — den-atlas → Rust, and pulling the dataset producer out of the TV app
+# Plan (v2, post-audit) — Rust serving + extracting the dataset producer from the TV app
 
-Two coupled goals:
-1. **Rewrite the always-on serving layer in Rust** for minimal memory + optimal CPU.
-2. **Move the whole dataset "ranking/taxonomy" producer out of the Den TV app into den-atlas** (it has no
-   business in a tvOS app repo). The producer runs rarely, so it *could* be a slower language — but making it
-   Rust too lets it share the artifact-format types with the server (one source of truth). Go is a viable
-   alternative for the producer alone.
+> **v2 changes** (an audit verified v1 against both repos and found several "clean move" claims false):
+> - **Server → Rust** (confirmed sound; memory claims hold).
+> - **Producer → stays Swift**, lifted into its own package that `import DenKit` — NOT a Rust port. This
+>   removes it from the tvOS *app* while keeping byte-exact parity and avoiding duplicating three app catalogs.
+> - Corrected the real phase/checkpoint/vote contract, the e01-vs-e02 gap, the `import-dataset.mjs` work, and
+>   the (over-stated) TMDB decoupling. Effort re-baselined to ~1.5–2 weeks.
+
+Two goals: (1) rewrite the always-on serving layer in Rust for minimal memory + CPU; (2) get the dataset
+"ranking/taxonomy" producer out of the Den tvOS app repo. These are independent — do the server first.
 
 **Constraints from the owner:**
-- The existing `t01`/`e02` labels+vectors are NOT being rebuilt — den-atlas keeps serving today's bytes. The
-  producer is *relocated* (and tidied), only **minimally tested** on a handful of titles, never run at 60k
-  scale.
-- **Classification stays agent-driven.** The labeling runs on the owner's **Claude Code** credit (Opus
-  orchestrates Haiku subagents) — NOT a server-side API key. So the producer is a set of **deterministic
-  scripts** the agent runs, with the LLM votes slotted in as JSON files between phases (exactly today's design,
-  relocated). The scripts need only `TMDB_KEY`; there is no `ANTHROPIC_API_KEY`.
-- **Don't couple TMDB too tightly.** A future taxonomy may enrich from **Wikipedia/Wikidata** instead of TMDB,
-  so the metadata source sits behind a trait (TMDB is just the first impl). Identity stays the `tmdbId` (the
-  app keys on it) — a future source draws the *text/signal* from elsewhere but still resolves to TMDB ids.
-
----
-
-## Architecture: one Cargo workspace, two binaries + a shared crate
-
-```
-den-atlas/
-  crates/
-    atlas-format/   # shared: IndexRecord/LabelsArtifact, the vector-blob codec, DatasetDescriptor, meta
-    atlas-serve/    # the always-on HTTP addon (axum) — replaces src/*.ts
-    atlas-build/    # the rare batch producer (TMDB → classify → embed → quantize → publish)
-  data/             # labels-t01.json, vectors-e02.bin, labels-t01.json.gz, dataset.meta.json (gitignored)
-  Dockerfile        # multi-stage: musl static build → FROM scratch (~10 MB image)
-  .github/workflows/publish.yml   # build the Rust image → GHCR
-  docs/rust-migration-plan.md
-```
-
-`atlas-serve` and `atlas-build` both depend on `atlas-format`, so the **labels JSON schema + the
-`[int32 count][int32 dim]` int8 vector layout are defined exactly once** and can't drift between producer and
-server. This shared-types win is the main reason to prefer Rust over Go for the producer.
+- The existing `t01`/`e02` labels+vectors are NOT rebuilt — den-atlas keeps serving today's bytes. The
+  producer is *relocated*, only **minimally tested** (a handful of titles), never run at 60k scale.
+- **Classification stays agent-driven** — labeling runs on the owner's **Claude Code** credit (Opus
+  orchestrates Haiku subagents that write vote JSON files); the scripts need only `TMDB_KEY`, no server-side
+  Anthropic key.
+- **Don't hard-couple TMDB** — a future taxonomy may enrich from Wikipedia/Wikidata (see the honest scope in
+  Part B; it's more than a trait swap).
 
 ---
 
 ## Part A — `atlas-serve` (Rust): the memory/CPU rewrite
 
-Today (TypeScript/Node): loads both blobs (33 MB) + the gzip (0.6 MB) into the heap → **~34 MB RSS**, 196 MB
-Alpine image. The Rust rewrite keeps every current behaviour (see the vitest suite) and drives that down hard.
+Today (Node): loads labels (11.19 MB) + vectors (22.22 MB) into the heap, plus a boot-time `gzipSync` and a
+boot-time `sha256` → **~33 MB RSS**, 196 MB image. Rust target: **< 10 MB RSS, ~5 ms boot, ~10 MB image**,
+identical behaviour. (Audit confirmed the memory math and that these targets are plausible.)
 
-**Stack:** `axum` (tokio + hyper) + `tower-http`. Small, mature, ideal for static + custom handlers.
+**Stack:** `axum` (tokio/hyper). Serve blob bodies via **`tokio::fs` streaming** (`ReaderStream`, 64 KiB
+chunks; Range = stream just the window). **Avoid `mmap` for the hot path** — a republish that overwrites a
+file in place under a live mmap causes SIGBUS/torn reads (the audit flagged this; Node is immune only because
+it loads into the heap at boot). Streaming from a freshly-`open`ed fd per request sidesteps it; if mmap is
+ever wanted for speed, pair it with atomic-rename-and-reopen.
 
-**Memory wins (the point):**
-- **Never load a blob into RAM.** Serve it by **streaming from disk** (`tokio::fs::File` + `ReaderStream`, 64
-  KiB chunks) — or `sendfile`/`mmap` (`memmap2`) for the hot path. RSS stays flat regardless of blob size or
-  concurrency. Range slices stream the requested byte window only.
-- **Precompute gzip to a file** (`labels-t01.json.gz`, written by the producer/import) and stream *that* for
-  gzip clients — zero runtime compression, zero in-RAM gzip copy (Node held it in the heap).
-- **No startup hashing.** Read sha256 + size + `builtAt` from the `dataset.meta.json` sidecar (the producer
-  writes them), so boot is a tiny file read (~1 ms) instead of hashing 33 MB.
-- **Target: < 10 MB RSS** serving the same 33 MB, boot < 5 ms.
+**Where the wins come from:**
+- **Never hold a blob in RAM** — stream from disk. RSS stays flat under load.
+- **Precomputed gzip file** (`labels-t01.json.gz`, written by the producer) served for gzip clients — no
+  runtime compression, no in-RAM gzip.
+- **Sha from the sidecar** — the producer writes per-blob sha256 into `dataset.meta.json` (NEW: today's meta
+  has no sha; the Node server hashes at boot, `dataset.ts:52`). Server just reads it → instant boot.
 
-**CPU wins:** static serving becomes syscall-bound (stream/`sendfile`); sha computed **once, offline** (in the
-producer) not per-boot; gzip precomputed; tokio handles many concurrent Range/blob requests with constant
-memory.
+**`tower-http` `ServeFile`/`ServeDir` is NOT enough** — it won't reproduce the sha `ETag`, the distinct
+`"<sha>-gzip"` ETag, `Vary`-only-when-gzip, `?v` immutable-vs-revalidate, or multi-range/garbage→`200`. So
+**hand-roll `serve_bytes` over `tokio::fs`**. Only the *validator/negotiation* logic ports from `http.ts` (137
+lines): this is a **body-layer rewrite** (today it's all in-memory `Uint8Array.subarray`), not a "verbatim
+port".
 
-**Caching:** port `src/http.ts` verbatim (it's ~200 lines and fully spec'd + tested). Keep: strong `ETag`
-(sha for blobs / a cheap hash for JSON) + `If-None-Match`, `Last-Modified` + `If-Modified-Since` → 304, `HEAD`,
-`Range`/206/416 + `Accept-Ranges`, gzip negotiation with `Vary` only when a gzip variant exists, the distinct
-`"<sha>-gzip"` ETag, and version-stamped (`?v=`) immutable URLs. Port the vitest cases to `#[tokio::test]`.
+**Port checklist — every behaviour, incl. the ones v1 missed** (verified against `handler.ts`/`http.ts`/
+`util.ts`/`descriptor.ts`):
+- `ETag` (blob sha / JSON fnv) + `If-None-Match`; `Last-Modified` + `If-Modified-Since` → 304 (INM precedence).
+- `HEAD`; **`405` for non-GET/HEAD**; `/configure` + `/configure/` alias to the landing page.
+- `Range` → 206 `Content-Range` / 416; `Accept-Ranges`; **multi-range or garbage Range → full 200**.
+- gzip negotiation (`Accept-Encoding`, incl. `*` and `q=0`); **`Vary` only when a gzip variant exists**; the
+  **distinct `"<sha>-gzip"` ETag** for the gzip representation.
+- Origin from **`X-Forwarded-Proto` + `X-Forwarded-Host`/`Host`** (v1 omitted `x-forwarded-host`,
+  `util.ts:37-38`); `PUBLIC_BASE_URL` override.
+- `?v=<datasetVersion>` → `immutable, max-age=1y`; bare path → revalidate. Distinct TTLs: `manifest.json`
+  `max-age=3600`; `dataset.json` `max-age=300` + ETag + Last-Modified (`handler.ts:44-48`).
+- The Cloudflare `worker.ts` reference entry is dropped by a native binary (acceptable — it's not the CI path).
 
-**Endpoints:** unchanged — `/`, `/health`, `/manifest.json`, `/dataset.json` (absolute, `?v`-stamped blob
-URLs from `X-Forwarded-Proto`/`Host`), `/labels-t01.json`, `/vectors-e02.bin`. Byte-identical descriptor
-(same sha as today) so the Den app can't tell the difference.
-
-**Image:** multi-stage — `rust:1-alpine` with the `x86_64-unknown-linux-musl` target builds a **static
-binary**, copied into `FROM scratch` (or `distroless/static`). **~5–15 MB** vs 196 MB. Data is mounted (as
-now). Update `publish.yml` to build the Rust image.
-
-**Cutover:** land `atlas-serve` at parity (probes below), tag the current tree `legacy-ts`, then delete
-`src/*.ts` + the node toolchain. Same repo, same GHCR package name.
-
----
-
-## Part B — `atlas-build` (Rust): the producer, moved out of the TV app
-
-Everything the Den repo currently carries only to *build* the dataset moves here. It's ~1,300 LOC of Swift
-today; a direct port. What moves and what it becomes:
-
-| Swift (Den repo, producer-only) | Rust (`atlas-build`) | Notes |
-|---|---|---|
-| `tools/taxonomy-backfill/main.swift` (762) | the CLI + resumable phases | `worklist → enrich →` **`[agent: Haiku votes]`** `→ assemble → embed → finalize`, checkpointed for a 24 h run |
-| `Backfill/TaxonomyClassifier.swift` (211) | `classifier.rs` (the `classify(rawVotes:)` aggregation, run by `assemble`) | port EXACTLY: n=3 self-consistency, fused primary genre (majority + IDF rarity tie-break), per-family thresholds **0.70/0.55/0.60**, grounding bonus, off-vocab reject, top-3. Reads the agent's vote JSON |
-| `Taxonomy/Taxonomy.swift` + `TaxonomyScorer.swift` | `taxonomy.rs` | the controlled vocab (`t01`) + IDF weights — data port |
-| `Backfill/Embedder.swift` (FNV + Quantizer) | `embed.rs` | FNV-1a signed feature hashing → 384-d, L2-norm; int8 ×127. Trivial, port **bit-exact** (golden test) |
-| `Backfill/BackfillPipeline.swift` | the orchestration in the CLI | |
-| producer half of `BackfillModels.swift` (WorklistEntry, EnrichedTitle, RunReport, Checkpoint, Worklist) | `model.rs` | the *format* half (IndexRecord/LabelsArtifact) stays in the app + lives in `atlas-format` |
-| `TMDBClient` (the bits the tool uses) | `sources/tmdb.rs` behind an `EnrichmentSource` trait (reqwest) | `/discover`, daily-export parse, `classificationRecord` (detail + `append_to_response=keywords`), vote-floor + anime filter — all TMDB-specific bits stay inside this impl |
-
-**The LLM step stays agent-driven (by design).** The producer keeps today's contract: the deterministic
-phases are scripts the owner's **Claude Code** agent runs, and between `enrich` and `assemble` the agent spawns
-**Haiku subagents** that write `out/votes/batch-N-pass<K>.json` (the classification prompt lives in the repo
-for the agent to use). `assemble` reads those vote files and runs the **calibrated aggregation**
-(`classify(rawVotes:)`) — no server-side LLM key, the labeling runs on Claude Code credit. This is the current
-design, just relocated to den-atlas; the aggregation is a plain library function so it stays unit-tested
-against fixture votes.
-
-**Pluggable metadata source (Wikipedia-ready).** Enrichment sits behind an `EnrichmentSource` trait producing
-a source-agnostic `EnrichedTitle` (title / year / overview / keywords / genres / origin). TMDB is the first
-impl; a future `sources/wikipedia.rs` (Wikidata → article → plot/themes) slots in **without touching** the
-classifier, embedder, or format. Identity stays the `tmdbId` the app keys on, so a Wikipedia source still
-resolves to TMDB ids — it just draws the *text/signal* from elsewhere. Keep TMDB-only concerns (vote-floor,
-keyword-id grounding) inside the TMDB impl, not the classifier core.
-
-**CLI (what the agent runs):** `atlas-build worklist | enrich | assemble | embed | finalize` (resumable,
-checkpointed), reading `.env` (`TMDB_KEY` only). A run script + README document the loop the Claude Code agent
-drives: `enrich` a batch → the agent writes Haiku votes → `assemble` → `embed` + quantize → `finalize`. Output
-lands in `data/` with `labels-t01.json.gz` + `dataset.meta.json` (sha/size/builtAt) so the server needs zero
-startup work.
-
-**ToS invariant preserved:** `finalize` keeps the "no raw overview/text in the published artifact" assertion
-(derived labels + int8 vectors only).
-
-**Language note:** Rust for the DRY win (shares `atlas-format` with the server). **Go is acceptable** for
-`atlas-build` alone (reqwest→net/http, serde→encoding/json) — the cost is defining the artifact format a second
-time and losing the shared codec. Recommendation: **Rust**, unless you'd rather iterate the producer faster in
-Go and accept the duplicated format.
+**Image / CI:** multi-stage `rust:alpine` musl → `FROM scratch`/`distroless-static`. Rework `Dockerfile`,
+`publish.yml` (currently node/npm), and drop `package.json`/`vitest`. Data still mounted. Port the vitest
+cases to `#[tokio::test]`. Cutover: tag `legacy-ts`, then delete `src/*.ts`.
 
 ---
 
-## Part C — Den app cleanup (what leaves, what stays)
+## Part B — the producer: **stay Swift**, lift it out of the app
 
-**Delete from the Den repo** (0 `App/` references — verified): `tools/taxonomy-backfill/`,
-`Backfill/{BackfillPipeline,TaxonomyClassifier,Embedder}.swift`, `Taxonomy/{Taxonomy,TaxonomyScorer}.swift`,
-their tests, and the producer-only types in `BackfillModels.swift`. (`LLMClient` STAYS — `SubtitleTranslator`
-+ `AIRecoProvider` use it; only the classifier's use goes.)
+The audit's key finding: a Rust port of the producer is the **wrong call**. It never runs hot (a rare batch
+that shells JSON to/from a Claude Code agent), so the memory/CPU thesis doesn't apply; and porting is
+expensive + risky because the classifier is entangled with app catalogs and today's exact bytes come from
+Swift's `JSONEncoder`/FNV. So:
 
-**Keep in DenKit (runtime feature store):** `SubgenreIndex`, `SubgenreIndexStore`, `DatasetProvider`,
-`DatasetDescriptor`, `IndexConsumers`, the *format* types (`IndexRecord`/`LabelsArtifact`/`LabelConfidence`/
-`LabelSource`), `RecipeCatalog`, `DiscoverQuery`, `GenreCatalog`, `GenreRarity`.
+**Move the producer files out of `den/` into a standalone SwiftPM executable package `den-dataset`** (its own
+repo, or a `producer/` subdir here) that **`import DenKit`**. This gets the producer out of the tvOS app repo
+(the actual goal) while:
+- **No catalog duplication.** The classifier needs `GenreRarity`, `RecipeCatalog` (grounding keyword-ids),
+  `GenreCatalog` (id↔name) — all of which STAY in DenKit (used by `LibraryInsights`/`HomeView`/`SearchModel`/
+  `BrowseView`). A Swift package just depends on DenKit and uses them directly. (A Rust/Go port would have to
+  **copy all three and keep them in sync forever** — the audit's single biggest unstated risk.)
+- **Byte-exact parity for free** — same `JSONEncoder(.sortedKeys)`, same FNV, same int8 quantizer → today's
+  sha is reproducible; the "golden bit-exact" tests become trivial.
+- **Agent-driven contract unchanged** — same phases, same `out/votes/batch-N-pass<K>.json` files, same
+  `NoLLM` stub. Claude Code drives it exactly as today.
 
-**Flip the source of truth.** Today the Den repo's `Resources/` is the master and den-atlas imports from it.
-After: **`atlas-build` output is the master**; the app bundles a *snapshot* copied from atlas (a
-`make sync-dataset` that pulls atlas's `data/`, or a published release asset). Today's `t01`/`e02` bytes are
-just relocated — not rebuilt.
+**What actually moves** (out of `den/`): `tools/taxonomy-backfill/` and, out of DenKit,
+`Backfill/{TaxonomyClassifier, Embedder, BackfillPipeline}.swift`, `Taxonomy/{Taxonomy, TaxonomyScorer}.swift`,
+and the **producer-only types** in `BackfillModels.swift` (`WorklistEntry`, `EnrichedTitle`, `RunReport`,
+`Checkpoint`, `Worklist`). DenKit keeps the format types + the catalogs the package imports.
 
-**tvOS bundled fallback: keep** (decided). The app bundles a snapshot so it works offline / out-of-box; atlas
-is the fresh canonical copy, and the snapshot is sourced from atlas going forward.
+**The real tool** (corrected from v1 — verified against `main.swift`). Commands are
+`worklist | enrich | enrich-ids | escalation | assemble | finalize | score` — not v1's 5:
+- **Embedding + int8 quantization happen INSIDE `assemble`** (`main.swift:283`), not a separate `embed` phase.
+- **`escalation`** is the adaptive self-consistency pass: after pass 1 it emits only the subset needing n=3
+  (primary ∈ {Drama,Comedy,Thriller}, or top-subgenre confidence < 0.65; `main.swift:219-247`). This *is* the
+  n=3 mechanism — v1 described n=3 as a classifier property but omitted the phase that selects who gets it.
+- **Two forward-compatible checkpoints** (`enrich-checkpoint.json`, `classify-checkpoint.json`) using
+  `decodeIfPresent` so a new field doesn't silently trigger a full re-run (`main.swift:597-605`).
+- **Append-only index store** (`index/labels.jsonl`+`vectors.jsonl` via `LineAppender`); a `--force` re-pass
+  writes superseding records; **`finalize` de-dupes by `(mediaType,tmdbId)` keeping the LAST**, vectors kept
+  aligned (`main.swift:271-312`).
+- **Lenient `HaikuVote` decoding**: a label may be a bare string or an object; missing confidence defaults to
+  **0.7** (`main.swift:558-576`) so one off-schema item can't spuriously escalate a title. Test fixtures must
+  include a malformed vote, not just clean ones.
 
-**Gate:** `make verify` stays green after the deletion (the app never used the deleted code).
+**Two things v1 hand-waved that must be built (regardless of language):**
+- **e01 vs e02.** `finalize` hard-codes `vectors-e01.bin` (`main.swift:321`) but the shipped/served artifact
+  is `vectors-e02.bin`. Today's e02 was NOT produced by the committed `finalize`. **Reconcile how e02 was
+  actually made** before claiming "relocate today's bytes" — likely a small `finalize`/embedder-version fix.
+- **`datasetVersion` + meta.** `import-dataset.mjs` content-addresses `datasetVersion =
+  sha256(labelsSha:vectorsSha)[..12]` and validates header/count alignment (`import-dataset.mjs:42-56`). That
+  derivation + writing per-blob sha256 into `dataset.meta.json` + emitting `labels-t01.json.gz` must move into
+  the producer's `finalize` (the server now reads sha from meta and `?v` depends on `datasetVersion`). This
+  replaces `import-dataset.mjs`.
+
+**TMDB decoupling — honest scope (downgraded from v1).** The `EnrichmentSource` trait cleanly abstracts the
+*text* (title/overview/year), but the *signals* are TMDB-bound and live in the classifier + pipeline, not just
+enrichment:
+- **Grounding** matches TMDB **keyword integer ids** inside the classifier (`TaxonomyClassifier.swift:185-201`)
+  — a Wikipedia source has none, so the grounding bonus silently no-ops.
+- **`animated`** = `genreIDs.contains(16)`; **anime filter** = keyword `210024`/genre 16 + `ja`; **vote-floor**
+  = `voteCount` (`main.swift:154,284,455`).
+So: build the `EnrichmentSource` seam now for the *text*, and be explicit that a real Wikipedia source is a
+**future project** needing (a) a Wikidata→tmdbId resolver (identity stays tmdbId) and (b) grounding/animated
+fallbacks — not a drop-in. Don't over-invest in the abstraction now; just don't bake TMDB assumptions into new
+code paths.
 
 ---
 
-## The format contract (the one invariant that must not drift)
+## Part C — Den app cleanup (surgical, not "delete files")
 
-The producer, the server, and the Den app's `SubgenreIndex` parser must agree byte-for-byte on:
-- `labels-tNN.json`: `{ taxonomyVersion, count, records:[{tmdbId, mediaType, primaryGenre, subgenres:[{label,
-  confidence}], moods:[…], source, animated}] }`
-- `vectors-eNN.bin`: little-endian `[int32 count][int32 dim]` then `count*dim` int8, row-major, aligned 1:1
-  with `records`; int8 = L2-normalized float ×127.
+v1 said "delete producer-only files, 0 App references." Two are entangled into runtime files that STAY:
+- `EnrichedTitle` + `Classification` are referenced by `Sources/DenKit/TMDB/TMDBClient.swift:87`
+  (`classificationRecord → EnrichedTitle`) and `TMDBWire.swift:309-318` (`toEnrichedTitle`). These files stay
+  (runtime browsing) — so cleanup means **editing them** to remove the classification-only method, or moving
+  `EnrichedTitle` to shared and the `classificationRecord` helper into the producer. Enumerate this, don't
+  "rm".
 
-Guard it with a **cross-language conformance fixture**: a tiny labels+vectors sample the Rust `atlas-format`
-codec *produces* and the Swift `SubgenreIndex` *parses* (checked into both repos), so a change on either side
-fails a test.
+**Moves out** (to `den-dataset`): `tools/taxonomy-backfill/`, `Backfill/{TaxonomyClassifier,Embedder,
+BackfillPipeline}.swift`, `Taxonomy/{Taxonomy,TaxonomyScorer}.swift`, producer-only `BackfillModels` types,
+their tests, plus the `classificationRecord` enrichment helper.
+**Stays in DenKit:** `SubgenreIndex`, `SubgenreIndexStore`, `DatasetProvider`, `DatasetDescriptor`,
+`IndexConsumers`, format types (`IndexRecord`/`LabelsArtifact`/`LabelConfidence`/`LabelSource`),
+`RecipeCatalog`, `DiscoverQuery`, `GenreCatalog`, `GenreRarity`, `TMDBClient`/`TMDBWire`, `LLMClient` (used by
+`SubtitleTranslator`/`AIRecoProvider` — only the classifier's use leaves).
+
+**Source-of-truth flip + fallback (kept):** `den-dataset`'s `finalize` output becomes the master; den-atlas
+serves it; the app bundles a **snapshot** from atlas (a `make sync-dataset`, replacing `import-dataset.mjs`'s
+role). The tvOS bundled fallback is **kept** (offline/out-of-box). Today's `t01`/`e02` bytes are relocated,
+not rebuilt. **Gate:** `make verify` green after the extraction.
+
+---
+
+## The format contract (guard against drift)
+
+Producer, server, and the app's `SubgenreIndex` parser must agree on: `labels-tNN.json` (`{taxonomyVersion,
+count, records:[{tmdbId, mediaType, primaryGenre, subgenres:[{label,confidence}], moods, source, animated}]}`)
+and `vectors-eNN.bin` (LE `[int32 count][int32 dim]` + row-major int8, 1:1 with records, L2-norm ×127) —
+verified accurate against `SubgenreIndex.parseVectors` + `BackfillModels`.
+
+Note (audit M12): a conformance fixture guards the **schema**, not the **sha** — the app decodes order/space-
+independently, so a Rust-produced-but-logically-identical labels file would still have a different sha (encoder
+differences) and trigger a re-sync. With the **Swift producer this is a non-issue** (same encoder → same
+bytes), which is another reason to keep it Swift. If any component is ever non-Swift, the guard is a
+schema-level round-trip fixture, and drift-of-sha is expected/handled by the re-sync gate.
 
 ---
 
 ## Phases
 
-1. **RUST-1 — serve at parity.** Workspace + `atlas-format` + `atlas-serve` (axum, streaming, full caching
-   port). Serve the existing `data/`. Port the vitest suite. New musl/scratch Dockerfile + GHCR workflow.
-   *Exit:* byte-identical descriptor, all caching probes pass, **RSS + image size measured** (prove the win),
-   TS retired.
-2. **RUST-2 — producer port.** `atlas-build`: `EnrichmentSource` (TMDB impl), taxonomy, the `classify(rawVotes:)`
-   aggregation, embed+quantize, assemble/finalize, resumable CLI + the agent run-book (vote-file contract +
-   prompt). Golden parity tests (embedder/quantizer bit-exact; a few classifier cases). *Exit:* the
-   deterministic phases on 3–5 titles (with fixture votes standing in for the agent's Haiku pass) emit a valid
-   chunk the conformance fixture accepts.
-3. **DEN-CLEANUP.** Delete the moved Swift + tests, trim `BackfillModels` to format-only, flip the
-   source-of-truth, decide the bundled fallback. *Exit:* `make verify` green; Den repo carries no producer.
-4. **(later) FP-2 hook.** `atlas-build`'s `Embedder` trait leaves room for a real semantic model (bge-m3 via
-   Workers AI or `candle`) — the quality upgrade then lives naturally in the producer, not the app.
+1. **RUST-1 — `atlas-serve` at parity** (~3–5 days). Rust project + hand-rolled `serve_bytes` over `tokio::fs`
+   + the full port checklist above. New Dockerfile + `publish.yml`; port the vitest suite. *Exit:* every probe
+   passes, descriptor byte-identical, **RSS + image measured**, TS retired.
+2. **DATASET-1 — extract the Swift producer** (~2–4 days). New `den-dataset` SwiftPM package `import DenKit`;
+   move the producer files + tests; fold `import-dataset.mjs`'s `datasetVersion`/meta/gzip into `finalize`;
+   reconcile e01/e02; add the `EnrichmentSource` seam (text only). *Exit:* runs the deterministic phases on
+   3–5 titles with fixture votes → emits `t01`-shaped output; conformance fixture + `swift test` green.
+3. **DEN-CLEANUP** (~1 day). Surgically remove the moved code (incl. the `TMDBClient`/`TMDBWire` edits), flip
+   the source-of-truth, wire the app's bundled-snapshot sync. *Exit:* `make verify` green; Den repo carries no
+   producer.
+4. **(later) FP-2 / Wikipedia** — semantic embedder + a real `EnrichmentSource` (Wikidata resolver + grounding
+   fallback) as separate projects.
 
 ---
 
 ## Testing (minimal, per the constraint)
+- **Serve:** boot against the real `data/`; re-run the exact probes used on the TS server (health, manifest,
+  `dataset.json` behind proxy headers, Range 206, gzip round-trip whose gunzip sha matches the descriptor,
+  If-None-Match 304, HEAD); assert byte-identical descriptor; measure RSS + image.
+- **Producer (no Anthropic key):** `TMDB_KEY` only; run the phases on 3–5 titles with **fixture vote JSON**
+  (incl. one malformed vote), assert `t01`-shaped output passes the conformance fixture + the app parser.
+  Since it's the same Swift code, `classify(rawVotes:)` + FNV + quantizer parity is inherited, not re-proven.
+  Real Haiku labeling happens when the owner runs it via Claude Code. **No 60k rebuild.**
 
-- **Serve:** boot `atlas-serve` against the real `data/`; re-run the exact probes already used on the TS
-  server (health, manifest, `dataset.json` behind proxy headers, `Range` 206, gzip round-trip whose gunzip
-  sha matches the descriptor, `If-None-Match` 304, HEAD). Assert the descriptor is byte-identical to today.
-  Measure RSS (`/proc` or `ps`) and image size to confirm the targets.
-- **Producer (no Anthropic key needed):** with `TMDB_KEY`, run the deterministic phases on **3–5 known
-  titles** — `enrich` → feed **fixture vote JSON** (standing in for the agent's Haiku pass) → `assemble` →
-  `embed` → `finalize` → assert the emitted labels+vectors pass the conformance fixture + the Swift parser.
-  Golden unit tests: the FNV embedder + int8 quantizer match the Swift output bit-for-bit; a couple of
-  `classify(rawVotes:)` cases match the Swift calibrated result. The real Haiku labeling is exercised when the
-  owner runs it via Claude Code. **No 60k rebuild.**
+## Risks
+- **e01/e02 reconciliation** (must resolve before "relocate today's bytes" is true).
+- **`import-dataset.mjs` → `finalize`**: the content-addressed `datasetVersion` + per-blob-sha meta is new
+  producer work the server now depends on.
+- **`TMDBClient`/`TMDBWire` surgery** in the app (not a clean delete).
+- **mmap SIGBUS** on in-place republish — use `tokio::fs` streaming (or atomic rename+reopen).
+- **Wikipedia decoupling is future work**, not a trait swap (grounding/animated/anime/vote-floor are TMDB
+  signals).
 
----
-
-## Risks & watch-items
-
-- **Classifier fidelity** — the thresholds + IDF tie-break must port exactly; golden-test them. (Low urgency:
-  nothing is being rebuilt now, so this only bites a future run.)
-- **Format drift** — mitigated by the shared `atlas-format` crate + the cross-language conformance fixture.
-- **Toolchain** — adds cargo + musl cross-compile to the homelab (one-time); the image gets *smaller* and
-  dependency-free.
-- **Agent-driven labeling** — the classify step runs on Claude Code credit (Haiku subagents write vote files);
-  the scripts themselves need only `TMDB_KEY`. Keep the classification prompt + the vote-file schema in the
-  repo so an agent run is reproducible, and keep `assemble` a pure library function tested against fixtures.
-- **Source coupling** — enrichment lives behind `EnrichmentSource` so a future Wikipedia/Wikidata source swaps
-  in; TMDB-specific bits (vote-floor, keyword-id grounding) stay in the TMDB impl, not the classifier core.
-
-## Rough effort
-RUST-1 ~2–3 days (serving is small + well-spec'd). RUST-2 ~3–5 days (the classifier + LLM + TMDB port is the
-bulk). DEN-CLEANUP ~0.5 day. Total ~1–1.5 weeks, landable in the phase order above with the app untouched
-until Phase 3.
+## Effort
+RUST-1 ~3–5 days · DATASET-1 ~2–4 days (Swift move, not a port) · DEN-CLEANUP ~1 day → **~1.5–2 weeks**, app
+untouched until DEN-CLEANUP. (A Rust producer port would be ~2–3 weeks *more* for no runtime benefit — the
+audit's recommendation, and mine, is to keep it Swift.)
