@@ -52,6 +52,9 @@ pub fn public_origin(headers: &HeaderMap, override_base: Option<&str>) -> String
             .filter(|s| !s.is_empty())
     };
     let proto = first("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
+    // Only reflect a sane Host charset into the blob URLs we advertise (a spoofed Host would point
+    // the app's fetch at an attacker origin; the checksum still gates content). PUBLIC_BASE_URL
+    // short-circuits this in prod.
     let host = first("x-forwarded-host")
         .or_else(|| {
             headers
@@ -59,8 +62,16 @@ pub fn public_origin(headers: &HeaderMap, override_base: Option<&str>) -> String
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_owned())
         })
+        .filter(|h| is_sane_host(h))
         .unwrap_or_else(|| "localhost".to_owned());
     format!("{proto}://{host}")
+}
+
+/// A hostname/authority we're willing to reflect into a returned URL: alnum + host+port punctuation.
+fn is_sane_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
 }
 
 /// HTML-escape (landing page) — port of the TS `escapeHtml`.
@@ -85,7 +96,7 @@ pub fn group_thousands(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
