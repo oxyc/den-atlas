@@ -1,0 +1,31 @@
+{
+  "name": "den-atlas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted dataset addon for Den — serves the derived feature store (labels + int8 vectors) the app downloads and refreshes for similar-titles, categories, and billboard. Derived, ToS-clean data only; no raw TMDB text, nothing personal.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "import": "node scripts/import-dataset.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
+  }
+}

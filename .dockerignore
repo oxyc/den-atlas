@@ -1,0 +1,8 @@
+node_modules
+dist
+coverage
+.git
+.github
+*.log
+test
+# NB: data/ is NOT ignored — the dataset blobs must go into the image.
