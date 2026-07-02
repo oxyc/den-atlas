@@ -29,10 +29,11 @@ descriptor, so the app verifies what it downloads and a mismatch keeps the prior
 |---|---|
 | `GET /` | landing page with the install URL |
 | `GET /health` | `{ "status": "ok" }` |
-| `GET /manifest.json` | the `dataset`-resource manifest |
+| `GET /manifest.json` | the `dataset` + `catalog` manifest |
 | `GET /dataset.json` | the descriptor (absolute blob URLs from the request origin) |
 | `GET /labels-<tax>.json` | the derived labels blob |
 | `GET /vectors-<embed>.bin` | the quantized int8 vectors blob |
+| `GET /catalog/<type>/<id>.json` | a "most popular" row of `{id,type,name,poster}` metas |
 
 ## The dataset
 The blobs are the **same artifacts the Den app currently bundles** — `labels-t01.json` +
@@ -40,6 +41,17 @@ The blobs are the **same artifacts the Den app currently bundles** — `labels-t
 30 MB in the app: same bytes, now downloaded + refreshed instead of shipped. The descriptor declares
 `embeddingModel` opaquely, so a future semantic re-embed (bge-m3) is a drop-in — publish new blobs, bump
 the version, and the app re-syncs. See `docs`/the Den EPIC for the FP-2 embedding upgrade.
+
+## Catalogs (JustWatch)
+Alongside the dataset, Atlas serves Stremio **catalog** rows of "most popular" titles per streaming
+service — `Popular on Netflix`, `Max`, `Prime Video`, `Disney+`, `Apple TV+` — plus a headline
+**Trending Everywhere** row that unions the services and re-ranks by inverse-rank-sum (a title trending
+on several services floats up). Data is the unofficial **JustWatch** GraphQL API (public, tokenless),
+fetched server-side and cached in-process (~6h, serve-stale-on-error). Items are keyed by **IMDb id**, so
+Stremio's built-in Cinemeta fills the detail page and other addons resolve streams — no TMDB, no `meta`
+resource. The module is fully **isolated**: if JustWatch breaks, catalog rows go empty and the dataset
+resource is unaffected. Tunables: `JW_COUNTRY`, `JW_PROVIDERS`, `JW_CACHE_TTL_SECS`. Catalog data from
+JustWatch.
 
 ## Implementation
 A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** serving 33 MB of data.

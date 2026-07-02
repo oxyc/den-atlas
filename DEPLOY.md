@@ -36,11 +36,17 @@ docker run -d --name den-atlas -p 8080:8080 --restart unless-stopped den-atlas
 
 Smoke-test either way:
 ```sh
-curl -s localhost:8080/health                       # {"status":"ok"}
-curl -s localhost:8080/manifest.json | jq .resources # ["dataset"]
+curl -s localhost:8080/health                        # {"status":"ok"}
+curl -s localhost:8080/manifest.json | jq .resources # ["dataset","catalog"]
 curl -s -H 'x-forwarded-proto: https' -H 'host: atlas.example.com' \
      localhost:8080/dataset.json | jq '.count, .vectors.url'
+curl -s localhost:8080/catalog/movie/jw-nfx.json | jq '.metas | length'  # live JustWatch (needs egress)
 ```
+
+**Catalogs (JustWatch).** The catalog rows make an outbound call to `apis.justwatch.com` (unauthenticated,
+no secret). Tune with `JW_COUNTRY` / `JW_PROVIDERS` / `JW_CACHE_TTL_SECS` (see `.env.example`). Results are
+cached in-process ~6h and serve-stale-on-error, so a JustWatch outage degrades to empty rows without
+affecting the dataset resource. If the container has no outbound internet, the catalog rows are simply empty.
 
 ## 3. Reverse proxy (Caddy)
 ```
