@@ -51,7 +51,28 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     if path == format!("/{}", ds.vectors.name) {
         return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
     }
+    if let Some(rest) = path.strip_prefix("/catalog/") {
+        return handle_catalog(&method, &headers, rest, &state).await;
+    }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+/// `GET /catalog/{type}/{id}.json` (a trailing `/{extra}` segment is tolerated and ignored). Public,
+/// tokenless; a JustWatch failure degrades to empty rows, never a 5xx, and never touches the dataset.
+async fn handle_catalog(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    rest: &str,
+    state: &Arc<AppState>,
+) -> Response {
+    let rest = rest.strip_suffix(".json").unwrap_or(rest);
+    let mut parts = rest.splitn(3, '/'); // type / id / optional extra
+    let type_ = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    match state.catalog.metas_json(id, type_).await {
+        Some(body) => serve_json(method, headers, body, "public, max-age=3600", None).await,
+        None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
+    }
 }
 
 async fn serve_json(
@@ -142,6 +163,7 @@ fn landing_page(origin: &str, ds: &Dataset) -> String {
         ),
         "<p>Add this URL in Den → Settings → Plugins:</p>",
         &format!("<p><code>{manifest_url}</code></p>"),
+        "<p>Also serves \u{201c}most popular\u{201d} streaming catalog rows. Catalog data from JustWatch.</p>",
         "</body></html>",
     ]
     .join("")

@@ -17,6 +17,10 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 httpdate = "1"
+# JustWatch catalog source (docs/CATALOG-justwatch.md): a GraphQL POST client (rustls, no OpenSSL) +
+# async-trait so the source is injectable/mockable. Isolated to the catalog resource.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+async-trait = "0.1"
 
 # Tiny, dependency-free static binary — the whole point of the rewrite.
 [profile.release]

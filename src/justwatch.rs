@@ -1,0 +1,187 @@
+//! Isolated JustWatch source (docs/CATALOG-justwatch.md). Fetches "most popular" (TRENDING) titles for
+//! a streaming provider via the unofficial GraphQL API and maps them to IMDb-keyed items. Nothing here
+//! can affect the dataset resource: every failure returns `Err(())`, which the handler turns into empty
+//! rows. User input never reaches this module — provider codes come from a fixed table.
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use std::time::Duration;
+
+/// Stremio content type ↔ JustWatch objectType.
+#[derive(Clone, Copy)]
+pub enum ObjectType {
+    Movie,
+    Show,
+}
+
+impl ObjectType {
+    fn as_jw(self) -> &'static str {
+        match self {
+            ObjectType::Movie => "MOVIE",
+            ObjectType::Show => "SHOW",
+        }
+    }
+    pub fn from_stremio(t: &str) -> Option<ObjectType> {
+        match t {
+            "movie" => Some(ObjectType::Movie),
+            "series" => Some(ObjectType::Show),
+            _ => None,
+        }
+    }
+}
+
+/// One trending title, keyed by a validated IMDb id. `rank` is the 0-based position in its source list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrendingItem {
+    pub imdb: String,
+    pub title: String,
+    pub rank: usize,
+}
+
+/// The source seam — the real JustWatch client in prod, a fake in tests.
+#[async_trait]
+pub trait TrendingSource: Send + Sync {
+    async fn popular(&self, provider: &str, obj: ObjectType) -> Result<Vec<TrendingItem>, ()>;
+}
+
+const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
+const MAX_BODY: usize = 4 << 20; // cap the response body (a hostile/huge reply must not OOM us)
+
+// Mirrors rleroi/Stremio-Streaming-Catalogs-Addon's GetPopularTitles (only the fields we use).
+const QUERY: &str = r#"query GetPopularTitles($country: Country!, $first: Int!, $popularTitlesSortBy: PopularTitlesSorting!, $packages: [String!], $objectTypes: [ObjectType!]) {
+  popularTitles(country: $country, first: $first, sortBy: $popularTitlesSortBy, filter: { objectTypes: $objectTypes, packages: $packages }) {
+    edges { node { content(country: $country, language: "en") { title externalIds { imdbId } } } }
+  }
+}"#;
+
+pub struct JustWatchClient {
+    http: reqwest::Client,
+    country: String,
+}
+
+impl JustWatchClient {
+    pub fn new(country: String) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .user_agent("den-atlas/0.1 (+https://github.com/oxyc/den)")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { http, country }
+    }
+}
+
+#[derive(Deserialize)]
+struct GqlResp {
+    data: Option<GqlData>,
+}
+#[derive(Deserialize)]
+struct GqlData {
+    #[serde(rename = "popularTitles")]
+    popular: Option<PopularTitles>,
+}
+#[derive(Deserialize)]
+struct PopularTitles {
+    edges: Vec<Edge>,
+}
+#[derive(Deserialize)]
+struct Edge {
+    node: Node,
+}
+#[derive(Deserialize)]
+struct Node {
+    content: Content,
+}
+#[derive(Deserialize)]
+struct Content {
+    title: String,
+    #[serde(rename = "externalIds")]
+    external_ids: Option<ExternalIds>,
+}
+#[derive(Deserialize)]
+struct ExternalIds {
+    #[serde(rename = "imdbId")]
+    imdb_id: Option<String>,
+}
+
+/// Parse a GraphQL response body into ranked items, dropping anything without a valid IMDb id (it
+/// couldn't be resolved by Cinemeta/other addons). Never panics; a malformed body → empty list.
+pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
+    let resp: GqlResp = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
+    let mut out = Vec::with_capacity(edges.len());
+    for e in edges {
+        let imdb = match e.node.content.external_ids.and_then(|x| x.imdb_id) {
+            Some(id) if is_imdb(&id) => id,
+            _ => continue,
+        };
+        let rank = out.len();
+        out.push(TrendingItem { imdb, title: e.node.content.title, rank });
+    }
+    out
+}
+
+fn is_imdb(s: &str) -> bool {
+    s.len() >= 3 && s.starts_with("tt") && s[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+#[async_trait]
+impl TrendingSource for JustWatchClient {
+    async fn popular(&self, provider: &str, obj: ObjectType) -> Result<Vec<TrendingItem>, ()> {
+        let payload = serde_json::json!({
+            "query": QUERY,
+            "variables": {
+                "country": self.country,
+                "first": 100,
+                "popularTitlesSortBy": "TRENDING",
+                "packages": [provider],
+                "objectTypes": [obj.as_jw()],
+            },
+        });
+        let resp = self.http.post(ENDPOINT).json(&payload).send().await.map_err(|_| ())?;
+        if !resp.status().is_success() {
+            return Err(());
+        }
+        let bytes = resp.bytes().await.map_err(|_| ())?;
+        if bytes.len() > MAX_BODY {
+            return Err(());
+        }
+        Ok(parse_popular(&String::from_utf8_lossy(&bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = r#"{"data":{"popularTitles":{"edges":[
+      {"node":{"content":{"title":"Alpha","externalIds":{"imdbId":"tt0000001"}}}},
+      {"node":{"content":{"title":"NoId","externalIds":{"imdbId":null}}}},
+      {"node":{"content":{"title":"Bad","externalIds":{"imdbId":"nope"}}}},
+      {"node":{"content":{"title":"Beta","externalIds":{"imdbId":"tt0000002"}}}}
+    ]}}}"#;
+
+    #[test]
+    fn parses_and_ranks_valid_imdb_only() {
+        let items = parse_popular(FIXTURE);
+        assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
+        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), title: "Alpha".into(), rank: 0 });
+        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), title: "Beta".into(), rank: 1 });
+    }
+
+    #[test]
+    fn malformed_body_is_empty_not_panic() {
+        assert!(parse_popular("not json").is_empty());
+        assert!(parse_popular(r#"{"data":null}"#).is_empty());
+    }
+
+    #[test]
+    fn imdb_validation() {
+        assert!(is_imdb("tt0111161"));
+        assert!(!is_imdb("tt"));
+        assert!(!is_imdb("nm123"));
+        assert!(!is_imdb("tt12a"));
+    }
+}
