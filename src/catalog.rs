@@ -5,6 +5,7 @@
 use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -76,11 +77,27 @@ pub struct CatalogState {
     // Per-key refresh gate (single-flight): coalesces concurrent misses so a cold-cache burst makes one
     // upstream fetch per key, not N. Keyspace is tiny + fixed (ids × types × country), so it isn't pruned.
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
+    // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
+    // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
+    // `fresh` flag, which shortens one row's HTTP TTL.
+    last_refresh_ok: AtomicBool,
 }
 
 impl CatalogState {
     pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration, country: String) -> Self {
-        Self { source, cache: TtlCache::new(ttl), country, inflight: Mutex::new(HashMap::new()) }
+        Self {
+            source,
+            cache: TtlCache::new(ttl),
+            country,
+            inflight: Mutex::new(HashMap::new()),
+            last_refresh_ok: AtomicBool::new(true),
+        }
+    }
+
+    /// Whether the last JustWatch refresh succeeded — the `/health` freshness signal (ADDON-02).
+    pub fn fresh(&self) -> bool {
+        self.last_refresh_ok.load(Ordering::Relaxed)
     }
 
     /// The `{ "metas": [...] }` body for a catalog id + Stremio type. `None` (→ 404) for an unknown
@@ -120,17 +137,22 @@ impl CatalogState {
             Some(items) => {
                 let body = render_metas(&items, stremio_type);
                 self.cache.put(&key, body.clone());
+                self.last_refresh_ok.store(true, Ordering::Relaxed);
                 Some(CatalogResponse { body, fresh: true })
             }
             // Refresh failed → serve stale if we have it, else an empty list (graceful degradation).
-            // Not fresh → the handler uses a short TTL so recovery isn't masked at the CDN.
-            None => Some(CatalogResponse {
-                body: match self.cache.get(&key) {
-                    Lookup::Fresh(v) | Lookup::Stale(v) => v,
-                    Lookup::Miss => render_metas(&[], stremio_type),
-                },
-                fresh: false,
-            }),
+            // Not fresh → the handler uses a short TTL so recovery isn't masked at the CDN, and `/health`
+            // reports `stale_catalog`.
+            None => {
+                self.last_refresh_ok.store(false, Ordering::Relaxed);
+                Some(CatalogResponse {
+                    body: match self.cache.get(&key) {
+                        Lookup::Fresh(v) | Lookup::Stale(v) => v,
+                        Lookup::Miss => render_metas(&[], stremio_type),
+                    },
+                    fresh: false,
+                })
+            }
         }
     }
 

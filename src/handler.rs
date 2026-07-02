@@ -41,14 +41,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return html_response(landing_page(&origin, ds));
     }
     if path == "/health" {
-        // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` when the
-        // dataset couldn't load so the app's Plugins screen (and any monitor) can see it.
-        let body = if ds.is_some() {
-            r#"{"status":"ok"}"#
-        } else {
-            r#"{"status":"degraded","reason":"dataset_unavailable","detail":"dataset failed to load; refresh with scripts/fetch-dataset.sh"}"#
-        };
-        return json_response(body, StatusCode::OK);
+        // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
+        // app's Plugins screen (and any monitor) can see a problem.
+        return json_response(health_body(ds.is_some(), state.catalog.fresh()), StatusCode::OK);
     }
     if path == "/manifest.json" {
         return serve_json(&method, &headers, manifest_json(), "public, max-age=3600", None).await;
@@ -77,6 +72,20 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return handle_catalog(&method, &headers, rest, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+/// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
+/// body carries the real state. Dataset-unavailable outranks a stale catalog (no dataset is the more
+/// severe condition): no dataset ⇒ `dataset_unavailable`; else a failed last JustWatch refresh ⇒
+/// `stale_catalog`; else `ok`. Pure + `&'static str` so the decision is unit-testable without an HTTP round-trip.
+fn health_body(dataset_loaded: bool, catalog_fresh: bool) -> &'static str {
+    if !dataset_loaded {
+        r#"{"status":"degraded","reason":"dataset_unavailable","detail":"dataset failed to load; refresh with scripts/fetch-dataset.sh"}"#
+    } else if !catalog_fresh {
+        r#"{"status":"degraded","reason":"stale_catalog","detail":"last JustWatch refresh failed; serving stale catalog"}"#
+    } else {
+        r#"{"status":"ok"}"#
+    }
 }
 
 /// `GET /catalog/{type}/{id}.json` (a trailing `/{extra}` segment is tolerated and ignored). Public,
@@ -197,4 +206,30 @@ fn landing_page(origin: &str, ds: Option<&Dataset>) -> String {
         "</body></html>",
     ]
     .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_ok_when_dataset_loaded_and_fresh() {
+        assert_eq!(health_body(true, true), r#"{"status":"ok"}"#);
+    }
+
+    #[test]
+    fn health_stale_catalog_when_last_refresh_failed() {
+        let body = health_body(true, false);
+        assert!(body.contains(r#""status":"degraded""#));
+        assert!(body.contains(r#""reason":"stale_catalog""#));
+    }
+
+    #[test]
+    fn health_dataset_unavailable_when_dataset_missing() {
+        // Dataset-unavailable outranks stale: even with a fresh catalog, no dataset is the reported reason.
+        let body = health_body(false, true);
+        assert!(body.contains(r#""reason":"dataset_unavailable""#));
+        // …and it still takes precedence when the catalog is also stale (the more severe condition wins).
+        assert!(health_body(false, false).contains(r#""reason":"dataset_unavailable""#));
+    }
 }
