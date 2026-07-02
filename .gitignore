@@ -1,5 +1,6 @@
 # Rust
 /target
+dist/
 
 # (legacy Node — the TS server was removed at RUST-1; the import script still runs via `node`)
 node_modules/
