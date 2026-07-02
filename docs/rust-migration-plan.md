@@ -2,8 +2,9 @@
 
 > **v2 changes** (an audit verified v1 against both repos and found several "clean move" claims false):
 > - **Server → Rust** (confirmed sound; memory claims hold).
-> - **Producer → stays Swift**, lifted into its own package that `import DenKit` — NOT a Rust port. This
->   removes it from the tvOS *app* while keeping byte-exact parity and avoiding duplicating three app catalogs.
+> - **Producer → standalone Swift package, NO DenKit import** — coupled to the app only by the published
+>   artifact format, exactly like the server. Keeps the calibrated code (moved, not ported) + byte-parity;
+>   owns small self-contained copies of the static genre tables + a thin TMDB client + its own format structs.
 > - Corrected the real phase/checkpoint/vote contract, the e01-vs-e02 gap, the `import-dataset.mjs` work, and
 >   the (over-stated) TMDB decoupling. Effort re-baselined to ~1.5–2 weeks.
 
@@ -65,29 +66,35 @@ cases to `#[tokio::test]`. Cutover: tag `legacy-ts`, then delete `src/*.ts`.
 
 ---
 
-## Part B — the producer: **stay Swift**, lift it out of the app
+## Part B — the producer: **standalone Swift, NO DenKit import**
 
-The audit's key finding: a Rust port of the producer is the **wrong call**. It never runs hot (a rare batch
-that shells JSON to/from a Claude Code agent), so the memory/CPU thesis doesn't apply; and porting is
-expensive + risky because the classifier is entangled with app catalogs and today's exact bytes come from
-Swift's `JSONEncoder`/FNV. So:
+Keep it Swift (the calibrated classifier + FNV + int8 quantizer are the same code — re-deriving them in
+another language is the real cost/risk, for a batch job where speed is irrelevant). But — per the owner —
+`den-dataset` must **not import DenKit**. Depending on the app's *internal library* was the wrong boundary;
+the correct one is the one the **server already uses**: den-atlas agrees with the app on a **published
+artifact format**, not shared code. The producer becomes a **self-contained SwiftPM package**, symmetric with
+the server, coupled to the app by exactly one thing — the format.
 
-**Move the producer files out of `den/` into a standalone SwiftPM executable package `den-dataset`** (its own
-repo, or a `producer/` subdir here) that **`import DenKit`**. This gets the producer out of the tvOS app repo
-(the actual goal) while:
-- **No catalog duplication.** The classifier needs `GenreRarity`, `RecipeCatalog` (grounding keyword-ids),
-  `GenreCatalog` (id↔name) — all of which STAY in DenKit (used by `LibraryInsights`/`HomeView`/`SearchModel`/
-  `BrowseView`). A Swift package just depends on DenKit and uses them directly. (A Rust/Go port would have to
-  **copy all three and keep them in sync forever** — the audit's single biggest unstated risk.)
-- **Byte-exact parity for free** — same `JSONEncoder(.sortedKeys)`, same FNV, same int8 quantizer → today's
-  sha is reproducible; the "golden bit-exact" tests become trivial.
-- **Agent-driven contract unchanged** — same phases, same `out/votes/batch-N-pass<K>.json` files, same
-  `NoLLM` stub. Claude Code drives it exactly as today.
+**Moves in as-is (relocated, deleted from the app — these are producer-only in DenKit today):**
+`tools/taxonomy-backfill/`, `TaxonomyClassifier`, `Taxonomy` + `TaxonomyScorer`, `Embedder` (FNV + Quantizer),
+`BackfillPipeline`, the producer `BackfillModels` types (`WorklistEntry`/`EnrichedTitle`/`RunReport`/
+`Checkpoint`/`Worklist`), and the `finalize`/serialization code. This ~1,300 LOC just changes folder — same
+Swift → **byte-parity stays free** (same `JSONEncoder(.sortedKeys)`/FNV/quantizer), no re-derivation.
 
-**What actually moves** (out of `den/`): `tools/taxonomy-backfill/` and, out of DenKit,
-`Backfill/{TaxonomyClassifier, Embedder, BackfillPipeline}.swift`, `Taxonomy/{Taxonomy, TaxonomyScorer}.swift`,
-and the **producer-only types** in `BackfillModels.swift` (`WorklistEntry`, `EnrichedTitle`, `RunReport`,
-`Checkpoint`, `Worklist`). DenKit keeps the format types + the catalogs the package imports.
+**Owns small self-contained copies** instead of importing DenKit — because these are *reference data / a wire
+schema*, not business logic (the owner's point: `GenreCatalog` is just TMDB's list):
+- `GenreCatalog` (TMDB's static id↔name — a ~20-line copy) and `GenreRarity` (static IDF priors) — copy.
+- the **grounding keyword-id map** — extract it into a producer-owned taxonomy table instead of deriving it
+  from the app's `RecipeCatalog`. This *also fixes the one real smell*: the classifier stops reaching into a
+  UI-discovery construct. The app's `RecipeCatalog` is untouched (it keeps its own keyword ids for queries).
+- a **thin TMDB client** (`/discover`, `/{movie,tv}/{id}?append_to_response=keywords`, daily-export parse) —
+  the producer shouldn't borrow the app's client.
+- its **own copy of the format structs** (`IndexRecord`/`LabelsArtifact`/…). The app keeps its copy in DenKit;
+  the two agree via the **format spec + a conformance fixture** (below), exactly like the server does today.
+
+Net: `den-dataset` is fully standalone. **den-atlas (server + producer) and the Den app share one thing — the
+published artifact format — and no code.** The only duplication is static reference data + a small wire schema,
+which is the *correct* price for a defined-contract boundary; the calibrated logic is *moved*, not copied.
 
 **The real tool** (corrected from v1 — verified against `main.swift`). Commands are
 `worklist | enrich | enrich-ids | escalation | assemble | finalize | score` — not v1's 5:
@@ -131,15 +138,17 @@ code paths.
 ## Part C — Den app cleanup (surgical, not "delete files")
 
 v1 said "delete producer-only files, 0 App references." Two are entangled into runtime files that STAY:
-- `EnrichedTitle` + `Classification` are referenced by `Sources/DenKit/TMDB/TMDBClient.swift:87`
-  (`classificationRecord → EnrichedTitle`) and `TMDBWire.swift:309-318` (`toEnrichedTitle`). These files stay
-  (runtime browsing) — so cleanup means **editing them** to remove the classification-only method, or moving
-  `EnrichedTitle` to shared and the `classificationRecord` helper into the producer. Enumerate this, don't
-  "rm".
+- `EnrichedTitle` + `Classification` + the `classificationRecord` helper live in `Sources/DenKit/TMDB/
+  TMDBClient.swift:87` + `TMDBWire.swift:309-318` (`toEnrichedTitle`). Those *files* stay (runtime browsing),
+  but the classification-only members are producer-only — so cleanup **surgically deletes those members** from
+  DenKit (first verify no `App/` caller). The standalone producer re-derives them in its own thin TMDB client;
+  nothing is "moved to shared."
 
-**Moves out** (to `den-dataset`): `tools/taxonomy-backfill/`, `Backfill/{TaxonomyClassifier,Embedder,
-BackfillPipeline}.swift`, `Taxonomy/{Taxonomy,TaxonomyScorer}.swift`, producer-only `BackfillModels` types,
-their tests, plus the `classificationRecord` enrichment helper.
+**Re-homed in `den-dataset`** (deleted from `den/`): `tools/taxonomy-backfill/`, `Backfill/{TaxonomyClassifier,
+Embedder,BackfillPipeline}.swift`, `Taxonomy/{Taxonomy,TaxonomyScorer}.swift`, producer-only `BackfillModels`
+types, their tests, plus the classification members carved out of `TMDBClient`/`TMDBWire`. The producer also
+gets its own copies of `GenreCatalog`/`GenreRarity`/the grounding map + its own format structs (Part B) — no
+DenKit import.
 **Stays in DenKit:** `SubgenreIndex`, `SubgenreIndexStore`, `DatasetProvider`, `DatasetDescriptor`,
 `IndexConsumers`, format types (`IndexRecord`/`LabelsArtifact`/`LabelConfidence`/`LabelSource`),
 `RecipeCatalog`, `DiscoverQuery`, `GenreCatalog`, `GenreRarity`, `TMDBClient`/`TMDBWire`, `LLMClient` (used by
@@ -152,18 +161,22 @@ not rebuilt. **Gate:** `make verify` green after the extraction.
 
 ---
 
-## The format contract (guard against drift)
+## The format contract — den-atlas's one public interface
 
-Producer, server, and the app's `SubgenreIndex` parser must agree on: `labels-tNN.json` (`{taxonomyVersion,
-count, records:[{tmdbId, mediaType, primaryGenre, subgenres:[{label,confidence}], moods, source, animated}]}`)
-and `vectors-eNN.bin` (LE `[int32 count][int32 dim]` + row-major int8, 1:1 with records, L2-norm ×127) —
-verified accurate against `SubgenreIndex.parseVectors` + `BackfillModels`.
+Since nothing imports anything across the boundary, the **artifact format IS the contract** — the only thing
+the producer, the server, and the app share. It's already how the serving side works (the app hits
+`manifest.json`/`dataset.json`/blobs; neither imports the other). Formalise it as den-atlas's published spec:
+- `labels-tNN.json`: `{taxonomyVersion, count, records:[{tmdbId, mediaType, primaryGenre,
+  subgenres:[{label,confidence}], moods, source, animated}]}`
+- `vectors-eNN.bin`: LE `[int32 count][int32 dim]` + row-major int8, 1:1 with records, L2-norm ×127.
+- `dataset.json`: the descriptor (per-blob sha256 + size + `datasetVersion` + `embeddingModel`/`dims`).
 
-Note (audit M12): a conformance fixture guards the **schema**, not the **sha** — the app decodes order/space-
-independently, so a Rust-produced-but-logically-identical labels file would still have a different sha (encoder
-differences) and trigger a re-sync. With the **Swift producer this is a non-issue** (same encoder → same
-bytes), which is another reason to keep it Swift. If any component is ever non-Swift, the guard is a
-schema-level round-trip fixture, and drift-of-sha is expected/handled by the re-sync gate.
+**Three independent implementations, guarded by one conformance fixture:** the producer *writes* it (Swift),
+the server *serves* it (Rust), the app *reads* it (Swift). A tiny checked-in labels+vectors sample that a
+round-trip test parses on every side catches schema drift. Note (audit M12) the fixture guards the **schema**,
+not the **sha** — different encoders can produce logically-identical-but-different bytes; the app's re-sync
+gate keys on `datasetVersion` + sha, so that's expected, not a bug. (Producer and app being both Swift with
+identical structs means their bytes *do* match today — a free bonus, not a requirement.)
 
 ---
 
@@ -172,10 +185,12 @@ schema-level round-trip fixture, and drift-of-sha is expected/handled by the re-
 1. **RUST-1 — `atlas-serve` at parity** (~3–5 days). Rust project + hand-rolled `serve_bytes` over `tokio::fs`
    + the full port checklist above. New Dockerfile + `publish.yml`; port the vitest suite. *Exit:* every probe
    passes, descriptor byte-identical, **RSS + image measured**, TS retired.
-2. **DATASET-1 — extract the Swift producer** (~2–4 days). New `den-dataset` SwiftPM package `import DenKit`;
-   move the producer files + tests; fold `import-dataset.mjs`'s `datasetVersion`/meta/gzip into `finalize`;
-   reconcile e01/e02; add the `EnrichmentSource` seam (text only). *Exit:* runs the deterministic phases on
-   3–5 titles with fixture votes → emits `t01`-shaped output; conformance fixture + `swift test` green.
+2. **DATASET-1 — extract the standalone Swift producer** (~2–4 days). New `den-dataset` SwiftPM package,
+   **no DenKit import**; relocate the calibrated code + tests; add self-contained `GenreCatalog`/`GenreRarity`
+   + the extracted grounding map + a thin TMDB client + its own format structs; fold `import-dataset.mjs`'s
+   `datasetVersion`/meta/gzip into `finalize`; reconcile e01/e02; add the `EnrichmentSource` seam (text only).
+   *Exit:* runs the deterministic phases on 3–5 titles with fixture votes → emits `t01`-shaped output; the
+   conformance fixture + `swift test` green.
 3. **DEN-CLEANUP** (~1 day). Surgically remove the moved code (incl. the `TMDBClient`/`TMDBWire` edits), flip
    the source-of-truth, wire the app's bundled-snapshot sync. *Exit:* `make verify` green; Den repo carries no
    producer.
