@@ -54,10 +54,11 @@ pub fn catalog_entries() -> Vec<CatalogEntry> {
     let providers = selected_providers();
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
+        // "Trending Everywhere" (the aggregated cross-provider chart) leads, then the per-provider rows.
+        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned() });
         for p in providers {
             out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned() });
         }
-        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned() });
     }
     out
 }
