@@ -1,6 +1,6 @@
 [package]
 name = "den-atlas"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Self-hosted dataset addon for Den — serves the derived feature store (labels + int8 vectors) the app syncs on-device. Rust serving layer (RUST-1)."
 license = "MIT"

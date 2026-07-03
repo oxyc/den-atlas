@@ -25,9 +25,14 @@ struct Descriptor {
     quantization: String,
     labels: DescriptorBlob,
     vectors: DescriptorBlob,
+    /// ADDON-03 — declares this addon can embed a free-text SEARCH query (`POST /embed` → den-embed is
+    /// configured). Omitted when disabled, so the disabled descriptor stays byte-identical to before; the app
+    /// reads it as `decodeIfPresent`, so absent ⇒ no semantic query search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embed: Option<bool>,
 }
 
-pub fn build_descriptor(origin: &str, ds: &Dataset) -> String {
+pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> String {
     // `datasetVersion` is a content-hash hex / safe token, so `encodeURIComponent` is the identity here.
     let v = &ds.meta.dataset_version;
     let d = Descriptor {
@@ -47,6 +52,7 @@ pub fn build_descriptor(origin: &str, ds: &Dataset) -> String {
             sha256: ds.vectors.sha256.clone(),
             bytes: ds.vectors.size,
         },
+        embed: embed_enabled.then_some(true),
     };
     serde_json::to_string(&d).unwrap()
 }

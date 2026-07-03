@@ -70,7 +70,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     if route == "/dataset.json" {
         return match ds {
             Some(ds) => {
-                serve_json(&method, &headers, build_descriptor(&origin, ds), "public, max-age=300", ds.last_modified.clone()).await
+                serve_json(&method, &headers, build_descriptor(&origin, ds, state.embed.is_some()), "public, max-age=300", ds.last_modified.clone()).await
             }
             None => json_response(
                 r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
