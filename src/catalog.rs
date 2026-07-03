@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+#[derive(Debug)]
 pub struct Provider {
     pub code: &'static str, // JustWatch package short-code
     pub id: &'static str,   // Stremio catalog id
@@ -30,8 +31,19 @@ pub const TRENDING_ID: &str = "jw-trending";
 pub const TRENDING_NAME: &str = "Trending Everywhere";
 const STREMIO_TYPES: [&str; 2] = ["movie", "series"];
 
-/// The providers actually served — the full table, or a subset selected by `JW_PROVIDERS` (codes).
-/// Resolved once (env is effectively static) so it's not re-parsed on every request.
+/// Look up a provider by its JustWatch short-code (for parsing a per-install config). `None` for an
+/// unknown code, so a garbled config segment simply drops that provider.
+pub fn provider_by_code(code: &str) -> Option<&'static Provider> {
+    PROVIDERS.iter().find(|p| p.code == code)
+}
+
+/// Every provider den-atlas can serve — the checkbox list shown on `/configure`.
+pub fn all_providers() -> &'static [Provider] {
+    PROVIDERS
+}
+
+/// The operator-default provider set — the full table, or a subset selected by `JW_PROVIDERS` (codes).
+/// Used when no per-install config is supplied. Resolved once (env is effectively static).
 pub fn selected_providers() -> &'static [&'static Provider] {
     static SELECTED: OnceLock<Vec<&'static Provider>> = OnceLock::new();
     SELECTED.get_or_init(|| match std::env::var("JW_PROVIDERS") {
@@ -49,9 +61,12 @@ pub struct CatalogEntry {
     pub name: String,
 }
 
-/// The manifest `catalogs[]` — one per provider × type, plus "Trending Everywhere" × type.
-pub fn catalog_entries() -> Vec<CatalogEntry> {
-    let providers = selected_providers();
+/// The manifest `catalogs[]` for a given provider set — one per provider × type, plus "Trending
+/// Everywhere" × type. Empty when no providers are selected (the feature is off for that install).
+pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
+    if providers.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
         // "Trending Everywhere" (the aggregated cross-provider chart) leads, then the per-provider rows.
@@ -74,9 +89,8 @@ pub struct CatalogResponse {
 pub struct CatalogState {
     source: Arc<dyn TrendingSource>,
     cache: TtlCache,
-    country: String,
     // Per-key refresh gate (single-flight): coalesces concurrent misses so a cold-cache burst makes one
-    // upstream fetch per key, not N. Keyspace is tiny + fixed (ids × types × country), so it isn't pruned.
+    // upstream fetch per key, not N. Keyspace is bounded (ids × types × the handful of live countries).
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
     // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
@@ -86,11 +100,10 @@ pub struct CatalogState {
 }
 
 impl CatalogState {
-    pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration, country: String) -> Self {
+    pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration) -> Self {
         Self {
             source,
             cache: TtlCache::new(ttl),
-            country,
             inflight: Mutex::new(HashMap::new()),
             last_refresh_ok: AtomicBool::new(true),
         }
@@ -101,18 +114,25 @@ impl CatalogState {
         self.last_refresh_ok.load(Ordering::Relaxed)
     }
 
-    /// The `{ "metas": [...] }` body for a catalog id + Stremio type. `None` (→ 404) for an unknown
-    /// id/type. Otherwise always valid JSON; on a source failure it serves last-good rows, else empty —
-    /// both marked `fresh: false` so the handler can cache them briefly.
-    pub async fn metas_json(&self, catalog_id: &str, stremio_type: &str) -> Option<CatalogResponse> {
+    /// The `{ "metas": [...] }` body for a catalog id + Stremio type in a given `country`, restricted to
+    /// this install's `providers`. `None` (→ 404) for an unknown/unselected id or unknown type.
+    /// Otherwise always valid JSON; on a source failure it serves last-good rows, else empty — both
+    /// marked `fresh: false` so the handler can cache them briefly.
+    pub async fn metas_json(
+        &self,
+        catalog_id: &str,
+        stremio_type: &str,
+        country: &str,
+        providers: &[&'static Provider],
+    ) -> Option<CatalogResponse> {
         let obj = ObjectType::from_stremio(stremio_type)?;
-        let is_trending = catalog_id == TRENDING_ID;
-        let code = selected_providers().iter().find(|p| p.id == catalog_id).map(|p| p.code);
+        let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
+        let code = providers.iter().find(|p| p.id == catalog_id).map(|p| p.code);
         if !is_trending && code.is_none() {
-            return None; // unknown catalog id
+            return None; // unknown id, or not one of this install's selected providers
         }
 
-        let key = format!("jw:{}:{}:{}", self.country, catalog_id, stremio_type);
+        let key = format!("jw:{}:{}:{}", country, catalog_id, stremio_type);
         if let Lookup::Fresh(v) = self.cache.get(&key) {
             return Some(CatalogResponse { body: v, fresh: true });
         }
@@ -129,9 +149,9 @@ impl CatalogState {
         }
 
         let fetched = if is_trending {
-            self.aggregate(obj).await
+            self.aggregate(obj, country, providers).await
         } else {
-            self.source.popular(code.unwrap(), obj).await.ok()
+            self.source.popular(code.unwrap(), obj, country).await.ok()
         };
 
         match fetched {
@@ -161,14 +181,19 @@ impl CatalogState {
     /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` only when
     /// every provider fetch failed (so the caller can serve stale/empty). Results are placed by provider
     /// index to keep the dedupe representative deterministic regardless of completion order.
-    async fn aggregate(&self, obj: ObjectType) -> Option<Vec<TrendingItem>> {
-        let providers = selected_providers();
+    async fn aggregate(
+        &self,
+        obj: ObjectType,
+        country: &str,
+        providers: &[&'static Provider],
+    ) -> Option<Vec<TrendingItem>> {
         let mut slots: Vec<Option<Vec<TrendingItem>>> = vec![None; providers.len()];
         let mut set: JoinSet<(usize, Result<Vec<TrendingItem>, ()>)> = JoinSet::new();
         for (i, p) in providers.iter().enumerate() {
             let src = Arc::clone(&self.source);
             let code = p.code;
-            set.spawn(async move { (i, src.popular(code, obj).await) });
+            let country = country.to_owned();
+            set.spawn(async move { (i, src.popular(code, obj, &country).await) });
         }
         while let Some(joined) = set.join_next().await {
             if let Ok((i, Ok(items))) = joined {
@@ -252,7 +277,7 @@ mod tests {
     }
     #[async_trait]
     impl TrendingSource for Fake {
-        async fn popular(&self, _p: &str, _o: ObjectType) -> Result<Vec<TrendingItem>, ()> {
+        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n >= self.fail_after {
                 Err(())
@@ -263,17 +288,13 @@ mod tests {
     }
 
     fn state(data: Vec<TrendingItem>, ttl: Duration, fail_after: usize) -> CatalogState {
-        CatalogState::new(
-            Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after }),
-            ttl,
-            "US".to_owned(),
-        )
+        CatalogState::new(Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after }), ttl)
     }
 
     #[tokio::test]
     async fn renders_provider_row() {
         let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), usize::MAX);
-        let r = s.metas_json("jw-nfx", "movie").await.unwrap();
+        let r = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
         assert!(r.fresh);
         assert!(r.body.contains(r#""id":"tt1""#));
         assert!(r.body.contains(r#""imdb_id":"tt1""#));
@@ -285,14 +306,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_id_or_type_is_none() {
         let s = state(vec![], Duration::from_secs(3600), usize::MAX);
-        assert!(s.metas_json("bogus", "movie").await.is_none());
-        assert!(s.metas_json("jw-nfx", "audiobook").await.is_none());
+        assert!(s.metas_json("bogus", "movie", "US", selected_providers()).await.is_none());
+        assert!(s.metas_json("jw-nfx", "audiobook", "US", selected_providers()).await.is_none());
     }
 
     #[tokio::test]
     async fn source_failure_degrades_to_empty_and_not_fresh() {
         let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), 0); // fail immediately
-        let r = s.metas_json("jw-nfx", "movie").await.unwrap();
+        let r = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
         assert_eq!(r.body, r#"{"metas":[]}"#);
         assert!(!r.fresh, "empty degradation must be marked not-fresh for a short HTTP TTL");
     }
@@ -302,9 +323,9 @@ mod tests {
         // ttl=0 → the first put is immediately stale, so the 2nd call refreshes and (source now failing)
         // must return the stale last-good rows rather than going empty.
         let s = state(vec![item("tt1", "A", 0)], Duration::ZERO, 1); // Ok once, then Err
-        let first = s.metas_json("jw-nfx", "movie").await.unwrap();
+        let first = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
         assert!(first.body.contains(r#""id":"tt1""#));
-        let second = s.metas_json("jw-nfx", "movie").await.unwrap();
+        let second = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
         assert_eq!(second.body, first.body, "stale value served when refresh fails");
         assert!(!second.fresh, "stale-served body must be marked not-fresh");
     }
@@ -324,11 +345,16 @@ mod tests {
 
     #[test]
     fn catalog_entries_cover_providers_and_trending() {
-        let entries = catalog_entries();
+        let entries = catalog_entries(selected_providers());
         assert!(entries.iter().any(|e| e.id == "jw-nfx" && e.type_ == "movie" && e.name == "Popular on Netflix"));
         assert!(entries.iter().any(|e| e.id == TRENDING_ID && e.type_ == "series"));
         // per type: N providers + 1 trending
         let per_type = selected_providers().len() + 1;
         assert_eq!(entries.len(), per_type * 2);
+    }
+
+    #[test]
+    fn empty_provider_set_yields_no_catalog_entries() {
+        assert!(catalog_entries(&[]).is_empty());
     }
 }

@@ -1,6 +1,8 @@
 //! Routing — the port of `handleAtlas`. A single fallback handler matches on the path (exact, like the TS),
 //! so unknown paths 404 and non-GET/HEAD 405.
 
+use crate::catalog::all_providers;
+use crate::config::{Config, Region};
 use crate::dataset::{Blob, Dataset};
 use crate::descriptor::build_descriptor;
 use crate::http::{serve, Payload, Servable};
@@ -37,18 +39,24 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let origin = public_origin(&headers, state.public_base.as_deref());
     let ds = state.dataset.as_ref();
 
-    if path == "/" || path == "/configure" || path == "/configure/" {
-        return html_response(landing_page(&origin, ds));
+    // A leading `<region>_<codes>` path segment is a per-install config (Stremio config-URL pattern);
+    // strip it and route on the remainder. Absent/garbled → the operator-default config. The dataset,
+    // health, and blob routes are config-independent — the config only shapes manifest + catalog.
+    let (config, route) = split_config(&path);
+    let route = route.as_str();
+
+    if route == "/" || route == "/configure" || route == "/configure/" {
+        return html_response(configure_page(&origin, &config, ds));
     }
-    if path == "/health" {
+    if route == "/health" {
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
         // app's Plugins screen (and any monitor) can see a problem.
         return json_response(health_body(ds.is_some(), state.catalog.fresh()), StatusCode::OK);
     }
-    if path == "/manifest.json" {
-        return serve_json(&method, &headers, manifest_json(), "public, max-age=3600", None).await;
+    if route == "/manifest.json" {
+        return serve_json(&method, &headers, manifest_json(&config), "public, max-age=3600", None).await;
     }
-    if path == "/dataset.json" {
+    if route == "/dataset.json" {
         return match ds {
             Some(ds) => {
                 serve_json(&method, &headers, build_descriptor(&origin, ds), "public, max-age=300", ds.last_modified.clone()).await
@@ -61,15 +69,15 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     }
     // Blob routes exist only when the dataset loaded (their names come from the meta).
     if let Some(ds) = ds {
-        if path == format!("/{}", ds.labels.name) {
+        if route == format!("/{}", ds.labels.name) {
             return serve_blob(&method, &headers, &query, ds, &ds.labels).await;
         }
-        if path == format!("/{}", ds.vectors.name) {
+        if route == format!("/{}", ds.vectors.name) {
             return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
         }
     }
-    if let Some(rest) = path.strip_prefix("/catalog/") {
-        return handle_catalog(&method, &headers, rest, &state).await;
+    if let Some(rest) = route.strip_prefix("/catalog/") {
+        return handle_catalog(&method, &headers, rest, &config, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
 }
@@ -88,19 +96,25 @@ fn health_body(dataset_loaded: bool, catalog_fresh: bool) -> &'static str {
     }
 }
 
-/// `GET /catalog/{type}/{id}.json` (a trailing `/{extra}` segment is tolerated and ignored). Public,
-/// tokenless; a JustWatch failure degrades to empty rows, never a 5xx, and never touches the dataset.
+/// `GET /catalog/{type}/{id}[/{extra}].json`. The optional extra may carry `country=XX` — the region
+/// the Den app forwards for an `auto` install. Public, tokenless; a JustWatch failure degrades to empty
+/// rows, never a 5xx, and never touches the dataset.
 async fn handle_catalog(
     method: &Method,
     headers: &axum::http::HeaderMap,
     rest: &str,
+    config: &Config,
     state: &Arc<AppState>,
 ) -> Response {
     let rest = rest.strip_suffix(".json").unwrap_or(rest);
     let mut parts = rest.splitn(3, '/'); // type / id / optional extra
     let type_ = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("");
-    match state.catalog.metas_json(id, type_).await {
+    let extra = parts.next().unwrap_or("");
+    // A fixed-country config wins; an `auto` config takes the forwarded `country` extra; else default.
+    let forwarded = extra_value(extra, "country");
+    let country = config.country(forwarded.as_deref(), &state.default_country);
+    match state.catalog.metas_json(id, type_, &country, &config.providers).await {
         Some(r) => {
             // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
             // CDN doesn't pin a broken row past JustWatch's recovery.
@@ -180,30 +194,119 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-fn landing_page(origin: &str, ds: Option<&Dataset>) -> String {
-    let manifest_url = format!("{}/manifest.json", escape_html(origin));
-    let status = match ds {
-        Some(d) => format!(
-            "<p>Currently serving <b>{}</b> titles (<code>{}</code> / <code>{}</code>).</p>",
-            group_thousands(d.meta.count),
-            escape_html(&d.meta.taxonomy_version),
-            escape_html(&d.meta.embedding_model)
-        ),
-        None => "<p><b>Dataset unavailable</b> — the feature-store blobs failed to load (refresh with <code>scripts/fetch-dataset.sh</code>). Catalog rows still work.</p>".to_owned(),
+/// Split an optional leading `<region>_<codes>` config segment off the path — returning the parsed
+/// config (or the operator default) and the remaining route with a leading `/`.
+fn split_config(path: &str) -> (Config, String) {
+    let trimmed = path.trim_start_matches('/');
+    let mut it = trimmed.splitn(2, '/');
+    let first = it.next().unwrap_or("");
+    if let Some(cfg) = Config::parse(first) {
+        (cfg, format!("/{}", it.next().unwrap_or("")))
+    } else {
+        (Config::default_config(), path.to_owned())
+    }
+}
+
+/// First non-empty value of `key` in a Stremio path-extra like `country=SE&genre=Action`.
+fn extra_value(extra: &str, key: &str) -> Option<String> {
+    extra.split('&').find_map(|kv| {
+        let mut it = kv.splitn(2, '=');
+        (it.next()? == key)
+            .then(|| it.next().unwrap_or("").to_owned())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// Countries offered in the `/configure` dropdown (major JustWatch-covered markets). "Auto" is added
+/// first in the HTML. Not exhaustive — a fixed code JustWatch doesn't cover just yields empty rows.
+const COUNTRIES: &[(&str, &str)] = &[
+    ("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"), ("AU", "Australia"),
+    ("IE", "Ireland"), ("NZ", "New Zealand"),
+    ("SE", "Sweden"), ("NO", "Norway"), ("DK", "Denmark"), ("FI", "Finland"), ("IS", "Iceland"),
+    ("DE", "Germany"), ("AT", "Austria"), ("CH", "Switzerland"), ("NL", "Netherlands"),
+    ("BE", "Belgium"), ("FR", "France"), ("ES", "Spain"), ("PT", "Portugal"), ("IT", "Italy"),
+    ("PL", "Poland"), ("CZ", "Czechia"), ("GR", "Greece"), ("TR", "Turkey"),
+    ("BR", "Brazil"), ("MX", "Mexico"), ("AR", "Argentina"), ("CL", "Chile"),
+    ("JP", "Japan"), ("KR", "South Korea"), ("IN", "India"), ("ID", "Indonesia"),
+    ("SG", "Singapore"), ("ZA", "South Africa"),
+];
+
+/// The `/configure` page: pick a region (Auto or a country) + the streaming services you care about,
+/// and it builds the install URL live. Reflects the current config when editing an existing install.
+fn configure_page(origin: &str, config: &Config, ds: Option<&Dataset>) -> String {
+    let current_region = match &config.region {
+        Region::Auto => "auto".to_owned(),
+        Region::Fixed(cc) => cc.clone(),
     };
+    let auto_sel = if current_region == "auto" { " selected" } else { "" };
+    let country_options: String = COUNTRIES
+        .iter()
+        .map(|&(code, name)| {
+            let sel = if current_region == code { " selected" } else { "" };
+            format!("<option value='{code}'{sel}>{}</option>", escape_html(name))
+        })
+        .collect();
+    let checked: Vec<&str> = config.providers.iter().map(|p| p.code).collect();
+    let provider_inputs: String = all_providers()
+        .iter()
+        .map(|p| {
+            let ck = if checked.contains(&p.code) { " checked" } else { "" };
+            format!(
+                "<label class=prov><input type=checkbox value='{}'{ck}> {}</label>",
+                p.code,
+                escape_html(p.name)
+            )
+        })
+        .collect();
+    let status = match ds {
+        Some(d) => format!("<p class=muted>Feature store: <b>{}</b> titles.</p>", group_thousands(d.meta.count)),
+        None => "<p class=muted>Dataset unavailable — catalog rows still work.</p>".to_owned(),
+    };
+    let origin_js = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
     [
         "<!doctype html><html><head><meta charset=utf-8>",
         "<meta name=viewport content='width=device-width,initial-scale=1'>",
-        "<title>Den Atlas</title>",
-        "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}",
-        "code{background:#f2f2f2;padding:.15rem .35rem;border-radius:4px;word-break:break-all}</style></head><body>",
+        "<title>Den Atlas — Configure</title>",
+        "<style>",
+        "body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}",
+        "h1{margin-bottom:.2rem}.muted{color:#666;font-size:.9rem}",
+        "fieldset{border:1px solid #ddd;border-radius:8px;margin:1.2rem 0;padding:1rem}",
+        "legend{font-weight:600;padding:0 .4rem}select{font:inherit;padding:.3rem}",
+        ".prov{display:block;margin:.3rem 0}",
+        "code,input#url{background:#f2f2f2;padding:.4rem .5rem;border-radius:4px;word-break:break-all;",
+        "font:14px ui-monospace,monospace;width:100%;border:1px solid #ddd;box-sizing:border-box}",
+        "a.btn,button{font:inherit;padding:.5rem .9rem;border-radius:6px;border:1px solid #ccc;",
+        "background:#fafafa;cursor:pointer;text-decoration:none;color:#222;display:inline-block;margin:.4rem .4rem 0 0}",
+        "a.install{background:#6f42c1;color:#fff;border-color:#6f42c1}#warn{color:#b00;display:none}",
+        "</style></head><body>",
         "<h1>Den Atlas</h1>",
-        "<p>A self-hosted <b>dataset addon</b> for Den — derived labels + semantic vectors for the whole catalog.</p>",
+        "<p class=muted>Derived labels + semantic vectors for Den, plus \u{201c}most popular\u{201d} streaming rows (data from JustWatch).</p>",
         &status,
-        "<p>Add this URL in Den → Settings → Plugins:</p>",
-        &format!("<p><code>{manifest_url}</code></p>"),
-        "<p>Also serves \u{201c}most popular\u{201d} streaming catalog rows. Catalog data from JustWatch.</p>",
-        "</body></html>",
+        "<fieldset><legend>Region</legend>",
+        "<p class=muted>\u{201c}Auto\u{201d} uses your Apple TV\u{2019}s country automatically. Or pin one:</p>",
+        &format!("<select id=region><option value=auto{auto_sel}>Auto (device region)</option>{country_options}</select>"),
+        "</fieldset>",
+        "<fieldset><legend>Streaming services</legend>",
+        "<p class=muted>\u{201c}Popular on\u{2026}\u{201d} rows for the services you pick. Uncheck all to turn these rows off.</p>",
+        &provider_inputs,
+        "</fieldset>",
+        "<p><b>Install URL</b> (add in Den \u{2192} Settings \u{2192} Plugins):</p>",
+        "<input id=url readonly>",
+        "<p id=warn>No services selected \u{2014} the \u{201c}most popular\u{201d} rows are off; only the dataset is served.</p>",
+        "<p><a class='btn install' id=install>Install in Stremio</a>",
+        "<button type=button onclick=copyUrl()>Copy URL</button></p>",
+        "<script>",
+        &format!("const ORIGIN={origin_js};"),
+        "function rebuild(){",
+        "var region=document.getElementById('region').value;",
+        "var codes=Array.prototype.slice.call(document.querySelectorAll('.prov input:checked')).map(function(c){return c.value});",
+        "var url=ORIGIN+'/'+region+'_'+codes.join('-')+'/manifest.json';",
+        "document.getElementById('url').value=url;",
+        "document.getElementById('install').href=url.replace(/^https?:/,'stremio:');",
+        "document.getElementById('warn').style.display=codes.length?'none':'block';}",
+        "function copyUrl(){var u=document.getElementById('url');u.select();try{document.execCommand('copy')}catch(e){}}",
+        "document.addEventListener('input',rebuild);window.addEventListener('load',rebuild);",
+        "</script></body></html>",
     ]
     .join("")
 }

@@ -3,6 +3,7 @@
 
 mod cache;
 mod catalog;
+mod config;
 mod dataset;
 mod descriptor;
 mod handler;
@@ -22,6 +23,9 @@ pub struct AppState {
     pub public_base: Option<String>,
     /// JustWatch "most popular" catalog rows (public, isolated from the dataset resource).
     pub catalog: catalog::CatalogState,
+    /// The operator-default country (env `JW_COUNTRY`) — used when an `auto` install forwards no
+    /// `country` extra. A fixed-country install ignores it.
+    pub default_country: String,
 }
 
 #[tokio::main]
@@ -38,20 +42,17 @@ async fn main() {
         }
     };
 
-    let country = std::env::var("JW_COUNTRY").unwrap_or_else(|_| "US".to_owned());
+    let default_country = std::env::var("JW_COUNTRY").unwrap_or_else(|_| "US".to_owned());
     let ttl = Duration::from_secs(
         std::env::var("JW_CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(21_600),
     );
-    let catalog = catalog::CatalogState::new(
-        Arc::new(justwatch::JustWatchClient::new(country.clone())),
-        ttl,
-        country,
-    );
+    let catalog = catalog::CatalogState::new(Arc::new(justwatch::JustWatchClient::new()), ttl);
 
     let state = Arc::new(AppState {
         dataset,
         public_base: std::env::var("PUBLIC_BASE_URL").ok(),
         catalog,
+        default_country,
     });
 
     let app = axum::Router::new()

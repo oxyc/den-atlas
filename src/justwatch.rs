@@ -41,10 +41,11 @@ pub struct TrendingItem {
     pub rank: usize,
 }
 
-/// The source seam — the real JustWatch client in prod, a fake in tests.
+/// The source seam — the real JustWatch client in prod, a fake in tests. `country` is per-request (an
+/// ISO-3166 code) so one client serves every configured/forwarded region.
 #[async_trait]
 pub trait TrendingSource: Send + Sync {
-    async fn popular(&self, provider: &str, obj: ObjectType) -> Result<Vec<TrendingItem>, ()>;
+    async fn popular(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()>;
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -61,18 +62,23 @@ pub struct JustWatchClient {
     // None if the client couldn't be built (TLS backend init) — catalog then degrades to empty rows
     // instead of `reqwest::Client::new()` panicking at startup.
     http: Option<reqwest::Client>,
-    country: String,
 }
 
 impl JustWatchClient {
-    pub fn new(country: String) -> Self {
+    pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .user_agent("den-atlas/0.1 (+https://github.com/oxyc/den)")
             .build()
             .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
             .ok();
-        Self { http, country }
+        Self { http }
+    }
+}
+
+impl Default for JustWatchClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -139,11 +145,11 @@ fn is_imdb(s: &str) -> bool {
 
 #[async_trait]
 impl TrendingSource for JustWatchClient {
-    async fn popular(&self, provider: &str, obj: ObjectType) -> Result<Vec<TrendingItem>, ()> {
+    async fn popular(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()> {
         let payload = serde_json::json!({
             "query": QUERY,
             "variables": {
-                "country": self.country,
+                "country": country,
                 "first": 100,
                 "popularTitlesSortBy": "TRENDING",
                 "packages": [provider],
