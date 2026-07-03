@@ -37,11 +37,6 @@ pub fn provider_by_code(code: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.code == code)
 }
 
-/// Every provider den-atlas can serve — the checkbox list shown on `/configure`.
-pub fn all_providers() -> &'static [Provider] {
-    PROVIDERS
-}
-
 /// The operator-default provider set — the full table, or a subset selected by `JW_PROVIDERS` (codes).
 /// Used when no per-install config is supplied. Resolved once (env is effectively static).
 pub fn selected_providers() -> &'static [&'static Provider] {

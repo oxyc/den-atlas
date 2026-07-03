@@ -1,15 +1,12 @@
 //! Routing — the port of `handleAtlas`. A single fallback handler matches on the path (exact, like the TS),
 //! so unknown paths 404 and non-GET/HEAD 405.
 
-use crate::catalog::all_providers;
-use crate::config::{Config, Region};
+use crate::config::Config;
 use crate::dataset::{Blob, Dataset};
 use crate::descriptor::build_descriptor;
 use crate::http::{serve, Payload, Servable};
 use crate::manifest::manifest_json;
-use crate::util::{
-    escape_html, fnv1a, group_thousands, html_response, json_response, public_origin,
-};
+use crate::util::{fnv1a, html_response, json_response, public_origin};
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -17,6 +14,10 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::sync::Arc;
+
+/// The /configure page, embedded so the binary is self-contained. Region + provider choice is plaintext
+/// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
+const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
@@ -46,7 +47,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let route = route.as_str();
 
     if route == "/" || route == "/configure" || route == "/configure/" {
-        return html_response(configure_page(&origin, &config, ds));
+        return html_response(CONFIGURE_PAGE.to_owned());
     }
     if route == "/health" {
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
@@ -217,99 +218,6 @@ fn extra_value(extra: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Countries offered in the `/configure` dropdown (major JustWatch-covered markets). "Auto" is added
-/// first in the HTML. Not exhaustive — a fixed code JustWatch doesn't cover just yields empty rows.
-const COUNTRIES: &[(&str, &str)] = &[
-    ("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"), ("AU", "Australia"),
-    ("IE", "Ireland"), ("NZ", "New Zealand"),
-    ("SE", "Sweden"), ("NO", "Norway"), ("DK", "Denmark"), ("FI", "Finland"), ("IS", "Iceland"),
-    ("DE", "Germany"), ("AT", "Austria"), ("CH", "Switzerland"), ("NL", "Netherlands"),
-    ("BE", "Belgium"), ("FR", "France"), ("ES", "Spain"), ("PT", "Portugal"), ("IT", "Italy"),
-    ("PL", "Poland"), ("CZ", "Czechia"), ("GR", "Greece"), ("TR", "Turkey"),
-    ("BR", "Brazil"), ("MX", "Mexico"), ("AR", "Argentina"), ("CL", "Chile"),
-    ("JP", "Japan"), ("KR", "South Korea"), ("IN", "India"), ("ID", "Indonesia"),
-    ("SG", "Singapore"), ("ZA", "South Africa"),
-];
-
-/// The `/configure` page: pick a region (Auto or a country) + the streaming services you care about,
-/// and it builds the install URL live. Reflects the current config when editing an existing install.
-fn configure_page(origin: &str, config: &Config, ds: Option<&Dataset>) -> String {
-    let current_region = match &config.region {
-        Region::Auto => "auto".to_owned(),
-        Region::Fixed(cc) => cc.clone(),
-    };
-    let auto_sel = if current_region == "auto" { " selected" } else { "" };
-    let country_options: String = COUNTRIES
-        .iter()
-        .map(|&(code, name)| {
-            let sel = if current_region == code { " selected" } else { "" };
-            format!("<option value='{code}'{sel}>{}</option>", escape_html(name))
-        })
-        .collect();
-    let checked: Vec<&str> = config.providers.iter().map(|p| p.code).collect();
-    let provider_inputs: String = all_providers()
-        .iter()
-        .map(|p| {
-            let ck = if checked.contains(&p.code) { " checked" } else { "" };
-            format!(
-                "<label class=prov><input type=checkbox value='{}'{ck}> {}</label>",
-                p.code,
-                escape_html(p.name)
-            )
-        })
-        .collect();
-    let status = match ds {
-        Some(d) => format!("<p class=muted>Feature store: <b>{}</b> titles.</p>", group_thousands(d.meta.count)),
-        None => "<p class=muted>Dataset unavailable — catalog rows still work.</p>".to_owned(),
-    };
-    let origin_js = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".to_owned());
-    [
-        "<!doctype html><html><head><meta charset=utf-8>",
-        "<meta name=viewport content='width=device-width,initial-scale=1'>",
-        "<title>Den Atlas — Configure</title>",
-        "<style>",
-        "body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}",
-        "h1{margin-bottom:.2rem}.muted{color:#666;font-size:.9rem}",
-        "fieldset{border:1px solid #ddd;border-radius:8px;margin:1.2rem 0;padding:1rem}",
-        "legend{font-weight:600;padding:0 .4rem}select{font:inherit;padding:.3rem}",
-        ".prov{display:block;margin:.3rem 0}",
-        "code,input#url{background:#f2f2f2;padding:.4rem .5rem;border-radius:4px;word-break:break-all;",
-        "font:14px ui-monospace,monospace;width:100%;border:1px solid #ddd;box-sizing:border-box}",
-        "a.btn,button{font:inherit;padding:.5rem .9rem;border-radius:6px;border:1px solid #ccc;",
-        "background:#fafafa;cursor:pointer;text-decoration:none;color:#222;display:inline-block;margin:.4rem .4rem 0 0}",
-        "a.install{background:#6f42c1;color:#fff;border-color:#6f42c1}#warn{color:#b00;display:none}",
-        "</style></head><body>",
-        "<h1>Den Atlas</h1>",
-        "<p class=muted>Derived labels + semantic vectors for Den, plus \u{201c}most popular\u{201d} streaming rows (data from JustWatch).</p>",
-        &status,
-        "<fieldset><legend>Region</legend>",
-        "<p class=muted>\u{201c}Auto\u{201d} uses your Apple TV\u{2019}s country automatically. Or pin one:</p>",
-        &format!("<select id=region><option value=auto{auto_sel}>Auto (device region)</option>{country_options}</select>"),
-        "</fieldset>",
-        "<fieldset><legend>Streaming services</legend>",
-        "<p class=muted>\u{201c}Popular on\u{2026}\u{201d} rows for the services you pick. Uncheck all to turn these rows off.</p>",
-        &provider_inputs,
-        "</fieldset>",
-        "<p><b>Install URL</b> (add in Den \u{2192} Settings \u{2192} Plugins):</p>",
-        "<input id=url readonly>",
-        "<p id=warn>No services selected \u{2014} the \u{201c}most popular\u{201d} rows are off; only the dataset is served.</p>",
-        "<p><a class='btn install' id=install>Install in Stremio</a>",
-        "<button type=button onclick=copyUrl()>Copy URL</button></p>",
-        "<script>",
-        &format!("const ORIGIN={origin_js};"),
-        "function rebuild(){",
-        "var region=document.getElementById('region').value;",
-        "var codes=Array.prototype.slice.call(document.querySelectorAll('.prov input:checked')).map(function(c){return c.value});",
-        "var url=ORIGIN+'/'+region+'_'+codes.join('-')+'/manifest.json';",
-        "document.getElementById('url').value=url;",
-        "document.getElementById('install').href=url.replace(/^https?:/,'stremio:');",
-        "document.getElementById('warn').style.display=codes.length?'none':'block';}",
-        "function copyUrl(){var u=document.getElementById('url');u.select();try{document.execCommand('copy')}catch(e){}}",
-        "document.addEventListener('input',rebuild);window.addEventListener('load',rebuild);",
-        "</script></body></html>",
-    ]
-    .join("")
-}
 
 #[cfg(test)]
 mod tests {

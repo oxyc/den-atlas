@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Den Atlas — Configure</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0d0f13; color: #e6e8ec;
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; }
+  main { max-width: 34rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  p.sub { color: #9aa0aa; margin: 0 0 1.5rem; }
+  h2 { font-size: .78rem; color: #9aa0aa; text-transform: uppercase; letter-spacing: .06em;
+       margin: 1.75rem 0 .7rem; }
+  label { display: block; font-weight: 600; margin: 0 0 .35rem; color: #c9ccd3; }
+  input[type=text], input[type=password], input[type=number], select {
+    width: 100%; padding: .65rem .7rem; border-radius: 9px; border: 1px solid #2a2f38;
+    background: #161a20; color: inherit; font: inherit; outline: none; }
+  input:focus, select:focus { border-color: #5b8cff; }
+  .field { margin-top: .9rem; }
+  .hint { color: #8b919b; font-size: .82rem; margin-top: .3rem; }
+  .hint a { color: #7fb0ff; }
+  .row-inputs { display: flex; gap: .75rem; } .row-inputs > * { flex: 1; }
+  .chk { display: inline-flex; align-items: center; gap: .5rem; margin: 0 1rem .55rem 0;
+         color: #c9ccd3; font-weight: 400; }
+  .chk input { width: auto; }
+  .optional { font-weight: 400; color: #8b919b; }
+  button.primary { width: 100%; margin-top: 1.75rem; padding: .8rem; border: 0; border-radius: 10px;
+    background: #3b82f6; color: #fff; font-weight: 600; font-size: 1rem; cursor: pointer; }
+  #out { margin-top: 1.5rem; }
+  #out.hidden { display: none; }
+  #url { width: 100%; padding: .7rem; border: 1px solid #2a2f38; border-radius: 9px; background: #10141a;
+    color: #8ab4ff; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    resize: vertical; overflow-wrap: anywhere; box-sizing: border-box; }
+  .row { display: flex; gap: .6rem; margin-top: .6rem; }
+  #copy { padding: .55rem 1.1rem; border: 1px solid #2a2f38; border-radius: 9px; background: #1c212a;
+    color: #e6e8ec; font: inherit; cursor: pointer; }
+  .note { font-size: .86rem; margin: .8rem 0 0; font-weight: 600; }
+  .note.sealed { color: #56d18c; }
+  .note.unsealed { color: #f0b74a; }
+  .disclaimer { color: #9aa0aa; font-size: .8rem; line-height: 1.55; margin: .55rem 0 0;
+    padding: .8rem .9rem; background: #12151b; border: 1px solid #222833; border-radius: 9px; }
+  .disclaimer b { color: #c9ccd3; font-weight: 600; }
+  .err { color: #ff6b6b; min-height: 1.1rem; margin-top: .5rem; font-size: .85rem; }
+  .foot { margin-top: 1rem; color: #8b919b; font-size: .8rem; }
+  .foot a { color: #8b919b; }
+</style></head><body>
+<main>
+<h1>Den Atlas</h1>
+<p class="sub">Derived labels + semantic vectors for Den, plus “most popular” streaming rows (data from
+  JustWatch). Pick your region and the services you care about — the choice lives in this install link,
+  no account or token.</p>
+
+<h2>Region</h2>
+<label for="region">Country</label>
+<select id="region"></select>
+<div class="hint">“Auto” uses your Apple TV’s region automatically. Pick a country to pin it instead.</div>
+
+<h2>Streaming services</h2>
+<div id="providers"></div>
+<div class="hint">“Popular on…” rows for the services you pick. Uncheck all to turn these rows off (only
+  the dataset is served).</div>
+
+<button id="go" class="primary">Build install link</button>
+<div class="err" id="err"></div>
+
+<div id="out" class="hidden">
+  <h2>Your install link</h2>
+  <textarea id="url" readonly rows="3" aria-label="Install URL"></textarea>
+  <div class="row"><button id="copy" type="button">Copy link</button></div>
+  <p class="note" id="note"></p>
+  <p class="foot">In Den: Settings → Plugins → Add, paste this link.</p>
+</div>
+</main>
+<script>
+// Den Atlas /configure — plaintext config (region + providers), no secrets to seal. The choice is a
+// `<region>_<codes>` path segment; the JS builds `origin/<segment>/manifest.json` client-side.
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var PROVIDERS = [
+    ["nfx", "Netflix"], ["max", "Max"], ["amp", "Prime Video"], ["dnp", "Disney+"], ["atp", "Apple TV+"],
+  ];
+  var COUNTRIES = [
+    ["auto", "Auto (device region)"],
+    ["US", "United States"], ["GB", "United Kingdom"], ["CA", "Canada"], ["AU", "Australia"],
+    ["IE", "Ireland"], ["NZ", "New Zealand"],
+    ["SE", "Sweden"], ["NO", "Norway"], ["DK", "Denmark"], ["FI", "Finland"], ["IS", "Iceland"],
+    ["DE", "Germany"], ["AT", "Austria"], ["CH", "Switzerland"], ["NL", "Netherlands"],
+    ["BE", "Belgium"], ["FR", "France"], ["ES", "Spain"], ["PT", "Portugal"], ["IT", "Italy"],
+    ["PL", "Poland"], ["CZ", "Czechia"], ["GR", "Greece"], ["TR", "Turkey"],
+    ["BR", "Brazil"], ["MX", "Mexico"], ["AR", "Argentina"], ["CL", "Chile"],
+    ["JP", "Japan"], ["KR", "South Korea"], ["IN", "India"], ["ID", "Indonesia"],
+    ["SG", "Singapore"], ["ZA", "South Africa"],
+  ];
+
+  $("region").innerHTML = COUNTRIES.map(function (c) {
+    return "<option value='" + c[0] + "'>" + c[1] + "</option>";
+  }).join("");
+  $("providers").innerHTML = PROVIDERS.map(function (p) {
+    return "<label class=chk><input type=checkbox value='" + p[0] + "' checked> " + p[1] + "</label>";
+  }).join("");
+
+  // Pre-fill from an existing config segment in the path (…/<region>_<codes>/configure) so editing an
+  // install reflects its current choice.
+  var m = location.pathname.match(/\/(auto|[A-Za-z]{2})_([a-z-]*)\//);
+  if (m) {
+    var region = m[1].toLowerCase() === "auto" ? "auto" : m[1].toUpperCase();
+    var codes = (m[2] || "").split("-").filter(Boolean);
+    $("region").value = region;
+    Array.prototype.forEach.call(document.querySelectorAll("#providers input"), function (cb) {
+      cb.checked = codes.indexOf(cb.value) !== -1;
+    });
+  }
+
+  function checkedCodes() {
+    return Array.prototype.slice.call(document.querySelectorAll("#providers input:checked"))
+      .map(function (c) { return c.value; });
+  }
+
+  function build() {
+    var codes = checkedCodes();
+    $("url").value = location.origin + "/" + $("region").value + "_" + codes.join("-") + "/manifest.json";
+    $("note").textContent = codes.length ? ""
+      : "No services selected — the “most popular” rows are off; only the dataset is served.";
+    $("note").className = codes.length ? "note" : "note unsealed";
+    $("out").classList.remove("hidden");
+    copyURL();
+  }
+
+  function copyURL() {
+    var u = $("url"); u.focus(); u.select();
+    try { document.execCommand("copy"); } catch (e) {}
+  }
+
+  $("go").addEventListener("click", build);
+  $("copy").addEventListener("click", copyURL);
+})();
+</script>
+</body></html>
