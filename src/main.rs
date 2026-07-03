@@ -26,6 +26,16 @@ pub struct AppState {
     /// The operator-default country (env `JW_COUNTRY`) — used when an `auto` install forwards no
     /// `country` extra. A fixed-country install ignores it.
     pub default_country: String,
+    /// Upstream den-embed for the `/embed` search proxy (env `DEN_EMBED_URL`). `None` disables search embeds.
+    pub embed: Option<EmbedProxy>,
+}
+
+/// Search query-embed proxy. den-atlas never runs the model — it forwards to the single den-embed authority
+/// so a search query embeds through the SAME bge-m3 + int8 quantizer that built the corpus (the alignment
+/// rule). den-embed stays internal; the app only ever talks to den-atlas.
+pub struct EmbedProxy {
+    pub client: reqwest::Client,
+    pub base: String,
 }
 
 #[tokio::main]
@@ -48,11 +58,24 @@ async fn main() {
     );
     let catalog = catalog::CatalogState::new(Arc::new(justwatch::JustWatchClient::new()), ttl);
 
+    // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
+    // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
+    let embed = std::env::var("DEN_EMBED_URL").ok().and_then(|base| {
+        match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(client) => Some(EmbedProxy { client, base: base.trim_end_matches('/').to_owned() }),
+            Err(e) => {
+                eprintln!("den-atlas: embed proxy disabled (reqwest build failed: {e})");
+                None
+            }
+        }
+    });
+
     let state = Arc::new(AppState {
         dataset,
         public_base: std::env::var("PUBLIC_BASE_URL").ok(),
         catalog,
         default_country,
+        embed,
     });
 
     let app = axum::Router::new()

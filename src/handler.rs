@@ -26,25 +26,35 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS")
             .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
             .body(Body::empty())
             .unwrap();
     }
-    if method != Method::GET && method != Method::HEAD {
-        return json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED);
-    }
-    let headers = req.headers().clone();
-    let path = req.uri().path().to_owned();
-    let query = req.uri().query().unwrap_or("").to_owned();
-    let origin = public_origin(&headers, state.public_base.as_deref());
-    let ds = state.dataset.as_ref();
 
+    let path = req.uri().path().to_owned();
     // A leading `<region>_<codes>` path segment is a per-install config (Stremio config-URL pattern);
     // strip it and route on the remainder. Absent/garbled → the operator-default config. The dataset,
     // health, and blob routes are config-independent — the config only shapes manifest + catalog.
     let (config, route) = split_config(&path);
     let route = route.as_str();
+
+    // Search query-embed proxy: POST /embed forwards the query to den-embed (the single quantizer authority)
+    // and returns its int8 vector. Handled before the GET/HEAD guard because it's the one write route.
+    if method == Method::POST {
+        return if route == "/embed" {
+            handle_embed(&state, req).await
+        } else {
+            json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED)
+        };
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let headers = req.headers().clone();
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let origin = public_origin(&headers, state.public_base.as_deref());
+    let ds = state.dataset.as_ref();
 
     if route == "/" || route == "/configure" || route == "/configure/" {
         return html_response(CONFIGURE_PAGE.to_owned());
@@ -81,6 +91,47 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return handle_catalog(&method, &headers, rest, &config, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+/// `POST /embed` — the search query-embed proxy. Forwards the JSON body (`{"text":"…"}`) to den-embed and
+/// returns its response verbatim (`{"vector":int8[dims],"dims":Int,"model":String}`). den-atlas never runs
+/// the model, so a query embeds through the SAME bge-m3 + int8 quantizer as the corpus (the alignment rule),
+/// and den-embed stays internal. Absent `DEN_EMBED_URL` ⇒ 503 (dataset serving is unaffected).
+async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
+    let Some(proxy) = state.embed.as_ref() else {
+        return json_response(
+            r#"{"error":"embed_unavailable","detail":"search embeds are not configured (DEN_EMBED_URL unset)"}"#,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    };
+    // A search query is short — cap the body so this can't relay large payloads to the internal service.
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST),
+    };
+    match proxy
+        .client
+        .post(format!("{}/embed", proxy.base))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let bytes = resp.bytes().await.unwrap_or_default();
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            eprintln!("den-atlas: embed upstream error: {e}");
+            json_response(r#"{"error":"embed_upstream_failed"}"#, StatusCode::BAD_GATEWAY)
+        }
+    }
 }
 
 /// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the

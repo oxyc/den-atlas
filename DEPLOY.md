@@ -63,6 +63,14 @@ Den → Settings → Plugins → add `https://atlas.example.com/manifest.json`. 
 dataset (sha256-gated, stale-while-revalidate) and the on-device feature store comes from Atlas instead of
 the bundled copy. Removing the addon falls back to the bundled artifact — discovery never goes blank.
 
+## Search embeds (optional)
+Set `DEN_EMBED_URL=http://den-embed:8080` to enable `POST /embed` — a proxy that forwards a search query
+(`{"text":"…"}`) to the internal [den-embed](https://github.com/oxyc/den-embed) service and returns its int8
+vector (`{"vector":…,"dims":1024,"model":"bge-m3"}`). This is what powers semantic search: the app embeds the
+query through Atlas → den-embed, i.e. the SAME bge-m3 + quantizer that built the corpus (the alignment rule),
+so query and corpus vectors are comparable. den-embed stays internal — only Atlas is exposed. Unset ⇒ `/embed`
+returns 503 and dataset serving is unaffected.
+
 ## Refreshing / new versions
 Re-run `scripts/fetch-dataset.sh` after a new den-dataset release (its `datasetVersion` bumps iff the bytes changed) → rebuild → redeploy. The app
 re-syncs only when `datasetVersion`/`embeddingModel`/`taxonomyVersion` moves; unchanged blobs are served
