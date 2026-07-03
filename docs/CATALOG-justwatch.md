@@ -85,7 +85,14 @@ No cache crate — hand-roll a tiny TTL map (§4) to avoid pulling in `moka`. `t
   | `dnp` | `jw-dnp` | Popular on Disney+ |
   | `atp` | `jw-atp` | Popular on Apple TV+ |
 
-  Configurable via env `JW_PROVIDERS` (comma-separated codes) — else the default set.
+  **Per-install config (`/configure`).** Region + provider set are chosen per install, carried in a
+  `<region>_<codes>` URL path segment (Stremio config-URL pattern) — no server-side state:
+  - `region` = `auto` (the Den app forwards the device country as a `country` catalog extra) or a
+    fixed ISO code; `codes` = provider short-codes joined by `-`. Empty codes = no catalog rows.
+  - `country` is per-request through `TrendingSource::popular(provider, ObjectType, country)`; the
+    manifest is `configurable:true` and declares the `country` extra only when `region=auto`.
+  - A config-less `…/manifest.json` install falls back to the **operator default**: env `JW_COUNTRY`
+    (default `US`) + `JW_PROVIDERS` (default all). So existing installs are unaffected.
 - Manifest changes: `resources: vec!["dataset", "catalog"]`; populate `catalogs` with one entry per
   provider × type **plus** the aggregated row:
 

@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Single source of truth: the manifest reads env!("CARGO_PKG_VERSION"), and the image tag is the
+      # git tag — so a v* tag must equal v<Cargo.toml version> or the release version would be a lie.
+      # Fail fast on a mismatch (skipped on workflow_dispatch, which has no tag).
+      - name: Tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag_v="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml=$cargo_v  tag=$tag_v"
+          test "$cargo_v" = "$tag_v" || { echo "::error::tag $GITHUB_REF_NAME != Cargo.toml version $cargo_v — bump Cargo.toml before tagging"; exit 1; }
+
       - name: cargo test
         run: cargo test --locked
 

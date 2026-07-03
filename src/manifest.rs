@@ -6,7 +6,9 @@ use crate::catalog;
 use crate::config::{Config, Region};
 use serde::Serialize;
 
-const VERSION: &str = "0.1.0";
+// Single source of truth: the Cargo package version (bumped per release, asserted == the v* tag in
+// CI). So the manifest can never drift from Cargo.toml, and the tag can't drift from either.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DESCRIPTION: &str = "A map of the catalog: derived labels (genre / subgenre / mood) + semantic vectors the Den app downloads and refreshes, plus \"most popular\" streaming catalogs. Derived data only; catalog data from JustWatch.";
 
 #[derive(Serialize)]
