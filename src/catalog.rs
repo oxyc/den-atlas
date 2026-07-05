@@ -225,7 +225,7 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
         .enumerate()
         .map(|(i, (imdb, _))| {
             let r = repr[imdb];
-            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i }
+            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i, rating: r.rating }
         })
         .collect()
 }
@@ -248,6 +248,11 @@ pub fn render_metas(items: &[TrendingItem], stremio_type: &str) -> String {
             if let Some(tmdb) = it.moviedb {
                 m["moviedb_id"] = serde_json::json!(tmdb);
             }
+            // JustWatch's IMDb score → the Den card's star (the app maps `imdbRating` → voteAverage; a
+            // detail visit later upgrades it to the OMDb/IMDb value). Emitted as a string, Stremio-style.
+            if let Some(rating) = it.rating {
+                m["imdbRating"] = serde_json::json!(format!("{rating:.1}"));
+            }
             m
         })
         .collect();
@@ -262,7 +267,7 @@ mod tests {
     use std::sync::Arc;
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
-        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank }
+        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank, rating: None }
     }
 
     struct Fake {
