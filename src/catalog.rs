@@ -146,7 +146,8 @@ impl CatalogState {
         let fetched = if is_trending {
             self.aggregate(obj, country, providers).await
         } else {
-            self.source.popular(code.unwrap(), obj, country).await.ok()
+            // A "Popular on <service>" row = JustWatch's POPULAR sort (matches their site), not TRENDING.
+            self.source.popular(code.unwrap(), obj, country, "POPULAR").await.ok()
         };
 
         match fetched {
@@ -188,7 +189,8 @@ impl CatalogState {
             let src = Arc::clone(&self.source);
             let code = p.code;
             let country = country.to_owned();
-            set.spawn(async move { (i, src.popular(code, obj, &country).await) });
+            // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
+            set.spawn(async move { (i, src.popular(code, obj, &country, "TRENDING").await) });
         }
         while let Some(joined) = set.join_next().await {
             if let Ok((i, Ok(items))) = joined {
@@ -281,7 +283,7 @@ mod tests {
     }
     #[async_trait]
     impl TrendingSource for Fake {
-        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
+        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str, _sort: &str) -> Result<Vec<TrendingItem>, ()> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n >= self.fail_after {
                 Err(())

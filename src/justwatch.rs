@@ -49,7 +49,9 @@ pub struct TrendingItem {
 /// ISO-3166 code) so one client serves every configured/forwarded region.
 #[async_trait]
 pub trait TrendingSource: Send + Sync {
-    async fn popular(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()>;
+    /// `sort` is JustWatch's `PopularTitlesSorting` (e.g. "POPULAR" for the "Popular on <service>" rows,
+    /// "TRENDING" for the aggregated "Trending Everywhere" chart) — the two rank very differently.
+    async fn popular(&self, provider: &str, obj: ObjectType, country: &str, sort: &str) -> Result<Vec<TrendingItem>, ()>;
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -159,13 +161,13 @@ fn is_imdb(s: &str) -> bool {
 
 #[async_trait]
 impl TrendingSource for JustWatchClient {
-    async fn popular(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()> {
+    async fn popular(&self, provider: &str, obj: ObjectType, country: &str, sort: &str) -> Result<Vec<TrendingItem>, ()> {
         let payload = serde_json::json!({
             "query": QUERY,
             "variables": {
                 "country": country,
                 "first": 100,
-                "popularTitlesSortBy": "TRENDING",
+                "popularTitlesSortBy": sort,
                 "packages": [provider],
                 "objectTypes": [obj.as_jw()],
             },
