@@ -225,7 +225,7 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
         .enumerate()
         .map(|(i, (imdb, _))| {
             let r = repr[imdb];
-            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i, rating: r.rating }
+            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i, rating: r.rating, year: r.year }
         })
         .collect()
 }
@@ -253,6 +253,10 @@ pub fn render_metas(items: &[TrendingItem], stremio_type: &str) -> String {
             if let Some(rating) = it.rating {
                 m["imdbRating"] = serde_json::json!(format!("{rating:.1}"));
             }
+            // Original release year → the card year (Stremio `releaseInfo`; the app reads its first 4 digits).
+            if let Some(year) = it.year {
+                m["releaseInfo"] = serde_json::json!(year.to_string());
+            }
             m
         })
         .collect();
@@ -267,7 +271,7 @@ mod tests {
     use std::sync::Arc;
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
-        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank, rating: None }
+        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank, rating: None, year: None }
     }
 
     struct Fake {

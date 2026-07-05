@@ -41,6 +41,8 @@ pub struct TrendingItem {
     pub rank: usize,
     /// IMDb score from JustWatch's own `scoring` (free — same response), surfaced as the card rating.
     pub rating: Option<f64>,
+    /// Original release year from JustWatch (free — same response), surfaced as the card year.
+    pub year: Option<i64>,
 }
 
 /// The source seam — the real JustWatch client in prod, a fake in tests. `country` is per-request (an
@@ -56,7 +58,7 @@ const MAX_BODY: usize = 4 << 20; // cap the response body (a hostile/huge reply 
 // Mirrors rleroi/Stremio-Streaming-Catalogs-Addon's GetPopularTitles (only the fields we use).
 const QUERY: &str = r#"query GetPopularTitles($country: Country!, $first: Int!, $popularTitlesSortBy: PopularTitlesSorting!, $packages: [String!], $objectTypes: [ObjectType!]) {
   popularTitles(country: $country, first: $first, sortBy: $popularTitlesSortBy, filter: { objectTypes: $objectTypes, packages: $packages }) {
-    edges { node { content(country: $country, language: "en") { title externalIds { imdbId tmdbId } scoring { imdbScore } } } }
+    edges { node { content(country: $country, language: "en") { title originalReleaseYear externalIds { imdbId tmdbId } scoring { imdbScore } } } }
   }
 }"#;
 
@@ -108,6 +110,8 @@ struct Node {
 #[derive(Deserialize)]
 struct Content {
     title: String,
+    #[serde(rename = "originalReleaseYear")]
+    original_release_year: Option<i64>,
     #[serde(rename = "externalIds")]
     external_ids: Option<ExternalIds>,
     scoring: Option<Scoring>,
@@ -142,8 +146,9 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
         };
         let moviedb = ext.and_then(|x| x.tmdb_id).and_then(|s| s.parse::<i64>().ok());
         let rating = e.node.content.scoring.and_then(|s| s.imdb_score);
+        let year = e.node.content.original_release_year;
         let rank = out.len();
-        out.push(TrendingItem { imdb, moviedb, title: e.node.content.title, rank, rating });
+        out.push(TrendingItem { imdb, moviedb, title: e.node.content.title, rank, rating, year });
     }
     out
 }
@@ -205,18 +210,18 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{"data":{"popularTitles":{"edges":[
-      {"node":{"content":{"title":"Alpha","externalIds":{"imdbId":"tt0000001","tmdbId":"1397385"},"scoring":{"imdbScore":7.4}}}},
+      {"node":{"content":{"title":"Alpha","originalReleaseYear":1999,"externalIds":{"imdbId":"tt0000001","tmdbId":"1397385"},"scoring":{"imdbScore":7.4}}}},
       {"node":{"content":{"title":"NoId","externalIds":{"imdbId":null}}}},
       {"node":{"content":{"title":"Bad","externalIds":{"imdbId":"nope"}}}},
       {"node":{"content":{"title":"Beta","externalIds":{"imdbId":"tt0000002","tmdbId":null},"scoring":{"imdbScore":null}}}}
     ]}}}"#;
 
     #[test]
-    fn parses_ranks_and_carries_tmdb_and_rating() {
+    fn parses_ranks_and_carries_tmdb_rating_and_year() {
         let items = parse_popular(FIXTURE);
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
-        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0, rating: Some(7.4) });
-        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1, rating: None });
+        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0, rating: Some(7.4), year: Some(1999) });
+        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1, rating: None, year: None });
     }
 
     #[test]
