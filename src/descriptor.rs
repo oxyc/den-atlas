@@ -25,6 +25,10 @@ struct Descriptor {
     quantization: String,
     labels: DescriptorBlob,
     vectors: DescriptorBlob,
+    /// Optional metadata sidecar blob (poster/title cache). Omitted when absent, so the descriptor stays
+    /// byte-identical to before; the app reads it as `decodeIfPresent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<DescriptorBlob>,
     /// ADDON-03 — declares this addon can embed a free-text SEARCH query (`POST /embed` → den-embed is
     /// configured). Omitted when disabled, so the disabled descriptor stays byte-identical to before; the app
     /// reads it as `decodeIfPresent`, so absent ⇒ no semantic query search.
@@ -52,6 +56,11 @@ pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> Stri
             sha256: ds.vectors.sha256.clone(),
             bytes: ds.vectors.size,
         },
+        metadata: ds.metadata.as_ref().map(|m| DescriptorBlob {
+            url: format!("{origin}/{}?v={v}", m.name),
+            sha256: m.sha256.clone(),
+            bytes: m.size,
+        }),
         embed: embed_enabled.then_some(true),
     };
     serde_json::to_string(&d).unwrap()

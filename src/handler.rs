@@ -86,6 +86,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         if route == format!("/{}", ds.vectors.name) {
             return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
         }
+        if let Some(md) = &ds.metadata {
+            if route == format!("/{}", md.name) {
+                return serve_blob(&method, &headers, &query, ds, md).await;
+            }
+        }
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
         return handle_catalog(&method, &headers, rest, &config, &state).await;

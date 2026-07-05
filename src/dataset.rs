@@ -32,6 +32,14 @@ pub struct Meta {
     pub vectors_bytes: u64,
     #[serde(rename = "lastModifiedHttp")]
     pub last_modified_http: Option<String>,
+    // Metadata sidecar (optional) — a ≤6-month synced cache of tmdbId→{title,poster_path,year} so the app
+    // renders semantic/ANN neighbour cards without a per-result TMDB call. Absent ⇒ served labels+vectors only.
+    #[serde(rename = "metadataFile")]
+    pub metadata_file: Option<String>,
+    #[serde(rename = "metadataSha256")]
+    pub metadata_sha256: Option<String>,
+    #[serde(rename = "metadataBytes")]
+    pub metadata_bytes: Option<u64>,
 }
 
 pub struct Gz {
@@ -53,6 +61,8 @@ pub struct Dataset {
     pub meta: Meta,
     pub labels: Blob,
     pub vectors: Blob,
+    /// Optional metadata sidecar blob (poster/title cache); None when the meta declares no sidecar.
+    pub metadata: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
     pub last_modified: Option<String>,
 }
@@ -83,11 +93,19 @@ impl Dataset {
             "application/octet-stream",
             None,
         )?;
+        // Resolve the optional sidecar only when the meta fully declares it (file + sha + bytes).
+        let metadata = match (&meta.metadata_file, &meta.metadata_sha256, meta.metadata_bytes) {
+            (Some(file), Some(sha), Some(bytes)) => {
+                Some(resolve_blob(dir, file, bytes, sha, "application/json", None)?)
+            }
+            _ => None,
+        };
         let last_modified = meta.last_modified_http.clone();
         Ok(Dataset {
             meta,
             labels,
             vectors,
+            metadata,
             last_modified,
         })
     }
