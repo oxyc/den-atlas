@@ -15,13 +15,13 @@ mkdir -p data
 
 # The meta names the blobs (version-agnostic), so fetch it first, then the files it points at.
 curl -fsSL "$BASE/dataset.meta.json" -o data/dataset.meta.json
-read -r LABELS VECTORS GZ < <(python3 - <<'PY'
+read -r LABELS VECTORS GZ METADATA < <(python3 - <<'PY'
 import json
 m = json.load(open("data/dataset.meta.json"))
-print(m["labelsFile"], m["vectorsFile"], m.get("labelsGzFile", ""))
+print(m["labelsFile"], m["vectorsFile"], m.get("labelsGzFile", ""), m.get("metadataFile", ""))
 PY
 )
-for f in "$LABELS" "$VECTORS" ${GZ:+"$GZ"}; do
+for f in "$LABELS" "$VECTORS" ${GZ:+"$GZ"} ${METADATA:+"$METADATA"}; do
   echo "fetching $f …"
   curl -fsSL "$BASE/$f" -o "data/$f"
 done
