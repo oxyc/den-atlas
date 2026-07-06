@@ -6,7 +6,7 @@ use crate::dataset::{Blob, Dataset};
 use crate::descriptor::build_descriptor;
 use crate::http::{serve, Payload, Servable};
 use crate::manifest::manifest_json;
-use crate::util::{fnv1a, html_response, json_response, public_origin};
+use crate::util::{fnv1a, json_response, public_origin};
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -28,6 +28,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS")
             .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
+            // Let browsers cache the preflight for a day so they stop re-preflighting every request.
+            .header(header::ACCESS_CONTROL_MAX_AGE, "86400")
             .body(Body::empty())
             .unwrap();
     }
@@ -57,7 +59,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let ds = state.dataset.as_ref();
 
     if route == "/" || route == "/configure" || route == "/configure/" {
-        return html_response(CONFIGURE_PAGE.to_owned());
+        return serve_html(&method, &headers, CONFIGURE_PAGE).await;
     }
     if route == "/health" {
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
@@ -65,7 +67,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return json_response(health_body(ds.is_some(), state.catalog.fresh()), StatusCode::OK);
     }
     if route == "/manifest.json" {
-        return serve_json(&method, &headers, manifest_json(&config), "public, max-age=3600", None).await;
+        return serve_json(&method, &headers, manifest_json(&config), "public, max-age=3600, stale-while-revalidate=600", None).await;
     }
     if route == "/dataset.json" {
         return match ds {
@@ -129,6 +131,8 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                // A POST proxy of per-query vectors — never let a heuristic/intermediary cache these.
+                .header(header::CACHE_CONTROL, "no-store")
                 .body(Body::from(bytes))
                 .unwrap()
         }
@@ -175,11 +179,33 @@ async fn handle_catalog(
         Some(r) => {
             // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
             // CDN doesn't pin a broken row past JustWatch's recovery.
-            let cc = if r.fresh { "public, max-age=3600" } else { "public, max-age=60" };
+            let cc = if r.fresh { "public, max-age=3600, stale-while-revalidate=600" } else { "public, max-age=60" };
             serve_json(method, headers, r.body, cc, None).await
         }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
+}
+
+/// The embedded landing/configure page — served through the conditional layer so it gets a strong ETag
+/// + `If-None-Match`/304 for free, plus a modest TTL (the page changes only on redeploy).
+async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'static str) -> Response {
+    let etag = fnv1a(html);
+    let bytes = Bytes::from_static(html.as_bytes());
+    let size = bytes.len() as u64;
+    serve(
+        method,
+        headers,
+        Servable {
+            etag_base: etag,
+            content_type: "text/html; charset=utf-8".to_owned(),
+            cache_control: "public, max-age=3600".to_owned(),
+            last_modified: None,
+            size,
+            identity: Payload::Memory(bytes),
+            gzip: None,
+        },
+    )
+    .await
 }
 
 async fn serve_json(

@@ -1,4 +1,4 @@
-//! Small shared helpers — ports of `src/util.ts` (fnv1a, public_origin, plain json/html responses).
+//! Small shared helpers — ports of `src/util.ts` (fnv1a, public_origin, plain json responses).
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -24,15 +24,6 @@ pub fn json_response(body: &'static str, status: StatusCode) -> Response {
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*") // public data, no credentials
-        .body(Body::from(body))
-        .unwrap()
-}
-
-/// A plain HTML response (the landing page).
-pub fn html_response(body: String) -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(Body::from(body))
         .unwrap()
 }
