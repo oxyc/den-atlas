@@ -104,6 +104,12 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
                 return serve_blob(&method, &headers, &query, ds, pv).await;
             }
         }
+        // DT-I facet blob.
+        if let Some(f) = &ds.facets {
+            if route == format!("/{}", f.name) {
+                return serve_blob(&method, &headers, &query, ds, f).await;
+            }
+        }
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
         return handle_catalog(&method, &headers, rest, &config, &state).await;

@@ -61,6 +61,14 @@ pub struct Meta {
     pub premise_vectors_sha256: Option<String>,
     #[serde(rename = "premiseVectorsBytes")]
     pub premise_vectors_bytes: Option<u64>,
+    // DT-I facet blob (optional) — compact per-film country/language/year/media-type/popularity for on-device
+    // attribute search ("spanish series"). Absent ⇒ omitted from the descriptor.
+    #[serde(rename = "facetsFile")]
+    pub facets_file: Option<String>,
+    #[serde(rename = "facetsSha256")]
+    pub facets_sha256: Option<String>,
+    #[serde(rename = "facetsBytes")]
+    pub facets_bytes: Option<u64>,
 }
 
 pub struct Gz {
@@ -88,6 +96,8 @@ pub struct Dataset {
     /// present or both None (the meta must declare the pair fully).
     pub premise_labels: Option<Blob>,
     pub premise_vectors: Option<Blob>,
+    /// DT-I compact facet blob (optional).
+    pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
     pub last_modified: Option<String>,
 }
@@ -136,6 +146,13 @@ impl Dataset {
             ),
             _ => (None, None),
         };
+        // DT-I facet blob — resolved only when the meta fully declares it.
+        let facets = match (&meta.facets_file, &meta.facets_sha256, meta.facets_bytes) {
+            (Some(file), Some(sha), Some(bytes)) => {
+                Some(resolve_blob(dir, file, bytes, sha, "application/octet-stream", None)?)
+            }
+            _ => None,
+        };
         let last_modified = meta.last_modified_http.clone();
         Ok(Dataset {
             meta,
@@ -144,6 +161,7 @@ impl Dataset {
             metadata,
             premise_labels,
             premise_vectors,
+            facets,
             last_modified,
         })
     }

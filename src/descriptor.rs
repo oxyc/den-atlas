@@ -43,6 +43,9 @@ struct Descriptor {
     /// DT-H — the optional second (premise) index. Omitted when absent; the app reads it as `decodeIfPresent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     premise: Option<PremiseDescriptor>,
+    /// DT-I — the optional compact facet blob. Omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    facets: Option<DescriptorBlob>,
     /// ADDON-03 — declares this addon can embed a free-text SEARCH query (`POST /embed` → den-embed is
     /// configured). Omitted when disabled, so the disabled descriptor stays byte-identical to before; the app
     /// reads it as `decodeIfPresent`, so absent ⇒ no semantic query search.
@@ -97,6 +100,11 @@ pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> Stri
             }),
             _ => None,
         },
+        facets: ds.facets.as_ref().map(|f| DescriptorBlob {
+            url: format!("{origin}/{}?v={v}", f.name),
+            sha256: f.sha256.clone(),
+            bytes: f.size,
+        }),
         embed: embed_enabled.then_some(true),
     };
     serde_json::to_string(&d).unwrap()
