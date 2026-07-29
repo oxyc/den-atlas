@@ -93,6 +93,17 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
                 return serve_blob(&method, &headers, &query, ds, md).await;
             }
         }
+        // DT-H premise index blobs.
+        if let Some(pl) = &ds.premise_labels {
+            if route == format!("/{}", pl.name) {
+                return serve_blob(&method, &headers, &query, ds, pl).await;
+            }
+        }
+        if let Some(pv) = &ds.premise_vectors {
+            if route == format!("/{}", pv.name) {
+                return serve_blob(&method, &headers, &query, ds, pv).await;
+            }
+        }
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
         return handle_catalog(&method, &headers, rest, &config, &state).await;

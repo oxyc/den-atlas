@@ -40,6 +40,27 @@ pub struct Meta {
     pub metadata_sha256: Option<String>,
     #[serde(rename = "metadataBytes")]
     pub metadata_bytes: Option<u64>,
+    // DT-H premise index (optional) — a SECOND labels+vectors index in a DIFFERENT embedding space (tag-string
+    // embeddings) served alongside the plot index, so the app clusters "More Like This" by premise. Absent ⇒
+    // omitted from the descriptor; the app runs plot-only.
+    #[serde(rename = "premiseEmbeddingModel")]
+    pub premise_embedding_model: Option<String>,
+    #[serde(rename = "premiseDims")]
+    pub premise_dims: Option<u32>,
+    #[serde(rename = "premiseCount")]
+    pub premise_count: Option<u64>,
+    #[serde(rename = "premiseLabelsFile")]
+    pub premise_labels_file: Option<String>,
+    #[serde(rename = "premiseLabelsSha256")]
+    pub premise_labels_sha256: Option<String>,
+    #[serde(rename = "premiseLabelsBytes")]
+    pub premise_labels_bytes: Option<u64>,
+    #[serde(rename = "premiseVectorsFile")]
+    pub premise_vectors_file: Option<String>,
+    #[serde(rename = "premiseVectorsSha256")]
+    pub premise_vectors_sha256: Option<String>,
+    #[serde(rename = "premiseVectorsBytes")]
+    pub premise_vectors_bytes: Option<u64>,
 }
 
 pub struct Gz {
@@ -63,6 +84,10 @@ pub struct Dataset {
     pub vectors: Blob,
     /// Optional metadata sidecar blob (poster/title cache); None when the meta declares no sidecar.
     pub metadata: Option<Blob>,
+    /// DT-H premise index blobs (optional): a second labels+vectors pair in the tag-embedding space. Both
+    /// present or both None (the meta must declare the pair fully).
+    pub premise_labels: Option<Blob>,
+    pub premise_vectors: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
     pub last_modified: Option<String>,
 }
@@ -100,12 +125,25 @@ impl Dataset {
             }
             _ => None,
         };
+        // DT-H premise index — resolved only when the meta fully declares BOTH blobs (labels + vectors).
+        let (premise_labels, premise_vectors) = match (
+            &meta.premise_labels_file, &meta.premise_labels_sha256, meta.premise_labels_bytes,
+            &meta.premise_vectors_file, &meta.premise_vectors_sha256, meta.premise_vectors_bytes,
+        ) {
+            (Some(lf), Some(ls), Some(lb), Some(vf), Some(vs), Some(vb)) => (
+                Some(resolve_blob(dir, lf, lb, ls, "application/json", None)?),
+                Some(resolve_blob(dir, vf, vb, vs, "application/octet-stream", None)?),
+            ),
+            _ => (None, None),
+        };
         let last_modified = meta.last_modified_http.clone();
         Ok(Dataset {
             meta,
             labels,
             vectors,
             metadata,
+            premise_labels,
+            premise_vectors,
             last_modified,
         })
     }
