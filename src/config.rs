@@ -3,7 +3,7 @@
 //! segment is `<region>_<codes>`:
 //!   - `region` = `auto` (the Den app forwards the device country as a `country` catalog extra) or an
 //!     ISO-3166 alpha-2 code (a fixed country for this install).
-//!   - `codes`  = JustWatch provider short-codes joined by `-` (e.g. `nfx-max-dnp`). Empty = no catalog
+//!   - `codes`  = JustWatch provider short-codes joined by `-` (e.g. `nfx-mxx-dnp`). Empty = no catalog
 //!     rows (the "most popular" feature is off for this install).
 //! An absent or unparseable segment falls back to the operator default (env `JW_COUNTRY`/`JW_PROVIDERS`).
 
@@ -75,9 +75,9 @@ mod tests {
 
     #[test]
     fn parses_auto_and_providers() {
-        let c = Config::parse("auto_nfx-max").unwrap();
+        let c = Config::parse("auto_nfx-mxx").unwrap();
         assert_eq!(c.region, Region::Auto);
-        assert_eq!(c.providers.iter().map(|p| p.code).collect::<Vec<_>>(), vec!["nfx", "max"]);
+        assert_eq!(c.providers.iter().map(|p| p.code).collect::<Vec<_>>(), vec!["nfx", "mxx"]);
     }
 
     #[test]
@@ -94,8 +94,8 @@ mod tests {
 
     #[test]
     fn drops_unknown_provider_codes() {
-        let c = Config::parse("auto_nfx-bogus-max").unwrap();
-        assert_eq!(c.providers.iter().map(|p| p.code).collect::<Vec<_>>(), vec!["nfx", "max"]);
+        let c = Config::parse("auto_nfx-bogus-mxx").unwrap();
+        assert_eq!(c.providers.iter().map(|p| p.code).collect::<Vec<_>>(), vec!["nfx", "mxx"]);
     }
 
     #[test]

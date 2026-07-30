@@ -15,17 +15,41 @@ pub struct Provider {
     pub code: &'static str, // JustWatch package short-code
     pub id: &'static str,   // Stremio catalog id
     pub name: &'static str, // row title the client renders
+    /// JustWatch package id — identical to the TMDB watch-provider id (verified against both lists).
+    pub package_id: i64,
 }
 
 // Short codes can drift per country; if a row comes back empty, verify against JustWatch's provider
 // list for that country. Adding a service = one row here.
+// Codes verified against JustWatch's own `packages(country: FI, platform: WEB)` list on 2026-07-30. `max` and
+// `amp` were WRONG — both returned 0 titles, so "Popular on Max" and "Popular on Prime Video" were empty rows.
+// `package_id` is JustWatch's id, which is also the TMDB watch-provider id — the bridge a client needs to line
+// these rows up with TMDB's provider directory, so it's published rather than left for the client to guess.
 const PROVIDERS: &[Provider] = &[
-    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix" },
-    Provider { code: "max", id: "jw-max", name: "Popular on Max" },
-    Provider { code: "amp", id: "jw-amp", name: "Popular on Prime Video" },
-    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+" },
-    Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+" },
+    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix", package_id: 8 },
+    Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_id: 1899 },
+    Provider { code: "prv", id: "jw-prv", name: "Popular on Prime Video", package_id: 119 },
+    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_id: 337 },
+    Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+", package_id: 350 },
+    Provider { code: "sst", id: "jw-sst", name: "Popular on SkyShowtime", package_id: 1773 },
 ];
+
+/// Suffix marking a provider's **arrivals** catalog ("New on Netflix") — the one signal TMDB has no data for,
+/// so it exists only on the JustWatch path. Appended to the provider's catalog id.
+pub const NEW_SUFFIX: &str = "-new";
+
+/// The arrivals catalog id for a provider, e.g. "jw-nfx-new".
+pub fn new_catalog_id(provider: &Provider) -> String {
+    format!("{}{}", provider.id, NEW_SUFFIX)
+}
+
+/// Resolve a catalog id to a provider + whether it's the arrivals variant.
+pub fn resolve_catalog<'a>(catalog_id: &str, providers: &[&'a Provider]) -> Option<(&'a Provider, bool)> {
+    if let Some(base) = catalog_id.strip_suffix(NEW_SUFFIX) {
+        return providers.iter().find(|p| p.id == base).map(|p| (*p, true));
+    }
+    providers.iter().find(|p| p.id == catalog_id).map(|p| (*p, false))
+}
 
 pub const TRENDING_ID: &str = "jw-trending";
 pub const TRENDING_NAME: &str = "Trending Everywhere";
@@ -68,6 +92,13 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
         out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned() });
         for p in providers {
             out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned() });
+            // "New on <service>" sits next to "Popular on <service>". `name` is derived from the provider's
+            // display name so a new service needs only its one PROVIDERS row.
+            out.push(CatalogEntry {
+                type_: t,
+                id: new_catalog_id(p),
+                name: format!("New on {}", p.name.trim_start_matches("Popular on ")),
+            });
         }
     }
     out
@@ -122,8 +153,8 @@ impl CatalogState {
     ) -> Option<CatalogResponse> {
         let obj = ObjectType::from_stremio(stremio_type)?;
         let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
-        let code = providers.iter().find(|p| p.id == catalog_id).map(|p| p.code);
-        if !is_trending && code.is_none() {
+        let resolved = resolve_catalog(catalog_id, providers);
+        if !is_trending && resolved.is_none() {
             return None; // unknown id, or not one of this install's selected providers
         }
 
@@ -146,8 +177,14 @@ impl CatalogState {
         let fetched = if is_trending {
             self.aggregate(obj, country, providers).await
         } else {
-            // A "Popular on <service>" row = JustWatch's POPULAR sort (matches their site), not TRENDING.
-            self.source.popular(code.unwrap(), obj, country, "POPULAR").await.ok()
+            let (provider, is_new) = resolved.unwrap();
+            if is_new {
+                // Arrivals come back most-recently-added first; that order IS the row.
+                self.source.new_titles(provider.code, obj, country).await.ok()
+            } else {
+                // A "Popular on <service>" row = JustWatch's POPULAR sort (matches their site), not TRENDING.
+                self.source.popular(provider.code, obj, country, "POPULAR").await.ok()
+            }
         };
 
         match fetched {
@@ -280,10 +317,11 @@ mod tests {
         data: Vec<TrendingItem>,
         calls: AtomicUsize,
         fail_after: usize, // Ok for the first `fail_after` calls, then Err
+        /// Records which arm the router picked, so a test can prove "-new" reaches `new_titles`.
+        new_calls: AtomicUsize,
     }
-    #[async_trait]
-    impl TrendingSource for Fake {
-        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str, _sort: &str) -> Result<Vec<TrendingItem>, ()> {
+    impl Fake {
+        fn answer(&self) -> Result<Vec<TrendingItem>, ()> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n >= self.fail_after {
                 Err(())
@@ -292,9 +330,19 @@ mod tests {
             }
         }
     }
+    #[async_trait]
+    impl TrendingSource for Fake {
+        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str, _sort: &str) -> Result<Vec<TrendingItem>, ()> {
+            self.answer()
+        }
+        async fn new_titles(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
+            self.new_calls.fetch_add(1, Ordering::SeqCst);
+            self.answer()
+        }
+    }
 
     fn state(data: Vec<TrendingItem>, ttl: Duration, fail_after: usize) -> CatalogState {
-        CatalogState::new(Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after }), ttl)
+        CatalogState::new(Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after, new_calls: AtomicUsize::new(0) }), ttl)
     }
 
     #[tokio::test]
@@ -354,9 +402,53 @@ mod tests {
         let entries = catalog_entries(selected_providers());
         assert!(entries.iter().any(|e| e.id == "jw-nfx" && e.type_ == "movie" && e.name == "Popular on Netflix"));
         assert!(entries.iter().any(|e| e.id == TRENDING_ID && e.type_ == "series"));
-        // per type: N providers + 1 trending
-        let per_type = selected_providers().len() + 1;
+        // per type: N providers × (popular + new) + 1 trending
+        let per_type = selected_providers().len() * 2 + 1;
         assert_eq!(entries.len(), per_type * 2);
+    }
+
+    #[test]
+    fn arrivals_catalog_per_provider_is_named_from_the_provider() {
+        let entries = catalog_entries(selected_providers());
+        // "New on Netflix" is derived from "Popular on Netflix" — adding a service needs only its
+        // PROVIDERS row, no second name to keep in sync.
+        assert!(entries.iter().any(|e| e.id == "jw-nfx-new" && e.type_ == "movie" && e.name == "New on Netflix"));
+        assert!(entries.iter().any(|e| e.id == "jw-sst-new" && e.type_ == "series" && e.name == "New on SkyShowtime"));
+        // Every provider gets both rows, for both types.
+        for p in selected_providers() {
+            for t in STREMIO_TYPES {
+                assert!(entries.iter().any(|e| e.id == p.id && e.type_ == t), "missing popular {} {t}", p.id);
+                assert!(entries.iter().any(|e| e.id == new_catalog_id(p) && e.type_ == t), "missing new {} {t}", p.id);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_catalog_distinguishes_popular_from_arrivals() {
+        let ps = selected_providers();
+        assert_eq!(resolve_catalog("jw-nfx", ps).map(|(p, n)| (p.code, n)), Some(("nfx", false)));
+        assert_eq!(resolve_catalog("jw-nfx-new", ps).map(|(p, n)| (p.code, n)), Some(("nfx", true)));
+        assert!(resolve_catalog("jw-bogus", ps).is_none());
+        assert!(resolve_catalog("jw-bogus-new", ps).is_none());
+    }
+
+    #[tokio::test]
+    async fn arrivals_id_routes_to_new_titles_not_popular() {
+        // Keep the Fake so the test can read which arm ran — no test-only hook in production code.
+        let fake = Arc::new(Fake {
+            data: vec![item("tt1", "A", 0)],
+            calls: AtomicUsize::new(0),
+            fail_after: 9,
+            new_calls: AtomicUsize::new(0),
+        });
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
+        // The arrivals row must not silently serve the Popular chart — that would look plausible and be wrong.
+        let r = s.metas_json("jw-nfx-new", "movie", "US", selected_providers()).await;
+        assert!(r.is_some());
+        assert_eq!(fake.new_calls.load(Ordering::SeqCst), 1);
+
+        let _ = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await;
+        assert_eq!(fake.new_calls.load(Ordering::SeqCst), 1, "the Popular row must not hit new_titles");
     }
 
     #[test]

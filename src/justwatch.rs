@@ -52,6 +52,10 @@ pub trait TrendingSource: Send + Sync {
     /// `sort` is JustWatch's `PopularTitlesSorting` (e.g. "POPULAR" for the "Popular on <service>" rows,
     /// "TRENDING" for the aggregated "Trending Everywhere" chart) — the two rank very differently.
     async fn popular(&self, provider: &str, obj: ObjectType, country: &str, sort: &str) -> Result<Vec<TrendingItem>, ()>;
+
+    /// Titles **newly added to a service**, most recently added first. This is the one signal TMDB cannot
+    /// provide at all (it carries no added-date and no such sort), so it only exists on this path.
+    async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()>;
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -61,6 +65,25 @@ const MAX_BODY: usize = 4 << 20; // cap the response body (a hostile/huge reply 
 const QUERY: &str = r#"query GetPopularTitles($country: Country!, $first: Int!, $popularTitlesSortBy: PopularTitlesSorting!, $packages: [String!], $objectTypes: [ObjectType!]) {
   popularTitles(country: $country, first: $first, sortBy: $popularTitlesSortBy, filter: { objectTypes: $objectTypes, packages: $packages }) {
     edges { node { content(country: $country, language: "en") { title originalReleaseYear externalIds { imdbId tmdbId } scoring { imdbScore } } } }
+  }
+}"#;
+
+// Arrivals — titles newly added to a service, most recently added first.
+//
+// Uses `newTitles`, NOT `newTitleBuckets`: verified 2026-07-30 that `newTitleBuckets` **silently ignores the
+// `packages` filter** (nfx, mxx and hbm all returned byte-identical results), so a per-service row built on it
+// would have shown "new in Finland" under a service's name — plausible-looking and wrong. `newTitles` honours
+// `packages` (a bogus code correctly returns nothing).
+//
+// An entry is a Movie, a Show, or a **Season**, and seasons are a large share of arrivals. A Season's own
+// `content` is useless to us ("Season 1", `tmdbId` "326119:1", no IMDb id), so we take `show { content }` and
+// surface the SHOW. Dropping seasons would gut the row.
+const NEW_QUERY: &str = r#"query GetNewTitles($country: Country!, $filter: TitleFilter, $first: Int!) {
+  newTitles(country: $country, filter: $filter, first: $first) {
+    edges { node { __typename
+      ... on MovieOrShowOrSeason { content(country: $country, language: "en") { title originalReleaseYear externalIds { imdbId tmdbId } scoring { imdbScore } } }
+      ... on Season { show { content(country: $country, language: "en") { title originalReleaseYear externalIds { imdbId tmdbId } scoring { imdbScore } } } }
+    } }
   }
 }"#;
 
@@ -155,8 +178,120 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
     out
 }
 
+/// Arrivals response. Defensive throughout (an addon reply is untrusted): every level optional, a malformed
+/// body yields an empty list rather than a panic.
+#[derive(Deserialize)]
+struct NewResp {
+    data: Option<NewData>,
+}
+#[derive(Deserialize)]
+struct NewData {
+    #[serde(rename = "newTitles")]
+    new_titles: Option<NewTitles>,
+}
+#[derive(Deserialize)]
+struct NewTitles {
+    edges: Vec<NewEdge>,
+}
+#[derive(Deserialize)]
+struct NewEdge {
+    node: NewNode,
+}
+#[derive(Deserialize)]
+struct NewNode {
+    content: Option<NewContent>,
+    /// Present on a `Season` — its own content is useless ("Season 1", no IMDb id), so we surface the show.
+    show: Option<NewShow>,
+}
+#[derive(Deserialize)]
+struct NewShow {
+    content: Option<NewContent>,
+}
+#[derive(Deserialize)]
+struct NewContent {
+    title: Option<String>,
+    #[serde(rename = "originalReleaseYear")]
+    original_release_year: Option<i64>,
+    #[serde(rename = "externalIds")]
+    external_ids: Option<ExternalIds>,
+    scoring: Option<Scoring>,
+}
+
+/// Parse an arrivals body into items, **most recently added first** (the service's own order, preserved — that
+/// ordering IS the feature).
+///
+/// A show whose new season lands is surfaced as the SHOW, deduped so a weekly series appears once. Items
+/// without a usable IMDb id are dropped, matching `parse_popular` and the addon's `idPrefixes: ["tt"]` contract.
+pub fn parse_new_titles(body: &str) -> Vec<TrendingItem> {
+    let resp: NewResp = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let edges = resp.data.and_then(|d| d.new_titles).map(|n| n.edges).unwrap_or_default();
+    let mut out: Vec<TrendingItem> = Vec::with_capacity(edges.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in edges {
+        // A Season's `show.content` wins over its own; a Movie/Show has no `show`.
+        let content = match e.node.show.and_then(|s| s.content).or(e.node.content) {
+            Some(c) => c,
+            None => continue,
+        };
+        let ext = content.external_ids;
+        let imdb = match ext.as_ref().and_then(|x| x.imdb_id.clone()) {
+            Some(id) if is_imdb(&id) => id,
+            _ => continue,
+        };
+        if !seen.insert(imdb.clone()) {
+            continue; // a weekly series drops a season repeatedly
+        }
+        let moviedb = ext.and_then(|x| x.tmdb_id).and_then(|s| s.parse::<i64>().ok());
+        let rank = out.len();
+        out.push(TrendingItem {
+            imdb,
+            moviedb,
+            title: content.title.unwrap_or_default(),
+            rank,
+            rating: content.scoring.and_then(|s| s.imdb_score),
+            year: content.original_release_year,
+        });
+    }
+    out
+}
+
 fn is_imdb(s: &str) -> bool {
     s.len() >= 3 && s.starts_with("tt") && s[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
+impl JustWatchClient {
+    /// POST one GraphQL payload and return the body, bounded as it streams — reqwest has no default size
+    /// limit, so `.bytes()` would buffer a hostile/huge reply in full before any check. Shared by both
+    /// queries; `label` only names the request in log lines.
+    async fn post_graphql(&self, payload: &serde_json::Value, label: &str) -> Result<String, ()> {
+        let http = match self.http.as_ref() {
+            Some(h) => h,
+            None => return Err(()),
+        };
+        let mut resp = match http.post(ENDPOINT).json(payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("den-atlas: justwatch request failed ({label}): {e}");
+                return Err(());
+            }
+        };
+        if !resp.status().is_success() {
+            eprintln!("den-atlas: justwatch http {} ({label})", resp.status());
+            return Err(());
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
+            if buf.len() + chunk.len() > MAX_BODY {
+                eprintln!("den-atlas: justwatch body exceeded {MAX_BODY} bytes ({label}) — dropping");
+                return Err(());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
 }
 
 #[async_trait]
@@ -172,36 +307,33 @@ impl TrendingSource for JustWatchClient {
                 "objectTypes": [obj.as_jw()],
             },
         });
-        let http = match self.http.as_ref() {
-            Some(h) => h,
-            None => return Err(()),
-        };
-        let mut resp = match http.post(ENDPOINT).json(&payload).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("den-atlas: justwatch request failed ({provider}/{}): {e}", obj.as_jw());
-                return Err(());
-            }
-        };
-        if !resp.status().is_success() {
-            eprintln!("den-atlas: justwatch http {} ({provider}/{})", resp.status(), obj.as_jw());
-            return Err(());
-        }
-        // Bound the body as it streams — reqwest has no default size limit, so `.bytes()` would buffer a
-        // hostile/huge reply in full before any check. Bail once we exceed the cap.
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
-            if buf.len() + chunk.len() > MAX_BODY {
-                eprintln!("den-atlas: justwatch body exceeded {MAX_BODY} bytes ({provider}) — dropping");
-                return Err(());
-            }
-            buf.extend_from_slice(&chunk);
-        }
-        let items = parse_popular(&String::from_utf8_lossy(&buf));
+        let label = format!("{provider}/{}", obj.as_jw());
+        let body = self.post_graphql(&payload, &label).await?;
+        let items = parse_popular(&body);
         // A non-empty body that yields zero usable items is the signal of a breaking GraphQL schema change
         // (it would otherwise silently serve empty rows forever).
-        if items.is_empty() && !buf.is_empty() {
-            eprintln!("den-atlas: justwatch returned a non-empty body but 0 usable items ({provider}) — possible schema change");
+        if items.is_empty() && !body.is_empty() {
+            eprintln!("den-atlas: justwatch returned a non-empty body but 0 usable items ({label}) — possible schema change");
+        }
+        Ok(items)
+    }
+
+    async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()> {
+        let payload = serde_json::json!({
+            "query": NEW_QUERY,
+            "variables": {
+                "country": country,
+                // Same page size as the popular rows; `newTitles` accepts 100 (unlike `newTitleBuckets`,
+                // which rejects >~20 with TOO_BIG).
+                "first": 100,
+                "filter": { "packages": [provider], "objectTypes": [obj.as_jw()] },
+            },
+        });
+        let label = format!("new:{provider}/{}", obj.as_jw());
+        let body = self.post_graphql(&payload, &label).await?;
+        let items = parse_new_titles(&body);
+        if items.is_empty() && !body.is_empty() {
+            eprintln!("den-atlas: justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
         }
         Ok(items)
     }
@@ -210,6 +342,55 @@ impl TrendingSource for JustWatchClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real shapes seen from JustWatch FI: a Movie, a Season (whose own ids are useless), the same show
+    /// recurring from a second season drop, and an entry with no IMDb id.
+    const NEW_FIXTURE: &str = r#"{"data":{"newTitles":{"edges":[
+      {"node":{"__typename":"Movie","content":{"title":"Aquaman","originalReleaseYear":2018,"externalIds":{"imdbId":"tt1477834","tmdbId":"297802"},"scoring":{"imdbScore":6.9}}}},
+      {"node":{"__typename":"Season","content":{"title":"Season 1","externalIds":{"imdbId":null,"tmdbId":"326119:1"}},"show":{"content":{"title":"Thunder 3","originalReleaseYear":2026,"externalIds":{"imdbId":"tt43589481","tmdbId":"326119"},"scoring":{"imdbScore":7.1}}}}},
+      {"node":{"__typename":"Show","content":{"title":"NoImdb","externalIds":{"imdbId":null,"tmdbId":"320938"}}}},
+      {"node":{"__typename":"Season","content":{"title":"Season 9","externalIds":{"imdbId":null,"tmdbId":"326119:9"}},"show":{"content":{"title":"Thunder 3","externalIds":{"imdbId":"tt43589481","tmdbId":"326119"}}}}},
+      {"node":{"__typename":"Movie","content":{"title":"Crawl","originalReleaseYear":2019,"externalIds":{"imdbId":"tt8364368","tmdbId":"570670"}}}}
+    ]}}}"#;
+
+    #[test]
+    fn new_titles_are_ordered_newest_first() {
+        let items = parse_new_titles(NEW_FIXTURE);
+        // The service's own order is the feature: the most recently added title leads.
+        assert_eq!(items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+                   vec!["Aquaman", "Thunder 3", "Crawl"]);
+        assert_eq!(items.iter().map(|i| i.rank).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_new_season_surfaces_its_show_not_the_season() {
+        let items = parse_new_titles(NEW_FIXTURE);
+        let show = items.iter().find(|i| i.title == "Thunder 3").expect("season resolved to its show");
+        // The season's own ids are unusable ("326119:1", no IMDb id); the show's are what Den maps through.
+        assert_eq!(show.imdb, "tt43589481");
+        assert_eq!(show.moviedb, Some(326119));
+    }
+
+    #[test]
+    fn a_recurring_series_appears_once() {
+        let items = parse_new_titles(NEW_FIXTURE);
+        // "Thunder 3" appears twice (two season drops) — it must not repeat down the row.
+        assert_eq!(items.iter().filter(|i| i.title == "Thunder 3").count(), 1);
+    }
+
+    #[test]
+    fn new_titles_drops_entries_without_a_usable_imdb_id() {
+        let items = parse_new_titles(NEW_FIXTURE);
+        // Matches parse_popular and the addon's `idPrefixes: ["tt"]` contract.
+        assert!(!items.iter().any(|i| i.title == "NoImdb"));
+    }
+
+    #[test]
+    fn malformed_new_titles_body_yields_no_items() {
+        for body in ["", "{}", "not json", r#"{"data":null}"#, r#"{"data":{"newTitles":{"edges":[]}}}"#] {
+            assert!(parse_new_titles(body).is_empty(), "body: {body}");
+        }
+    }
 
     const FIXTURE: &str = r#"{"data":{"popularTitles":{"edges":[
       {"node":{"content":{"title":"Alpha","originalReleaseYear":1999,"externalIds":{"imdbId":"tt0000001","tmdbId":"1397385"},"scoring":{"imdbScore":7.4}}}},
