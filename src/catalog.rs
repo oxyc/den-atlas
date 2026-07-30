@@ -78,6 +78,10 @@ pub struct CatalogEntry {
     pub type_: &'static str,
     pub id: String,
     pub name: String,
+    /// The provider's JustWatch package id — identical to the TMDB watch-provider id. Published on the
+    /// manifest so a client can associate this row with its own provider directory instead of parsing the
+    /// display name. `None` for the aggregate "Trending Everywhere" row, which spans providers.
+    pub package_id: Option<i64>,
 }
 
 /// The manifest `catalogs[]` for a given provider set — one per provider × type, plus "Trending
@@ -89,15 +93,16 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
         // "Trending Everywhere" (the aggregated cross-provider chart) leads, then the per-provider rows.
-        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned() });
+        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned(), package_id: None });
         for p in providers {
-            out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned() });
+            out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned(), package_id: Some(p.package_id) });
             // "New on <service>" sits next to "Popular on <service>". `name` is derived from the provider's
             // display name so a new service needs only its one PROVIDERS row.
             out.push(CatalogEntry {
                 type_: t,
                 id: new_catalog_id(p),
                 name: format!("New on {}", p.name.trim_start_matches("Popular on ")),
+                package_id: Some(p.package_id),
             });
         }
     }

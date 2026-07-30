@@ -35,6 +35,11 @@ struct Catalog {
     // app sends the device region). Omitted for a fixed-country install (country is baked into the URL).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     extra: Vec<CatalogExtra>,
+    /// Den superset field: the TMDB watch-provider id this row is for (JustWatch's package id is the same
+    /// number). Lets a client line the row up with TMDB's provider directory rather than parsing "Popular on
+    /// Netflix". Stock Stremio clients ignore unknown catalog fields. Omitted for the cross-provider row.
+    #[serde(rename = "denProviderId", skip_serializing_if = "Option::is_none")]
+    den_provider_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -61,6 +66,7 @@ pub fn manifest_json(config: &Config) -> String {
             type_: e.type_.to_owned(),
             id: e.id,
             name: e.name,
+            den_provider_id: e.package_id,
             extra: if auto {
                 vec![CatalogExtra { name: "country", is_required: false }]
             } else {
@@ -86,4 +92,24 @@ pub fn manifest_json(config: &Config) -> String {
         },
     };
     serde_json::to_string(&m).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalogs_publish_the_tmdb_provider_id() {
+        let json = manifest_json(&Config::default_config());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cats = v["catalogs"].as_array().unwrap();
+        let by = |id: &str| cats.iter().find(|c| c["id"] == id).unwrap_or_else(|| panic!("missing {id}"));
+        // 8 is Netflix in BOTH JustWatch and TMDB — that shared id is the whole point of publishing it.
+        assert_eq!(by("jw-nfx")["denProviderId"], 8);
+        assert_eq!(by("jw-prv")["denProviderId"], 119, "Prime Video is 119, not the legacy 9");
+        // The arrivals row points at the same service as its popular row.
+        assert_eq!(by("jw-nfx-new")["denProviderId"], 8);
+        // The cross-provider aggregate has no single provider, so the field is absent (not null).
+        assert!(by(catalog::TRENDING_ID).get("denProviderId").is_none());
+    }
 }
