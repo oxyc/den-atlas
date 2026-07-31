@@ -21,8 +21,13 @@ pub struct Provider {
 
 // Short codes can drift per country; if a row comes back empty, verify against JustWatch's provider
 // list for that country. Adding a service = one row here.
-// Codes verified against JustWatch's own `packages(country: FI, platform: WEB)` list on 2026-07-30. `max` and
-// `amp` were WRONG — both returned 0 titles, so "Popular on Max" and "Popular on Prime Video" were empty rows.
+// Codes verified against JustWatch's own `packages(country:, platform: WEB)` list — FI and UY, 2026-07-30/31.
+// `max` and `amp` were WRONG (0 titles), so "Popular on Max" and "Popular on Prime Video" were empty rows.
+//
+// The table spans markets on purpose: a provider a country doesn't carry simply returns nothing and the client
+// drops the empty row, whereas a MISSING provider can't be picked at all. `sst` (SkyShowtime) is
+// Nordic/European only; `pmp` (Paramount+) is how that content is sold in Latin America.
+//
 // `package_id` is JustWatch's id, which is also the TMDB watch-provider id — the bridge a client needs to line
 // these rows up with TMDB's provider directory, so it's published rather than left for the client to guess.
 const PROVIDERS: &[Provider] = &[
@@ -30,6 +35,7 @@ const PROVIDERS: &[Provider] = &[
     Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_id: 1899 },
     Provider { code: "prv", id: "jw-prv", name: "Popular on Prime Video", package_id: 119 },
     Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_id: 337 },
+    Provider { code: "pmp", id: "jw-pmp", name: "Popular on Paramount+", package_id: 531 },
     Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+", package_id: 350 },
     Provider { code: "sst", id: "jw-sst", name: "Popular on SkyShowtime", package_id: 1773 },
 ];
@@ -418,7 +424,7 @@ mod tests {
         // "New on Netflix" is derived from "Popular on Netflix" — adding a service needs only its
         // PROVIDERS row, no second name to keep in sync.
         assert!(entries.iter().any(|e| e.id == "jw-nfx-new" && e.type_ == "movie" && e.name == "New on Netflix"));
-        assert!(entries.iter().any(|e| e.id == "jw-sst-new" && e.type_ == "series" && e.name == "New on SkyShowtime"));
+        assert!(entries.iter().any(|e| e.id == "jw-pmp-new" && e.type_ == "series" && e.name == "New on Paramount+"));
         // Every provider gets both rows, for both types.
         for p in selected_providers() {
             for t in STREMIO_TYPES {
