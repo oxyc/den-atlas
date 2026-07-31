@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "den-atlas"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "axum",

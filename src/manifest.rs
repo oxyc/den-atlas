@@ -40,6 +40,11 @@ struct Catalog {
     /// Netflix". Stock Stremio clients ignore unknown catalog fields. Omitted for the cross-provider row.
     #[serde(rename = "denProviderId", skip_serializing_if = "Option::is_none")]
     den_provider_id: Option<i64>,
+    /// EVERY id this service is known by. Ids are per-country (Prime is 119 in UY/FI, 9 in the US) and the
+    /// manifest is country-agnostic for an `auto` install — it is fetched with no country extra — so a single
+    /// id can't be right everywhere. A client matches on any of these.
+    #[serde(rename = "denProviderIds", skip_serializing_if = "Vec::is_empty")]
+    den_provider_ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -66,7 +71,8 @@ pub fn manifest_json(config: &Config) -> String {
             type_: e.type_.to_owned(),
             id: e.id,
             name: e.name,
-            den_provider_id: e.package_id,
+            den_provider_id: e.package_ids.first().copied(),
+            den_provider_ids: e.package_ids.to_vec(),
             extra: if auto {
                 vec![CatalogExtra { name: "country", is_required: false }]
             } else {

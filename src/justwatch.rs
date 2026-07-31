@@ -56,6 +56,14 @@ pub trait TrendingSource: Send + Sync {
     /// Titles **newly added to a service**, most recently added first. This is the one signal TMDB cannot
     /// provide at all (it carries no added-date and no such sort), so it only exists on this path.
     async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()>;
+
+    /// The services a country actually has, as `packageId -> shortName`.
+    ///
+    /// Needed because **both identifiers are per-country**: Amazon Prime Video is `prv`/119 in UY and FI but
+    /// `amp`/9 in the US (verified 2026-07-31). A table hardcoding either is wrong somewhere, which is how
+    /// "Popular on Prime Video" shipped empty. Providers are declared by their stable ids and the local code is
+    /// looked up here.
+    async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()>;
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -85,6 +93,10 @@ const NEW_QUERY: &str = r#"query GetNewTitles($country: Country!, $filter: Title
       ... on Season { show { content(country: $country, language: "en") { title originalReleaseYear externalIds { imdbId tmdbId } scoring { imdbScore } } } }
     } }
   }
+}"#;
+
+const PACKAGES_QUERY: &str = r#"query GetPackages($country: Country!, $platform: Platform!) {
+  packages(country: $country, platform: $platform) { packageId shortName monetizationTypes }
 }"#;
 
 pub struct JustWatchClient {
@@ -274,6 +286,44 @@ pub fn parse_new_titles(body: &str, want: ObjectType) -> Vec<TrendingItem> {
     out
 }
 
+#[derive(Deserialize)]
+struct PkgResp {
+    data: Option<PkgData>,
+}
+#[derive(Deserialize)]
+struct PkgData {
+    packages: Option<Vec<PkgEntry>>,
+}
+#[derive(Deserialize)]
+struct PkgEntry {
+    #[serde(rename = "packageId")]
+    package_id: Option<i64>,
+    #[serde(rename = "shortName")]
+    short_name: Option<String>,
+    #[serde(rename = "monetizationTypes")]
+    monetization_types: Option<Vec<String>>,
+}
+
+/// `packageId -> shortName` for a country, restricted to services you can watch on a subscription. Rent/buy
+/// storefronts are excluded: a "Popular on X" row is about what a subscription covers.
+pub fn parse_packages(body: &str) -> Vec<(i64, String)> {
+    let resp: PkgResp = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    resp.data
+        .and_then(|d| d.packages)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p.monetization_types
+                .as_ref()
+                .is_some_and(|m| m.iter().any(|t| t == "FLATRATE" || t == "FREE" || t == "ADS"))
+        })
+        .filter_map(|p| Some((p.package_id?, p.short_name?)))
+        .collect()
+}
+
 fn is_imdb(s: &str) -> bool {
     s.len() >= 3 && s.starts_with("tt") && s[2..].bytes().all(|b| b.is_ascii_digit())
 }
@@ -332,6 +382,19 @@ impl TrendingSource for JustWatchClient {
             eprintln!("den-atlas: justwatch returned a non-empty body but 0 usable items ({label}) — possible schema change");
         }
         Ok(items)
+    }
+
+    async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()> {
+        let payload = serde_json::json!({
+            "query": PACKAGES_QUERY,
+            "variables": { "country": country, "platform": "WEB" },
+        });
+        let body = self.post_graphql(&payload, &format!("packages/{country}")).await?;
+        let pkgs = parse_packages(&body);
+        if pkgs.is_empty() && !body.is_empty() {
+            eprintln!("den-atlas: justwatch packages returned a non-empty body but 0 usable entries ({country}) — possible schema change");
+        }
+        Ok(pkgs)
     }
 
     async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()> {

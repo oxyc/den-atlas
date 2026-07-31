@@ -15,33 +15,34 @@ pub struct Provider {
     pub code: &'static str, // JustWatch package short-code
     pub id: &'static str,   // Stremio catalog id
     pub name: &'static str, // row title the client renders
-    /// JustWatch package id — identical to the TMDB watch-provider id (verified against both lists).
-    pub package_id: i64,
+    /// Every JustWatch package id this service is known by, most common first. Identical to the TMDB
+    /// watch-provider ids (verified against both lists). Per-country: Prime is 119 in UY/FI, 9 in the US.
+    pub package_ids: &'static [i64],
 }
 
 // Short codes can drift per country; if a row comes back empty, verify against JustWatch's provider
 // list for that country. Adding a service = one row here.
-// Codes verified against JustWatch's own `packages(country:, platform: WEB)` list — FI and UY, 2026-07-30/31.
-// `max` and `amp` were WRONG (0 titles), so "Popular on Max" and "Popular on Prime Video" were empty rows.
+// Providers are declared by their **stable JustWatch package ids**, not by short code — because BOTH the code
+// and the id are per-country. Amazon Prime Video is `prv`/119 in UY and FI but `amp`/9 in the US (verified
+// 2026-07-31), which is how a hardcoded code shipped an empty "Popular on Prime Video" row. The local code is
+// resolved per request from `packages(country)`; a service the country doesn't carry resolves to nothing and
+// its row is simply absent.
 //
-// The table spans markets on purpose: a provider a country doesn't carry simply returns nothing and the client
-// drops the empty row, whereas a MISSING provider can't be picked at all. `sst` (SkyShowtime) is
-// Nordic/European only; `pmp` (Paramount+) is how that content is sold in Latin America.
-//
-// `package_id` is JustWatch's id, which is also the TMDB watch-provider id — the bridge a client needs to line
-// these rows up with TMDB's provider directory, so it's published rather than left for the client to guess.
+// `package_ids` lists every id a service is known by, most common first. The first is the primary — it's what
+// `denProviderId` publishes for back-compat — and all of them are published as `denProviderIds` so a client
+// keying on its own region's id (Den keys on TMDB's, which is the same number) matches whichever applies.
 const PROVIDERS: &[Provider] = &[
-    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix", package_id: 8 },
-    Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_id: 1899 },
-    Provider { code: "prv", id: "jw-prv", name: "Popular on Prime Video", package_id: 119 },
-    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_id: 337 },
-    Provider { code: "pmp", id: "jw-pmp", name: "Popular on Paramount+", package_id: 531 },
-    Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+", package_id: 350 },
-    Provider { code: "sst", id: "jw-sst", name: "Popular on SkyShowtime", package_id: 1773 },
+    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix", package_ids: &[8] },
+    Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_ids: &[1899] },
+    Provider { code: "prv", id: "jw-prv", name: "Popular on Prime Video", package_ids: &[119, 9] },
+    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_ids: &[337] },
+    // 531 is Paramount+ in LatAm/EU and is also TMDB's id everywhere; the US splits it into tiers with their
+    // own ids and no plain 531, so a client keying on TMDB's 531 still matches while we resolve the local tier.
+    Provider { code: "pmp", id: "jw-pmp", name: "Popular on Paramount+", package_ids: &[531, 2303, 2616] },
+    Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+", package_ids: &[350, 2552] },
+    Provider { code: "sst", id: "jw-sst", name: "Popular on SkyShowtime", package_ids: &[1773] },
 ];
 
-/// Suffix marking a provider's **arrivals** catalog ("New on Netflix") — the one signal TMDB has no data for,
-/// so it exists only on the JustWatch path. Appended to the provider's catalog id.
 pub const NEW_SUFFIX: &str = "-new";
 
 /// The arrivals catalog id for a provider, e.g. "jw-nfx-new".
@@ -84,10 +85,10 @@ pub struct CatalogEntry {
     pub type_: &'static str,
     pub id: String,
     pub name: String,
-    /// The provider's JustWatch package id — identical to the TMDB watch-provider id. Published on the
-    /// manifest so a client can associate this row with its own provider directory instead of parsing the
-    /// display name. `None` for the aggregate "Trending Everywhere" row, which spans providers.
-    pub package_id: Option<i64>,
+    /// Every JustWatch package id this row's service is known by — identical to the TMDB watch-provider ids.
+    /// Published on the manifest so a client can associate the row with its own provider directory instead of
+    /// parsing the display name. Empty for the aggregate "Trending Everywhere" row, which spans providers.
+    pub package_ids: &'static [i64],
 }
 
 /// The manifest `catalogs[]` for a given provider set — one per provider × type, plus "Trending
@@ -99,16 +100,16 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
         // "Trending Everywhere" (the aggregated cross-provider chart) leads, then the per-provider rows.
-        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned(), package_id: None });
+        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned(), package_ids: &[] });
         for p in providers {
-            out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned(), package_id: Some(p.package_id) });
+            out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned(), package_ids: p.package_ids });
             // "New on <service>" sits next to "Popular on <service>". `name` is derived from the provider's
             // display name so a new service needs only its one PROVIDERS row.
             out.push(CatalogEntry {
                 type_: t,
                 id: new_catalog_id(p),
                 name: format!("New on {}", p.name.trim_start_matches("Popular on ")),
-                package_id: Some(p.package_id),
+                package_ids: p.package_ids,
             });
         }
     }
@@ -129,6 +130,9 @@ pub struct CatalogState {
     // Per-key refresh gate (single-flight): coalesces concurrent misses so a cold-cache burst makes one
     // upstream fetch per key, not N. Keyspace is bounded (ids × types × the handful of live countries).
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// `country -> (packageId -> shortName)`. Both identifiers are per-country, so the local code for a
+    /// provider has to be looked up rather than hardcoded. Cached because it changes on the order of months.
+    packages: Mutex<HashMap<String, Arc<Vec<(i64, String)>>>>,
     // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
     // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
     // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
@@ -142,6 +146,7 @@ impl CatalogState {
             source,
             cache: TtlCache::new(ttl),
             inflight: Mutex::new(HashMap::new()),
+            packages: Mutex::new(HashMap::new()),
             last_refresh_ok: AtomicBool::new(true),
         }
     }
@@ -191,10 +196,12 @@ impl CatalogState {
             let (provider, is_new) = resolved.unwrap();
             if is_new {
                 // Arrivals come back most-recently-added first; that order IS the row.
-                self.source.new_titles(provider.code, obj, country).await.ok()
+                let code = self.code_for(provider, country).await?;
+                self.source.new_titles(&code, obj, country).await.ok()
             } else {
                 // A "Popular on <service>" row = JustWatch's POPULAR sort (matches their site), not TRENDING.
-                self.source.popular(provider.code, obj, country, "POPULAR").await.ok()
+                let code = self.code_for(provider, country).await?;
+                self.source.popular(&code, obj, country, "POPULAR").await.ok()
             }
         };
 
@@ -225,6 +232,33 @@ impl CatalogState {
     /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` only when
     /// every provider fetch failed (so the caller can serve stale/empty). Results are placed by provider
     /// index to keep the dedupe representative deterministic regardless of completion order.
+    /// The country-local short code for a provider, or `None` when that country doesn't carry the service —
+    /// in which case its row is simply absent rather than empty-but-present.
+    async fn code_for(&self, provider: &Provider, country: &str) -> Option<String> {
+        let cached = { self.packages.lock().unwrap().get(country).cloned() };
+        let map = match cached {
+            Some(m) => m,
+            None => {
+                let fetched = Arc::new(self.source.packages(country).await.unwrap_or_default());
+                // An empty result (JustWatch down) is NOT cached — otherwise one outage blanks every row
+                // until restart.
+                if !fetched.is_empty() {
+                    self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
+                }
+                fetched
+            }
+        };
+        if map.is_empty() {
+            // Couldn't resolve: fall back to the declared code so a lookup failure degrades to the old
+            // behaviour (right for most countries) instead of removing every row.
+            return Some(provider.code.to_owned());
+        }
+        provider
+            .package_ids
+            .iter()
+            .find_map(|id| map.iter().find(|(pid, _)| pid == id).map(|(_, code)| code.clone()))
+    }
+
     async fn aggregate(
         &self,
         obj: ObjectType,
@@ -235,10 +269,10 @@ impl CatalogState {
         let mut set: JoinSet<(usize, Result<Vec<TrendingItem>, ()>)> = JoinSet::new();
         for (i, p) in providers.iter().enumerate() {
             let src = Arc::clone(&self.source);
-            let code = p.code;
+            let Some(code) = self.code_for(p, country).await else { continue };
             let country = country.to_owned();
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
-            set.spawn(async move { (i, src.popular(code, obj, &country, "TRENDING").await) });
+            set.spawn(async move { (i, src.popular(&code, obj, &country, "TRENDING").await) });
         }
         while let Some(joined) = set.join_next().await {
             if let Ok((i, Ok(items))) = joined {
@@ -350,6 +384,15 @@ mod tests {
             self.new_calls.fetch_add(1, Ordering::SeqCst);
             self.answer()
         }
+        /// Mirrors a real country list: Prime is 119 here (as in UY/FI), never 9.
+        async fn packages(&self, _country: &str) -> Result<Vec<(i64, String)>, ()> {
+            Ok(vec![
+                (8, "nfx".into()),
+                (119, "prv".into()),
+                (1899, "mxx".into()),
+                (531, "pmp".into()),
+            ])
+        }
     }
 
     fn state(data: Vec<TrendingItem>, ttl: Duration, fail_after: usize) -> CatalogState {
@@ -432,6 +475,24 @@ mod tests {
                 assert!(entries.iter().any(|e| e.id == new_catalog_id(p) && e.type_ == t), "missing new {} {t}", p.id);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_provider_the_country_lacks_yields_no_row() {
+        let fake = Arc::new(Fake {
+            data: vec![item("tt1", "A", 0)],
+            calls: AtomicUsize::new(0),
+            fail_after: 9,
+            new_calls: AtomicUsize::new(0),
+        });
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
+        // SkyShowtime (1773) isn't in the stub's country list — the row is absent, not empty-but-present,
+        // and no upstream call is made for it.
+        assert!(s.metas_json("jw-sst", "movie", "UY", selected_providers()).await.is_none());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        // Paramount+ (531) is, so it resolves and fetches.
+        assert!(s.metas_json("jw-pmp", "movie", "UY", selected_providers()).await.is_some());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
