@@ -199,6 +199,8 @@ struct NewEdge {
 }
 #[derive(Deserialize)]
 struct NewNode {
+    #[serde(rename = "__typename")]
+    typename: Option<String>,
     content: Option<NewContent>,
     /// Present on a `Season` — its own content is useless ("Season 1", no IMDb id), so we surface the show.
     show: Option<NewShow>,
@@ -222,7 +224,12 @@ struct NewContent {
 ///
 /// A show whose new season lands is surfaced as the SHOW, deduped so a weekly series appears once. Items
 /// without a usable IMDb id are dropped, matching `parse_popular` and the addon's `idPrefixes: ["tt"]` contract.
-pub fn parse_new_titles(body: &str) -> Vec<TrendingItem> {
+///
+/// **Filters on `__typename` rather than trusting the request.** `newTitles` honours `objectTypes: [MOVIE]` but
+/// NOT `[SHOW]` — verified 2026-07-30, a SHOW query returned 3 Movies among 12 results. Serving those in a
+/// series catalog made the app resolve a movie id as a TV id, so the card opened to "couldn't be found on
+/// TMDB". (`popularTitles` filters correctly; this is specific to `newTitles`.)
+pub fn parse_new_titles(body: &str, want: ObjectType) -> Vec<TrendingItem> {
     let resp: NewResp = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -231,6 +238,15 @@ pub fn parse_new_titles(body: &str) -> Vec<TrendingItem> {
     let mut out: Vec<TrendingItem> = Vec::with_capacity(edges.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for e in edges {
+        // Keep only entries of the requested kind. A Season counts as a show — it resolves to one below.
+        let kind = e.node.typename.as_deref().unwrap_or_default();
+        let matches = match want {
+            ObjectType::Movie => kind == "Movie",
+            ObjectType::Show => kind == "Show" || kind == "Season",
+        };
+        if !matches {
+            continue;
+        }
         // A Season's `show.content` wins over its own; a Movie/Show has no `show`.
         let content = match e.node.show.and_then(|s| s.content).or(e.node.content) {
             Some(c) => c,
@@ -331,7 +347,7 @@ impl TrendingSource for JustWatchClient {
         });
         let label = format!("new:{provider}/{}", obj.as_jw());
         let body = self.post_graphql(&payload, &label).await?;
-        let items = parse_new_titles(&body);
+        let items = parse_new_titles(&body, obj);
         if items.is_empty() && !body.is_empty() {
             eprintln!("den-atlas: justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
         }
@@ -355,16 +371,30 @@ mod tests {
 
     #[test]
     fn new_titles_are_ordered_newest_first() {
-        let items = parse_new_titles(NEW_FIXTURE);
+        let items = parse_new_titles(NEW_FIXTURE, ObjectType::Movie);
         // The service's own order is the feature: the most recently added title leads.
-        assert_eq!(items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
-                   vec!["Aquaman", "Thunder 3", "Crawl"]);
-        assert_eq!(items.iter().map(|i| i.rank).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), vec!["Aquaman", "Crawl"]);
+        assert_eq!(items.iter().map(|i| i.rank).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// The bug this guards: `newTitles` honours `objectTypes: [MOVIE]` but NOT `[SHOW]`, so a movie leaked into
+    /// the series catalog, was emitted as `type: series`, and the app resolved a movie id as a TV id —
+    /// "The Truthers" opened to "couldn't be found on TMDB".
+    #[test]
+    fn a_movie_never_leaks_into_the_series_catalog() {
+        let shows = parse_new_titles(NEW_FIXTURE, ObjectType::Show);
+        assert!(!shows.iter().any(|i| i.title == "Aquaman"), "a Movie must not appear in a SHOW request");
+        assert!(!shows.iter().any(|i| i.title == "Crawl"));
+        assert_eq!(shows.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), vec!["Thunder 3"]);
+
+        // ...and the converse: a Show/Season must not appear in a MOVIE request.
+        let movies = parse_new_titles(NEW_FIXTURE, ObjectType::Movie);
+        assert!(!movies.iter().any(|i| i.title == "Thunder 3"));
     }
 
     #[test]
     fn a_new_season_surfaces_its_show_not_the_season() {
-        let items = parse_new_titles(NEW_FIXTURE);
+        let items = parse_new_titles(NEW_FIXTURE, ObjectType::Show);
         let show = items.iter().find(|i| i.title == "Thunder 3").expect("season resolved to its show");
         // The season's own ids are unusable ("326119:1", no IMDb id); the show's are what Den maps through.
         assert_eq!(show.imdb, "tt43589481");
@@ -373,14 +403,14 @@ mod tests {
 
     #[test]
     fn a_recurring_series_appears_once() {
-        let items = parse_new_titles(NEW_FIXTURE);
+        let items = parse_new_titles(NEW_FIXTURE, ObjectType::Show);
         // "Thunder 3" appears twice (two season drops) — it must not repeat down the row.
         assert_eq!(items.iter().filter(|i| i.title == "Thunder 3").count(), 1);
     }
 
     #[test]
     fn new_titles_drops_entries_without_a_usable_imdb_id() {
-        let items = parse_new_titles(NEW_FIXTURE);
+        let items = parse_new_titles(NEW_FIXTURE, ObjectType::Movie);
         // Matches parse_popular and the addon's `idPrefixes: ["tt"]` contract.
         assert!(!items.iter().any(|i| i.title == "NoImdb"));
     }
@@ -388,7 +418,7 @@ mod tests {
     #[test]
     fn malformed_new_titles_body_yields_no_items() {
         for body in ["", "{}", "not json", r#"{"data":null}"#, r#"{"data":{"newTitles":{"edges":[]}}}"#] {
-            assert!(parse_new_titles(body).is_empty(), "body: {body}");
+            assert!(parse_new_titles(body, ObjectType::Movie).is_empty(), "body: {body}");
         }
     }
 
