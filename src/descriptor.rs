@@ -51,6 +51,10 @@ struct Descriptor {
     /// reads it as `decodeIfPresent`, so absent ⇒ no semantic query search.
     #[serde(skip_serializing_if = "Option::is_none")]
     embed: Option<bool>,
+    /// FP-3 — the producer's signature, verbatim from the meta. Omitted when unsigned, so an unsigned
+    /// descriptor stays byte-identical to before and the app reads it as `decodeIfPresent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> String {
@@ -106,6 +110,86 @@ pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> Stri
             bytes: f.size,
         }),
         embed: embed_enabled.then_some(true),
+        signature: ds.meta.signature.clone(),
     };
     serde_json::to_string(&d).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::{Blob, Meta};
+    use std::path::PathBuf;
+
+    fn blob(name: &str) -> Blob {
+        Blob {
+            name: name.into(),
+            path: PathBuf::from(name),
+            size: 10,
+            sha256: format!("sha-{name}"),
+            content_type: "application/octet-stream",
+            gz: None,
+        }
+    }
+
+    fn dataset(signature: Option<&str>) -> Dataset {
+        Dataset {
+            meta: Meta {
+                dataset_version: "v1".into(),
+                taxonomy_version: "t02".into(),
+                embedding_model: "bge-m3".into(),
+                dims: 1024,
+                count: 100,
+                quantization: "int8-symmetric-x127".into(),
+                signature: signature.map(Into::into),
+                labels_file: "labels-t02.json".into(),
+                vectors_file: "vectors-bge-m3.bin".into(),
+                labels_gz_file: None,
+                labels_sha256: "l".into(),
+                labels_bytes: 10,
+                vectors_sha256: "v".into(),
+                vectors_bytes: 10,
+                last_modified_http: None,
+                metadata_file: None,
+                metadata_sha256: None,
+                metadata_bytes: None,
+                premise_embedding_model: None,
+                premise_dims: None,
+                premise_count: None,
+                premise_labels_file: None,
+                premise_labels_sha256: None,
+                premise_labels_bytes: None,
+                premise_vectors_file: None,
+                premise_vectors_sha256: None,
+                premise_vectors_bytes: None,
+                facets_file: None,
+                facets_sha256: None,
+                facets_bytes: None,
+            },
+            labels: blob("labels-t02.json"),
+            vectors: blob("vectors-bge-m3.bin"),
+            metadata: None,
+            premise_labels: None,
+            premise_vectors: None,
+            facets: None,
+            last_modified: None,
+        }
+    }
+
+    /// FP-3 — the signature is passed through verbatim. den-atlas neither mints nor validates it: signing
+    /// happens where the dataset is published, and verification happens in the app against a key the user
+    /// pinned. An addon able to mint its own signature would prove nothing.
+    #[test]
+    fn signature_is_passed_through_verbatim() {
+        let json = build_descriptor("https://atlas.test", &dataset(Some("ed25519:AAAA")), false);
+        assert!(json.contains(r#""signature":"ed25519:AAAA""#), "got {json}");
+    }
+
+    /// An unsigned dataset must serialize byte-identically to before the field existed, so existing
+    /// providers keep decoding unchanged (the app reads it as `decodeIfPresent`).
+    #[test]
+    fn unsigned_dataset_omits_the_field_entirely() {
+        let json = build_descriptor("https://atlas.test", &dataset(None), false);
+        assert!(!json.contains("signature"), "got {json}");
+    }
 }

@@ -16,6 +16,12 @@ pub struct Meta {
     pub dims: u32,
     pub count: u64,
     pub quantization: String,
+    /// FP-3 — the producer's Ed25519 signature over the canonical descriptor payload ("ed25519:<base64>").
+    /// Passed through verbatim to `/dataset.json`; den-atlas neither creates nor validates it. Signing
+    /// happens where the dataset is published (`den/scripts/sign-dataset.swift`) and verification happens in
+    /// the app against a key the user pinned — an addon that could mint its own signature would prove nothing.
+    #[serde(default)]
+    pub signature: Option<String>,
     #[serde(rename = "labelsFile")]
     pub labels_file: String,
     #[serde(rename = "vectorsFile")]
