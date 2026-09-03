@@ -10,7 +10,7 @@ name = "den-atlas"
 path = "src/main.rs"
 
 [dependencies]
-axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
