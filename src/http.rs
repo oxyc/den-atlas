@@ -35,18 +35,11 @@ pub struct Servable {
 
 pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Response {
     let is_head = method == Method::HEAD;
-    let range_header = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
     // Range wins over gzip (byte offsets need the identity representation).
     let use_gzip = range_header.is_none() && s.gzip.is_some() && accepts_gzip(headers);
     // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
-    let etag = if use_gzip {
-        format!("\"{}-gzip\"", s.etag_base)
-    } else {
-        format!("\"{}\"", s.etag_base)
-    };
+    let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
 
     let mut base: Vec<(&'static str, String)> = vec![
         ("etag", etag.clone()),
@@ -89,11 +82,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
                 h.push(("content-type", s.content_type.clone()));
                 h.push(("content-range", format!("bytes {start}-{end}/{}", s.size)));
                 h.push(("content-length", len.to_string()));
-                let body = if is_head {
-                    Body::empty()
-                } else {
-                    range_body(&s.identity, start, len).await
-                };
+                let body = if is_head { Body::empty() } else { range_body(&s.identity, start, len).await };
                 return build(StatusCode::PARTIAL_CONTENT, &h, body);
             }
             RangeResult::None => {} // malformed / multi-range → full 200
@@ -112,11 +101,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     if let Some(enc) = encoding {
         h.push(("content-encoding", enc.to_owned()));
     }
-    let body = if is_head {
-        Body::empty()
-    } else {
-        full_body(payload).await
-    };
+    let body = if is_head { Body::empty() } else { full_body(payload).await };
     build(StatusCode::OK, &h, body)
 }
 
@@ -168,15 +153,10 @@ pub fn is_not_modified(headers: &HeaderMap, etag_quoted: &str, last_modified: Op
             .map(|t| t.trim().trim_start_matches("W/"))
             .any(|t| t == "*" || t == etag_quoted);
     }
-    if let (Some(ims), Some(lm)) = (
-        headers
-            .get(header::IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok()),
-        last_modified,
-    ) {
-        if let (Ok(since), Ok(modified)) =
-            (httpdate::parse_http_date(ims), httpdate::parse_http_date(lm))
-        {
+    if let (Some(ims), Some(lm)) =
+        (headers.get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()), last_modified)
+    {
+        if let (Ok(since), Ok(modified)) = (httpdate::parse_http_date(ims), httpdate::parse_http_date(lm)) {
             return modified <= since;
         }
     }
@@ -184,10 +164,7 @@ pub fn is_not_modified(headers: &HeaderMap, etag_quoted: &str, last_modified: Op
 }
 
 pub fn accepts_gzip(headers: &HeaderMap) -> bool {
-    let ae = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
     ae.split(',').any(|part| {
         let mut it = part.trim().split(';');
         let enc = it.next().unwrap_or("").trim();
@@ -241,11 +218,7 @@ pub fn parse_range(header: &str, size: u64) -> RangeResult {
         if start >= size {
             return RangeResult::Unsatisfiable;
         }
-        end = if b.is_empty() {
-            size - 1
-        } else {
-            b.parse::<u64>().unwrap_or(0).min(size - 1)
-        };
+        end = if b.is_empty() { size - 1 } else { b.parse::<u64>().unwrap_or(0).min(size - 1) };
         if start > end {
             return RangeResult::Unsatisfiable;
         }
@@ -279,20 +252,13 @@ mod tests {
             last_modified: Some(LAST_MODIFIED.to_owned()),
             size: raw.len() as u64,
             identity: Payload::Memory(raw.clone()),
-            gzip: if gzip {
-                Some((Payload::Memory(Bytes::from(vec![b'z'; 40])), 40))
-            } else {
-                None
-            },
+            gzip: if gzip { Some((Payload::Memory(Bytes::from(vec![b'z'; 40])), 40)) } else { None },
             vary_on_origin: false,
         }
     }
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
-        axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec()
+        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
     }
 
     #[tokio::test]
@@ -307,9 +273,7 @@ mod tests {
     #[tokio::test]
     async fn t304_on_star_and_ims() {
         assert_eq!(
-            serve(&Method::GET, &hdrs(&[("if-none-match", "*")]), servable(false))
-                .await
-                .status(),
+            serve(&Method::GET, &hdrs(&[("if-none-match", "*")]), servable(false)).await.status(),
             StatusCode::NOT_MODIFIED
         );
         assert_eq!(
@@ -320,9 +284,13 @@ mod tests {
         );
         // Before the build time → 200.
         assert_eq!(
-            serve(&Method::GET, &hdrs(&[("if-modified-since", "Tue, 30 Jun 2026 00:00:00 GMT")]), servable(false))
-                .await
-                .status(),
+            serve(
+                &Method::GET,
+                &hdrs(&[("if-modified-since", "Tue, 30 Jun 2026 00:00:00 GMT")]),
+                servable(false)
+            )
+            .await
+            .status(),
             StatusCode::OK
         );
     }
@@ -361,7 +329,10 @@ mod tests {
         // Identity servable → no Vary.
         assert!(serve(&Method::GET, &hdrs(&[]), servable(false)).await.headers().get("vary").is_none());
         // Gzip servable → Vary present.
-        assert_eq!(serve(&Method::GET, &hdrs(&[]), servable(true)).await.headers().get("vary").unwrap(), "Accept-Encoding");
+        assert_eq!(
+            serve(&Method::GET, &hdrs(&[]), servable(true)).await.headers().get("vary").unwrap(),
+            "Accept-Encoding"
+        );
     }
 
     #[tokio::test]

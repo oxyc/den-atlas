@@ -73,11 +73,7 @@ pub fn manifest_json(config: &Config) -> String {
             name: e.name,
             den_provider_id: e.package_ids.first().copied(),
             den_provider_ids: e.package_ids.to_vec(),
-            extra: if auto {
-                vec![CatalogExtra { name: "country", is_required: false }]
-            } else {
-                Vec::new()
-            },
+            extra: if auto { vec![CatalogExtra { name: "country", is_required: false }] } else { Vec::new() },
         })
         .collect();
     let m = Manifest {
@@ -92,10 +88,7 @@ pub fn manifest_json(config: &Config) -> String {
         catalogs,
         // Configurable: /configure builds a `<region>_<providers>` install URL. Not *required* — a bare
         // …/manifest.json still serves the operator-default config, so existing installs keep working.
-        behavior_hints: BehaviorHints {
-            configurable: true,
-            configuration_required: false,
-        },
+        behavior_hints: BehaviorHints { configurable: true, configuration_required: false },
     };
     serde_json::to_string(&m).unwrap()
 }

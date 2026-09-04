@@ -80,7 +80,8 @@ pub fn selected_providers() -> &'static [&'static Provider] {
     static SELECTED: OnceLock<Vec<&'static Provider>> = OnceLock::new();
     SELECTED.get_or_init(|| match std::env::var("JW_PROVIDERS") {
         Ok(v) if !v.trim().is_empty() => {
-            let codes: Vec<String> = v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
+            let codes: Vec<String> =
+                v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
             PROVIDERS.iter().filter(|p| codes.iter().any(|c| c == p.code)).collect()
         }
         _ => PROVIDERS.iter().collect(),
@@ -106,9 +107,19 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
     let mut out = Vec::with_capacity((providers.len() + 1) * STREMIO_TYPES.len());
     for t in STREMIO_TYPES {
         // "Trending Everywhere" (the aggregated cross-provider chart) leads, then the per-provider rows.
-        out.push(CatalogEntry { type_: t, id: TRENDING_ID.to_owned(), name: TRENDING_NAME.to_owned(), package_ids: &[] });
+        out.push(CatalogEntry {
+            type_: t,
+            id: TRENDING_ID.to_owned(),
+            name: TRENDING_NAME.to_owned(),
+            package_ids: &[],
+        });
         for p in providers {
-            out.push(CatalogEntry { type_: t, id: p.id.to_owned(), name: p.name.to_owned(), package_ids: p.package_ids });
+            out.push(CatalogEntry {
+                type_: t,
+                id: p.id.to_owned(),
+                name: p.name.to_owned(),
+                package_ids: p.package_ids,
+            });
             // "New on <service>" sits next to "Popular on <service>". `name` is derived from the provider's
             // display name so a new service needs only its one PROVIDERS row.
             out.push(CatalogEntry {
@@ -383,7 +394,6 @@ impl CatalogState {
             .find_map(|id| map.iter().find(|(pid, _)| pid == id).map(|(_, code)| code.clone()))
     }
 
-
     /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. Providers are
     /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` when no
     /// provider produced a list, so the caller can serve stale rather than publish an empty row.
@@ -464,7 +474,14 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
         .enumerate()
         .map(|(i, (imdb, _))| {
             let r = repr[imdb];
-            TrendingItem { imdb: r.imdb.clone(), moviedb: r.moviedb, title: r.title.clone(), rank: i, rating: r.rating, year: r.year }
+            TrendingItem {
+                imdb: r.imdb.clone(),
+                moviedb: r.moviedb,
+                title: r.title.clone(),
+                rank: i,
+                rating: r.rating,
+                year: r.year,
+            }
         })
         .collect()
 }
@@ -510,7 +527,14 @@ mod tests {
     use std::sync::Arc;
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
-        TrendingItem { imdb: imdb.into(), moviedb: Some(42), title: title.into(), rank, rating: None, year: None }
+        TrendingItem {
+            imdb: imdb.into(),
+            moviedb: Some(42),
+            title: title.into(),
+            rank,
+            rating: None,
+            year: None,
+        }
     }
 
     struct Fake {
@@ -557,14 +581,25 @@ mod tests {
     }
     #[async_trait]
     impl TrendingSource for Fake {
-        async fn popular(&self, _p: &str, _o: ObjectType, _country: &str, _sort: &str) -> Result<Vec<TrendingItem>, ()> {
+        async fn popular(
+            &self,
+            _p: &str,
+            _o: ObjectType,
+            _country: &str,
+            _sort: &str,
+        ) -> Result<Vec<TrendingItem>, ()> {
             if self.popular_ok_first_only && self.calls.load(Ordering::SeqCst) > 0 {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 return Err(());
             }
             self.tracked(async { self.answer() }).await
         }
-        async fn new_titles(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
+        async fn new_titles(
+            &self,
+            _p: &str,
+            _o: ObjectType,
+            _country: &str,
+        ) -> Result<Vec<TrendingItem>, ()> {
             self.new_calls.fetch_add(1, Ordering::SeqCst);
             self.tracked(async { self.answer() }).await
         }
@@ -578,12 +613,7 @@ mod tests {
                 return Ok(Vec::new()); // asked, answered, this market carries nothing
             }
             let _t = self.tracked(async {}).await;
-            Ok(vec![
-                (8, "nfx".into()),
-                (119, "prv".into()),
-                (1899, "mxx".into()),
-                (531, "pmp".into()),
-            ])
+            Ok(vec![(8, "nfx".into()), (119, "prv".into()), (1899, "mxx".into()), (531, "pmp".into())])
         }
     }
 
@@ -663,7 +693,9 @@ mod tests {
     #[test]
     fn catalog_entries_cover_providers_and_trending() {
         let entries = catalog_entries(selected_providers());
-        assert!(entries.iter().any(|e| e.id == "jw-nfx" && e.type_ == "movie" && e.name == "Popular on Netflix"));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "jw-nfx" && e.type_ == "movie" && e.name == "Popular on Netflix"));
         assert!(entries.iter().any(|e| e.id == TRENDING_ID && e.type_ == "series"));
         // per type: N providers × (popular + new) + 1 trending
         let per_type = selected_providers().len() * 2 + 1;
@@ -675,13 +707,21 @@ mod tests {
         let entries = catalog_entries(selected_providers());
         // "New on Netflix" is derived from "Popular on Netflix" — adding a service needs only its
         // PROVIDERS row, no second name to keep in sync.
-        assert!(entries.iter().any(|e| e.id == "jw-nfx-new" && e.type_ == "movie" && e.name == "New on Netflix"));
-        assert!(entries.iter().any(|e| e.id == "jw-pmp-new" && e.type_ == "series" && e.name == "New on Paramount+"));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "jw-nfx-new" && e.type_ == "movie" && e.name == "New on Netflix"));
+        assert!(entries
+            .iter()
+            .any(|e| e.id == "jw-pmp-new" && e.type_ == "series" && e.name == "New on Paramount+"));
         // Every provider gets both rows, for both types.
         for p in selected_providers() {
             for t in STREMIO_TYPES {
                 assert!(entries.iter().any(|e| e.id == p.id && e.type_ == t), "missing popular {} {t}", p.id);
-                assert!(entries.iter().any(|e| e.id == new_catalog_id(p) && e.type_ == t), "missing new {} {t}", p.id);
+                assert!(
+                    entries.iter().any(|e| e.id == new_catalog_id(p) && e.type_ == t),
+                    "missing new {} {t}",
+                    p.id
+                );
             }
         }
     }
@@ -804,11 +844,7 @@ mod tests {
 
         // Never a guessed code: JustWatch does not reject one it doesn't know, it returns the
         // country's whole chart, so a guess publishes everything under one service's name.
-        assert_eq!(
-            fake.calls.load(Ordering::SeqCst),
-            0,
-            "an unresolved code was sent upstream anyway"
-        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0, "an unresolved code was sent upstream anyway");
         // ...and it degrades rather than 404ing a catalog the manifest advertises — the manifest
         // promises the row, and a lookup we could not make is a refresh failure, not a missing route.
         let r = r.expect("an advertised row must not 404 because the upstream was unreachable");
@@ -859,11 +895,7 @@ mod tests {
         assert!(!s.fresh(), "/health stayed green while providers failed");
         // The BODY, not just the flags: asserting is_some()/!fresh/cache_len alone passed even when
         // the "served" partial was an empty list — which is the thing the name promises it is not.
-        assert!(
-            r.body.contains("tt1"),
-            "a partial union was served as an empty row: {}",
-            r.body
-        );
+        assert!(r.body.contains("tt1"), "a partial union was served as an empty row: {}", r.body);
         // Not cached: the next request must re-check rather than serve a pinned partial.
         assert_eq!(s.cache_len(), 0, "a partial union was pinned in the cache");
     }
@@ -947,10 +979,7 @@ mod tests {
         // goalpost, so raising the cap to 100_000 — removing the protection that exists because
         // this host was 403'd — passed every test. The literal has to be the cap itself, too: at
         // `<= 16` a doubling of the concurrency against that same host still passed both of these.
-        assert!(
-            peak <= 8,
-            "{peak} simultaneous upstream calls — the process-wide cap is not holding"
-        );
+        assert!(peak <= 8, "{peak} simultaneous upstream calls — the process-wide cap is not holding");
     }
 
     /// A cold burst must end with every row COMPLETE and CACHED. Capping upstream concurrency is
@@ -972,8 +1001,7 @@ mod tests {
         let mut set = JoinSet::new();
         for i in 0..24 {
             let s = Arc::clone(&s);
-            let country =
-                format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            let country = format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
             set.spawn(async move {
                 s.metas_json(TRENDING_ID, "movie", &country, selected_providers())
                     .await
@@ -1008,8 +1036,7 @@ mod tests {
         let mut set = JoinSet::new();
         for i in 0..24 {
             let s = Arc::clone(&s);
-            let country =
-                format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            let country = format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
             set.spawn(async move {
                 let _ = s.metas_json("jw-nfx-new", "movie", &country, selected_providers()).await;
                 let _ = s.metas_json("jw-nfx", "movie", &country, selected_providers()).await;

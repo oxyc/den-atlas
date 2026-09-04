@@ -113,10 +113,8 @@ impl Dataset {
     /// a misconfigured deploy should not serve half a dataset.
     pub fn load(dir: &Path) -> Result<Dataset, String> {
         let meta_path = dir.join("dataset.meta.json");
-        let raw = std::fs::read(&meta_path)
-            .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
-        let meta: Meta = serde_json::from_slice(&raw)
-            .map_err(|e| format!("parse dataset.meta.json: {e}"))?;
+        let raw = std::fs::read(&meta_path).map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+        let meta: Meta = serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
 
         let labels = resolve_blob(
             dir,
@@ -143,8 +141,12 @@ impl Dataset {
         };
         // DT-H premise index — resolved only when the meta fully declares BOTH blobs (labels + vectors).
         let (premise_labels, premise_vectors) = match (
-            &meta.premise_labels_file, &meta.premise_labels_sha256, meta.premise_labels_bytes,
-            &meta.premise_vectors_file, &meta.premise_vectors_sha256, meta.premise_vectors_bytes,
+            &meta.premise_labels_file,
+            &meta.premise_labels_sha256,
+            meta.premise_labels_bytes,
+            &meta.premise_vectors_file,
+            &meta.premise_vectors_sha256,
+            meta.premise_vectors_bytes,
         ) {
             (Some(lf), Some(ls), Some(lb), Some(vf), Some(vs), Some(vb)) => (
                 Some(resolve_blob(dir, lf, lb, ls, "application/json", None)?),
@@ -178,10 +180,7 @@ impl Dataset {
 fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(name);
     let mut parts = candidate.components();
-    let only = matches!(
-        (parts.next(), parts.next()),
-        (Some(std::path::Component::Normal(_)), None)
-    );
+    let only = matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
     if !only {
         return Err(format!("blob name {name:?} is not a plain file name"));
     }
@@ -204,9 +203,7 @@ fn resolve_blob(
     let path = safe_blob_path(dir, name)?;
     // Use the on-disk length, not the meta's declared size: if a refreshed/stale meta disagrees with the
     // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
-    let actual = std::fs::metadata(&path)
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len();
+    let actual = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?.len();
     if actual != size {
         eprintln!(
             "den-atlas: {} is {actual} bytes but meta declares {size} — using the on-disk size",
@@ -233,14 +230,7 @@ fn resolve_blob(
         },
         None => None,
     };
-    Ok(Blob {
-        name: name.to_owned(),
-        path,
-        size: actual,
-        sha256: sha256.to_owned(),
-        content_type,
-        gz,
-    })
+    Ok(Blob { name: name.to_owned(), path, size: actual, sha256: sha256.to_owned(), content_type, gz })
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
       - name: Tests
@@ -39,9 +39,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # No `cargo fmt --check`: there is no rustfmt.toml and the file style is wider than rustfmt's
-      # default, so the gate would fail on the first run and reformat the whole codebase to pass.
-      # Adopting rustfmt is a deliberate change, not something to smuggle in with a CI workflow.
+      # rustfmt.toml is tuned to how this codebase was already written (see the comments there), so
+      # this gate holds the existing style rather than imposing a new one.
+      - name: Formatting
+        run: cargo fmt --check
 
       # The catalog talks to JustWatch over the network at runtime, and an audit probe once put
       # enough load on it to earn the host a 403. Nothing in CI should reach it.

@@ -55,12 +55,7 @@ pub fn public_origin(headers: &HeaderMap, override_base: Option<&str>) -> String
     // attacker-chosen name passes it — so the response must also name these headers in Vary, or a
     // shared cache hands one requester's origin to everyone.
     let host = first("x-forwarded-host")
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_owned())
-        })
+        .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(|s| s.to_owned()))
         .filter(|h| is_sane_host(h))
         .unwrap_or_else(|| "localhost".to_owned());
     format!("{proto}://{host}")
@@ -92,11 +87,7 @@ mod tests {
         assert_eq!(origin("HTTPS"), "https://atlas.local", "a title-cased header downgraded to plaintext");
         assert_eq!(origin("http"), "http://atlas.local");
         for hostile in ["https://evil.example/pwn?x=", "javascript:", "://", "https evil"] {
-            assert_eq!(
-                origin(hostile),
-                "http://atlas.local",
-                "{hostile:?} reached the advertised blob URLs"
-            );
+            assert_eq!(origin(hostile), "http://atlas.local", "{hostile:?} reached the advertised blob URLs");
         }
     }
 }

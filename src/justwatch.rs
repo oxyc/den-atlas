@@ -52,11 +52,22 @@ pub struct TrendingItem {
 pub trait TrendingSource: Send + Sync {
     /// `sort` is JustWatch's `PopularTitlesSorting` (e.g. "POPULAR" for the "Popular on <service>" rows,
     /// "TRENDING" for the aggregated "Trending Everywhere" chart) — the two rank very differently.
-    async fn popular(&self, provider: &str, obj: ObjectType, country: &str, sort: &str) -> Result<Vec<TrendingItem>, ()>;
+    async fn popular(
+        &self,
+        provider: &str,
+        obj: ObjectType,
+        country: &str,
+        sort: &str,
+    ) -> Result<Vec<TrendingItem>, ()>;
 
     /// Titles **newly added to a service**, most recently added first. This is the one signal TMDB cannot
     /// provide at all (it carries no added-date and no such sort), so it only exists on this path.
-    async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()>;
+    async fn new_titles(
+        &self,
+        provider: &str,
+        obj: ObjectType,
+        country: &str,
+    ) -> Result<Vec<TrendingItem>, ()>;
 
     /// The services a country actually has, as `packageId -> shortName`.
     ///
@@ -263,7 +274,9 @@ fn schema_break_warning(label: &str, body: &str, chart: &Chart) -> Option<String
         return None;
     }
     if !chart.present {
-        return Some(format!("den-atlas: justwatch {label} returned no popularTitles node — possible schema change"));
+        return Some(format!(
+            "den-atlas: justwatch {label} returned no popularTitles node — possible schema change"
+        ));
     }
     // An empty chart is an answer, so say nothing: `0 of 0` is not a shortfall, and the previous
     // form of this check reported it as one on every cold fetch for any row a provider genuinely
@@ -467,18 +480,18 @@ fn graphql_error(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let errors = v.get("errors")?.as_array()?;
     let first = errors.first()?;
-    Some(
-        first
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unspecified")
-            .to_string(),
-    )
+    Some(first.get("message").and_then(|m| m.as_str()).unwrap_or("unspecified").to_string())
 }
 
 #[async_trait]
 impl TrendingSource for JustWatchClient {
-    async fn popular(&self, provider: &str, obj: ObjectType, country: &str, sort: &str) -> Result<Vec<TrendingItem>, ()> {
+    async fn popular(
+        &self,
+        provider: &str,
+        obj: ObjectType,
+        country: &str,
+        sort: &str,
+    ) -> Result<Vec<TrendingItem>, ()> {
         let payload = serde_json::json!({
             "query": QUERY,
             "variables": {
@@ -512,7 +525,12 @@ impl TrendingSource for JustWatchClient {
         Ok(pkgs)
     }
 
-    async fn new_titles(&self, provider: &str, obj: ObjectType, country: &str) -> Result<Vec<TrendingItem>, ()> {
+    async fn new_titles(
+        &self,
+        provider: &str,
+        obj: ObjectType,
+        country: &str,
+    ) -> Result<Vec<TrendingItem>, ()> {
         let payload = serde_json::json!({
             "query": NEW_QUERY,
             "variables": {
@@ -611,8 +629,28 @@ mod tests {
     fn parses_ranks_and_carries_tmdb_rating_and_year() {
         let items = parse_popular(FIXTURE).items;
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
-        assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0, rating: Some(7.4), year: Some(1999) });
-        assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1, rating: None, year: None });
+        assert_eq!(
+            items[0],
+            TrendingItem {
+                imdb: "tt0000001".into(),
+                moviedb: Some(1397385),
+                title: "Alpha".into(),
+                rank: 0,
+                rating: Some(7.4),
+                year: Some(1999)
+            }
+        );
+        assert_eq!(
+            items[1],
+            TrendingItem {
+                imdb: "tt0000002".into(),
+                moviedb: None,
+                title: "Beta".into(),
+                rank: 1,
+                rating: None,
+                year: None
+            }
+        );
     }
 
     /// A card with no name is not a card. Skipping a bad edge rather than failing the document is
@@ -673,7 +711,10 @@ mod tests {
         assert!(why.contains("locale"), "the log line must name the cause: {why}");
 
         // Errors beside partial data are still a failure — a partial chart is not a chart.
-        assert!(graphql_error(r#"{"errors":[{"message":"rate limited"}],"data":{"popularTitles":{"edges":[]}}}"#).is_some());
+        assert!(graphql_error(
+            r#"{"errors":[{"message":"rate limited"}],"data":{"popularTitles":{"edges":[]}}}"#
+        )
+        .is_some());
 
         // ...and a genuinely empty chart is NOT an error.
         assert!(graphql_error(r#"{"data":{"popularTitles":{"edges":[]}}}"#).is_none());
@@ -708,9 +749,13 @@ mod tests {
             edges.push(if i < bad {
                 match how {
                     // No `en` localisation for this country — routine, and documented as such.
-                    "no_title" => format!(r#"{{"node":{{"content":{{"title":"","externalIds":{{"imdbId":"{id}"}}}}}}}}"#),
+                    "no_title" => format!(
+                        r#"{{"node":{{"content":{{"title":"","externalIds":{{"imdbId":"{id}"}}}}}}}}"#
+                    ),
                     // A rename under externalIds: parseable, but every affected row loses its id.
-                    _ => format!(r#"{{"node":{{"content":{{"title":"T{i}","external_ids":{{"imdbId":"{id}"}}}}}}}}"#),
+                    _ => format!(
+                        r#"{{"node":{{"content":{{"title":"T{i}","external_ids":{{"imdbId":"{id}"}}}}}}}}"#
+                    ),
                 }
             } else {
                 format!(r#"{{"node":{{"content":{{"title":"T{i}","externalIds":{{"imdbId":"{id}"}}}}}}}}"#)
@@ -770,7 +815,9 @@ mod tests {
 
         // The node itself gone — a rename, or a 200 carrying `data: null` — is the break the
         // zero-items check was originally there to catch, and it must survive the change above.
-        for missing in [r#"{"data":null}"#, r#"{"data":{}}"#, r#"{"data":{"popular":{"edges":[]}}}"#, "not json"] {
+        for missing in
+            [r#"{"data":null}"#, r#"{"data":{}}"#, r#"{"data":{"popular":{"edges":[]}}}"#, "not json"]
+        {
             let chart = parse_popular(missing);
             assert!(!chart.present, "{missing} looked like a present chart");
             let w = schema_break_warning("nfx/MOVIE", missing, &chart)

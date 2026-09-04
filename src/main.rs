@@ -155,20 +155,13 @@ async fn main() {
         embed,
     });
 
-    let app = axum::Router::new()
-        .fallback(handler::handle)
-        .with_state(Arc::clone(&state));
+    let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("den-atlas: bind :{port} failed: {e}");
-            std::process::exit(1);
-        });
+    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
+        eprintln!("den-atlas: bind :{port} failed: {e}");
+        std::process::exit(1);
+    });
     match &state.dataset {
         Some(ds) => eprintln!(
             "den-atlas listening on :{port} — {} titles ({}/{})",

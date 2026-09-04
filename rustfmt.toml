@@ -1,0 +1,12 @@
+# Chosen to match how this codebase was already written, so adopting the formatter is a one-time
+# mechanical pass rather than a restyle.
+#
+# max_width 110 — the existing p99 line is 114 chars, and rustfmt's default 100 would have rewrapped
+# ~1400 lines. 110 wraps the genuine outliers and leaves the rest alone.
+edition = "2021"
+max_width = 110
+
+# Keep short structs, calls and matches on one line instead of exploding them. rustfmt's default
+# ("Default") caps struct literals at 18% of max_width — 19 chars — which turns the PROVIDERS table
+# into forty lines of one field each and destroys the thing that makes it readable as a table.
+use_small_heuristics = "Max"
