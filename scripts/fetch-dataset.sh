@@ -103,7 +103,7 @@ EOF
 # past it with an eprintln, and `docker build` bakes that in. deploy/atlas-dataset-sync.sh has always
 # taken the other policy for the same situation: keep last-good and retry.
 [ -z "$MISSING" ] || {
-  echo "release declares blobs that are not published:$MISSING — half-published, refusing, ./data untouched" >&2
+  echo "release declares blobs that are missing or not ready:$MISSING — refusing, ./data untouched" >&2
   exit 1
 }
 

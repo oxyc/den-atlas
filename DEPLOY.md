@@ -5,7 +5,7 @@ terminates TLS. The Den app needs an **https** URL (or a LAN/private-range host 
 
 ## 1. Fetch the dataset
 The blobs are gitignored — fetch the published artifact from the [den-dataset](https://github.com/oxyc/den-dataset)
-`data-latest` release into `./data` (anonymous; needs only curl + python3):
+`data-latest` release into `./data` (anonymous; needs curl, python3 and shasum):
 ```sh
 scripts/fetch-dataset.sh
 ```
