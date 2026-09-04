@@ -5,8 +5,8 @@
 #
 #   scripts/fetch-dataset.sh          # populates ./data for `cargo run` or a data-included `docker build`
 #
-# Anonymous (public repo) — needs only curl + python3, no `gh`/token. The server reads sha256/size/gzip from
-# dataset.meta.json (no startup hashing), so all four assets are fetched.
+# Anonymous (public repo) — needs curl, python3 and shasum, no `gh`/token. The server reads sha256/size/gzip
+# from dataset.meta.json and does NOT hash at startup, so this verifies every blob before it lands.
 set -euo pipefail
 
 REPO="${DEN_DATASET_REPO:-oxyc/den-dataset}"
@@ -98,7 +98,14 @@ EOF
   echo "release declares required blobs that are not published:$FATAL — refusing, ./data untouched" >&2
   exit 1
 }
-[ -z "$MISSING" ] || echo "declared but not in the release, skipping:$MISSING" >&2
+# A declared blob that 404s means a half-published release, not an optional extra. Skipping it and then
+# laying down the new manifest anyway left ./data declaring a file it does not have — den-atlas degrades
+# past it with an eprintln, and `docker build` bakes that in. deploy/atlas-dataset-sync.sh has always
+# taken the other policy for the same situation: keep last-good and retry.
+[ -z "$MISSING" ] || {
+  echo "release declares blobs that are not published:$MISSING — half-published, refusing, ./data untouched" >&2
+  exit 1
+}
 
 # Newline-delimited via a redirect, so a name is never word-split or glob-expanded and `set -e` can
 # still abort the script (a pipe would put this loop in a subshell).

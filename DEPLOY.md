@@ -9,7 +9,9 @@ The blobs are gitignored — fetch the published artifact from the [den-dataset]
 ```sh
 scripts/fetch-dataset.sh
 ```
-This downloads `labels-t01.json`, `vectors-e02.bin`, `labels-t01.json.gz`, and `dataset.meta.json` (per-blob
+This downloads every blob `dataset.meta.json` declares — currently `labels-t02.json`, `vectors-bge-m3.bin`,
+`labels-t02.json.gz`, the poster sidecar `metadata-<datasetVersion>.json`, the premise index and
+`facets.bin` — plus the manifest itself (per-blob
 sha256/size + `datasetVersion` + HTTP-date). The Rust server reads all of that — it never hashes or compresses
 at boot. **den-dataset's `finalize` + `publish-dataset.sh` is the source of truth** (not the Den repo);
 re-run this to refresh after a new dataset release.
