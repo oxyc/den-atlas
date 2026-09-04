@@ -1,0 +1,69 @@
+name: ci
+
+# Tests, lints and the release build, on every push and PR. Until now the only workflow here was
+# publish.yml, which builds an image on a v* tag — so a tagged release was the first thing that ever
+# compiled the code on anything but a developer's machine, and the test suite ran only when someone
+# remembered to type the command. Several rounds of audit findings were guarded solely by tests that
+# nothing executed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --locked
+
+      # Denied, not reported. The lint set here is small and the codebase is clean, so a new warning
+      # is a real signal rather than background noise to scroll past.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # No `cargo fmt --check`: there is no rustfmt.toml and the file style is wider than rustfmt's
+      # default, so the gate would fail on the first run and reformat the whole codebase to pass.
+      # Adopting rustfmt is a deliberate change, not something to smuggle in with a CI workflow.
+
+      # The catalog talks to JustWatch over the network at runtime, and an audit probe once put
+      # enough load on it to earn the host a 403. Nothing in CI should reach it: the tests all use
+      # a local fake or an injected endpoint, and this fails the build if that ever stops being true.
+      - name: No test reaches apis.justwatch.com
+        run: |
+          if grep -rn "apis\.justwatch\.com" src/ --include='*.rs' | grep -v '^src/justwatch.rs:.*const ENDPOINT'; then
+            echo "::error::a test or non-ENDPOINT site references the live JustWatch host"
+            exit 1
+          fi
+          echo "ok — the live host appears only as ENDPOINT"
+
+  # The image is what actually ships, and it builds differently from `cargo build` (musl target,
+  # scratch base). Catching a Dockerfile break here rather than at `git tag` time.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

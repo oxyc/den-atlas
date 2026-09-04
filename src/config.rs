@@ -5,6 +5,7 @@
 //!     ISO-3166 alpha-2 code (a fixed country for this install).
 //!   - `codes`  = JustWatch provider short-codes joined by `-` (e.g. `nfx-mxx-dnp`). Empty = no catalog
 //!     rows (the "most popular" feature is off for this install).
+//!
 //! An absent or unparseable segment falls back to the operator default (env `JW_COUNTRY`/`JW_PROVIDERS`).
 
 use crate::catalog::{provider_by_code, selected_providers, Provider};

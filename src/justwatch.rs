@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Stremio content type ↔ JustWatch objectType.
@@ -106,6 +107,11 @@ pub struct JustWatchClient {
     /// Always ENDPOINT in production; a test points it at a local socket so the 200-with-errors
     /// path can be exercised against a real response rather than asserted on a helper in isolation.
     endpoint: String,
+    /// How many charts have come back looking like a schema break. The warning is a log line, and a
+    /// log line cannot be asserted on — so testing the predicate alone left the CALL SITE free to
+    /// drop it, which is the failure this file already documents for `graphql_error`. Counting makes
+    /// the decision observable at the place it is actually made.
+    suspected_schema_breaks: AtomicUsize,
 }
 
 impl JustWatchClient {
@@ -116,7 +122,12 @@ impl JustWatchClient {
             .build()
             .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
             .ok();
-        Self { http, endpoint: ENDPOINT.to_string() }
+        Self { http, endpoint: ENDPOINT.to_string(), suspected_schema_breaks: AtomicUsize::new(0) }
+    }
+
+    #[cfg(test)]
+    fn suspected_schema_breaks(&self) -> usize {
+        self.suspected_schema_breaks.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -181,32 +192,36 @@ struct Scoring {
     imdb_score: Option<f64>,
 }
 
+/// A parsed chart: the usable items, plus how many edges the document actually carried.
+///
+/// The edge count is what makes a PARTIAL schema change visible. Dropping a bad edge rather than
+/// failing the whole document is right, but a half-length row is then cached as complete for the
+/// full TTL, served with a long max-age, and /health stays green — so the shortfall has no other
+/// way to surface. Counting only the specific shapes we know about does not work: a rename under
+/// `externalIds` drops every edge through the ordinary no-IMDb-id path, which is indistinguishable
+/// from the routine case. The ratio catches any of them, including ones not thought of here.
+pub struct Chart {
+    pub items: Vec<TrendingItem>,
+    /// Edges present before any were dropped.
+    pub edges: usize,
+}
+
 /// Parse a GraphQL response body into ranked items, dropping anything without a valid IMDb id (it
 /// couldn't be resolved by Cinemeta/other addons). Never panics; a malformed body → empty list.
-pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
+pub fn parse_popular(body: &str) -> Chart {
     let resp: GqlResp = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(_) => return Chart { items: Vec::new(), edges: 0 },
     };
     let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
     let total = edges.len();
-    // Edges dropped because their SHAPE was wrong, counted separately from the ones dropped for
-    // lacking an IMDb id — which is routine and says nothing. Skipping a bad edge instead of failing
-    // the document is right, but silently is not: a half-length row is cached as complete for the
-    // full TTL and served with a long max-age, and /health stays green, so a partial schema change
-    // has no other way to surface. Only the whole-document case tripped the caller's 0-items log.
-    let mut malformed = 0usize;
     let mut out = Vec::with_capacity(total);
     for e in edges {
-        let Some(content) = e.node.content else {
-            malformed += 1;
-            continue;
-        };
+        let Some(content) = e.node.content else { continue };
         // A present-but-empty title is as unusable as a missing one — it renders as a nameless card.
-        let Some(title) = content.title.filter(|t| !t.trim().is_empty()) else {
-            malformed += 1;
-            continue;
-        };
+        // Not a schema signal on its own: this file documents `""` as what JustWatch sends for a
+        // title with no localisation in that country, which is routine in a non-English market.
+        let Some(title) = content.title.filter(|t| !t.trim().is_empty()) else { continue };
         let ext = content.external_ids;
         let imdb = match ext.as_ref().and_then(|x| x.imdb_id.clone()) {
             Some(id) if is_imdb(&id) => id,
@@ -218,10 +233,32 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
         let rank = out.len();
         out.push(TrendingItem { imdb, moviedb, title, rank, rating, year });
     }
-    if malformed > 0 {
-        eprintln!("den-atlas: justwatch popularTitles dropped {malformed} of {total} edges with no usable content/title — possible schema change");
+    Chart { items: out, edges: total }
+}
+
+/// The warning to print when a chart looks like a schema break rather than an ordinary chart, or
+/// `None` when it looks normal.
+///
+/// A non-empty body yielding zero usable items is the classic signal (it would otherwise serve empty
+/// rows forever). Most of a chart going missing is the same signal arriving one edge at a time: a
+/// rename under `externalIds` leaves the document parseable and every row short, and no count of
+/// specific known-bad shapes sees it, because those edges drop through the ordinary no-IMDb-id path.
+/// A ratio catches any shortfall, including shapes not thought of here.
+///
+/// Half is well clear of the routine drop rate — titles with no resolvable IMDb id are a small
+/// minority of any real chart — so this stays quiet in normal operation, which is the whole point of
+/// it. Dropping a few titles that have no localisation in a given country is expected and says
+/// nothing; treating that as a schema alarm put a line on the hot path per provider per request, for
+/// a condition this file documents as normal.
+fn schema_break_warning(label: &str, body: &str, chart: &Chart) -> Option<String> {
+    if body.is_empty() || chart.items.len() * 2 >= chart.edges.max(1) {
+        return None;
     }
-    out
+    Some(format!(
+        "den-atlas: justwatch {label} yielded {} usable titles from {} edges — possible schema change",
+        chart.items.len(),
+        chart.edges
+    ))
 }
 
 /// Arrivals response. Defensive throughout (an addon reply is untrusted): every level optional, a malformed
@@ -437,13 +474,12 @@ impl TrendingSource for JustWatchClient {
         });
         let label = format!("{provider}/{}", obj.as_jw());
         let body = self.post_graphql(&payload, &label).await?;
-        let items = parse_popular(&body);
-        // A non-empty body that yields zero usable items is the signal of a breaking GraphQL schema change
-        // (it would otherwise silently serve empty rows forever).
-        if items.is_empty() && !body.is_empty() {
-            eprintln!("den-atlas: justwatch returned a non-empty body but 0 usable items ({label}) — possible schema change");
+        let chart = parse_popular(&body);
+        if let Some(w) = schema_break_warning(&label, &body, &chart) {
+            self.suspected_schema_breaks.fetch_add(1, Ordering::Relaxed);
+            eprintln!("{w}");
         }
-        Ok(items)
+        Ok(chart.items)
     }
 
     async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()> {
@@ -556,7 +592,7 @@ mod tests {
 
     #[test]
     fn parses_ranks_and_carries_tmdb_rating_and_year() {
-        let items = parse_popular(FIXTURE);
+        let items = parse_popular(FIXTURE).items;
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
         assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0, rating: Some(7.4), year: Some(1999) });
         assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1, rating: None, year: None });
@@ -575,7 +611,7 @@ mod tests {
             {"node":{"content":{"title":"   ","externalIds":{"imdbId":"tt0000003"}}}},
             {"node":{"content":{"title":"Real","externalIds":{"imdbId":"tt0000004"}}}}
         ]}}}"#;
-        let items = parse_popular(body);
+        let items = parse_popular(body).items;
         assert_eq!(items.len(), 1, "a nameless edge was shipped: {items:?}");
         assert_eq!(items[0].title, "Real");
         assert_eq!(items[0].rank, 0, "the surviving item did not take the top slot");
@@ -597,8 +633,8 @@ mod tests {
 
     #[test]
     fn malformed_body_is_empty_not_panic() {
-        assert!(parse_popular("not json").is_empty());
-        assert!(parse_popular(r#"{"data":null}"#).is_empty());
+        assert!(parse_popular("not json").items.is_empty());
+        assert!(parse_popular(r#"{"data":null}"#).items.is_empty());
     }
 
     #[test]
@@ -628,8 +664,9 @@ mod tests {
     }
 
     /// Serve one fixed HTTP 200 body on an ephemeral port, then close.
-    async fn serve_once(body: &'static str) -> String {
+    async fn serve_once(body: impl Into<String>) -> String {
         use tokio::io::AsyncWriteExt;
+        let body: String = body.into();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let head = format!(
@@ -644,6 +681,94 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Build a chart body of `n` edges, of which `bad` are broken in the way `how` says.
+    fn chart_body(n: usize, bad: usize, how: &str) -> String {
+        let mut edges = Vec::new();
+        for i in 0..n {
+            let id = format!("tt{:07}", i + 1);
+            edges.push(if i < bad {
+                match how {
+                    // No `en` localisation for this country — routine, and documented as such.
+                    "no_title" => format!(r#"{{"node":{{"content":{{"title":"","externalIds":{{"imdbId":"{id}"}}}}}}}}"#),
+                    // A rename under externalIds: parseable, but every affected row loses its id.
+                    _ => format!(r#"{{"node":{{"content":{{"title":"T{i}","external_ids":{{"imdbId":"{id}"}}}}}}}}"#),
+                }
+            } else {
+                format!(r#"{{"node":{{"content":{{"title":"T{i}","externalIds":{{"imdbId":"{id}"}}}}}}}}"#)
+            });
+        }
+        format!(r#"{{"data":{{"popularTitles":{{"edges":[{}]}}}}}}"#, edges.join(","))
+    }
+
+    /// The alarm has to stay silent on a healthy chart, or it is not an alarm. A few titles with no
+    /// localisation in a country is normal — treating it as a schema break put a line on the hot
+    /// path for every provider of every request in any non-English market.
+    #[test]
+    fn a_healthy_chart_raises_no_schema_warning() {
+        for how in ["no_title", "renamed"] {
+            let body = chart_body(100, 3, how);
+            let chart = parse_popular(&body);
+            assert_eq!(chart.edges, 100);
+            assert_eq!(chart.items.len(), 97, "{how}");
+            assert_eq!(
+                schema_break_warning("nfx/MOVIE", &body, &chart),
+                None,
+                "3 dropped titles out of 100 raised a schema alarm ({how})"
+            );
+        }
+    }
+
+    /// ...and it has to fire when most of the chart vanishes, whatever the shape of the break. A
+    /// rename under `externalIds` drops edges through the ORDINARY no-IMDb-id path, so counting
+    /// known-bad shapes never sees it; the row just comes back short, cached as complete for 6h,
+    /// served with an hour of max-age, /health green.
+    #[test]
+    fn a_chart_that_mostly_vanished_raises_one() {
+        let body = chart_body(100, 80, "renamed");
+        let chart = parse_popular(&body);
+        assert_eq!(chart.items.len(), 20);
+        let w = schema_break_warning("nfx/MOVIE", &body, &chart)
+            .expect("80 of 100 edges lost their id and nothing was reported");
+        assert!(w.contains("20 usable titles from 100 edges"), "{w}");
+        assert!(w.contains("nfx/MOVIE"), "the warning does not say which row: {w}");
+    }
+
+    /// A body that parses to nothing at all is the same signal, and was the only one before.
+    #[test]
+    fn a_non_empty_body_with_no_usable_items_raises_one() {
+        let body = r#"{"data":{"popularTitles":{"edges":[]}}}"#;
+        let chart = parse_popular(body);
+        assert!(schema_break_warning("nfx/MOVIE", body, &chart).is_some());
+        // An empty body is a transport failure, reported elsewhere; not a schema claim.
+        assert!(schema_break_warning("nfx/MOVIE", "", &chart).is_none());
+    }
+
+    /// End-to-end through `popular`, so the parse the warning reasons about is the real one: a
+    /// partial break still serves the surviving titles rather than failing the row.
+    #[tokio::test]
+    async fn a_partial_schema_break_still_serves_what_survived() {
+        let base = serve_once(chart_body(10, 8, "renamed")).await;
+        let c = JustWatchClient::with_endpoint(base);
+        let items = c.popular("nfx", ObjectType::Movie, "US", "POPULAR").await.expect("row should not fail");
+        assert_eq!(items.len(), 2, "a partial break should degrade, not empty the row");
+        assert_eq!(items[0].rank, 0, "ranks must stay contiguous after the drops");
+        assert_eq!(items[1].rank, 1);
+        // ...and the break was NOTICED. Asserting the predicate alone leaves the call site free to
+        // drop it — deleting the whole `if let` at the call site passed every other test here.
+        assert_eq!(c.suspected_schema_breaks(), 1, "the row came back gutted and nothing recorded it");
+    }
+
+    /// The counterpart: a healthy row must not register a break. Without this, a call site that
+    /// counted unconditionally would satisfy the test above.
+    #[tokio::test]
+    async fn a_healthy_row_records_no_schema_break() {
+        let base = serve_once(chart_body(10, 1, "no_title")).await;
+        let c = JustWatchClient::with_endpoint(base);
+        let items = c.popular("nfx", ObjectType::Movie, "US", "POPULAR").await.expect("row should not fail");
+        assert_eq!(items.len(), 9);
+        assert_eq!(c.suspected_schema_breaks(), 0, "a normal row was reported as a schema break");
     }
 
     /// End-to-end, against a real 200 carrying GraphQL errors: `popular` must report failure, not an

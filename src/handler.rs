@@ -519,23 +519,33 @@ mod tests {
         for u in &urls {
             assert!(u.contains("?v=v9"), "an advertised URL is unversioned: {u} (all: {urls:?})");
         }
-        // WHICH blob each URL points at, not just that six of them are stamped. Pointing the premise
-        // labels entry at the vectors blob kept the count and the stamps intact and passed.
-        let mut names: Vec<&str> =
-            urls.iter().map(|u| u.rsplit('/').next().unwrap_or(u).split('?').next().unwrap_or(u)).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "facets.bin",
-                "labels.json",
-                "meta.json",
-                "premise-labels.json",
-                "premise-vectors.bin",
-                "vectors.bin"
-            ],
-            "the descriptor advertised the wrong URL for a blob: {urls:?}"
-        );
+        // WHICH blob each FIELD points at. Collecting the six names and sorting them destroys the
+        // binding that matters: transposing the premise labels/vectors entries — two adjacent,
+        // near-identical literals, the likeliest bug in that block — left the sorted set identical
+        // and passed. The sha and byte count travel with the URL, so they are checked together;
+        // a transposition moves all three.
+        let d: serde_json::Value = serde_json::from_str(&desc).expect("descriptor must be JSON");
+        for (path, name, sha, bytes) in [
+            (&["labels"][..], "labels.json", "a", 6u64),
+            (&["vectors"][..], "vectors.bin", "b", 8),
+            (&["metadata"][..], "meta.json", "c", 8),
+            (&["facets"][..], "facets.bin", "d", 6),
+            (&["premise", "labels"][..], "premise-labels.json", "e", 7),
+            (&["premise", "vectors"][..], "premise-vectors.bin", "f", 8),
+        ] {
+            let mut node = &d;
+            for k in path {
+                node = node.get(k).unwrap_or_else(|| panic!("descriptor has no {path:?}: {desc}"));
+            }
+            let url = node["url"].as_str().unwrap_or_default();
+            assert_eq!(
+                url,
+                format!("http://localhost/{name}?v=v9"),
+                "{path:?} advertises the wrong blob"
+            );
+            assert_eq!(node["sha256"].as_str().unwrap_or_default(), sha, "{path:?} carries the wrong sha");
+            assert_eq!(node["bytes"].as_u64().unwrap_or_default(), bytes, "{path:?} carries the wrong size");
+        }
         assert!(desc.contains("\"count\":1"), "{desc}");
 
         let _ = std::fs::remove_dir_all(&dir);

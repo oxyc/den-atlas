@@ -144,7 +144,7 @@ pub struct CatalogState {
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `country -> (packageId -> shortName)`. Both identifiers are per-country, so the local code for a
     /// provider has to be looked up rather than hardcoded. Cached because it changes on the order of months.
-    packages: Mutex<HashMap<String, Arc<Vec<(i64, String)>>>>,
+    packages: Mutex<HashMap<String, PackageList>>,
     // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
     // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
     // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
@@ -162,6 +162,10 @@ pub struct CatalogState {
 
 /// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
 /// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
+/// A country's services as JustWatch reports them: `(packageId, shortName)`, shared between the
+/// cache and every caller that resolves a provider for that country.
+type PackageList = Arc<Vec<(i64, String)>>;
+
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
 
 // The cap is the protection, not a tuning knob: raising it is what earned this host a 403. The
@@ -339,7 +343,7 @@ impl CatalogState {
     /// possible schema change. Caching it pinned the country dead for the process lifetime: 14
     /// provider rows 404ing from a manifest that advertises them, trending permanently stale, only a
     /// restart to clear it. So empties are not cached and not trusted.
-    async fn packages_for(&self, country: &str) -> Result<Arc<Vec<(i64, String)>>, ()> {
+    async fn packages_for(&self, country: &str) -> Result<PackageList, ()> {
         if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
             return Ok(m);
         }

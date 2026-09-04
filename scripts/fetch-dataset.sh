@@ -28,7 +28,10 @@ PY
 # but not for a shell, which expands it. Same guard as deploy/atlas-dataset-sync.sh.
 safe_name() {
   case "$1" in
-    "" | . | ..) return 1 ;;
+    # dataset.meta.json is this script's own working copy in data/: a release declaring it as a blob
+    # overwrites the meta mid-fetch and Dataset::load then fails outright. Kept in step with
+    # deploy/atlas-dataset-sync.sh, which reserves the same name (that claim had drifted).
+    "" | . | .. | dataset.meta.json) return 1 ;;
     *[!A-Za-z0-9._-]*) return 1 ;;
     -*) return 1 ;;
     *) return 0 ;;
