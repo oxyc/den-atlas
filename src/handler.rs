@@ -408,12 +408,20 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(dir.join("vectors.bin"), b"VECTORS!").unwrap();
+        // The OPTIONAL blobs too. With only the two mandatory ones the "every advertised URL is
+        // versioned" loop saw two URLs, so dropping the stamp from metadata/premise/facets — the
+        // four the production dataset actually ships — passed. Same for a route serving the wrong
+        // blob: only the covered routes were pinned.
+        std::fs::write(dir.join("meta.json"), b"METADATA").unwrap();
+        std::fs::write(dir.join("facets.bin"), b"FACETS").unwrap();
         std::fs::write(
             dir.join("dataset.meta.json"),
             br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
                  "quantization":"int8",
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b"}"#,
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                 "metadataFile":"meta.json","metadataBytes":8,"metadataSha256":"c",
+                 "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d"}"#,
         )
         .unwrap();
         crate::dataset::Dataset::load(dir).expect("fixture dataset must load")
@@ -450,6 +458,14 @@ mod tests {
         assert_eq!(vectors.status(), 200);
         assert_eq!(body_of(vectors).await, "VECTORS!", "the vectors route served another blob");
 
+        // ...and the optional blobs, whose routes were entirely uncovered.
+        let facets = get(&state, "/facets.bin").await;
+        assert_eq!(facets.status(), 200);
+        assert_eq!(body_of(facets).await, "FACETS", "the facets route served another blob");
+        let meta = get(&state, "/meta.json").await;
+        assert_eq!(meta.status(), 200);
+        assert_eq!(body_of(meta).await, "METADATA", "the metadata route served another blob");
+
         // `?v=<current version>` pins for a year; a bare request must revalidate instead.
         let pinned = get(&state, "/labels.json?v=v9").await;
         let cc = pinned.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
@@ -468,7 +484,7 @@ mod tests {
                 &rest[..rest.find('"').unwrap_or(0)]
             })
             .collect();
-        assert!(urls.len() >= 2, "the descriptor advertised almost nothing: {desc}");
+        assert!(urls.len() >= 4, "the descriptor advertised almost nothing: {desc}");
         for u in &urls {
             assert!(u.contains("?v=v9"), "an advertised URL is unversioned: {u} (all: {urls:?})");
         }
