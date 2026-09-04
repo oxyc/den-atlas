@@ -24,9 +24,13 @@ PY
 )
 # The names come from a release meta we do not control, and are used as `-o "data/$f"` — so
 # "../../../x" writes outside the repo. den-atlas rejects the same shapes when it loads them.
+# An allowlist: "not a path" is the right question for the server, where `*` is a legal file name,
+# but not for a shell, which expands it. Same guard as deploy/atlas-dataset-sync.sh.
 safe_name() {
   case "$1" in
-    "" | . | .. | */* | -*) return 1 ;;
+    "" | . | ..) return 1 ;;
+    *[!A-Za-z0-9._-]*) return 1 ;;
+    -*) return 1 ;;
     *) return 0 ;;
   esac
 }
