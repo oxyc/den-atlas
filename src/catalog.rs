@@ -160,12 +160,12 @@ pub struct CatalogState {
     upstream: Arc<tokio::sync::Semaphore>,
 }
 
-/// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
-/// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 /// A country's services as JustWatch reports them: `(packageId, shortName)`, shared between the
 /// cache and every caller that resolves a provider for that country.
 type PackageList = Arc<Vec<(i64, String)>>;
 
+/// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
+/// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
 
 // The cap is the protection, not a tuning knob: raising it is what earned this host a 403. The

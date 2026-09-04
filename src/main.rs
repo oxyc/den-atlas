@@ -30,6 +30,37 @@ pub struct AppState {
     pub embed: Option<EmbedProxy>,
 }
 
+/// A `TrendingSource` that answers nothing, so a test can never reach the network by accident.
+/// Every method fails the way a real upstream failure does, which is a state the catalog already
+/// degrades through.
+#[cfg(test)]
+struct OfflineSource;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl justwatch::TrendingSource for OfflineSource {
+    async fn popular(
+        &self,
+        _p: &str,
+        _o: justwatch::ObjectType,
+        _c: &str,
+        _s: &str,
+    ) -> Result<Vec<justwatch::TrendingItem>, ()> {
+        Err(())
+    }
+    async fn new_titles(
+        &self,
+        _p: &str,
+        _o: justwatch::ObjectType,
+        _c: &str,
+    ) -> Result<Vec<justwatch::TrendingItem>, ()> {
+        Err(())
+    }
+    async fn packages(&self, _c: &str) -> Result<Vec<(i64, String)>, ()> {
+        Err(())
+    }
+}
+
 #[cfg(test)]
 impl AppState {
     /// Minimal state for a route test: no embed proxy, no origin override, so the descriptor's URLs
@@ -38,8 +69,13 @@ impl AppState {
         AppState {
             dataset,
             public_base: None,
+            // An OFFLINE source, not a real client. `JustWatchClient::new()` here pointed every
+            // route test at apis.justwatch.com: any test that touched /catalog would have made
+            // live requests without naming the host anywhere, which is plausibly how an audit
+            // probe once earned this host a 403. Tests that need catalog data pass their own fake
+            // through `for_test_with_source`.
             catalog: catalog::CatalogState::new(
-                std::sync::Arc::new(justwatch::JustWatchClient::new()),
+                std::sync::Arc::new(OfflineSource),
                 std::time::Duration::from_secs(3600),
             ),
             default_country: "US".to_owned(),

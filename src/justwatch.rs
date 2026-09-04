@@ -202,6 +202,11 @@ struct Scoring {
 /// from the routine case. The ratio catches any of them, including ones not thought of here.
 pub struct Chart {
     pub items: Vec<TrendingItem>,
+    /// Whether the response carried a `popularTitles` node at all. An empty chart is a legitimate
+    /// answer — a provider may genuinely carry no movies in a small market — but a document with no
+    /// such node is the shape a rename or a `{"data":null}` produces, and those look identical once
+    /// both have collapsed to zero items.
+    pub present: bool,
     /// Edges present before any were dropped.
     pub edges: usize,
 }
@@ -211,9 +216,12 @@ pub struct Chart {
 pub fn parse_popular(body: &str) -> Chart {
     let resp: GqlResp = match serde_json::from_str(body) {
         Ok(r) => r,
-        Err(_) => return Chart { items: Vec::new(), edges: 0 },
+        Err(_) => return Chart { items: Vec::new(), present: false, edges: 0 },
     };
-    let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
+    let Some(popular) = resp.data.and_then(|d| d.popular) else {
+        return Chart { items: Vec::new(), present: false, edges: 0 };
+    };
+    let edges = popular.edges;
     let total = edges.len();
     let mut out = Vec::with_capacity(total);
     for e in edges {
@@ -233,7 +241,7 @@ pub fn parse_popular(body: &str) -> Chart {
         let rank = out.len();
         out.push(TrendingItem { imdb, moviedb, title, rank, rating, year });
     }
-    Chart { items: out, edges: total }
+    Chart { items: out, present: true, edges: total }
 }
 
 /// The warning to print when a chart looks like a schema break rather than an ordinary chart, or
@@ -251,7 +259,16 @@ pub fn parse_popular(body: &str) -> Chart {
 /// nothing; treating that as a schema alarm put a line on the hot path per provider per request, for
 /// a condition this file documents as normal.
 fn schema_break_warning(label: &str, body: &str, chart: &Chart) -> Option<String> {
-    if body.is_empty() || chart.items.len() * 2 >= chart.edges.max(1) {
+    if body.is_empty() {
+        return None;
+    }
+    if !chart.present {
+        return Some(format!("den-atlas: justwatch {label} returned no popularTitles node — possible schema change"));
+    }
+    // An empty chart is an answer, so say nothing: `0 of 0` is not a shortfall, and the previous
+    // form of this check reported it as one on every cold fetch for any row a provider genuinely
+    // has nothing in. The shortfall test only means anything once there are edges to fall short of.
+    if chart.edges == 0 || chart.items.len() * 2 >= chart.edges {
         return None;
     }
     Some(format!(
@@ -735,14 +752,52 @@ mod tests {
         assert!(w.contains("nfx/MOVIE"), "the warning does not say which row: {w}");
     }
 
-    /// A body that parses to nothing at all is the same signal, and was the only one before.
+    /// An empty chart is an ANSWER; a missing node is a break. Both collapse to zero items, and the
+    /// old check could not tell them apart — so a provider that genuinely carries nothing of that
+    /// type in a small market logged "possible schema change" on every cold fetch, forever, in a
+    /// line that read "0 usable titles from 0 edges". That is the condition this alarm exists to
+    /// not fire on.
     #[test]
-    fn a_non_empty_body_with_no_usable_items_raises_one() {
-        let body = r#"{"data":{"popularTitles":{"edges":[]}}}"#;
-        let chart = parse_popular(body);
-        assert!(schema_break_warning("nfx/MOVIE", body, &chart).is_some());
+    fn an_empty_chart_is_an_answer_but_a_missing_node_is_a_break() {
+        let empty = r#"{"data":{"popularTitles":{"edges":[]}}}"#;
+        let chart = parse_popular(empty);
+        assert!(chart.present, "an empty edge list is still a chart");
+        assert_eq!(
+            schema_break_warning("nfx/MOVIE", empty, &chart),
+            None,
+            "a genuinely empty row was reported as a schema change"
+        );
+
+        // The node itself gone — a rename, or a 200 carrying `data: null` — is the break the
+        // zero-items check was originally there to catch, and it must survive the change above.
+        for missing in [r#"{"data":null}"#, r#"{"data":{}}"#, r#"{"data":{"popular":{"edges":[]}}}"#, "not json"] {
+            let chart = parse_popular(missing);
+            assert!(!chart.present, "{missing} looked like a present chart");
+            let w = schema_break_warning("nfx/MOVIE", missing, &chart)
+                .unwrap_or_else(|| panic!("{missing} raised nothing"));
+            assert!(w.contains("no popularTitles node"), "{w}");
+        }
+
         // An empty body is a transport failure, reported elsewhere; not a schema claim.
-        assert!(schema_break_warning("nfx/MOVIE", "", &chart).is_none());
+        assert!(schema_break_warning("nfx/MOVIE", "", &parse_popular(empty)).is_none());
+    }
+
+    /// The threshold is "fewer than half", and both sides of that boundary are pinned — otherwise
+    /// the constant can be moved (2 → 3) with every other test still green.
+    #[test]
+    fn the_shortfall_threshold_sits_exactly_at_half() {
+        // Exactly half is fine; one below it is not.
+        let half = chart_body(10, 5, "renamed");
+        assert_eq!(
+            schema_break_warning("nfx/MOVIE", &half, &parse_popular(&half)),
+            None,
+            "exactly half the chart surviving must not alarm"
+        );
+        let under = chart_body(10, 6, "renamed");
+        assert!(
+            schema_break_warning("nfx/MOVIE", &under, &parse_popular(&under)).is_some(),
+            "4 of 10 surviving is a shortfall and must alarm"
+        );
     }
 
     /// End-to-end through `popular`, so the parse the warning reasons about is the real one: a
