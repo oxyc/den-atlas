@@ -141,6 +141,11 @@ pub struct CatalogState {
 }
 
 impl CatalogState {
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
     pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration) -> Self {
         Self {
             source,
@@ -174,7 +179,18 @@ impl CatalogState {
             return None; // unknown id, or not one of this install's selected providers
         }
 
-        let key = format!("jw:{}:{}:{}", country, catalog_id, stremio_type);
+        // The aggregate row is a union over THIS install's selected providers, so the selection is
+        // part of what the value is. Without it in the key, whichever install warmed the entry won
+        // for the whole TTL: a Netflix-only install's chart was served verbatim to someone who had
+        // picked four services, and vice versa — titles they cannot stream. Non-aggregate rows are
+        // already one provider, named by catalog_id, so they need nothing extra.
+        let key = if is_trending {
+            let mut codes: Vec<&str> = providers.iter().map(|p| p.code).collect();
+            codes.sort_unstable(); // selection is a set; order must not split the cache
+            format!("jw:{}:{}:{}:{}", country, catalog_id, stremio_type, codes.join(","))
+        } else {
+            format!("jw:{}:{}:{}", country, catalog_id, stremio_type)
+        };
         if let Lookup::Fresh(v) = self.cache.get(&key) {
             return Some(CatalogResponse { body: v, fresh: true });
         }
@@ -228,30 +244,33 @@ impl CatalogState {
         }
     }
 
-    /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. Providers are
-    /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` only when
-    /// every provider fetch failed (so the caller can serve stale/empty). Results are placed by provider
-    /// index to keep the dedupe representative deterministic regardless of completion order.
-    /// The country-local short code for a provider, or `None` when that country doesn't carry the service —
-    /// in which case its row is simply absent rather than empty-but-present.
-    async fn code_for(&self, provider: &Provider, country: &str) -> Option<String> {
-        let cached = { self.packages.lock().unwrap().get(country).cloned() };
-        let map = match cached {
-            Some(m) => m,
-            None => {
-                let fetched = Arc::new(self.source.packages(country).await.unwrap_or_default());
-                // An empty result (JustWatch down) is NOT cached — otherwise one outage blanks every row
-                // until restart.
-                if !fetched.is_empty() {
-                    self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
-                }
-                fetched
-            }
-        };
+    /// The country's package list, fetched at most once per call. An empty result (JustWatch down)
+    /// is NOT cached — otherwise one outage blanks every row until restart — so callers must resolve
+    /// it once and reuse it rather than per provider.
+    async fn packages_for(&self, country: &str) -> Arc<Vec<(i64, String)>> {
+        if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
+            return m;
+        }
+        let fetched = Arc::new(self.source.packages(country).await.unwrap_or_default());
+        if !fetched.is_empty() {
+            self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
+        }
+        fetched
+    }
+
+    /// The country-local short code for a provider, or `None` when that country doesn't carry the
+    /// service, or when we could not resolve the list — in which case its row is simply absent
+    /// rather than wrong.
+    fn code_in(&self, provider: &Provider, country: &str, map: &[(i64, String)]) -> Option<String> {
         if map.is_empty() {
-            // Couldn't resolve: fall back to the declared code so a lookup failure degrades to the old
-            // behaviour (right for most countries) instead of removing every row.
-            return Some(provider.code.to_owned());
+            // No row rather than a wrong one. The fallback used to send `provider.code` upstream
+            // unvalidated, and JustWatch does NOT reject a code it doesn't recognise — verified
+            // live: `packages:["bogus_xyz"]` returns the country's overall chart, byte-identical to
+            // sending no filter. So a stale or mistyped code published the whole country's chart
+            // under a service's name, and because that response is non-empty the "0 usable items"
+            // schema-change guard never fired. (prv/119 is already not the US Prime code.)
+            eprintln!("den-atlas: no package list for {country}; skipping {} rather than guessing", provider.code);
+            return None;
         }
         provider
             .package_ids
@@ -259,6 +278,17 @@ impl CatalogState {
             .find_map(|id| map.iter().find(|(pid, _)| pid == id).map(|(_, code)| code.clone()))
     }
 
+    /// One fetch, then resolve — the single-provider rows go through here too.
+    async fn code_for(&self, provider: &Provider, country: &str) -> Option<String> {
+        let map = self.packages_for(country).await;
+        self.code_in(provider, country, &map)
+    }
+
+    /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. Providers are
+    /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` when no
+    /// provider produced a list, so the caller can serve stale rather than publish an empty row.
+    /// Results are placed by provider index to keep the dedupe representative deterministic
+    /// regardless of completion order.
     async fn aggregate(
         &self,
         obj: ObjectType,
@@ -267,9 +297,15 @@ impl CatalogState {
     ) -> Option<Vec<TrendingItem>> {
         let mut slots: Vec<Option<Vec<TrendingItem>>> = vec![None; providers.len()];
         let mut set: JoinSet<(usize, Result<Vec<TrendingItem>, ()>)> = JoinSet::new();
+        // ONE package fetch for the whole aggregate. This was awaited per provider, and a failing
+        // lookup is deliberately not cached, so a JustWatch blip cost a full 8s timeout per provider
+        // serially — ~64s for the default seven, inside a single request with no server-side
+        // deadline, while every concurrent request for the key queued behind the single-flight gate
+        // and the client's retries each started another seven.
+        let map = self.packages_for(country).await;
         for (i, p) in providers.iter().enumerate() {
             let src = Arc::clone(&self.source);
-            let Some(code) = self.code_for(p, country).await else { continue };
+            let Some(code) = self.code_in(p, country, &map) else { continue };
             let country = country.to_owned();
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
             set.spawn(async move { (i, src.popular(&code, obj, &country, "TRENDING").await) });
@@ -364,6 +400,9 @@ mod tests {
         fail_after: usize, // Ok for the first `fail_after` calls, then Err
         /// Records which arm the router picked, so a test can prove "-new" reaches `new_titles`.
         new_calls: AtomicUsize,
+        /// Fail the package lookup, and count how often it is asked.
+        no_packages: bool,
+        package_calls: AtomicUsize,
     }
     impl Fake {
         fn answer(&self) -> Result<Vec<TrendingItem>, ()> {
@@ -386,6 +425,10 @@ mod tests {
         }
         /// Mirrors a real country list: Prime is 119 here (as in UY/FI), never 9.
         async fn packages(&self, _country: &str) -> Result<Vec<(i64, String)>, ()> {
+            self.package_calls.fetch_add(1, Ordering::SeqCst);
+            if self.no_packages {
+                return Err(());
+            }
             Ok(vec![
                 (8, "nfx".into()),
                 (119, "prv".into()),
@@ -396,7 +439,18 @@ mod tests {
     }
 
     fn state(data: Vec<TrendingItem>, ttl: Duration, fail_after: usize) -> CatalogState {
-        CatalogState::new(Arc::new(Fake { data, calls: AtomicUsize::new(0), fail_after, new_calls: AtomicUsize::new(0) }), ttl)
+        CatalogState::new(Arc::new(fake(data, fail_after, false)), ttl)
+    }
+
+    fn fake(data: Vec<TrendingItem>, fail_after: usize, no_packages: bool) -> Fake {
+        Fake {
+            data,
+            calls: AtomicUsize::new(0),
+            fail_after,
+            new_calls: AtomicUsize::new(0),
+            no_packages,
+            package_calls: AtomicUsize::new(0),
+        }
     }
 
     #[tokio::test]
@@ -484,6 +538,8 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_after: 9,
             new_calls: AtomicUsize::new(0),
+            no_packages: false,
+            package_calls: AtomicUsize::new(0),
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // SkyShowtime (1773) isn't in the stub's country list — the row is absent, not empty-but-present,
@@ -512,6 +568,8 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_after: 9,
             new_calls: AtomicUsize::new(0),
+            no_packages: false,
+            package_calls: AtomicUsize::new(0),
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // The arrivals row must not silently serve the Popular chart — that would look plausible and be wrong.
@@ -526,5 +584,64 @@ mod tests {
     #[test]
     fn empty_provider_set_yields_no_catalog_entries() {
         assert!(catalog_entries(&[]).is_empty());
+    }
+
+    /// The aggregate row is a union over the install's OWN provider selection, so the selection is
+    /// part of what the value is. Without it in the key, whichever install warmed the entry won for
+    /// the whole 6h TTL: a Netflix-only chart was served verbatim to someone who picked four
+    /// services, and a four-service chart to someone who picked one — titles they cannot stream.
+    #[tokio::test]
+    async fn the_aggregate_row_is_keyed_by_the_install_s_providers() {
+        let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), usize::MAX);
+        let one: Vec<&'static Provider> = vec![provider_by_code("nfx").unwrap()];
+        let two: Vec<&'static Provider> =
+            vec![provider_by_code("nfx").unwrap(), provider_by_code("mxx").unwrap()];
+
+        let a = s.metas_json(TRENDING_ID, "movie", "US", &one).await.unwrap();
+        let b = s.metas_json(TRENDING_ID, "movie", "US", &two).await.unwrap();
+        assert!(a.fresh && b.fresh);
+        // The fake returns the same rows either way, so prove it by the upstream call count: a
+        // shared key would have served the first install's body without asking again.
+        assert!(
+            s.cache_len() >= 2,
+            "one install's Trending row was served to an install with a different selection"
+        );
+
+        // ...and the selection is a SET: order must not split the cache into duplicates.
+        let reordered: Vec<&'static Provider> =
+            vec![provider_by_code("mxx").unwrap(), provider_by_code("nfx").unwrap()];
+        let before = s.cache_len();
+        let c = s.metas_json(TRENDING_ID, "movie", "US", &reordered).await.unwrap();
+        assert!(c.fresh);
+        assert_eq!(s.cache_len(), before, "reordering the same selection split the cache");
+    }
+
+    /// A package lookup that fails must not send an unvalidated code upstream. JustWatch does not
+    /// reject a code it doesn't recognise — it returns the country's whole chart — so guessing
+    /// published everything under one service's name, and the non-empty response meant the
+    /// "0 usable items" schema-change guard never fired either.
+    #[tokio::test]
+    async fn an_unresolvable_provider_is_skipped_rather_than_guessed() {
+        let fake = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
+        assert!(
+            s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.is_none(),
+            "a guessed code would have published the country's whole chart as a Netflix row"
+        );
+    }
+
+    /// The package list is fetched once per aggregate, not once per provider. A failing lookup is
+    /// deliberately not cached, so awaiting it per provider cost a full upstream timeout each,
+    /// serially — ~64s for the default seven, inside one request with no server-side deadline.
+    #[tokio::test]
+    async fn the_aggregate_resolves_packages_once() {
+        let fake = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
+        let _ = s.metas_json(TRENDING_ID, "movie", "US", selected_providers()).await;
+        assert_eq!(
+            fake.package_calls.load(Ordering::SeqCst),
+            1,
+            "one failing package lookup per provider, serially, is a per-request timeout multiplier"
+        );
     }
 }

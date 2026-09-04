@@ -29,6 +29,8 @@ pub struct Servable {
     pub identity: Payload,
     /// Precomputed gzip body + its size (only where compression pays — the labels JSON).
     pub gzip: Option<(Payload, u64)>,
+    /// The body embeds the request's forwarded host/scheme, so a shared cache must key on them.
+    pub vary_on_origin: bool,
 }
 
 pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Response {
@@ -52,8 +54,18 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         ("accept-ranges", "bytes".to_owned()),
     ];
     // `Vary` only when a gzip variant exists — else a CDN split-caches the identical identity blob per AE.
+    // The forwarded host/scheme are added by the caller for bodies that EMBED them (the descriptor's
+    // absolute blob URLs), because those are unkeyed request inputs a shared cache would otherwise
+    // ignore, handing one requester's chosen origin to everyone under the plain URL.
+    let mut vary: Vec<&str> = Vec::new();
     if s.gzip.is_some() {
-        base.push(("vary", "Accept-Encoding".to_owned()));
+        vary.push("Accept-Encoding");
+    }
+    if s.vary_on_origin {
+        vary.extend(["X-Forwarded-Host", "X-Forwarded-Proto", "Host"]);
+    }
+    if !vary.is_empty() {
+        base.push(("vary", vary.join(", ")));
     }
     if let Some(lm) = &s.last_modified {
         base.push(("last-modified", lm.clone()));
@@ -272,6 +284,7 @@ mod tests {
             } else {
                 None
             },
+            vary_on_origin: false,
         }
     }
 
@@ -392,5 +405,26 @@ mod tests {
         assert_eq!(parse_range("bytes=200-", 100), RangeResult::Unsatisfiable);
         assert_eq!(parse_range("bytes=0-9,20-29", 100), RangeResult::None);
         assert_eq!(parse_range("nonsense", 100), RangeResult::None);
+    }
+
+    /// A body that embeds the request's own host/scheme must name them in Vary, or a shared cache
+    /// serves one requester's chosen origin to everyone under the plain URL. The descriptor's blob
+    /// URLs are built from those headers and it goes out `public, max-age=300`.
+    #[tokio::test]
+    async fn a_body_built_from_the_request_origin_varies_on_it() {
+        let mut s = servable(false);
+        s.vary_on_origin = true;
+        let r = serve(&Method::GET, &hdrs(&[]), s).await;
+        let vary = r.headers().get("vary").expect("no Vary at all").to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("x-forwarded-host"), "{vary}");
+        assert!(vary.contains("x-forwarded-proto"), "{vary}");
+        assert!(vary.contains("host"), "{vary}");
+
+        // ...and it still composes with the gzip variant rather than replacing it.
+        let mut s = servable(true);
+        s.vary_on_origin = true;
+        let r = serve(&Method::GET, &hdrs(&[]), s).await;
+        let vary = r.headers().get("vary").unwrap().to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("accept-encoding") && vary.contains("x-forwarded-host"), "{vary}");
     }
 }

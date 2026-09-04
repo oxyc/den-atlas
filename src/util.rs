@@ -42,10 +42,18 @@ pub fn public_origin(headers: &HeaderMap, override_base: Option<&str>) -> String
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
     };
-    let proto = first("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
+    // Coerced to exactly one of two values. It was reflected verbatim, so a header of
+    // `https://evil.example/pwn?x=` was spliced straight into the advertised blob URLs — the Host
+    // beside it is filtered for precisely this reason and the scheme was not.
+    let proto = match first("x-forwarded-proto").as_deref() {
+        Some(p) if p.eq_ignore_ascii_case("https") => "https",
+        _ => "http",
+    };
     // Only reflect a sane Host charset into the blob URLs we advertise (a spoofed Host would point
     // the app's fetch at an attacker origin; the checksum still gates content). PUBLIC_BASE_URL
-    // short-circuits this in prod.
+    // short-circuits this in prod. Note the charset filter does not make a host TRUSTED — an
+    // attacker-chosen name passes it — so the response must also name these headers in Vary, or a
+    // shared cache hands one requester's origin to everyone.
     let host = first("x-forwarded-host")
         .or_else(|| {
             headers
@@ -63,4 +71,32 @@ fn is_sane_host(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 255
         && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The forwarded scheme was spliced verbatim into the descriptor's absolute blob URLs, so a
+    /// header of `https://evil.example/pwn?x=` pointed the app's fetch at an attacker origin. The
+    /// Host beside it is charset-filtered for exactly this reason; the scheme had nothing.
+    #[test]
+    fn a_forwarded_scheme_is_http_or_https_and_nothing_else() {
+        let origin = |proto: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-proto", proto.parse().unwrap());
+            h.insert(header::HOST, "atlas.local".parse().unwrap());
+            public_origin(&h, None)
+        };
+        assert_eq!(origin("https"), "https://atlas.local");
+        assert_eq!(origin("HTTPS"), "https://atlas.local", "a title-cased header downgraded to plaintext");
+        assert_eq!(origin("http"), "http://atlas.local");
+        for hostile in ["https://evil.example/pwn?x=", "javascript:", "://", "https evil"] {
+            assert_eq!(
+                origin(hostile),
+                "http://atlas.local",
+                "{hostile:?} reached the advertised blob URLs"
+            );
+        }
+    }
 }

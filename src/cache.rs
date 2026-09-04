@@ -24,6 +24,13 @@ pub enum Lookup {
 }
 
 impl TtlCache {
+    /// How many keys are held. Tests use it to prove two lookups landed on DIFFERENT keys, which
+    /// is the only way to see a key that silently omits part of what the value depends on.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
     pub fn new(ttl: Duration) -> Self {
         Self { ttl, map: Mutex::new(HashMap::new()) }
     }

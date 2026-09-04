@@ -67,12 +67,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         return json_response(health_body(ds.is_some(), state.catalog.fresh()), StatusCode::OK);
     }
     if route == "/manifest.json" {
-        return serve_json(&method, &headers, manifest_json(&config), "public, max-age=3600, stale-while-revalidate=600", None).await;
+        return serve_json(&method, &headers, manifest_json(&config), "public, max-age=3600, stale-while-revalidate=600", None, false).await;
     }
     if route == "/dataset.json" {
         return match ds {
             Some(ds) => {
-                serve_json(&method, &headers, build_descriptor(&origin, ds, state.embed.is_some()), "public, max-age=300", ds.last_modified.clone()).await
+                // The descriptor embeds absolute blob URLs built from the request's own
+                // host/scheme, so those headers are part of what the body says.
+                serve_json(&method, &headers, build_descriptor(&origin, ds, state.embed.is_some()), "public, max-age=300", ds.last_modified.clone(), true).await
             }
             None => json_response(
                 r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
@@ -197,7 +199,7 @@ async fn handle_catalog(
             // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
             // CDN doesn't pin a broken row past JustWatch's recovery.
             let cc = if r.fresh { "public, max-age=3600, stale-while-revalidate=600" } else { "public, max-age=60" };
-            serve_json(method, headers, r.body, cc, None).await
+            serve_json(method, headers, r.body, cc, None, false).await
         }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
@@ -220,6 +222,7 @@ async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'st
             size,
             identity: Payload::Memory(bytes),
             gzip: None,
+            vary_on_origin: false,
         },
     )
     .await
@@ -231,6 +234,7 @@ async fn serve_json(
     body: String,
     cache_control: &str,
     last_modified: Option<String>,
+    vary_on_origin: bool,
 ) -> Response {
     let etag = fnv1a(&body);
     let bytes = Bytes::from(body.into_bytes());
@@ -246,6 +250,7 @@ async fn serve_json(
             size,
             identity: Payload::Memory(bytes),
             gzip: None,
+            vary_on_origin,
         },
     )
     .await
@@ -281,6 +286,7 @@ async fn serve_blob(
             size: blob.size,
             identity: Payload::File(blob.path.clone()),
             gzip,
+            vary_on_origin: false, // a blob body carries no origin-derived URLs
         },
     )
     .await

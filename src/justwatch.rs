@@ -103,6 +103,9 @@ pub struct JustWatchClient {
     // None if the client couldn't be built (TLS backend init) — catalog then degrades to empty rows
     // instead of `reqwest::Client::new()` panicking at startup.
     http: Option<reqwest::Client>,
+    /// Always ENDPOINT in production; a test points it at a local socket so the 200-with-errors
+    /// path can be exercised against a real response rather than asserted on a helper in isolation.
+    endpoint: String,
 }
 
 impl JustWatchClient {
@@ -113,7 +116,14 @@ impl JustWatchClient {
             .build()
             .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
             .ok();
-        Self { http }
+        Self { http, endpoint: ENDPOINT.to_string() }
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(endpoint: String) -> Self {
+        let mut c = Self::new();
+        c.endpoint = endpoint;
+        c
     }
 }
 
@@ -337,7 +347,7 @@ impl JustWatchClient {
             Some(h) => h,
             None => return Err(()),
         };
-        let mut resp = match http.post(ENDPOINT).json(payload).send().await {
+        let mut resp = match http.post(&self.endpoint).json(payload).send().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("den-atlas: justwatch request failed ({label}): {e}");
@@ -356,8 +366,33 @@ impl JustWatchClient {
             }
             buf.extend_from_slice(&chunk);
         }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
+        let body = String::from_utf8_lossy(&buf).into_owned();
+        // GraphQL reports failures with HTTP 200 and {"errors":[…],"data":null}. Checking only the
+        // status made a bad country, a rate-limit, a validation error or a schema change look like
+        // "this row is empty" — which was then stored as a fresh answer over the last-good rows,
+        // pinned for the cache TTL and an hour of CDN max-age, with /health still reporting ok.
+        if let Some(why) = graphql_error(&body) {
+            eprintln!("den-atlas: justwatch graphql error ({label}): {why}");
+            return Err(());
+        }
+        Ok(body)
     }
+}
+
+/// The first GraphQL error message, if the response carries any. `data: null` alongside errors is
+/// the unambiguous failure shape; errors beside partial data are still a failure for our purposes,
+/// because a partial chart is not a chart.
+fn graphql_error(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let errors = v.get("errors")?.as_array()?;
+    let first = errors.first()?;
+    Some(
+        first
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unspecified")
+            .to_string(),
+    )
 }
 
 #[async_trait]
@@ -512,5 +547,67 @@ mod tests {
         assert!(!is_imdb("tt"));
         assert!(!is_imdb("nm123"));
         assert!(!is_imdb("tt12a"));
+    }
+
+    /// GraphQL reports failures with HTTP 200 and `{"errors":[…],"data":null}`. Checking only the
+    /// status made a bad country, a rate-limit, a validation error or a schema change look like
+    /// "this row is empty" — which was then stored as a fresh answer OVER the last-good rows,
+    /// pinned for the 6h cache TTL and an hour of CDN max-age, with /health still reporting ok.
+    #[test]
+    fn a_graphql_error_is_not_an_empty_row() {
+        let body = r#"{"errors":[{"message":"locale by the country code: couldn't get locale with country code \"ZZ\"","extensions":{"code":"BAD_REQUEST"}}],"data":null}"#;
+        let why = graphql_error(body).expect("a 200 carrying errors is a failure, not an empty chart");
+        assert!(why.contains("locale"), "the log line must name the cause: {why}");
+
+        // Errors beside partial data are still a failure — a partial chart is not a chart.
+        assert!(graphql_error(r#"{"errors":[{"message":"rate limited"}],"data":{"popularTitles":{"edges":[]}}}"#).is_some());
+
+        // ...and a genuinely empty chart is NOT an error.
+        assert!(graphql_error(r#"{"data":{"popularTitles":{"edges":[]}}}"#).is_none());
+        assert!(graphql_error("not json at all").is_none());
+    }
+
+    /// Serve one fixed HTTP 200 body on an ephemeral port, then close.
+    async fn serve_once(body: &'static str) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// End-to-end, against a real 200 carrying GraphQL errors: `popular` must report failure, not an
+    /// empty chart. Asserting `graphql_error` alone proves nothing — the call site can drop the
+    /// check entirely and the helper still passes its own test.
+    #[tokio::test]
+    async fn a_200_carrying_graphql_errors_fails_the_fetch() {
+        let base = serve_once(
+            r#"{"errors":[{"message":"locale by the country code: couldn't get locale with country code \"ZZ\""}],"data":null}"#,
+        )
+        .await;
+        let c = JustWatchClient::with_endpoint(base);
+        let r = c.popular("nfx", ObjectType::Movie, "ZZ", "TRENDING").await;
+        assert!(
+            r.is_err(),
+            "a GraphQL error was reported as an empty row, which then overwrites the last-good rows"
+        );
+    }
+
+    /// ...and a genuinely empty chart still succeeds, or every quiet country would serve stale.
+    #[tokio::test]
+    async fn a_genuinely_empty_chart_is_still_an_answer() {
+        let base = serve_once(r#"{"data":{"popularTitles":{"edges":[]}}}"#).await;
+        let c = JustWatchClient::with_endpoint(base);
+        assert!(c.popular("nfx", ObjectType::Movie, "US", "TRENDING").await.is_ok());
     }
 }

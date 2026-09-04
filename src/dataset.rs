@@ -173,6 +173,21 @@ impl Dataset {
     }
 }
 
+/// `dir/name` where `name` must be a plain file name. Rejects anything with a separator, a parent
+/// component, or a root — the three ways `Path::join` stops meaning "inside dir".
+fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(name);
+    let mut parts = candidate.components();
+    let only = matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !only {
+        return Err(format!("blob name {name:?} is not a plain file name"));
+    }
+    Ok(dir.join(name))
+}
+
 fn resolve_blob(
     dir: &Path,
     name: &str,
@@ -181,7 +196,12 @@ fn resolve_blob(
     content_type: &'static str,
     gz_file: Option<&str>,
 ) -> Result<Blob, String> {
-    let path = dir.join(name);
+    // A blob name is a FILE NAME, not a path. `dir.join` on "../secret" walks out, and on an
+    // absolute path discards `dir` entirely — and these names come from dataset.meta.json, which
+    // scripts/fetch-dataset.sh pulls from a GitHub release over the network. FP-3's own rationale
+    // names a compromised dataset host as the adversary, and den-atlas loads that meta without
+    // checking the signature it passes through, so this was arbitrary file read over HTTP.
+    let path = safe_blob_path(dir, name)?;
     // Use the on-disk length, not the meta's declared size: if a refreshed/stale meta disagrees with the
     // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
     let actual = std::fs::metadata(&path)
@@ -195,7 +215,7 @@ fn resolve_blob(
     }
     let gz = match gz_file {
         Some(gzname) => {
-            let gzpath = dir.join(gzname);
+            let gzpath = safe_blob_path(dir, gzname)?;
             let sz = std::fs::metadata(&gzpath)
                 .map_err(|e| format!("stat {}: {e}", gzpath.display()))?
                 .len();
@@ -211,4 +231,40 @@ fn resolve_blob(
         content_type,
         gz,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Blob names come from dataset.meta.json, which the refresh script pulls from a GitHub release
+    /// over the network — and FP-3's rationale names a compromised dataset host as the adversary.
+    /// `dir.join` walks out on "../x" and discards `dir` outright on an absolute path, so this was
+    /// arbitrary file read over HTTP, bounded only by what the container process can read.
+    #[test]
+    fn a_blob_name_cannot_escape_the_dataset_directory() {
+        let dir = Path::new("/data/den-atlas");
+        for bad in ["../secret.txt", "/etc/passwd", "a/b.json", "..", "./x.json", ""] {
+            assert!(safe_blob_path(dir, bad).is_err(), "{bad:?} was accepted as a blob name");
+        }
+        assert_eq!(safe_blob_path(dir, "labels-t02.json").unwrap(), dir.join("labels-t02.json"));
+    }
+
+    /// ...and through the CALL SITE, because a helper's own test cannot see `resolve_blob` going
+    /// back to `dir.join`. A real secret outside the dataset dir, reachable by the traversal.
+    #[test]
+    fn resolve_blob_refuses_to_read_outside_the_dataset_directory() {
+        let root = std::env::temp_dir().join(format!("den-atlas-trav-{}", std::process::id()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"a credential the dataset dir must not reach").unwrap();
+        let len = std::fs::metadata(&secret).unwrap().len();
+
+        for escape in ["../secret.txt", secret.to_string_lossy().as_ref()] {
+            let r = resolve_blob(&data, escape, len, "sha", "application/json", None);
+            assert!(r.is_err(), "{escape:?} resolved to a readable blob outside the dataset dir");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
