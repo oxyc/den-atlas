@@ -213,14 +213,24 @@ fn resolve_blob(
             path.display()
         );
     }
+    // The gz variant is an OPTIMISATION, so an unusable one drops the variant — it does not take the
+    // dataset down. Propagating here made a single bad optional name fatal for labels, vectors,
+    // premise and facets alike: `"labelsGzFile": ""` served 503 on /dataset.json and 404 on every
+    // blob, where before it merely produced a junk variant nobody could select. The sync script
+    // treats an empty *File value as an ordinary shape (`[ -n "$f" ] || continue`), so this is a
+    // release away, and main.rs's stated posture is to degrade rather than refuse.
     let gz = match gz_file {
-        Some(gzname) => {
-            let gzpath = safe_blob_path(dir, gzname)?;
-            let sz = std::fs::metadata(&gzpath)
-                .map_err(|e| format!("stat {}: {e}", gzpath.display()))?
-                .len();
-            Some(Gz { path: gzpath, size: sz })
-        }
+        Some(gzname) => match safe_blob_path(dir, gzname).and_then(|p| {
+            std::fs::metadata(&p)
+                .map(|m| Gz { path: p.clone(), size: m.len() })
+                .map_err(|e| format!("stat {}: {e}", p.display()))
+        }) {
+            Ok(gz) => Some(gz),
+            Err(why) => {
+                eprintln!("den-atlas: no gzip variant for {name} ({why}) — serving identity only");
+                None
+            }
+        },
         None => None,
     };
     Ok(Blob {
@@ -264,6 +274,54 @@ mod tests {
         for escape in ["../secret.txt", secret.to_string_lossy().as_ref()] {
             let r = resolve_blob(&data, escape, len, "sha", "application/json", None);
             assert!(r.is_err(), "{escape:?} resolved to a readable blob outside the dataset dir");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The gz variant is the SECOND call site, and the first version of this test passed `None` for
+    /// it — so reverting that one line to `dir.join` left the suite green while
+    /// `"labelsGzFile": "../../../etc/shadow"` was served to anyone sending `Accept-Encoding: gzip`.
+    #[test]
+    fn a_gz_blob_name_cannot_escape_either() {
+        let root = std::env::temp_dir().join(format!("den-atlas-gz-{}", std::process::id()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("labels.json"), b"{}").unwrap();
+        let secret = root.join("secret.gz");
+        std::fs::write(&secret, b"not for the wire").unwrap();
+
+        // An escaping gz name must not resolve to the file outside the data dir...
+        let blob = resolve_blob(&data, "labels.json", 2, "sha", "application/json", Some("../secret.gz"))
+            .expect("a bad OPTIONAL name must not take the whole dataset down");
+        assert!(blob.gz.is_none(), "a gz variant resolved outside the dataset directory");
+
+        // ...and neither must an absolute one.
+        let blob = resolve_blob(
+            &data,
+            "labels.json",
+            2,
+            "sha",
+            "application/json",
+            Some(secret.to_string_lossy().as_ref()),
+        )
+        .expect("still not fatal");
+        assert!(blob.gz.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An unusable OPTIONAL blob drops the variant; it does not refuse the dataset. Propagating the
+    /// error made `"labelsGzFile": ""` serve 503 on /dataset.json and 404 on every blob — and the
+    /// sync script treats an empty *File value as an ordinary shape, so that is one release away.
+    #[test]
+    fn an_unusable_gzip_variant_does_not_take_the_dataset_down() {
+        let root = std::env::temp_dir().join(format!("den-atlas-optgz-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("labels.json"), b"{}").unwrap();
+
+        for bad in ["", "missing.json.gz", "../x.gz"] {
+            let blob = resolve_blob(&root, "labels.json", 2, "sha", "application/json", Some(bad))
+                .unwrap_or_else(|e| panic!("{bad:?} took the whole dataset down: {e}"));
+            assert!(blob.gz.is_none(), "{bad:?} produced a gz variant");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

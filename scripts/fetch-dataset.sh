@@ -22,7 +22,17 @@ print(m["labelsFile"], m["vectorsFile"], m.get("labelsGzFile", ""), m.get("metad
       m.get("premiseLabelsFile", ""), m.get("premiseVectorsFile", ""), m.get("facetsFile", ""))
 PY
 )
+# The names come from a release meta we do not control, and are used as `-o "data/$f"` — so
+# "../../../x" writes outside the repo. den-atlas rejects the same shapes when it loads them.
+safe_name() {
+  case "$1" in
+    "" | . | .. | */* | -*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 for f in "$LABELS" "$VECTORS" ${GZ:+"$GZ"} ${METADATA:+"$METADATA"} ${PLABELS:+"$PLABELS"} ${PVECTORS:+"$PVECTORS"} ${FACETS:+"$FACETS"}; do
+  safe_name "$f" || { echo "refusing unsafe blob name: $f" >&2; exit 1; }
   echo "fetching $f …"
   curl -fsSL "$BASE/$f" -o "data/$f"
 done

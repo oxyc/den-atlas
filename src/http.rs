@@ -427,4 +427,19 @@ mod tests {
         let vary = r.headers().get("vary").unwrap().to_str().unwrap().to_ascii_lowercase();
         assert!(vary.contains("accept-encoding") && vary.contains("x-forwarded-host"), "{vary}");
     }
+
+    /// The 304 must carry the same Vary as the 200 it stands in for. Assembling it after the
+    /// conditional early-return silently drops it, which is the shape that bit the sibling service:
+    /// a revalidating cache then keeps a body built for another origin.
+    #[tokio::test]
+    async fn a_304_carries_the_origin_vary_too() {
+        let mut s = servable(false);
+        s.vary_on_origin = true;
+        let etag = format!("\"{}\"", s.etag_base);
+        let r = serve(&Method::GET, &hdrs(&[("if-none-match", &etag)]), s).await;
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED, "the probe did not take the 304 path");
+        let vary = r.headers().get("vary").expect("the 304 dropped Vary entirely");
+        let vary = vary.to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("x-forwarded-host"), "{vary}");
+    }
 }

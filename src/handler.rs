@@ -348,4 +348,46 @@ mod tests {
         // …and it still takes precedence when the catalog is also stale (the more severe condition wins).
         assert!(health_body(false, false).contains(r#""reason":"dataset_unavailable""#));
     }
+
+    /// The descriptor's Vary depends on ONE bool at its call site, and flipping it left the whole
+    /// suite green — the fix was in `http.rs` with nothing checking it was actually wired up. This
+    /// goes through `handle`, so the route, the flag and the header are all on the hook.
+    #[tokio::test]
+    async fn the_descriptor_route_varies_on_the_origin_it_embeds() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-desc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("labels.json"), b"{}").unwrap();
+        std::fs::write(dir.join("vectors.bin"), b"\0\0").unwrap();
+        std::fs::write(
+            dir.join("dataset.meta.json"),
+            br#"{"datasetVersion":"t","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":2,"labelsSha256":"a",
+                 "vectorsFile":"vectors.bin","vectorsBytes":2,"vectorsSha256":"b"}"#,
+        )
+        .unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("fixture dataset must load");
+
+        let state = Arc::new(AppState::for_test(Some(ds)));
+        let req = HttpRequest::builder()
+            .uri("/dataset.json")
+            .header("x-forwarded-host", "atlas.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle(State(state), req).await;
+
+        assert_eq!(resp.status(), 200);
+        let vary = resp
+            .headers()
+            .get("vary")
+            .expect("the descriptor embeds the request origin but did not vary on it")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(vary.contains("x-forwarded-host"), "{vary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

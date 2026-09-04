@@ -30,6 +30,24 @@ pub struct AppState {
     pub embed: Option<EmbedProxy>,
 }
 
+#[cfg(test)]
+impl AppState {
+    /// Minimal state for a route test: no embed proxy, no origin override, so the descriptor's URLs
+    /// come from the request headers — which is the case the origin `Vary` exists for.
+    pub fn for_test(dataset: Option<dataset::Dataset>) -> Self {
+        AppState {
+            dataset,
+            public_base: None,
+            catalog: catalog::CatalogState::new(
+                std::sync::Arc::new(justwatch::JustWatchClient::new()),
+                std::time::Duration::from_secs(3600),
+            ),
+            default_country: "US".to_owned(),
+            embed: None,
+        }
+    }
+}
+
 /// Search query-embed proxy. den-atlas never runs the model — it forwards to the single den-embed authority
 /// so a search query embeds through the SAME bge-m3 + int8 quantizer that built the corpus (the alignment
 /// rule). den-embed stays internal; the app only ever talks to den-atlas.
