@@ -152,11 +152,16 @@ struct Edge {
 }
 #[derive(Deserialize)]
 struct Node {
-    content: Content,
+    // Optional, like every level of parse_new_titles and for the same reason: an upstream reply is
+    // untrusted. These were required, so ONE edge with a null content or a missing title failed the
+    // whole document — and an unparseable chart became `Ok(vec![])`, which the caller treats as a
+    // complete answer, caches, marks fresh, and reports healthy. A title with no `en` localisation
+    // for that country is enough.
+    content: Option<Content>,
 }
 #[derive(Deserialize)]
 struct Content {
-    title: String,
+    title: Option<String>,
     #[serde(rename = "originalReleaseYear")]
     original_release_year: Option<i64>,
     #[serde(rename = "externalIds")]
@@ -186,16 +191,18 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
     let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
     let mut out = Vec::with_capacity(edges.len());
     for e in edges {
-        let ext = e.node.content.external_ids;
+        let Some(content) = e.node.content else { continue };
+        let Some(title) = content.title else { continue };
+        let ext = content.external_ids;
         let imdb = match ext.as_ref().and_then(|x| x.imdb_id.clone()) {
             Some(id) if is_imdb(&id) => id,
             _ => continue,
         };
         let moviedb = ext.and_then(|x| x.tmdb_id).and_then(|s| s.parse::<i64>().ok());
-        let rating = e.node.content.scoring.and_then(|s| s.imdb_score);
-        let year = e.node.content.original_release_year;
+        let rating = content.scoring.and_then(|s| s.imdb_score);
+        let year = content.original_release_year;
         let rank = out.len();
-        out.push(TrendingItem { imdb, moviedb, title: e.node.content.title, rank, rating, year });
+        out.push(TrendingItem { imdb, moviedb, title, rank, rating, year });
     }
     out
 }

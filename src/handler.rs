@@ -14,12 +14,34 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The /configure page, embedded so the binary is self-contained. Region + provider choice is plaintext
 /// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
+/// A ceiling on how long any single request may occupy the server.
+///
+/// This is the bound the catalog's upstream cap always claimed to have and never did: capping
+/// concurrent upstream calls without bounding the wait made the queue grow linearly with load —
+/// measured p50 17s at 100 concurrent cold keys and 170s at 1,000, by which point every client has
+/// long since given up while their work is still queued. Shedding inside the catalog was tried and
+/// was worse (it produced empty, uncachable rows). Bounding it HERE is the third option: the queue
+/// drains at the edge, a client that has gone away stops holding a slot, and the work that does run
+/// still produces complete, cached rows.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    match tokio::time::timeout(REQUEST_DEADLINE, handle_inner(State(state), req)).await {
+        Ok(resp) => resp,
+        Err(_) => json_response(
+            r#"{"error":"timeout","detail":"the request exceeded the server deadline; retry shortly"}"#,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    }
+}
+
+async fn handle_inner(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
     // CORS preflight for browser-based Stremio clients (public, credential-free data).
     if method == Method::OPTIONS {

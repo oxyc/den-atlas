@@ -255,7 +255,7 @@ impl CatalogState {
                 Err(()) => None,
                 Ok(map) => match self.code_in(provider, &map) {
                     Some(code) if is_new => {
-                        let _permit = self.upstream.acquire().await;
+                        let Ok(_permit) = self.upstream.acquire().await else { return None };
                         // Arrivals come back most-recently-added first; that order IS the row.
                         self.source
                             .new_titles(&code, obj, country)
@@ -264,7 +264,7 @@ impl CatalogState {
                             .map(|items| Aggregate { items, complete: true })
                     }
                     Some(code) => {
-                        let _permit = self.upstream.acquire().await;
+                        let Ok(_permit) = self.upstream.acquire().await else { return None };
                         // "Popular on <service>" = JustWatch's POPULAR sort, not TRENDING.
                         self.source
                             .popular(&code, obj, country, "POPULAR")
@@ -333,7 +333,9 @@ impl CatalogState {
             return Ok(m);
         }
         let fetched = {
-            let _permit = self.upstream.acquire().await;
+            // A closed semaphore must not silently proceed UNCAPPED — the bare `let _permit =`
+            // bound the Result and ran anyway.
+            let Ok(_permit) = self.upstream.acquire().await else { return Err(()) };
             Arc::new(self.source.packages(country).await?)
         };
         if fetched.is_empty() {
@@ -395,7 +397,7 @@ impl CatalogState {
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
             let permits = Arc::clone(&self.upstream);
             set.spawn(async move {
-                let _permit = permits.acquire().await;
+                let Ok(_permit) = permits.acquire().await else { return (i, Err(())) };
                 (i, src.popular(&code, obj, &country, "TRENDING").await)
             });
         }
@@ -512,8 +514,9 @@ mod tests {
         /// Observe how many upstream calls are in flight at once, and the high-water mark.
         live: AtomicUsize,
         peak: AtomicUsize,
-        /// Hold each call briefly so overlap is observable.
+        /// Hold each call so overlap is observable, and for how long.
         dwell: bool,
+        dwell_ms: u64,
     }
     impl Fake {
         /// Bracket a call so `peak` records the high-water mark of simultaneous upstream work.
@@ -521,7 +524,7 @@ mod tests {
             let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             if self.dwell {
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::time::sleep(Duration::from_millis(self.dwell_ms)).await;
             }
             let out = f.await;
             self.live.fetch_sub(1, Ordering::SeqCst);
@@ -586,6 +589,7 @@ mod tests {
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             dwell: false,
+            dwell_ms: 30,
         }
     }
 
@@ -681,6 +685,7 @@ mod tests {
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             dwell: false,
+            dwell_ms: 30,
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // SkyShowtime (1773) isn't in the stub's country list — the row is absent, not empty-but-present,
@@ -716,6 +721,7 @@ mod tests {
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             dwell: false,
+            dwell_ms: 30,
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // The arrivals row must not silently serve the Popular chart — that would look plausible and be wrong.
@@ -922,10 +928,16 @@ mod tests {
 
         let peak = fake.peak.load(Ordering::SeqCst);
         assert!(peak > 1, "the probe never overlapped, so it proves nothing (peak {peak})");
+        // A LITERAL ceiling, not the constant: `peak <= MAX_UPSTREAM_INFLIGHT` moves its own
+        // goalpost, so raising the cap to 100_000 — removing the protection that exists because
+        // this host was 403'd — passed every test. Flagged three rounds running; fixed here.
         assert!(
-            peak <= MAX_UPSTREAM_INFLIGHT,
-            "{peak} simultaneous upstream calls against a cap of {MAX_UPSTREAM_INFLIGHT} — \
-             per-request bounds do not bound the process"
+            peak <= 16,
+            "{peak} simultaneous upstream calls — the process-wide cap is not holding"
+        );
+        assert!(
+            MAX_UPSTREAM_INFLIGHT <= 16,
+            "the cap itself was raised to {MAX_UPSTREAM_INFLIGHT}; that is the protection, not a tuning knob"
         );
     }
 
@@ -936,7 +948,12 @@ mod tests {
     #[tokio::test]
     async fn a_cold_burst_ends_up_complete_and_cached() {
         let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
-        f.dwell = true; // make every upstream call slow enough to saturate the permits
+        // Sized so a shed WOULD fire. The point of this test is that reintroducing the 2s permit
+        // deadline fails it, and at 30ms the longest wait was 490ms — the shed could go back in
+        // verbatim and this passed. 24 requests x 4 resolvable providers x 300ms over 8 permits is
+        // ~3.6s of queued work, so the tail is comfortably past any deadline in that range.
+        f.dwell = true;
+        f.dwell_ms = 300;
         let fake = Arc::new(f);
         let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
 
@@ -991,7 +1008,7 @@ mod tests {
         let peak = fake.peak.load(Ordering::SeqCst);
         assert!(peak > 1, "the probe never overlapped (peak {peak})");
         assert!(
-            peak <= MAX_UPSTREAM_INFLIGHT,
+            peak <= 16,
             "{peak} concurrent upstream calls on the arrivals/packages paths — those permits are \
              not being taken"
         );
