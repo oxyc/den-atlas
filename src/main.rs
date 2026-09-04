@@ -54,7 +54,16 @@ impl AppState {
 pub struct EmbedProxy {
     pub client: reqwest::Client,
     pub base: String,
+    /// The same bound the JustWatch path has, for the same reason: this is an unauthenticated public
+    /// POST that fans out 1:1 to the internal model service, and each call holds a 10s timeout.
+    /// Without it, N concurrent requests are N concurrent model invocations.
+    pub inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent embeds allowed through to den-embed. A search query is interactive, so a short queue
+/// with a deadline beats an unbounded one.
+pub const MAX_EMBED_INFLIGHT: usize = 4;
+pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
@@ -80,7 +89,11 @@ async fn main() {
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
     let embed = std::env::var("DEN_EMBED_URL").ok().and_then(|base| {
         match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
-            Ok(client) => Some(EmbedProxy { client, base: base.trim_end_matches('/').to_owned() }),
+            Ok(client) => Some(EmbedProxy {
+                client,
+                base: base.trim_end_matches('/').to_owned(),
+                inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT)),
+            }),
             Err(e) => {
                 eprintln!("den-atlas: embed proxy disabled (reqwest build failed: {e})");
                 None

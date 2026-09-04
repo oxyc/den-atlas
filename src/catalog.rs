@@ -163,13 +163,16 @@ pub struct CatalogState {
 /// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
 /// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
-/// How long a request will WAIT for a permit before giving up and degrading.
-///
-/// A cap without a deadline is a queue without a deadline: 100 concurrent cold requests measured a
-/// p50 of 11.75s and a p95 of 19.65s, and the queue grows linearly with load because axum has no
-/// request timeout and reqwest's only starts once a permit is granted. Shedding is the point — a
-/// stale or empty row now beats a client that has already given up and retried.
-const UPSTREAM_WAIT: Duration = Duration::from_secs(2);
+// There is deliberately NO deadline on acquiring a permit, and that is a considered trade rather
+// than an oversight. A 2s shed was tried and measured worse on every axis that matters: the same
+// 100-request cold burst went from 100 rows fresh and cached to 13 fresh, 75 EMPTY and only 8 keys
+// cached — and because almost nothing cached, the next wave re-ran the same fan-out, keeping
+// sustained pressure on the upstream that the cap exists to protect. Shedding also marked unions
+// incomplete from this server's own queueing, so /health reported degraded while nothing upstream
+// was wrong.
+//
+// Waiting is slow exactly once per key: a cold burst is bounded by (keys x latency / permits) and
+// every request that waits produces a complete, cached row that the next one gets instantly.
 
 impl CatalogState {
     #[cfg(test)]
@@ -252,11 +255,7 @@ impl CatalogState {
                 Err(()) => None,
                 Ok(map) => match self.code_in(provider, &map) {
                     Some(code) if is_new => {
-                        let Ok(Ok(_permit)) =
-                            tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
-                        else {
-                            return None;
-                        };
+                        let _permit = self.upstream.acquire().await;
                         // Arrivals come back most-recently-added first; that order IS the row.
                         self.source
                             .new_titles(&code, obj, country)
@@ -265,11 +264,7 @@ impl CatalogState {
                             .map(|items| Aggregate { items, complete: true })
                     }
                     Some(code) => {
-                        let Ok(Ok(_permit)) =
-                            tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
-                        else {
-                            return None;
-                        };
+                        let _permit = self.upstream.acquire().await;
                         // "Popular on <service>" = JustWatch's POPULAR sort, not TRENDING.
                         self.source
                             .popular(&code, obj, country, "POPULAR")
@@ -338,10 +333,7 @@ impl CatalogState {
             return Ok(m);
         }
         let fetched = {
-            let Ok(Ok(_permit)) = tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
-            else {
-                return Err(()); // shed rather than queue
-            };
+            let _permit = self.upstream.acquire().await;
             Arc::new(self.source.packages(country).await?)
         };
         if fetched.is_empty() {
@@ -403,10 +395,7 @@ impl CatalogState {
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
             let permits = Arc::clone(&self.upstream);
             set.spawn(async move {
-                let Ok(Ok(_permit)) = tokio::time::timeout(UPSTREAM_WAIT, permits.acquire()).await
-                else {
-                    return (i, Err(()));
-                };
+                let _permit = permits.acquire().await;
                 (i, src.popular(&code, obj, &country, "TRENDING").await)
             });
         }
@@ -559,7 +548,7 @@ mod tests {
         }
         async fn new_titles(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
             self.new_calls.fetch_add(1, Ordering::SeqCst);
-            self.answer()
+            self.tracked(async { self.answer() }).await
         }
         /// Mirrors a real country list: Prime is 119 here (as in UY/FI), never 9.
         async fn packages(&self, _country: &str) -> Result<Vec<(i64, String)>, ()> {
@@ -570,6 +559,7 @@ mod tests {
             if self.empty_packages.load(Ordering::SeqCst) {
                 return Ok(Vec::new()); // asked, answered, this market carries nothing
             }
+            let _t = self.tracked(async {}).await;
             Ok(vec![
                 (8, "nfx".into()),
                 (119, "prv".into()),
@@ -846,6 +836,13 @@ mod tests {
             .expect("a partial union still beats an empty row");
         assert!(!r.fresh, "a partial union was published as the complete one");
         assert!(!s.fresh(), "/health stayed green while providers failed");
+        // The BODY, not just the flags: asserting is_some()/!fresh/cache_len alone passed even when
+        // the "served" partial was an empty list — which is the thing the name promises it is not.
+        assert!(
+            r.body.contains("tt1"),
+            "a partial union was served as an empty row: {}",
+            r.body
+        );
         // Not cached: the next request must re-check rather than serve a pinned partial.
         assert_eq!(s.cache_len(), 0, "a partial union was pinned in the cache");
     }
@@ -929,6 +926,74 @@ mod tests {
             peak <= MAX_UPSTREAM_INFLIGHT,
             "{peak} simultaneous upstream calls against a cap of {MAX_UPSTREAM_INFLIGHT} — \
              per-request bounds do not bound the process"
+        );
+    }
+
+    /// A cold burst must end with every row COMPLETE and CACHED. Capping upstream concurrency is
+    /// worth latency; it is not worth empty rows. A 2s shed on the permit was tried and turned the
+    /// same burst into 13 fresh / 75 empty / 8 cached — and because almost nothing cached, the next
+    /// wave repeated the fan-out, keeping exactly the upstream pressure the cap exists to remove.
+    #[tokio::test]
+    async fn a_cold_burst_ends_up_complete_and_cached() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.dwell = true; // make every upstream call slow enough to saturate the permits
+        let fake = Arc::new(f);
+        let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
+
+        let mut set = JoinSet::new();
+        for i in 0..24 {
+            let s = Arc::clone(&s);
+            let country =
+                format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            set.spawn(async move {
+                s.metas_json(TRENDING_ID, "movie", &country, selected_providers())
+                    .await
+                    .map(|r| (r.fresh, r.body.contains("tt1")))
+            });
+        }
+        let mut fresh = 0;
+        let mut empty = 0;
+        while let Some(j) = set.join_next().await {
+            match j.unwrap() {
+                Some((true, _)) => fresh += 1,
+                Some((_, false)) => empty += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(empty, 0, "{empty} of 24 cold rows came back empty");
+        assert_eq!(fresh, 24, "only {fresh} of 24 cold rows were complete enough to cache");
+        assert_eq!(s.cache_len(), 24, "the cache did not fill, so the next wave re-fans out");
+        assert!(s.fresh(), "/health went degraded from this server's own queueing");
+    }
+
+    /// Every upstream call site takes a permit — not just the aggregate. The concurrency test could
+    /// only ever observe `popular`, so three of the four sites were structurally invisible to it.
+    #[tokio::test]
+    async fn every_upstream_call_site_takes_a_permit() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.dwell = true;
+        let fake = Arc::new(f);
+        let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
+
+        // Arrivals rows go through new_titles; package lookups through packages(). Both are tracked.
+        let mut set = JoinSet::new();
+        for i in 0..24 {
+            let s = Arc::clone(&s);
+            let country =
+                format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            set.spawn(async move {
+                let _ = s.metas_json("jw-nfx-new", "movie", &country, selected_providers()).await;
+                let _ = s.metas_json("jw-nfx", "movie", &country, selected_providers()).await;
+            });
+        }
+        while set.join_next().await.is_some() {}
+
+        let peak = fake.peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "the probe never overlapped (peak {peak})");
+        assert!(
+            peak <= MAX_UPSTREAM_INFLIGHT,
+            "{peak} concurrent upstream calls on the arrivals/packages paths — those permits are \
+             not being taken"
         );
     }
 }

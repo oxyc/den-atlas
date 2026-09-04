@@ -135,6 +135,17 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
         Ok(b) => b,
         Err(_) => return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST),
     };
+    // Bounded, with a deadline — an unauthenticated public POST must not be able to open as many
+    // concurrent model invocations as a client cares to make, and a queue without a deadline is just
+    // a slower way of failing.
+    let Ok(Ok(_permit)) =
+        tokio::time::timeout(crate::EMBED_WAIT, proxy.inflight.clone().acquire_owned()).await
+    else {
+        return json_response(
+            r#"{"error":"embed_busy","detail":"too many concurrent embeds; retry shortly"}"#,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    };
     match proxy
         .client
         .post(format!("{}/embed", proxy.base))
@@ -388,6 +399,101 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase();
         assert!(vary.contains("x-forwarded-host"), "{vary}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dataset fixture whose two blobs are distinguishable by content, so a route test can prove
+    /// WHICH blob it served rather than merely that it served something.
+    fn fixture(dir: &std::path::Path) -> crate::dataset::Dataset {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("labels.json"), b"LABELS").unwrap();
+        std::fs::write(dir.join("vectors.bin"), b"VECTORS!").unwrap();
+        std::fs::write(
+            dir.join("dataset.meta.json"),
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b"}"#,
+        )
+        .unwrap();
+        crate::dataset::Dataset::load(dir).expect("fixture dataset must load")
+    }
+
+    async fn get(state: &Arc<AppState>, uri: &str) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        handle(
+            State(Arc::clone(state)),
+            HttpRequest::builder().uri(uri).body(Body::empty()).unwrap(),
+        )
+        .await
+    }
+
+    async fn body_of(resp: axum::response::Response) -> String {
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// What each route SERVES, not merely that it answers. Every test in this file anchored a
+    /// previously-found bug, so swapping the labels and vectors routes, or serving every blob as
+    /// `immutable` regardless of `?v=`, or returning 200 for a missing dataset, all passed.
+    #[tokio::test]
+    async fn each_route_serves_what_it_advertises() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-routes-{}", std::process::id()));
+        let state = Arc::new(AppState::for_test(Some(fixture(&dir))));
+
+        let labels = get(&state, "/labels.json").await;
+        assert_eq!(labels.status(), 200);
+        assert_eq!(body_of(labels).await, "LABELS", "the labels route served another blob");
+
+        let vectors = get(&state, "/vectors.bin").await;
+        assert_eq!(vectors.status(), 200);
+        assert_eq!(body_of(vectors).await, "VECTORS!", "the vectors route served another blob");
+
+        // `?v=<current version>` pins for a year; a bare request must revalidate instead.
+        let pinned = get(&state, "/labels.json?v=v9").await;
+        let cc = pinned.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(cc.contains("immutable"), "a version-pinned blob was not immutable: {cc}");
+        let bare = get(&state, "/labels.json").await;
+        let cc = bare.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(!cc.contains("immutable"), "an unpinned blob was served immutable for a year: {cc}");
+
+        // EVERY advertised URL carries the version stamp, or the pin above is unusable for that
+        // blob. `contains("?v=v9")` is not enough — one stamped URL hides an unstamped sibling.
+        let desc = body_of(get(&state, "/dataset.json").await).await;
+        let urls: Vec<&str> = desc
+            .match_indices("\"url\":\"")
+            .map(|(i, m)| {
+                let rest = &desc[i + m.len()..];
+                &rest[..rest.find('"').unwrap_or(0)]
+            })
+            .collect();
+        assert!(urls.len() >= 2, "the descriptor advertised almost nothing: {desc}");
+        for u in &urls {
+            assert!(u.contains("?v=v9"), "an advertised URL is unversioned: {u} (all: {urls:?})");
+        }
+        assert!(desc.contains("\"count\":1"), "{desc}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing dataset must be a 503, not a 200 with nothing in it — the manifest still advertises
+    /// the resource, and the app needs to tell "no dataset here" from "an empty dataset".
+    #[tokio::test]
+    async fn a_missing_dataset_is_unavailable_not_empty() {
+        let state = Arc::new(AppState::for_test(None));
+        assert_eq!(get(&state, "/dataset.json").await.status(), 503);
+    }
+
+    /// The manifest is the contract the app reads first; dropping a resource or the country extra
+    /// silently removes a feature rather than breaking it.
+    #[tokio::test]
+    async fn the_manifest_advertises_the_dataset_resource() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-mf-{}", std::process::id()));
+        let state = Arc::new(AppState::for_test(Some(fixture(&dir))));
+        let m = body_of(get(&state, "/manifest.json").await).await;
+        assert!(m.contains("\"dataset\""), "the manifest stopped advertising the dataset: {m}");
+        assert!(m.contains("catalog"), "{m}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
