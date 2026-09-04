@@ -47,7 +47,17 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     // Opened HERE, before the ETag, because the ETag names the representation being served: falling
     // back after choosing `"<sha>-gzip"` would hand identity bytes to a cache under the gzip
     // validator (RFC 9110 §8.8.3). The cost is one open on a request that turns out to be a 304.
-    let gz_open = if wants_gzip { open_payload(&s.gzip.as_ref().unwrap().0).await } else { None };
+    let gz_open = if wants_gzip {
+        let opened = open_payload(&s.gzip.as_ref().unwrap().0, "the gzip variant").await;
+        if opened.is_none() {
+            // `resolve_blob` logs the same degradation at load time; this is its runtime twin, and
+            // without it every client silently drops to the full uncompressed blob.
+            eprintln!("den-atlas: serving {} as identity — its gzip variant is unusable", s.etag_base);
+        }
+        opened
+    } else {
+        None
+    };
     let use_gzip = gz_open.is_some();
     // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
     let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
@@ -104,7 +114,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
                 RangeResult::Range { start, end } => {
                     // Opened before the 206 is built, and the handle carries the body, so the file
                     // cannot vanish between the check and the read.
-                    let Some(open) = open_payload(&s.identity).await else {
+                    let Some(open) = open_payload(&s.identity, "the blob").await else {
                         return unavailable();
                     };
                     let len = end - start + 1;
@@ -129,13 +139,21 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         Some(o) => (o, s.gzip.as_ref().unwrap().1, Some("gzip")),
         None => {
             // Only a missing IDENTITY blob is unserveable.
-            let Some(o) = open_payload(&s.identity).await else {
+            let Some(o) = open_payload(&s.identity, "the blob").await else {
                 return unavailable();
             };
             (o, s.size, None)
         }
     };
     let mut h = base;
+    // A FALLBACK is not a cacheable answer. The response is identity bytes under `Vary:
+    // Accept-Encoding`, so a shared cache would store it against the gzip key — and with `?v=` that
+    // is `immutable` for a year, long after the variant is back. Serving it is right; letting it
+    // outlive the condition is the mistake `unavailable()` already avoids for the same reason.
+    if wants_gzip && encoding.is_none() {
+        h.retain(|(k, _)| *k != "cache-control");
+        h.push(("cache-control", "no-store".to_owned()));
+    }
     h.push(("content-type", s.content_type.clone()));
     h.push(("content-length", size.to_string()));
     if let Some(enc) = encoding {
@@ -173,21 +191,32 @@ enum Open {
     File(tokio::fs::File),
 }
 
-async fn open_payload(p: &Payload) -> Option<Open> {
+async fn open_payload(p: &Payload, what: &str) -> Option<Open> {
     match p {
         Payload::Memory(b) => Some(Open::Memory(b.clone())),
-        Payload::File(path) => tokio::fs::File::open(path).await.ok().map(Open::File),
+        Payload::File(path) => match tokio::fs::File::open(path).await {
+            Ok(f) => Some(Open::File(f)),
+            Err(e) => {
+                // The real errno, not just "gone". EACCES and EMFILE both land here and neither is
+                // fixed by re-fetching the dataset, which is what the 503's detail text tells the
+                // operator to do. Swallowing it left the whole runtime blob path silent.
+                eprintln!("den-atlas: cannot open {what} ({}): {e}", path.display());
+                None
+            }
+        },
     }
 }
 
-/// The blob is declared by the meta but not on disk. `no-store`, because the whole problem with the
-/// old behaviour was a broken answer being cached; this one must never outlive the condition.
+/// The blob is declared by the meta but could not be opened. `no-store`, because the whole problem
+/// with the old behaviour was a broken answer being cached; this one must never outlive the
+/// condition. `open_payload` has already logged the real errno — this text names the likeliest cause
+/// rather than the only one.
 fn unavailable() -> Response {
     build(
         StatusCode::SERVICE_UNAVAILABLE,
         &[("content-type", "application/json".to_owned()), ("cache-control", "no-store".to_owned())],
         Body::from(
-            r#"{"error":"blob_unavailable","detail":"the dataset declares this blob but it is not readable on disk; refresh it with scripts/fetch-dataset.sh"}"#,
+            r#"{"error":"blob_unavailable","detail":"the dataset declares this blob but it could not be opened (missing, or unreadable); see the server log for the reason"}"#,
         ),
     )
 }
@@ -500,6 +529,111 @@ mod tests {
         s.identity = Payload::File(missing);
         let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-99")]), s).await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as a 206");
+    }
+
+    /// The same fixture, but FILE-backed — which is what production always is (`handler.rs` builds
+    /// every blob from `Payload::File`). Every `serve` test used `Payload::Memory` for both
+    /// representations, so the `Open::File` arms were exercised once and never for byte correctness:
+    /// deleting the `seek` in `range_body`, taking the gzip content-length from the identity size,
+    /// and dropping `range_header.is_none()` from the gzip decision all passed 104 tests.
+    ///
+    /// Identity is 1000 bytes of ascending values so an offset is visible in the bytes themselves;
+    /// the "gzip" variant is 40 distinct bytes (not real gzip — nothing here decompresses).
+    fn file_servable(dir: &std::path::Path, gzip: bool) -> Servable {
+        std::fs::create_dir_all(dir).unwrap();
+        let raw: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let id = dir.join("blob.bin");
+        std::fs::write(&id, &raw).unwrap();
+        let gz = dir.join("blob.bin.gz");
+        std::fs::write(&gz, vec![b'z'; 40]).unwrap();
+        Servable {
+            etag_base: SHA.to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            cache_control: "public, max-age=31536000, immutable".to_owned(),
+            last_modified: Some(LAST_MODIFIED.to_owned()),
+            size: raw.len() as u64,
+            identity: Payload::File(id),
+            gzip: if gzip { Some((Payload::File(gz), 40)) } else { None },
+            vary_on_origin: false,
+        }
+    }
+
+    /// A Range forces the identity representation, so it must also carry the IDENTITY validator.
+    /// Serving identity bytes under `"<sha>-gzip"` is the RFC 9110 §8.8.3 hazard the ordering above
+    /// exists to prevent, and it is what a shared cache would then hand every later gzip request.
+    #[tokio::test]
+    async fn a_range_from_a_gzip_client_is_identity_bytes_under_the_identity_etag() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-rgz-{}", std::process::id()));
+        let resp = serve(
+            &Method::GET,
+            &hdrs(&[("range", "bytes=100-109"), ("accept-encoding", "gzip")]),
+            file_servable(&dir, true),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("etag").unwrap(),
+            &format!("\"{SHA}\""),
+            "a 206 carried the gzip validator"
+        );
+        assert!(resp.headers().get("content-encoding").is_none());
+        // ...and the bytes come from the right OFFSET. Dropping the seek returns byte 0 onwards.
+        let want: Vec<u8> = (100..110u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(body_bytes(resp).await, want, "the 206 served the wrong offset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gzip response must describe the GZIP file: its length, its bytes, its validator. Taking
+    /// the length from the identity size makes a streamed body hang or truncate.
+    #[tokio::test]
+    async fn a_gzip_response_describes_the_gzip_file_not_the_identity_one() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-gzf-{}", std::process::id()));
+        let resp =
+            serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), file_servable(&dir, true)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+        assert_eq!(resp.headers().get("etag").unwrap(), &format!("\"{SHA}-gzip\""));
+        assert_eq!(resp.headers().get("content-length").unwrap(), "40", "the identity length was declared");
+        assert_eq!(body_bytes(resp).await, vec![b'z'; 40], "the identity bytes were served as gzip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 416 keeps every validator the 200 would have carried — a cache and a client both need them
+    /// to revalidate afterwards. Only `cache-control` is replaced.
+    #[tokio::test]
+    async fn an_unsatisfiable_range_keeps_its_validators() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-416v-{}", std::process::id()));
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), file_servable(&dir, true)).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let h = resp.headers();
+        assert_eq!(h.get("etag").unwrap(), &format!("\"{SHA}\""));
+        assert_eq!(h.get("last-modified").unwrap(), LAST_MODIFIED);
+        assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(h.get("vary").unwrap(), "Accept-Encoding");
+        assert_eq!(h.get_all("cache-control").iter().count(), 1, "cache-control was duplicated");
+        assert_eq!(h.get("cache-control").unwrap(), "no-store");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gz→identity fallback must not be stored: it is identity bytes under `Vary:
+    /// Accept-Encoding`, so a cache would serve them for the gzip key long after the variant is back.
+    #[tokio::test]
+    async fn the_gzip_fallback_is_not_cacheable() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-gzfb-{}", std::process::id()));
+        let mut sv = file_servable(&dir, true);
+        sv.gzip = Some((Payload::File(dir.join("not-there.gz")), 40));
+        let resp = serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), sv).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("content-encoding").is_none());
+        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(cc.contains("no-store"), "a fallback was made cacheable: {cc}");
+        assert!(!cc.contains("immutable"), "{cc}");
+
+        // ...while an ordinary identity request, which is not a fallback, keeps its long TTL.
+        let plain = serve(&Method::GET, &HeaderMap::new(), file_servable(&dir, true)).await;
+        let cc = plain.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(cc.contains("immutable"), "a normal identity response lost its caching: {cc}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A gzip variant that has gone missing must fall back to the identity blob, not 503 a request

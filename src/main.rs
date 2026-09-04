@@ -217,9 +217,13 @@ async fn serve_until(
 /// Every real request is milliseconds; the long tail is a blob download, which can legitimately run
 /// for minutes on a slow link. Waiting for that tail is not worth it: a restart is rare, blob
 /// requests are resumable (`Range` + `If-Range`, both honoured), and the alternative is letting one
-/// slow or stuck client decide how long the addon is down. The container's stop timeout sits above
-/// this so podman never preempts the drain — but this, not podman, is what bounds it.
-const DRAIN_GRACE: Duration = Duration::from_secs(15);
+/// slow or stuck client decide how long the addon is down.
+///
+/// Under podman's DEFAULT 10s stop timeout, deliberately. The image auto-updates daily on a tag
+/// while the quadlet's own `--stop-timeout` only lands when someone re-runs the provisioner, so for
+/// some window this binary runs on a box that still kills at 10s. Sized to fit that window, the
+/// drain works everywhere and the container setting is headroom rather than a prerequisite.
+const DRAIN_GRACE: Duration = Duration::from_secs(8);
 
 /// Resolves when the process is asked to stop.
 ///
