@@ -162,6 +162,12 @@ async fn main() {
         eprintln!("den-atlas: bind :{port} failed: {e}");
         std::process::exit(1);
     });
+    // Before the readiness line below, so nothing can be told we are up while a stop signal would
+    // still be a hard kill.
+    let shutdown = shutdown_signal();
+    // The port it actually BOUND, not the one it was asked for: with PORT=0 the kernel picks one,
+    // and reporting the request rather than the result made the line useless in exactly that case.
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     match &state.dataset {
         Some(ds) => eprintln!(
             "den-atlas listening on :{port} — {} titles ({}/{})",
@@ -169,7 +175,7 @@ async fn main() {
         ),
         None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
     }
-    let outcome = serve_until(listener, app, shutdown_signal(), DRAIN_GRACE).await;
+    let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("den-atlas: {}", outcome.describe());
     let code = outcome.exit_code();
     if code != 0 {
@@ -261,6 +267,12 @@ async fn serve_until(
 /// drain works everywhere and the container setting is headroom rather than a prerequisite.
 const DRAIN_GRACE: Duration = Duration::from_secs(8);
 
+// Its whole reason for being 8 is that it must finish before an external stop timeout kills us, and
+// the smallest one that can apply is podman's and docker's default 10s. A test only guards what
+// someone remembers to run, and every test here passes its own grace, so raising this to 600 changed
+// nothing anywhere. This fails the build.
+const _: () = assert!(DRAIN_GRACE.as_secs() < 10);
+
 /// Resolves when the process is asked to stop.
 ///
 /// Without this the binary is PID 1 in a `scratch` image, and PID 1 gets no default terminate
@@ -270,25 +282,46 @@ const DRAIN_GRACE: Duration = Duration::from_secs(8);
 /// minute on a slow link, so that is a real truncation, not a theoretical one.
 ///
 /// SIGINT as well, so a foreground `docker run` in a terminal behaves the same way.
-async fn shutdown_signal() {
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
-    tokio::select! {
-        _ = wait_for(signal(SignalKind::terminate()), "SIGTERM") => {}
-        _ = wait_for(signal(SignalKind::interrupt()), "SIGINT") => {}
-    }
-    // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
-    // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C was
-    // caught and discarded, and an operator could not get out of the drain short of SIGKILL.
-    // Re-registering makes the usual "press it again" work; exit 0, because asking twice is a
-    // deliberate choice, not a failure.
-    tokio::spawn(async move {
+    // Registered NOW, by the caller, not lazily when the future is first polled. Polling starts once
+    // the server is already accepting, and until then SIGTERM keeps its default disposition — so a
+    // stop arriving in that window killed the process outright rather than draining it. Narrow, but
+    // it is exactly the window a supervisor uses when a unit is restarted immediately after start.
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
         tokio::select! {
-            _ = wait_for(signal(SignalKind::terminate()), "SIGTERM") => {}
-            _ = wait_for(signal(SignalKind::interrupt()), "SIGINT") => {}
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
         }
-        eprintln!("den-atlas: second signal — exiting without finishing the drain");
-        std::process::exit(0);
-    });
+        // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
+        // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C was
+        // caught and discarded, and an operator could not get out of the drain short of SIGKILL.
+        // Re-registering makes the usual "press it again" work; exit 0, because asking twice is a
+        // deliberate choice, not a failure.
+        //
+        // Silent, not via `wait_for`: that arm announces "draining in-flight requests", which is the
+        // opposite of what this does.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            eprintln!("den-atlas: second signal — exiting without finishing the drain");
+            std::process::exit(0);
+        });
+    }
+}
+
+/// Like `wait_for`, but says nothing — for a caller that prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
 }
 
 /// Resolve when this signal arrives, or never if it could not be registered.

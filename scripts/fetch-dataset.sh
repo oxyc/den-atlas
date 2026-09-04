@@ -47,34 +47,62 @@ safe_name() {
   esac
 }
 
-# The two the server cannot start without. deploy/atlas-dataset-sync.sh has always required these;
-# "$FILES is non-empty" only says SOMETHING was declared, so `"labelsFile": ""`, or a meta declaring
-# just labelsGzFile, fetched happily and reported success with a ./data den-atlas cannot load.
-for required in labelsFile vectorsFile; do
-  python3 - "$required" <<'PY' || { echo "release meta declares no $required — refusing" >&2; exit 1; }
+# What the server cannot start without. `"$FILES" is non-empty` only says SOMETHING was declared,
+# so `"labelsFile": ""`, or a meta declaring just labelsGzFile, fetched happily and reported success
+# with a ./data den-atlas cannot load.
+REQUIRED="labels vectors"
+for r in $REQUIRED; do
+  python3 - "${r}File" <<'PY' || { echo "release meta declares no ${r}File — refusing" >&2; exit 1; }
 import json, sys
 m = json.load(open("data/dataset.meta.json"))
 sys.exit(0 if m.get(sys.argv[1]) else 1)
 PY
 done
-
-# Newline-delimited via a redirect, so a name is never word-split or glob-expanded and `set -e` can
-# still abort the script (a pipe would put this loop in a subshell).
 [ -n "$FILES" ] || { echo "release meta declares no blobs — refusing" >&2; exit 1; }
+
+# PRE-FLIGHT, before anything on disk is touched, the same shape deploy/atlas-dataset-sync.sh has
+# always had. Skipping a 404 mid-loop was meant to tolerate a "<name>File" key that is not a release
+# asset; what it actually did was delete the previously-good copy of a REQUIRED blob (the `rm -f` on
+# the failure branch) and then exit 0, leaving a meta that declares a file no longer there. curl -f
+# does not truncate the output file on a 404, so the delete was the whole damage.
+#
+# A required blob that is declared but not published is fatal and nothing is touched. Anything else
+# missing is skipped, which is what the tolerance was for.
 MISSING=""
+FATAL=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   safe_name "$f" || { echo "refusing unsafe blob name: $f" >&2; exit 1; }
-  echo "fetching $f …"
-  # A declared name that is not a release asset is NOT fatal. Reading every "<name>File" key means
-  # picking up any future key of that shape, blob or not, and aborting mid-loop left ./data holding
-  # the meta and whichever files happened to come first. The two required ones are checked above, so
-  # anything else missing is a note, not a failure.
-  curl -fsSL "$BASE/$f" -o "data/$f" || { rm -f "data/$f"; MISSING="$MISSING $f"; }
+  code="$(curl -sL -m 20 -o /dev/null -w '%{http_code}' -r 0-0 "$BASE/$f" 2>/dev/null || echo 000)"
+  case "$code" in
+    200 | 206) continue ;;
+  esac
+  for r in $REQUIRED; do
+    if [ "$f" = "$(python3 -c 'import json,sys; print(json.load(open("data/dataset.meta.json")).get(sys.argv[1], ""))' "${r}File")" ]; then
+      FATAL="$FATAL $f($code)"
+      continue 2
+    fi
+  done
+  MISSING="$MISSING $f($code)"
 done <<EOF
 $FILES
 EOF
-[ -z "$MISSING" ] || echo "not in the release, skipped:$MISSING" >&2
+[ -z "$FATAL" ] || {
+  echo "release declares required blobs that are not published:$FATAL — refusing, ./data untouched" >&2
+  exit 1
+}
+[ -z "$MISSING" ] || echo "declared but not in the release, skipping:$MISSING" >&2
+
+# Newline-delimited via a redirect, so a name is never word-split or glob-expanded and `set -e` can
+# still abort the script (a pipe would put this loop in a subshell).
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case " $MISSING " in *" $f("*) continue ;; esac
+  echo "fetching $f …"
+  curl -fsSL "$BASE/$f" -o "data/$f"
+done <<EOF
+$FILES
+EOF
 echo "fetched → ./data:"
 # `|| true`: an unmatched glob makes `ls` exit 2, and under `set -o pipefail` that failed the whole
 # script AFTER a completely successful fetch — a release with no .gz was enough.

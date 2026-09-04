@@ -3,11 +3,13 @@
 //! `If-None-Match`; `Last-Modified` + `If-Modified-Since` → 304; `HEAD`; `Range` → 206/416; gzip negotiation
 //! (`Vary` only when a gzip variant exists). Range is served on the identity representation only.
 
+use crate::util::log_due;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
@@ -33,6 +35,9 @@ pub struct Servable {
     pub vary_on_origin: bool,
 }
 
+/// How often a standing condition on the request path may be reported.
+const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Response {
     let is_head = method == Method::HEAD;
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
@@ -47,17 +52,8 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     // Opened HERE, before the ETag, because the ETag names the representation being served: falling
     // back after choosing `"<sha>-gzip"` would hand identity bytes to a cache under the gzip
     // validator (RFC 9110 §8.8.3). The cost is one open on a request that turns out to be a 304.
-    let gz_open = if wants_gzip {
-        let opened = open_payload(&s.gzip.as_ref().unwrap().0, "the gzip variant").await;
-        if opened.is_none() {
-            // `resolve_blob` logs the same degradation at load time; this is its runtime twin, and
-            // without it every client silently drops to the full uncompressed blob.
-            eprintln!("den-atlas: serving {} as identity — its gzip variant is unusable", s.etag_base);
-        }
-        opened
-    } else {
-        None
-    };
+    let gz_open =
+        if wants_gzip { open_payload(&s.gzip.as_ref().unwrap().0, "the gzip variant").await } else { None };
     let use_gzip = gz_open.is_some();
     // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
     let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
@@ -145,6 +141,19 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
             (o, s.size, None)
         }
     };
+    if wants_gzip && encoding.is_none() {
+        // `resolve_blob` logs the same degradation at load time; this is its runtime twin, and
+        // without it every client silently drops to the full uncompressed blob.
+        //
+        // Reported HERE rather than where the fallback is decided, because that runs before the
+        // conditional check: a 304 serves nothing, and the line claimed it was serving identity.
+        // Throttled, because it describes a STATE that lasts the whole release-without-a-gz window,
+        // and one line per request is an amplifier.
+        static GZ_FALLBACK: AtomicU64 = AtomicU64::new(0);
+        if log_due(&GZ_FALLBACK, LOG_EVERY) {
+            eprintln!("den-atlas: serving {} as identity — its gzip variant is unusable", s.etag_base);
+        }
+    }
     let mut h = base;
     // A FALLBACK is not a cacheable answer. The response is identity bytes under `Vary:
     // Accept-Encoding`, so a shared cache would store it against the gzip key — and with `?v=` that
@@ -200,7 +209,14 @@ async fn open_payload(p: &Payload, what: &str) -> Option<Open> {
                 // The real errno, not just "gone". EACCES and EMFILE both land here and neither is
                 // fixed by re-fetching the dataset, which is what the 503's detail text tells the
                 // operator to do. Swallowing it left the whole runtime blob path silent.
-                eprintln!("den-atlas: cannot open {what} ({}): {e}", path.display());
+                // Throttled: an unreadable blob is a standing condition, and a client can ask for
+                // it in a loop — measured at 28k lines and 4.8 MB of stderr per second on loopback,
+                // which fills a json-file log driver's disk and pushes everything else out of
+                // journald's rate limiter. One line a minute reports the same fact.
+                static OPEN_FAILED: AtomicU64 = AtomicU64::new(0);
+                if log_due(&OPEN_FAILED, LOG_EVERY) {
+                    eprintln!("den-atlas: cannot open {what} ({}): {e}", path.display());
+                }
                 None
             }
         },

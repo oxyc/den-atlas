@@ -2,6 +2,7 @@
 //! serialized `metas` JSON per catalog key. Serve-stale-on-error: an expired entry is kept until a
 //! successful refresh replaces it, so a JustWatch blip serves the last-good rows instead of going empty.
 
+use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -47,7 +48,7 @@ impl TtlCache {
     /// is the only way to see a key that silently omits part of what the value depends on.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.map.lock().unwrap().len()
+        lock(&self.map).len()
     }
 
     pub fn new(ttl: Duration) -> Self {
@@ -60,7 +61,7 @@ impl TtlCache {
     }
 
     pub fn get(&self, key: &str) -> Lookup {
-        let map = self.map.lock().unwrap();
+        let map = lock(&self.map);
         match map.get(key) {
             Some(e) if e.stored.elapsed() < self.ttl => Lookup::Fresh(e.value.clone()),
             Some(e) => Lookup::Stale(e.value.clone()),
@@ -69,7 +70,7 @@ impl TtlCache {
     }
 
     pub fn put(&self, key: &str, value: String) {
-        let mut map = self.map.lock().unwrap();
+        let mut map = lock(&self.map);
         if map.len() >= self.max_entries && !map.contains_key(key) {
             evict_one(&mut map);
         }

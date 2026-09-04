@@ -4,6 +4,47 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 
+/// Time since the FIRST CALL to this function, on the monotonic clock. Used for anything that has to
+/// decide "recently?" — a wall clock steps under NTP and would answer wrongly in both directions.
+///
+/// First call, not process start: the `OnceLock` initialises lazily. That is fine for every use here
+/// because they all compare two readings of it, and a shared base cancels — but a reader reasoning
+/// about the very first recorded event needs to know the base is that event, not boot.
+pub fn since_start() -> std::time::Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// Whether it has been at least `every` since this slot last returned true; if so, claim it.
+///
+/// For messages on a request path. A per-request `eprintln!` is an unauthenticated amplifier: with a
+/// blob unreadable, a ~30-byte request produced ~350 bytes of stderr, measured at 28k lines and
+/// 4.8 MB per second on loopback — enough to fill a `json-file` log driver's disk, or to push
+/// everything else out of journald's rate limiter. The condition these report is a state, not an
+/// event, so one line a minute says the same thing.
+pub fn log_due(slot: &std::sync::atomic::AtomicU64, every: std::time::Duration) -> bool {
+    use std::sync::atomic::Ordering;
+    let now = since_start().as_millis() as u64;
+    let last = slot.load(Ordering::Relaxed);
+    // `last == 0` is "never logged"; a real t=0 is indistinguishable and simply logs twice.
+    if last != 0 && now.saturating_sub(last) < every.as_millis() as u64 {
+        return false;
+    }
+    // A lost race just means two lines instead of one, which is not worth a lock.
+    slot.store(now.max(1), Ordering::Relaxed);
+    true
+}
+
+/// Lock a mutex, poisoned or not.
+///
+/// Used wherever the critical section is a short, non-unwinding map or counter update, so a poisoned
+/// lock still guards usable data. Uniformly, because the alternative failed in both directions:
+/// `unwrap()` inside a `Drop` that runs during unwind double-panics into an abort, while hardening
+/// only that one turns "abort and restart clean" into "every request panics forever".
+pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// FNV-1a 32-bit → 8-char hex, byte-identical to the TS `fnv1a` (which hashes `charCodeAt`, i.e. UTF-16
 /// code units). Used for the small JSON responses' ETags; the big blobs use their real sha256.
 pub fn fnv1a(input: &str) -> String {

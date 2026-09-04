@@ -3,12 +3,11 @@
 //! can affect the dataset resource: every failure returns `Err(())`, which the handler turns into empty
 //! rows. User input never reaches this module — provider codes come from a fixed table.
 
+use crate::util::since_start;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
 use std::time::Duration;
-use std::time::Instant;
 
 /// Stremio content type ↔ JustWatch objectType.
 #[derive(Clone, Copy)]
@@ -97,18 +96,6 @@ pub trait TrendingSource: Send + Sync {
     }
 }
 
-/// Time since this process started, on the MONOTONIC clock.
-///
-/// Recency was measured in wall-clock unix seconds, which got the window wrong three ways: an NTP
-/// step backwards pinned the age at zero, so a suspected break stayed reported for the length of the
-/// step; a step forwards expired a break while the short row it describes was still being served
-/// (`TtlCache` ages on `Instant`, so the two clocks disagreed); and a pre-epoch clock stored 0,
-/// which is the "never" sentinel, silently discarding the record.
-fn since_start() -> Duration {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed()
-}
-
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
 const MAX_BODY: usize = 4 << 20; // cap the response body (a hostile/huge reply must not OOM us)
 
@@ -155,7 +142,11 @@ pub struct JustWatchClient {
     /// `graphql_error`.
     suspected_schema_breaks: AtomicUsize,
     /// When the last one was seen, as milliseconds since process start PLUS ONE, so 0 can mean
-    /// "never" without colliding with a break at t=0. `/health` reads recency, not the count: a total
+    /// "never" without colliding with a break at t=0. Monotonic (`util::since_start`): a wall clock
+    /// steps under NTP, which pinned the age at zero going back and expired a live break going
+    /// forward, while a pre-epoch clock stored the sentinel itself. Monotonic (`util::since_start`): a wall clock
+    /// steps under NTP, which pinned the age at zero going back and expired a live break going
+    /// forward, and a pre-epoch clock stored the sentinel itself. `/health` reads recency, not the count: a total
     /// is a lifetime figure, and reporting "rows may be short" in the present tense forever after one
     /// transient makes the signal something to ignore.
     last_schema_break: AtomicU64,

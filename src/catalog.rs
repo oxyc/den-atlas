@@ -4,6 +4,7 @@
 
 use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
+use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -177,17 +178,6 @@ pub struct CatalogState {
     /// simultaneous calls and earned this host a 403 from JustWatch. What upstream cares about is
     /// the total, so that is what has to be capped — the queue is bounded by the request timeout.
     upstream: Arc<tokio::sync::Semaphore>,
-}
-
-/// Lock one of this module's maps, poisoned or not.
-///
-/// Every one of them guards a plain `HashMap` operation that cannot leave the map half-updated, so a
-/// poisoned lock is still a usable map. Uniformly, because the alternative was worse in both
-/// directions: `unwrap()` inside `InflightSweep::drop` runs during unwind and would double-panic
-/// into an abort (the profile is `panic = unwind` precisely to avoid that), while hardening only
-/// that one turned "abort and restart clean" into "every catalog request panics forever".
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Removes a single-flight gate once nobody is using it.
