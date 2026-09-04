@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 /// Stremio content type ↔ JustWatch objectType.
 #[derive(Clone, Copy)]
@@ -95,9 +97,16 @@ pub trait TrendingSource: Send + Sync {
     }
 }
 
-/// Seconds since the unix epoch, saturating to 0 if the clock is before it.
-fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+/// Time since this process started, on the MONOTONIC clock.
+///
+/// Recency was measured in wall-clock unix seconds, which got the window wrong three ways: an NTP
+/// step backwards pinned the age at zero, so a suspected break stayed reported for the length of the
+/// step; a step forwards expired a break while the short row it describes was still being served
+/// (`TtlCache` ages on `Instant`, so the two clocks disagreed); and a pre-epoch clock stored 0,
+/// which is the "never" sentinel, silently discarding the record.
+fn since_start() -> Duration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -145,9 +154,10 @@ pub struct JustWatchClient {
     /// CALL SITE free to drop it, which is the failure this file already documents for
     /// `graphql_error`.
     suspected_schema_breaks: AtomicUsize,
-    /// When the last one was seen, as unix seconds; 0 = never. `/health` reads recency, not the
-    /// count: a total is a lifetime figure, and reporting "rows may be short" in the present tense
-    /// forever after one transient makes the signal something to ignore.
+    /// When the last one was seen, as milliseconds since process start PLUS ONE, so 0 can mean
+    /// "never" without colliding with a break at t=0. `/health` reads recency, not the count: a total
+    /// is a lifetime figure, and reporting "rows may be short" in the present tense forever after one
+    /// transient makes the signal something to ignore.
     last_schema_break: AtomicU64,
 }
 
@@ -533,7 +543,7 @@ impl TrendingSource for JustWatchClient {
         let chart = parse_popular(&body);
         if let Some(w) = schema_break_warning(&label, &body, &chart) {
             self.suspected_schema_breaks.fetch_add(1, Ordering::Relaxed);
-            self.last_schema_break.store(unix_now(), Ordering::Relaxed);
+            self.last_schema_break.store(since_start().as_millis() as u64 + 1, Ordering::Relaxed);
             eprintln!("{w}");
         }
         Ok(chart.items)
@@ -546,7 +556,7 @@ impl TrendingSource for JustWatchClient {
     fn last_schema_break_age(&self) -> Option<Duration> {
         match self.last_schema_break.load(Ordering::Relaxed) {
             0 => None,
-            at => Some(Duration::from_secs(unix_now().saturating_sub(at))),
+            at => Some(since_start().saturating_sub(Duration::from_millis(at - 1))),
         }
     }
 
@@ -898,6 +908,36 @@ mod tests {
         // ...and the break was NOTICED. Asserting the predicate alone leaves the call site free to
         // drop it — deleting the whole `if let` at the call site passed every other test here.
         assert_eq!(c.suspected_schema_breaks(), 1, "the row came back gutted and nothing recorded it");
+    }
+
+    /// The recency signal `/health` actually reads, through the REAL client. The handler test uses a
+    /// fake that overrides `last_schema_break_age` directly, so it never touches this — deleting the
+    /// `store` line, or reversing the subtraction, passed the whole suite. That is exactly what the
+    /// counter's own doc comment says this kind of field exists to prevent.
+    #[tokio::test]
+    async fn a_gutted_row_records_when_it_happened() {
+        let base = serve_once(chart_body(10, 8, "renamed")).await;
+        let c = JustWatchClient::with_endpoint(base);
+        assert_eq!(c.last_schema_break_age(), None, "a break was recorded before anything ran");
+
+        let _ = c.popular("nfx", ObjectType::Movie, "US", "POPULAR").await.expect("row should not fail");
+        let age = c.last_schema_break_age().expect("the break was not recorded at all");
+        // Just happened: small and forward-going. A reversed subtraction saturates to zero, so the
+        // upper bound is what catches it — as would a stored value that never moves.
+        assert!(age < Duration::from_secs(5), "the recorded age is {age:?}, not 'just now'");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let later = c.last_schema_break_age().expect("the record vanished");
+        assert!(later > age, "the age does not advance: {age:?} then {later:?}");
+    }
+
+    /// ...and a healthy row records nothing, so the age stays `None` rather than "a break, long ago".
+    #[tokio::test]
+    async fn a_healthy_row_records_no_break_time() {
+        let base = serve_once(chart_body(10, 1, "no_title")).await;
+        let c = JustWatchClient::with_endpoint(base);
+        let _ = c.popular("nfx", ObjectType::Movie, "US", "POPULAR").await.expect("row should not fail");
+        assert_eq!(c.last_schema_break_age(), None, "a normal row was recorded as a schema break");
     }
 
     /// The counterpart: a healthy row must not register a break. Without this, a call site that

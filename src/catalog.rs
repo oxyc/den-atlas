@@ -179,6 +179,17 @@ pub struct CatalogState {
     upstream: Arc<tokio::sync::Semaphore>,
 }
 
+/// Lock one of this module's maps, poisoned or not.
+///
+/// Every one of them guards a plain `HashMap` operation that cannot leave the map half-updated, so a
+/// poisoned lock is still a usable map. Uniformly, because the alternative was worse in both
+/// directions: `unwrap()` inside `InflightSweep::drop` runs during unwind and would double-panic
+/// into an abort (the profile is `panic = unwind` precisely to avoid that), while hardening only
+/// that one turned "abort and restart clean" into "every catalog request panics forever".
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Removes a single-flight gate once nobody is using it.
 ///
 /// The map was insert-only, so it kept one entry per key ever requested for the life of the
@@ -190,10 +201,7 @@ struct InflightSweep<'a> {
 
 impl Drop for InflightSweep<'_> {
     fn drop(&mut self) {
-        // `unwrap()` here would double-panic and abort: this runs during unwind, and the profile is
-        // `panic = unwind` precisely so one bad request drops its connection instead of the process.
-        // A poisoned map is still a perfectly usable map for this.
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = lock(self.map);
         if let Some(gate) = map.get(self.key) {
             // Two handles = the map's and this task's. Every waiter cloned its own before awaiting,
             // so a key that anyone else still wants counts higher and stays. Cloning goes through
@@ -241,12 +249,12 @@ impl CatalogState {
 
     #[cfg(test)]
     fn inflight_len(&self) -> usize {
-        self.inflight.lock().unwrap().len()
+        lock(&self.inflight).len()
     }
 
     #[cfg(test)]
     fn package_failures(&self) -> usize {
-        self.packages_failed.lock().unwrap().len()
+        lock(&self.packages_failed).len()
     }
 
     pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration) -> Self {
@@ -316,7 +324,7 @@ impl CatalogState {
         // Single-flight: one refresh per key runs; the rest wait and then hit the warm cache. The std
         // lock is only held to fetch the per-key gate (never across the await).
         let gate = {
-            let mut map = self.inflight.lock().unwrap();
+            let mut map = lock(&self.inflight);
             Arc::clone(map.entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
         };
         // Declared BEFORE the lock is taken so it drops after it: locals drop in reverse order, and
@@ -421,7 +429,7 @@ impl CatalogState {
     /// provider rows 404ing from a manifest that advertises them, trending permanently stale, only a
     /// restart to clear it. So empties are not cached and not trusted.
     async fn packages_for(&self, country: &str) -> Result<PackageList, ()> {
-        if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
+        if let Some(m) = lock(&self.packages).get(country).cloned() {
             return Ok(m);
         }
         // A country whose lookup could not be COMPLETED is not re-asked for a while. Without this,
@@ -432,7 +440,7 @@ impl CatalogState {
         //
         // Only that case. An answer we merely disbelieve (an empty list) is handled below without a
         // backoff, because it is cheap to repeat and must recover the moment upstream does.
-        if let Some(at) = self.packages_failed.lock().unwrap().get(country) {
+        if let Some(at) = lock(&self.packages_failed).get(country) {
             if at.elapsed() < FAILED_PACKAGES_TTL {
                 return Err(());
             }
@@ -459,16 +467,16 @@ impl CatalogState {
             // 404ing until a restart.
             return Err(()); // asked, but the answer is not one to act on
         }
-        self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
+        lock(&self.packages).insert(country.to_owned(), Arc::clone(&fetched));
         // A country can recover; drop the block so the next request after the TTL retries cleanly.
-        self.packages_failed.lock().unwrap().remove(country);
+        lock(&self.packages_failed).remove(country);
         Ok(fetched)
     }
 
     /// Remember that this country's package list just failed, so the next requests degrade
     /// immediately instead of each buying another permit and another 8s wait.
     fn note_package_failure(&self, country: &str) {
-        let mut failed = self.packages_failed.lock().unwrap();
+        let mut failed = lock(&self.packages_failed);
         // Bounded: countries are validated to two letters, so this cannot exceed 676 entries, but
         // an unbounded map is how the row cache got into trouble. Cheapest possible reclaim — the
         // whole point is that entries are short-lived.
@@ -1173,6 +1181,63 @@ mod tests {
             "the country was re-asked on every request; each one takes a permit and waits out the client timeout"
         );
         assert_eq!(s.package_failures(), 1);
+    }
+
+    /// The suspect window is the CACHE TTL, not a constant. Hardcoding six hours there passed every
+    /// test, and the window is the whole point of the signal: inside it a short row is still being
+    /// served, past it the row has been refetched and the claim would be stale.
+    #[tokio::test]
+    async fn the_suspect_window_follows_the_cache_ttl() {
+        struct Aged(Duration);
+        #[async_trait]
+        impl TrendingSource for Aged {
+            async fn popular(
+                &self,
+                _: &str,
+                _: ObjectType,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<TrendingItem>, ()> {
+                Err(())
+            }
+            async fn new_titles(&self, _: &str, _: ObjectType, _: &str) -> Result<Vec<TrendingItem>, ()> {
+                Err(())
+            }
+            async fn packages(&self, _: &str) -> Result<Vec<(i64, String)>, ()> {
+                Err(())
+            }
+            fn last_schema_break_age(&self) -> Option<Duration> {
+                Some(self.0)
+            }
+        }
+
+        // A break an hour old is inside a 6h cache and outside a 10-minute one. Same source, same
+        // age; only the TTL differs, so nothing but the TTL comparison can produce both answers.
+        let hour = Duration::from_secs(3600);
+        assert!(CatalogState::new(Arc::new(Aged(hour)), Duration::from_secs(6 * 3600)).schema_suspect());
+        assert!(!CatalogState::new(Arc::new(Aged(hour)), Duration::from_secs(600)).schema_suspect());
+
+        // Never seen is never suspect, whatever the TTL.
+        struct Clean;
+        #[async_trait]
+        impl TrendingSource for Clean {
+            async fn popular(
+                &self,
+                _: &str,
+                _: ObjectType,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<TrendingItem>, ()> {
+                Err(())
+            }
+            async fn new_titles(&self, _: &str, _: ObjectType, _: &str) -> Result<Vec<TrendingItem>, ()> {
+                Err(())
+            }
+            async fn packages(&self, _: &str) -> Result<Vec<(i64, String)>, ()> {
+                Err(())
+            }
+        }
+        assert!(!CatalogState::new(Arc::new(Clean), Duration::from_secs(6 * 3600)).schema_suspect());
     }
 
     /// The backoff must EXPIRE. Blocking a country until restart is the exact failure the empty-list

@@ -169,11 +169,41 @@ async fn main() {
         ),
         None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
     }
-    match serve_until(listener, app, shutdown_signal(), DRAIN_GRACE).await {
-        None => eprintln!("den-atlas: shut down cleanly"),
-        Some(why) => {
-            eprintln!("den-atlas: {why}");
-            std::process::exit(1);
+    let outcome = serve_until(listener, app, shutdown_signal(), DRAIN_GRACE).await;
+    eprintln!("den-atlas: {}", outcome.describe());
+    let code = outcome.exit_code();
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+/// How serving ended. Separate from the message because the exit code differs: a drain that ran out
+/// of time is expected, a serve error is not.
+#[derive(Debug)]
+enum Outcome {
+    Drained,
+    DeadlineHit(String),
+    Failed(String),
+}
+
+impl Outcome {
+    /// A drain that ran out of time is a DESIGNED outcome, so it exits 0.
+    ///
+    /// Exiting non-zero put the unit into `failed` with `Result=exit-code`, and any unauthenticated
+    /// client can trigger it — thirty bytes of an unterminated request head is enough — so anything
+    /// watching unit state or container exit codes could be made to see every routine restart as a
+    /// crash. Only a real serve failure is a failure.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Outcome::Drained | Outcome::DeadlineHit(_) => 0,
+            Outcome::Failed(_) => 1,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Outcome::Drained => "shut down cleanly".to_owned(),
+            Outcome::DeadlineHit(why) | Outcome::Failed(why) => why.clone(),
         }
     }
 }
@@ -196,19 +226,25 @@ async fn serve_until(
     app: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     grace: Duration,
-) -> Option<String> {
+) -> Outcome {
     let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown.await;
         let _ = signalled_tx.send(());
     });
     tokio::select! {
-        r = serve => r.err().map(|e| format!("serve error: {e}")),
+        r = serve => match r {
+            Ok(()) => Outcome::Drained,
+            Err(e) => Outcome::Failed(format!("serve error: {e}")),
+        },
         _ = async {
-            // The clock starts when the signal arrives, not when the server does.
+            // The clock starts when the signal ARRIVES, not when the server does. A dropped sender
+            // resolves this too, which is only safe because axum holds the shutdown future for the
+            // life of the process — if that ever changed, a healthy idle server would start
+            // counting down to exit. `assert_serves_while_shutdown_never_fires` pins it.
             let _ = signalled_rx.await;
             tokio::time::sleep(grace).await;
-        } => Some(format!("drain deadline ({grace:?}) reached with requests still in flight")),
+        } => Outcome::DeadlineHit(format!("drain deadline ({grace:?}) reached with requests still in flight")),
     }
 }
 
@@ -236,30 +272,42 @@ const DRAIN_GRACE: Duration = Duration::from_secs(8);
 /// SIGINT as well, so a foreground `docker run` in a terminal behaves the same way.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-
-    /// One signal, or a future that never resolves if it could not be registered — returning
-    /// immediately would shut the server down the moment it started.
-    ///
-    /// Registered INDEPENDENTLY. Handling them as a pair meant one failure discarded the other, and
-    /// tokio does not restore the default disposition when a `Signal` is dropped — so a registered
-    /// SIGINT would have become caught-and-discarded, and ^C on a foreground `docker run` would
-    /// stop working. Whichever one registers still does its job.
-    async fn on(kind: SignalKind, name: &str) {
-        match signal(kind) {
-            Ok(mut sig) => {
-                sig.recv().await;
-                eprintln!("den-atlas: {name} — draining in-flight requests");
-            }
-            Err(e) => {
-                eprintln!("den-atlas: {name} handler unavailable ({e}); it will be a hard kill");
-                std::future::pending::<()>().await
-            }
-        }
-    }
-
     tokio::select! {
-        _ = on(SignalKind::terminate(), "SIGTERM") => {}
-        _ = on(SignalKind::interrupt(), "SIGINT") => {}
+        _ = wait_for(signal(SignalKind::terminate()), "SIGTERM") => {}
+        _ = wait_for(signal(SignalKind::interrupt()), "SIGINT") => {}
+    }
+    // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
+    // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C was
+    // caught and discarded, and an operator could not get out of the drain short of SIGKILL.
+    // Re-registering makes the usual "press it again" work; exit 0, because asking twice is a
+    // deliberate choice, not a failure.
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = wait_for(signal(SignalKind::terminate()), "SIGTERM") => {}
+            _ = wait_for(signal(SignalKind::interrupt()), "SIGINT") => {}
+        }
+        eprintln!("den-atlas: second signal — exiting without finishing the drain");
+        std::process::exit(0);
+    });
+}
+
+/// Resolve when this signal arrives, or never if it could not be registered.
+///
+/// Never, specifically: returning immediately would shut the server down the moment it started, so
+/// an unregisterable signal has to behave as it did before there was a handler at all — a hard kill.
+/// The two signals are registered INDEPENDENTLY by the caller, because handling them as a pair meant
+/// one failure discarded the other, and a dropped `Signal` leaves the signal caught-and-discarded
+/// rather than restoring the default — so ^C would have stopped working entirely.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            eprintln!("den-atlas: {name} — draining in-flight requests");
+        }
+        Err(e) => {
+            eprintln!("den-atlas: {name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
+        }
     }
 }
 
@@ -304,9 +352,72 @@ mod tests {
             .unwrap();
         let took = started.elapsed();
 
-        assert!(outcome.is_some_and(|w| w.contains("drain deadline")), "the deadline did not fire");
+        assert!(
+            matches!(&outcome, Outcome::DeadlineHit(w) if w.contains("drain deadline")),
+            "the deadline did not fire: {outcome:?}"
+        );
         assert!(took < grace * 4, "shutdown took {took:?}, far past the {grace:?} grace");
         drop(sock);
+    }
+
+    /// Only a real serve failure is a failure. A drain that hit its deadline is a designed outcome,
+    /// and an unauthenticated client can cause it at will — exiting non-zero there let anyone make
+    /// every restart of the service look like a crash to a monitor.
+    #[test]
+    fn only_a_serve_error_exits_non_zero() {
+        assert_eq!(Outcome::Drained.exit_code(), 0);
+        assert_eq!(
+            Outcome::DeadlineHit("deadline".into()).exit_code(),
+            0,
+            "a routine drain timeout looked like a crash"
+        );
+        assert_eq!(
+            Outcome::Failed("bind failed".into()).exit_code(),
+            1,
+            "a real failure was reported as success"
+        );
+        // ...and each still says what happened.
+        assert!(Outcome::Drained.describe().contains("cleanly"));
+        assert_eq!(Outcome::DeadlineHit("deadline".into()).describe(), "deadline");
+        assert_eq!(Outcome::Failed("bind failed".into()).describe(), "bind failed");
+    }
+
+    /// A signal that cannot be registered must never resolve. Returning immediately instead turns
+    /// the server into a crash loop — it would shut down microseconds after boot, every time — and
+    /// that mutation passed the entire suite, because nothing exercised this arm at all.
+    #[tokio::test]
+    async fn an_unregisterable_signal_never_fires() {
+        let err = Err(std::io::Error::other("no signal handler here"));
+        let fired = tokio::time::timeout(Duration::from_millis(200), wait_for(err, "SIGTERM")).await;
+        assert!(
+            fired.is_err(),
+            "an unregisterable signal resolved, which would shut the server down at boot"
+        );
+    }
+
+    /// ...and one that CAN be registered resolves when it arrives.
+    #[tokio::test]
+    async fn a_registered_signal_fires_when_raised() {
+        use tokio::signal::unix::{signal, SignalKind};
+        // SIGUSR2: nothing else in the process uses it, so raising it cannot disturb the test runner.
+        let reg = signal(SignalKind::user_defined2()).expect("registration must work on this platform");
+        let waiter = tokio::spawn(async move { wait_for(Ok(reg), "SIGUSR2").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        unsafe { libc_raise() };
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a registered signal never resolved")
+            .unwrap();
+    }
+
+    /// `raise(SIGUSR2)` without pulling in a libc dependency for one call.
+    unsafe fn libc_raise() {
+        extern "C" {
+            fn raise(sig: i32) -> i32;
+        }
+        // SIGUSR2 is 12 on Linux, 31 on macOS/BSD.
+        let sig = if cfg!(target_os = "linux") { 12 } else { 31 };
+        raise(sig);
     }
 
     /// The grace clock starts at the SIGNAL, not at boot, and costs nothing when there is nothing to
@@ -343,7 +454,7 @@ mod tests {
             .await
             .expect("an idle server never shut down")
             .unwrap();
-        assert!(outcome.is_none(), "a clean drain reported a failure: {outcome:?}");
+        assert!(matches!(outcome, Outcome::Drained), "a clean drain reported otherwise: {outcome:?}");
         assert!(started.elapsed() < grace, "an idle drain waited out the grace: {:?}", started.elapsed());
     }
 }
