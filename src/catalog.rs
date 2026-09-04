@@ -144,7 +144,19 @@ pub struct CatalogState {
     // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
     // `fresh` flag, which shortens one row's HTTP TTL.
     last_refresh_ok: AtomicBool,
+    /// A PROCESS-WIDE ceiling on simultaneous upstream calls.
+    ///
+    /// Bounding the fan-out per request is not enough: the caller picks the cache key (country ×
+    /// provider subset ≈ 171k of them), so every request is a distinct miss with its own
+    /// single-flight gate and nothing coalesces. ~1,000 concurrent GETs still reached ~4,000
+    /// simultaneous calls and earned this host a 403 from JustWatch. What upstream cares about is
+    /// the total, so that is what has to be capped — the queue is bounded by the request timeout.
+    upstream: Arc<tokio::sync::Semaphore>,
 }
+
+/// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
+/// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
+const MAX_UPSTREAM_INFLIGHT: usize = 8;
 
 impl CatalogState {
     #[cfg(test)]
@@ -159,6 +171,7 @@ impl CatalogState {
             inflight: Mutex::new(HashMap::new()),
             packages: Mutex::new(HashMap::new()),
             last_refresh_ok: AtomicBool::new(true),
+            upstream: Arc::new(tokio::sync::Semaphore::new(MAX_UPSTREAM_INFLIGHT)),
         }
     }
 
@@ -221,23 +234,29 @@ impl CatalogState {
             // arm below that clears last_refresh_ok — so the row a user asked for failed upstream
             // while /health still said ok. It falls through to the same serve-stale/empty
             // degradation as any other failed fetch now, which is also what the aggregate row does.
-            let map = self.packages_for(country).await;
-            match self.code_in(provider, &map) {
-                Some(code) if is_new => {
-                    // Arrivals come back most-recently-added first; that order IS the row.
-                    self.source.new_titles(&code, obj, country).await.ok()
-                }
-                Some(code) => {
-                    // "Popular on <service>" = JustWatch's POPULAR sort (their site), not TRENDING.
-                    self.source.popular(&code, obj, country, "POPULAR").await.ok()
-                }
+            // Err = could not ask (a refresh failure → degrade below); Ok = an answer we can act on.
+            match self.packages_for(country).await {
+                Err(()) => None,
+                Ok(map) => match self.code_in(provider, &map) {
+                    Some(code) if is_new => {
+                        let _permit = self.upstream.acquire().await;
+                        // Arrivals come back most-recently-added first; that order IS the row.
+                        self.source.new_titles(&code, obj, country).await.ok()
+                    }
+                    Some(code) => {
+                        let _permit = self.upstream.acquire().await;
+                        // "Popular on <service>" = JustWatch's POPULAR sort, not TRENDING.
+                        self.source.popular(&code, obj, country, "POPULAR").await.ok()
+                    }
                 // A country that genuinely doesn't carry the service has no row — absent, not
                 // empty-but-present. But an EMPTY map means we could not ask, which is a refresh
                 // failure: returning None there 404'd a catalog the manifest advertises, and did it
                 // before the arm that clears last_refresh_ok, so /health still said ok while the row
                 // the user asked for was failing upstream.
-                None if map.is_empty() => None, // fetch failed → fall through to degradation below
-                None => return None,            // country lacks the service → no such row
+                    // We asked and got an answer: this country simply doesn't carry the service,
+                    // so the row is absent rather than empty-but-present.
+                    None => return None,
+                },
             }
         };
 
@@ -267,15 +286,23 @@ impl CatalogState {
     /// The country's package list, fetched at most once per call. An empty result (JustWatch down)
     /// is NOT cached — otherwise one outage blanks every row until restart — so callers must resolve
     /// it once and reuse it rather than per provider.
-    async fn packages_for(&self, country: &str) -> Arc<Vec<(i64, String)>> {
+    /// `Err(())` = we could not ask. `Ok(list)` = JustWatch answered, and the list may legitimately
+    /// be empty for a small market once the monetization filter runs. `unwrap_or_default()` flattened
+    /// those together, so a country JustWatch genuinely serves nothing for was treated as an outage:
+    /// permanently `degraded: stale_catalog`, and re-fetched on every single request forever.
+    async fn packages_for(&self, country: &str) -> Result<Arc<Vec<(i64, String)>>, ()> {
         if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
-            return m;
+            return Ok(m);
         }
-        let fetched = Arc::new(self.source.packages(country).await.unwrap_or_default());
-        if !fetched.is_empty() {
-            self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
-        }
-        fetched
+        let fetched = {
+            let _permit = self.upstream.acquire().await;
+            Arc::new(self.source.packages(country).await?)
+        };
+        // Cache the answer either way, including a legitimately empty one — otherwise every request
+        // for such a country re-asks, which is the loop that pushes hardest exactly when the upstream
+        // is already refusing us.
+        self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
+        Ok(fetched)
     }
 
     /// The country-local short code for a provider, or `None` when that country doesn't carry the
@@ -320,18 +347,40 @@ impl CatalogState {
         // serially — ~64s for the default seven, inside a single request with no server-side
         // deadline, while every concurrent request for the key queued behind the single-flight gate
         // and the client's retries each started another seven.
-        let map = self.packages_for(country).await;
+        let Ok(map) = self.packages_for(country).await else {
+            return None; // could not ask → serve stale rather than publish a union of nothing
+        };
         for (i, p) in providers.iter().enumerate() {
             let src = Arc::clone(&self.source);
             let Some(code) = self.code_in(p, &map) else { continue };
             let country = country.to_owned();
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
-            set.spawn(async move { (i, src.popular(&code, obj, &country, "TRENDING").await) });
+            let permits = Arc::clone(&self.upstream);
+            set.spawn(async move {
+                let _permit = permits.acquire().await;
+                (i, src.popular(&code, obj, &country, "TRENDING").await)
+            });
         }
+        let mut asked = 0usize;
+        let mut answered = 0usize;
         while let Some(joined) = set.join_next().await {
+            asked += 1;
             if let Ok((i, Ok(items))) = joined {
+                answered += 1;
                 slots[i] = Some(items);
             }
+        }
+        // A PARTIAL union is not the union. Dropping the failures and rendering the survivors turned
+        // "Trending Everywhere" into one service's chart — cached fresh for 6h plus an hour of CDN,
+        // with /health green — and the 7 requests fire at one host on one 8s timeout, so a single
+        // slow provider is enough. It is the same principle graphql_error is built on: a partial
+        // chart is not a chart. Serve the last good union instead.
+        if answered < asked {
+            eprintln!(
+                "den-atlas: aggregate for {country} had {answered}/{asked} providers answer — \
+                 not publishing a partial union"
+            );
+            return None;
         }
         let lists: Vec<Vec<TrendingItem>> = slots.into_iter().flatten().collect();
         if lists.is_empty() {
@@ -421,8 +470,29 @@ mod tests {
         /// Fail the package lookup, and count how often it is asked.
         no_packages: bool,
         package_calls: AtomicUsize,
+        /// Answer the package lookup successfully with an EMPTY list (a small market).
+        empty_packages: bool,
+        /// Fail `popular` for every provider after the first — a partial aggregate.
+        popular_ok_first_only: bool,
+        /// Observe how many upstream calls are in flight at once, and the high-water mark.
+        live: AtomicUsize,
+        peak: AtomicUsize,
+        /// Hold each call briefly so overlap is observable.
+        dwell: bool,
     }
     impl Fake {
+        /// Bracket a call so `peak` records the high-water mark of simultaneous upstream work.
+        async fn tracked<T>(&self, f: impl std::future::Future<Output = T>) -> T {
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if self.dwell {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let out = f.await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+
         fn answer(&self) -> Result<Vec<TrendingItem>, ()> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n >= self.fail_after {
@@ -435,7 +505,11 @@ mod tests {
     #[async_trait]
     impl TrendingSource for Fake {
         async fn popular(&self, _p: &str, _o: ObjectType, _country: &str, _sort: &str) -> Result<Vec<TrendingItem>, ()> {
-            self.answer()
+            if self.popular_ok_first_only && self.calls.load(Ordering::SeqCst) > 0 {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                return Err(());
+            }
+            self.tracked(async { self.answer() }).await
         }
         async fn new_titles(&self, _p: &str, _o: ObjectType, _country: &str) -> Result<Vec<TrendingItem>, ()> {
             self.new_calls.fetch_add(1, Ordering::SeqCst);
@@ -446,6 +520,9 @@ mod tests {
             self.package_calls.fetch_add(1, Ordering::SeqCst);
             if self.no_packages {
                 return Err(());
+            }
+            if self.empty_packages {
+                return Ok(Vec::new()); // asked, answered, this market carries nothing
             }
             Ok(vec![
                 (8, "nfx".into()),
@@ -468,6 +545,11 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages,
             package_calls: AtomicUsize::new(0),
+            empty_packages: false,
+            popular_ok_first_only: false,
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            dwell: false,
         }
     }
 
@@ -558,6 +640,11 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages: false,
             package_calls: AtomicUsize::new(0),
+            empty_packages: false,
+            popular_ok_first_only: false,
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            dwell: false,
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // SkyShowtime (1773) isn't in the stub's country list — the row is absent, not empty-but-present,
@@ -588,6 +675,11 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages: false,
             package_calls: AtomicUsize::new(0),
+            empty_packages: false,
+            popular_ok_first_only: false,
+            live: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            dwell: false,
         });
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
         // The arrivals row must not silently serve the Popular chart — that would look plausible and be wrong.
@@ -688,6 +780,93 @@ mod tests {
             fake.package_calls.load(Ordering::SeqCst),
             1,
             "one failing package lookup per provider, serially, is a per-request timeout multiplier"
+        );
+    }
+
+    /// "Trending Everywhere" is a union. Rendering the survivors of a partial fetch turned it into
+    /// one service's chart — cached fresh for 6h plus an hour of CDN, with /health green — and the
+    /// providers fire simultaneously at one host on one timeout, so a single slow one is enough.
+    #[tokio::test]
+    async fn a_partial_aggregate_is_not_published_as_the_union() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.popular_ok_first_only = true;
+        let fake = Arc::new(f);
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(3600));
+
+        let r = s
+            .metas_json(TRENDING_ID, "movie", "US", selected_providers())
+            .await
+            .expect("a failed refresh degrades, it does not 404");
+        assert!(!r.fresh, "a partial union was published as a complete, fresh answer");
+        assert!(!s.fresh(), "/health stayed green while most providers failed");
+    }
+
+    /// The health flag is what /health reports (ADDON-02), and it is a different field from the
+    /// per-response `fresh`. Nothing asserted it: the line clearing it could be deleted outright and
+    /// the whole suite still passed.
+    #[tokio::test]
+    async fn a_failed_refresh_clears_the_health_flag() {
+        let fake = Arc::new(fake(vec![item("tt1", "A", 0)], 0, false)); // fails from the first call
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(3600));
+        assert!(s.fresh(), "starts optimistic");
+
+        let _ = s.metas_json(TRENDING_ID, "movie", "US", selected_providers()).await;
+        assert!(!s.fresh(), "an upstream failure left /health reporting ok");
+    }
+
+    /// A small market whose package list is legitimately empty is an ANSWER, not an outage. Flattening
+    /// `Ok(vec![])` and `Err(())` together made such a country permanently `degraded: stale_catalog`
+    /// and re-fetched on every single request, which pushes hardest exactly when upstream is refusing.
+    #[tokio::test]
+    async fn a_country_that_carries_nothing_is_an_answer_not_an_outage() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.empty_packages = true;
+        let fake = Arc::new(f);
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(3600));
+
+        // No row for a service the market doesn't carry...
+        assert!(s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await.is_none());
+        assert!(s.fresh(), "an empty market was reported as an upstream outage");
+
+        // ...and the answer is cached, rather than re-asked on every request.
+        let after = fake.package_calls.load(Ordering::SeqCst);
+        let _ = s.metas_json("jw-mxx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(
+            fake.package_calls.load(Ordering::SeqCst),
+            after,
+            "an empty package list was re-fetched on every request"
+        );
+    }
+
+    /// Bounding the fan-out PER REQUEST is not a bound on the process. The caller picks the cache
+    /// key — country × provider subset is ~171k distinct keys — so every request is its own miss
+    /// with its own single-flight gate and nothing coalesces. ~1,000 concurrent GETs still reached
+    /// ~4,000 simultaneous upstream calls, which is what got this host 403'd. Upstream cares about
+    /// the total, so the total is what has to be capped.
+    #[tokio::test]
+    async fn upstream_concurrency_is_capped_across_requests() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.dwell = true;
+        let fake = Arc::new(f);
+        let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
+
+        // Distinct countries ⇒ distinct keys ⇒ no coalescing, exactly the attacker's shape.
+        let mut set = JoinSet::new();
+        for i in 0..40 {
+            let s = Arc::clone(&s);
+            let country = format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            set.spawn(async move {
+                let _ = s.metas_json(TRENDING_ID, "movie", &country, selected_providers()).await;
+            });
+        }
+        while set.join_next().await.is_some() {}
+
+        let peak = fake.peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "the probe never overlapped, so it proves nothing (peak {peak})");
+        assert!(
+            peak <= MAX_UPSTREAM_INFLIGHT,
+            "{peak} simultaneous upstream calls against a cap of {MAX_UPSTREAM_INFLIGHT} — \
+             per-request bounds do not bound the process"
         );
     }
 }
