@@ -163,6 +163,11 @@ pub struct CatalogState {
 /// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
 /// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
+
+// The cap is the protection, not a tuning knob: raising it is what earned this host a 403. The
+// concurrency tests assert this same number as a literal for the same reason, but a test only
+// guards what someone remembers to run — this fails the build.
+const _: () = assert!(MAX_UPSTREAM_INFLIGHT <= 8);
 // There is deliberately NO deadline on acquiring a permit, and that is a considered trade rather
 // than an oversight. A 2s shed was tried and measured worse on every axis that matters: the same
 // 100-request cold burst went from 100 rows fresh and cached to 13 fresh, 75 EMPTY and only 8 keys
@@ -176,7 +181,7 @@ const MAX_UPSTREAM_INFLIGHT: usize = 8;
 
 impl CatalogState {
     #[cfg(test)]
-    fn cache_len(&self) -> usize {
+    pub(crate) fn cache_len(&self) -> usize {
         self.cache.len()
     }
 
@@ -254,24 +259,30 @@ impl CatalogState {
             match self.packages_for(country).await {
                 Err(()) => None,
                 Ok(map) => match self.code_in(provider, &map) {
-                    Some(code) if is_new => {
-                        let Ok(_permit) = self.upstream.acquire().await else { return None };
+                    // A closed semaphore is "could not ask", the same as the Err arm above, so it
+                    // degrades too. `return None` here would 404 a row the manifest advertises —
+                    // the exact bug the comment above says was fixed — and skip the arm that clears
+                    // last_refresh_ok, leaving /health green through it.
+                    Some(code) if is_new => match self.upstream.acquire().await {
+                        Err(_) => None,
                         // Arrivals come back most-recently-added first; that order IS the row.
-                        self.source
+                        Ok(_permit) => self
+                            .source
                             .new_titles(&code, obj, country)
                             .await
                             .ok()
-                            .map(|items| Aggregate { items, complete: true })
-                    }
-                    Some(code) => {
-                        let Ok(_permit) = self.upstream.acquire().await else { return None };
+                            .map(|items| Aggregate { items, complete: true }),
+                    },
+                    Some(code) => match self.upstream.acquire().await {
+                        Err(_) => None,
                         // "Popular on <service>" = JustWatch's POPULAR sort, not TRENDING.
-                        self.source
+                        Ok(_permit) => self
+                            .source
                             .popular(&code, obj, country, "POPULAR")
                             .await
                             .ok()
-                            .map(|items| Aggregate { items, complete: true })
-                    }
+                            .map(|items| Aggregate { items, complete: true }),
+                    },
                     // We asked and got an answer: this country simply doesn't carry the service,
                     // so the row is absent rather than empty-but-present. (An answer we could NOT
                     // get is the Err arm above, which degrades instead of 404ing a row the manifest
@@ -930,14 +941,11 @@ mod tests {
         assert!(peak > 1, "the probe never overlapped, so it proves nothing (peak {peak})");
         // A LITERAL ceiling, not the constant: `peak <= MAX_UPSTREAM_INFLIGHT` moves its own
         // goalpost, so raising the cap to 100_000 — removing the protection that exists because
-        // this host was 403'd — passed every test. Flagged three rounds running; fixed here.
+        // this host was 403'd — passed every test. The literal has to be the cap itself, too: at
+        // `<= 16` a doubling of the concurrency against that same host still passed both of these.
         assert!(
-            peak <= 16,
+            peak <= 8,
             "{peak} simultaneous upstream calls — the process-wide cap is not holding"
-        );
-        assert!(
-            MAX_UPSTREAM_INFLIGHT <= 16,
-            "the cap itself was raised to {MAX_UPSTREAM_INFLIGHT}; that is the protection, not a tuning knob"
         );
     }
 
@@ -1008,7 +1016,7 @@ mod tests {
         let peak = fake.peak.load(Ordering::SeqCst);
         assert!(peak > 1, "the probe never overlapped (peak {peak})");
         assert!(
-            peak <= 16,
+            peak <= 8,
             "{peak} concurrent upstream calls on the arrivals/packages paths — those permits are \
              not being taken"
         );

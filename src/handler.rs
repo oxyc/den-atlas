@@ -14,34 +14,29 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The /configure page, embedded so the binary is self-contained. Region + provider choice is plaintext
 /// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
-/// A ceiling on how long any single request may occupy the server.
-///
-/// This is the bound the catalog's upstream cap always claimed to have and never did: capping
-/// concurrent upstream calls without bounding the wait made the queue grow linearly with load —
-/// measured p50 17s at 100 concurrent cold keys and 170s at 1,000, by which point every client has
-/// long since given up while their work is still queued. Shedding inside the catalog was tried and
-/// was worse (it produced empty, uncachable rows). Bounding it HERE is the third option: the queue
-/// drains at the edge, a client that has gone away stops holding a slot, and the work that does run
-/// still produces complete, cached rows.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
-
+// There is deliberately NO server-side request deadline, and this is the third and last thing tried
+// here. A 20s one shipped and was measured strictly worse than nothing at the load it was added for.
+//
+// The catalog path takes two permits in sequence (the country's package list, then the chart), and
+// `Semaphore` is FIFO-fair, so every request's SECOND acquire queues behind every other request's
+// first. Completions therefore cluster at the very end of the drain rather than spreading across
+// it, and truncating that queue does not shed a proportional slice — it discards nearly all of the
+// work. Measured at 600 concurrent cold keys: with the deadline, 0 of 600 rows served and 0 keys
+// cached, having spent ~579 upstream calls (65 aborted mid-flight); without it, 600 of 600 served
+// and cached, in exactly the minimum 1200 calls, p50 34s. Nothing caching also meant the next wave
+// was equally cold, so the failure was self-sustaining rather than a spike.
+//
+// What a deadline actually protects against was already handled: hyper drops the handler future
+// when the client disconnects, which releases the permit and the single-flight gate. So a client
+// that has given up already stops holding a slot; the queue's length costs latency, which the
+// client bounds itself, not resources. Slow-and-correct beats fast-and-empty here — and a 5xx would
+// also bypass the serve-stale path that `handle_catalog` promises never returns one.
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    match tokio::time::timeout(REQUEST_DEADLINE, handle_inner(State(state), req)).await {
-        Ok(resp) => resp,
-        Err(_) => json_response(
-            r#"{"error":"timeout","detail":"the request exceeded the server deadline; retry shortly"}"#,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-    }
-}
-
-async fn handle_inner(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
     // CORS preflight for browser-based Stremio clients (public, credential-free data).
     if method == Method::OPTIONS {
@@ -430,12 +425,15 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(dir.join("vectors.bin"), b"VECTORS!").unwrap();
-        // The OPTIONAL blobs too. With only the two mandatory ones the "every advertised URL is
-        // versioned" loop saw two URLs, so dropping the stamp from metadata/premise/facets — the
-        // four the production dataset actually ships — passed. Same for a route serving the wrong
-        // blob: only the covered routes were pinned.
+        // Every OPTIONAL blob the production dataset ships, not just some of them. With only the two
+        // mandatory ones the "every advertised URL is versioned" loop saw two URLs, so dropping the
+        // stamp from any optional blob passed; declaring metadata + facets but not the two premise
+        // blobs left exactly that hole open for premise, and a premise route serving the wrong blob
+        // passed too. The loop's floor below is tied to what this writes.
         std::fs::write(dir.join("meta.json"), b"METADATA").unwrap();
         std::fs::write(dir.join("facets.bin"), b"FACETS").unwrap();
+        std::fs::write(dir.join("premise-labels.json"), b"PLABELS").unwrap();
+        std::fs::write(dir.join("premise-vectors.bin"), b"PVECTORS").unwrap();
         std::fs::write(
             dir.join("dataset.meta.json"),
             br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
@@ -443,7 +441,10 @@ mod tests {
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "metadataFile":"meta.json","metadataBytes":8,"metadataSha256":"c",
-                 "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d"}"#,
+                 "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d",
+                 "premiseEmbeddingModel":"pm","premiseDims":2,"premiseCount":1,
+                 "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
+                 "premiseVectorsFile":"premise-vectors.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}"#,
         )
         .unwrap();
         crate::dataset::Dataset::load(dir).expect("fixture dataset must load")
@@ -487,6 +488,12 @@ mod tests {
         let meta = get(&state, "/meta.json").await;
         assert_eq!(meta.status(), 200);
         assert_eq!(body_of(meta).await, "METADATA", "the metadata route served another blob");
+        let pl = get(&state, "/premise-labels.json").await;
+        assert_eq!(pl.status(), 200);
+        assert_eq!(body_of(pl).await, "PLABELS", "the premise-labels route served another blob");
+        let pv = get(&state, "/premise-vectors.bin").await;
+        assert_eq!(pv.status(), 200);
+        assert_eq!(body_of(pv).await, "PVECTORS", "the premise-vectors route served another blob");
 
         // `?v=<current version>` pins for a year; a bare request must revalidate instead.
         let pinned = get(&state, "/labels.json?v=v9").await;
@@ -506,10 +513,29 @@ mod tests {
                 &rest[..rest.find('"').unwrap_or(0)]
             })
             .collect();
-        assert!(urls.len() >= 4, "the descriptor advertised almost nothing: {desc}");
+        // Exact, not a floor: a floor of 4 was satisfied by the mandatory pair plus metadata and
+        // facets, so the two premise URLs the fixture did not declare were never looked at.
+        assert_eq!(urls.len(), 6, "the descriptor did not advertise every fixture blob: {desc}");
         for u in &urls {
             assert!(u.contains("?v=v9"), "an advertised URL is unversioned: {u} (all: {urls:?})");
         }
+        // WHICH blob each URL points at, not just that six of them are stamped. Pointing the premise
+        // labels entry at the vectors blob kept the count and the stamps intact and passed.
+        let mut names: Vec<&str> =
+            urls.iter().map(|u| u.rsplit('/').next().unwrap_or(u).split('?').next().unwrap_or(u)).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "facets.bin",
+                "labels.json",
+                "meta.json",
+                "premise-labels.json",
+                "premise-vectors.bin",
+                "vectors.bin"
+            ],
+            "the descriptor advertised the wrong URL for a blob: {urls:?}"
+        );
         assert!(desc.contains("\"count\":1"), "{desc}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -533,5 +559,93 @@ mod tests {
         assert!(m.contains("\"dataset\""), "the manifest stopped advertising the dataset: {m}");
         assert!(m.contains("catalog"), "{m}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upstream that always answers, but slowly. The catalog's own test fake lives in that
+    /// module; this one exists here because a request deadline can only be seen through `handle`.
+    struct SlowSource {
+        dwell: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::justwatch::TrendingSource for SlowSource {
+        async fn popular(
+            &self,
+            _p: &str,
+            _o: crate::justwatch::ObjectType,
+            _c: &str,
+            _s: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            tokio::time::sleep(self.dwell).await;
+            Ok(vec![crate::justwatch::TrendingItem {
+                imdb: "tt1".into(),
+                moviedb: Some(42),
+                title: "A".into(),
+                rank: 0,
+                rating: None,
+                year: None,
+            }])
+        }
+        async fn new_titles(
+            &self,
+            p: &str,
+            o: crate::justwatch::ObjectType,
+            c: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            self.popular(p, o, c, "").await
+        }
+        async fn packages(&self, _c: &str) -> Result<Vec<(i64, String)>, ()> {
+            tokio::time::sleep(self.dwell).await;
+            Ok(vec![(8, "nfx".into()), (119, "prv".into()), (1899, "mxx".into()), (531, "pmp".into())])
+        }
+    }
+
+    /// A cold burst must end with every row served and cached, however long the queue gets.
+    ///
+    /// This is the test that was missing when a 20s `REQUEST_DEADLINE` shipped in `handle`. The
+    /// catalog takes two permits in sequence and `Semaphore` is FIFO-fair, so completions cluster at
+    /// the end of the drain: cutting the queue off part-way discards nearly everything rather than a
+    /// proportional slice. At this size the drain is ~45s of upstream work, so reintroducing any
+    /// deadline in the 20s range turns all 600 rows into 5xx and leaves the cache empty — which is
+    /// worse than the slow answer, because nothing cached means the next wave is equally cold.
+    ///
+    /// Virtual time (`start_paused`), so 45s of simulated queue costs no wall clock. A deadline
+    /// built on `tokio::time::timeout` fires against the same clock, so the mutation is still caught.
+    #[tokio::test(start_paused = true)]
+    async fn a_cold_burst_is_served_whole_however_long_the_queue_gets() {
+        const KEYS: usize = 600;
+        let state = Arc::new(AppState::for_test_with_source(Arc::new(SlowSource {
+            dwell: std::time::Duration::from_millis(300),
+        })));
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..KEYS {
+            let state = Arc::clone(&state);
+            // A distinct country per request, so every one is a distinct cold cache key with its own
+            // single-flight gate — the shape that made the queue long in the first place.
+            let country =
+                format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            set.spawn(async move {
+                let resp = get(&state, &format!("/catalog/movie/jw-trending/country={country}.json")).await;
+                let status = resp.status().as_u16();
+                (status, body_of(resp).await.contains("tt1"))
+            });
+        }
+
+        let mut served = 0;
+        let mut empty = 0;
+        let mut refused = 0;
+        while let Some(j) = set.join_next().await {
+            match j.unwrap() {
+                (200, true) => served += 1,
+                (200, false) => empty += 1,
+                _ => refused += 1,
+            }
+        }
+        assert_eq!(refused, 0, "{refused} of {KEYS} cold rows were refused instead of served");
+        assert_eq!(empty, 0, "{empty} of {KEYS} cold rows came back empty");
+        assert_eq!(served, KEYS, "only {served} of {KEYS} cold rows carried titles");
+        assert_eq!(state.catalog.cache_len(), KEYS, "the cache did not fill, so the next wave re-fans out");
+        assert!(state.catalog.fresh(), "/health went degraded from this server's own queueing");
     }
 }

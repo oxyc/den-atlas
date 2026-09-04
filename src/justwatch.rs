@@ -189,10 +189,24 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
         Err(_) => return Vec::new(),
     };
     let edges = resp.data.and_then(|d| d.popular).map(|p| p.edges).unwrap_or_default();
-    let mut out = Vec::with_capacity(edges.len());
+    let total = edges.len();
+    // Edges dropped because their SHAPE was wrong, counted separately from the ones dropped for
+    // lacking an IMDb id — which is routine and says nothing. Skipping a bad edge instead of failing
+    // the document is right, but silently is not: a half-length row is cached as complete for the
+    // full TTL and served with a long max-age, and /health stays green, so a partial schema change
+    // has no other way to surface. Only the whole-document case tripped the caller's 0-items log.
+    let mut malformed = 0usize;
+    let mut out = Vec::with_capacity(total);
     for e in edges {
-        let Some(content) = e.node.content else { continue };
-        let Some(title) = content.title else { continue };
+        let Some(content) = e.node.content else {
+            malformed += 1;
+            continue;
+        };
+        // A present-but-empty title is as unusable as a missing one — it renders as a nameless card.
+        let Some(title) = content.title.filter(|t| !t.trim().is_empty()) else {
+            malformed += 1;
+            continue;
+        };
         let ext = content.external_ids;
         let imdb = match ext.as_ref().and_then(|x| x.imdb_id.clone()) {
             Some(id) if is_imdb(&id) => id,
@@ -203,6 +217,9 @@ pub fn parse_popular(body: &str) -> Vec<TrendingItem> {
         let year = content.original_release_year;
         let rank = out.len();
         out.push(TrendingItem { imdb, moviedb, title, rank, rating, year });
+    }
+    if malformed > 0 {
+        eprintln!("den-atlas: justwatch popularTitles dropped {malformed} of {total} edges with no usable content/title — possible schema change");
     }
     out
 }
@@ -286,6 +303,9 @@ pub fn parse_new_titles(body: &str, want: ObjectType) -> Vec<TrendingItem> {
             Some(id) if is_imdb(&id) => id,
             _ => continue,
         };
+        // Same rule as parse_popular: a nameless card is not worth a row slot. Checked BEFORE the
+        // dedupe below, so a title-less entry doesn't claim the id and suppress a later good one.
+        let Some(title) = content.title.filter(|t| !t.trim().is_empty()) else { continue };
         if !seen.insert(imdb.clone()) {
             continue; // a weekly series drops a season repeatedly
         }
@@ -294,7 +314,7 @@ pub fn parse_new_titles(body: &str, want: ObjectType) -> Vec<TrendingItem> {
         out.push(TrendingItem {
             imdb,
             moviedb,
-            title: content.title.unwrap_or_default(),
+            title,
             rank,
             rating: content.scoring.and_then(|s| s.imdb_score),
             year: content.original_release_year,
@@ -540,6 +560,39 @@ mod tests {
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
         assert_eq!(items[0], TrendingItem { imdb: "tt0000001".into(), moviedb: Some(1397385), title: "Alpha".into(), rank: 0, rating: Some(7.4), year: Some(1999) });
         assert_eq!(items[1], TrendingItem { imdb: "tt0000002".into(), moviedb: None, title: "Beta".into(), rank: 1, rating: None, year: None });
+    }
+
+    /// A card with no name is not a card. Skipping a bad edge rather than failing the document is
+    /// right, but the guard has to reject `""` as well as `null` — JustWatch sends the empty string
+    /// for a title with no localisation in that country, and it rendered as a blank row slot in
+    /// rank position 1.
+    #[test]
+    fn an_edge_with_no_usable_title_is_dropped_not_shipped_blank() {
+        let body = r#"{"data":{"popularTitles":{"edges":[
+            {"node":{"content":{"title":"","externalIds":{"imdbId":"tt0000001"}}}},
+            {"node":{"content":{"externalIds":{"imdbId":"tt0000002"}}}},
+            {"node":{"content":null}},
+            {"node":{"content":{"title":"   ","externalIds":{"imdbId":"tt0000003"}}}},
+            {"node":{"content":{"title":"Real","externalIds":{"imdbId":"tt0000004"}}}}
+        ]}}}"#;
+        let items = parse_popular(body);
+        assert_eq!(items.len(), 1, "a nameless edge was shipped: {items:?}");
+        assert_eq!(items[0].title, "Real");
+        assert_eq!(items[0].rank, 0, "the surviving item did not take the top slot");
+    }
+
+    /// Same rule on the arrivals path, and the check has to come BEFORE the dedupe: a title-less
+    /// edge that claims its imdb id in `seen` suppresses the good edge for the same title later in
+    /// the list, which is exactly the shape a weekly series produces.
+    #[test]
+    fn a_title_less_arrival_does_not_suppress_its_own_good_edge() {
+        let body = r#"{"data":{"newTitles":{"edges":[
+            {"node":{"__typename":"Movie","content":{"title":"","externalIds":{"imdbId":"tt0000001"}}}},
+            {"node":{"__typename":"Movie","content":{"title":"Real","externalIds":{"imdbId":"tt0000001"}}}}
+        ]}}}"#;
+        let items = parse_new_titles(body, ObjectType::Movie);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].title, "Real", "the blank edge claimed the id and hid the good one");
     }
 
     #[test]

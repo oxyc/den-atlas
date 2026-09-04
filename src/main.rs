@@ -46,6 +46,16 @@ impl AppState {
             embed: None,
         }
     }
+
+    /// Same, but with the catalog's upstream replaced. Needed because a server-side request deadline
+    /// lives in `handle`, so only a test that goes through `handle` with a slow upstream can see it —
+    /// a catalog-level burst test cannot, which is how a 20s deadline shipped with zero coverage.
+    pub fn for_test_with_source(source: std::sync::Arc<dyn justwatch::TrendingSource>) -> Self {
+        AppState {
+            catalog: catalog::CatalogState::new(source, std::time::Duration::from_secs(3600)),
+            ..AppState::for_test(None)
+        }
+    }
 }
 
 /// Search query-embed proxy. den-atlas never runs the model — it forwards to the single den-embed authority
