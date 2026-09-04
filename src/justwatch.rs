@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Stremio content type ↔ JustWatch objectType.
@@ -86,6 +86,18 @@ pub trait TrendingSource: Send + Sync {
     fn suspected_schema_breaks(&self) -> usize {
         0
     }
+
+    /// How long ago the last suspected break was seen, or `None` for never. `/health` needs current
+    /// state, and a lifetime count is not that — one transient would leave it reporting "rows may be
+    /// short" for the life of the process.
+    fn last_schema_break_age(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Seconds since the unix epoch, saturating to 0 if the clock is before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -128,11 +140,15 @@ pub struct JustWatchClient {
     /// Always ENDPOINT in production; a test points it at a local socket so the 200-with-errors
     /// path can be exercised against a real response rather than asserted on a helper in isolation.
     endpoint: String,
-    /// How many charts have come back looking like a schema break. Read by `/health`, and by the
-    /// tests: the warning is a log line, and a log line cannot be asserted on — so testing the
-    /// predicate alone left the CALL SITE free to drop it, which is the failure this file already
-    /// documents for `graphql_error`.
+    /// How many charts have come back looking like a schema break. Read by the tests: the warning is
+    /// a log line, and a log line cannot be asserted on — so testing the predicate alone left the
+    /// CALL SITE free to drop it, which is the failure this file already documents for
+    /// `graphql_error`.
     suspected_schema_breaks: AtomicUsize,
+    /// When the last one was seen, as unix seconds; 0 = never. `/health` reads recency, not the
+    /// count: a total is a lifetime figure, and reporting "rows may be short" in the present tense
+    /// forever after one transient makes the signal something to ignore.
+    last_schema_break: AtomicU64,
 }
 
 impl JustWatchClient {
@@ -143,7 +159,12 @@ impl JustWatchClient {
             .build()
             .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
             .ok();
-        Self { http, endpoint: ENDPOINT.to_string(), suspected_schema_breaks: AtomicUsize::new(0) }
+        Self {
+            http,
+            endpoint: ENDPOINT.to_string(),
+            suspected_schema_breaks: AtomicUsize::new(0),
+            last_schema_break: AtomicU64::new(0),
+        }
     }
 
     #[cfg(test)]
@@ -512,6 +533,7 @@ impl TrendingSource for JustWatchClient {
         let chart = parse_popular(&body);
         if let Some(w) = schema_break_warning(&label, &body, &chart) {
             self.suspected_schema_breaks.fetch_add(1, Ordering::Relaxed);
+            self.last_schema_break.store(unix_now(), Ordering::Relaxed);
             eprintln!("{w}");
         }
         Ok(chart.items)
@@ -519,6 +541,13 @@ impl TrendingSource for JustWatchClient {
 
     fn suspected_schema_breaks(&self) -> usize {
         self.suspected_schema_breaks.load(Ordering::Relaxed)
+    }
+
+    fn last_schema_break_age(&self) -> Option<Duration> {
+        match self.last_schema_break.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(Duration::from_secs(unix_now().saturating_sub(at))),
+        }
     }
 
     async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()> {

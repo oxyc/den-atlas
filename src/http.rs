@@ -37,7 +37,18 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     let is_head = method == Method::HEAD;
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
     // Range wins over gzip (byte offsets need the identity representation).
-    let use_gzip = range_header.is_none() && s.gzip.is_some() && accepts_gzip(headers);
+    let wants_gzip = range_header.is_none() && s.gzip.is_some() && accepts_gzip(headers);
+    // The gzip variant is an OPTIMISATION, which is what `resolve_blob` says at load time: an
+    // unusable one drops the variant rather than taking the dataset down. Runtime has to agree, or a
+    // release that stops publishing a `.gz` — the sync deletes the undeclared file while the process
+    // is still serving the old meta — turns every `Accept-Encoding: gzip` request into a 503, which
+    // is every URLSession client, for a blob sitting readable on disk right beside it.
+    //
+    // Opened HERE, before the ETag, because the ETag names the representation being served: falling
+    // back after choosing `"<sha>-gzip"` would hand identity bytes to a cache under the gzip
+    // validator (RFC 9110 §8.8.3). The cost is one open on a request that turns out to be a 304.
+    let gz_open = if wants_gzip { open_payload(&s.gzip.as_ref().unwrap().0).await } else { None };
+    let use_gzip = gz_open.is_some();
     // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
     let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
 
@@ -80,22 +91,28 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         if if_range_matches(headers, &etag, s.last_modified.as_deref()) {
             match parse_range(rh, s.size) {
                 RangeResult::Unsatisfiable => {
-                    let mut h = base.clone();
+                    // NOT cacheable. This body depends entirely on the Range header, which is not in
+                    // any shared cache's key, so it inherited the blob's `immutable, max-age=1y` and
+                    // one client's bad Range could in principle pin a 416 on the blob for a year.
+                    let mut h: Vec<(&'static str, String)> =
+                        base.iter().filter(|(k, _)| *k != "cache-control").cloned().collect();
+                    h.push(("cache-control", "no-store".to_owned()));
                     h.push(("content-range", format!("bytes */{}", s.size)));
                     h.push(("content-type", s.content_type.clone()));
                     return build(StatusCode::RANGE_NOT_SATISFIABLE, &h, Body::empty());
                 }
                 RangeResult::Range { start, end } => {
-                    if !readable(&s.identity).await {
+                    // Opened before the 206 is built, and the handle carries the body, so the file
+                    // cannot vanish between the check and the read.
+                    let Some(open) = open_payload(&s.identity).await else {
                         return unavailable();
-                    }
+                    };
                     let len = end - start + 1;
                     let mut h = base.clone();
                     h.push(("content-type", s.content_type.clone()));
                     h.push(("content-range", format!("bytes {start}-{end}/{}", s.size)));
                     h.push(("content-length", len.to_string()));
-                    let body =
-                        if is_head { Body::empty() } else { range_body(&s.identity, start, len).await };
+                    let body = if is_head { Body::empty() } else { range_body(open, start, len).await };
                     return build(StatusCode::PARTIAL_CONTENT, &h, body);
                 }
                 RangeResult::None => {} // malformed / multi-range → full 200
@@ -103,22 +120,28 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         }
     }
 
-    let (payload, size, encoding) = if use_gzip {
-        let (p, sz) = s.gzip.as_ref().unwrap();
-        (p, *sz, Some("gzip"))
-    } else {
-        (&s.identity, s.size, None)
+    // The gzip variant is an OPTIMISATION, which is what `resolve_blob` says at load time: an
+    // unusable one drops the variant rather than taking the dataset down. Runtime has to agree, or a
+    // release that stops publishing a `.gz` — the sync deletes the undeclared file while the process
+    // still serves the old meta — turns every `Accept-Encoding: gzip` request into a 503, which is
+    // every URLSession client, for a blob sitting readable on disk right next to it.
+    let (open, size, encoding) = match gz_open {
+        Some(o) => (o, s.gzip.as_ref().unwrap().1, Some("gzip")),
+        None => {
+            // Only a missing IDENTITY blob is unserveable.
+            let Some(o) = open_payload(&s.identity).await else {
+                return unavailable();
+            };
+            (o, s.size, None)
+        }
     };
-    if !readable(payload).await {
-        return unavailable();
-    }
     let mut h = base;
     h.push(("content-type", s.content_type.clone()));
     h.push(("content-length", size.to_string()));
     if let Some(enc) = encoding {
         h.push(("content-encoding", enc.to_owned()));
     }
-    let body = if is_head { Body::empty() } else { full_body(payload).await };
+    let body = if is_head { Body::empty() } else { full_body(open) };
     build(StatusCode::OK, &h, body)
 }
 
@@ -135,18 +158,25 @@ fn build(status: StatusCode, headers: &[(&'static str, String)], body: Body) -> 
     b.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Whether the bytes this response promises can actually be read.
+/// A payload with its file already OPEN, so the bytes a response promises are pinned before its
+/// status and `content-length` are chosen.
 ///
-/// The body helpers below fall back to an empty body when the file is gone, and by then the status
-/// and `content-length` are already chosen — so a missing blob went out as a 200 declaring N bytes
-/// and carrying none, under the blob's real ETag. With `?v=<version>` that response is
-/// `immutable, max-age=1y`, so a CDN pins a zero-length file as the valid representation of that
-/// blob for a year, and every client behind it fails the sha256 check with no way to recover.
-/// Checked before the response is built so the failure is a status, not a truncated success.
-async fn readable(p: &Payload) -> bool {
+/// Checking readability and then reopening for the body is not enough: the file can vanish between
+/// the two opens, and the body helper's fallback then produces an empty body whose size hint hyper
+/// uses to rewrite `content-length` to 0. The result is a self-consistent 200 with the blob's real
+/// ETag and zero bytes — reproduced at 3 in 900 requests against an unlink-and-recreate loop —
+/// which under `?v=<version>` is `immutable, max-age=1y`, so a CDN pins a zero-length file as the
+/// blob's valid representation for a year. Holding the handle removes the window: an unlinked file
+/// stays readable through an open descriptor.
+enum Open {
+    Memory(Bytes),
+    File(tokio::fs::File),
+}
+
+async fn open_payload(p: &Payload) -> Option<Open> {
     match p {
-        Payload::Memory(_) => true,
-        Payload::File(path) => tokio::fs::File::open(path).await.is_ok(),
+        Payload::Memory(b) => Some(Open::Memory(b.clone())),
+        Payload::File(path) => tokio::fs::File::open(path).await.ok().map(Open::File),
     }
 }
 
@@ -162,30 +192,24 @@ fn unavailable() -> Response {
     )
 }
 
-async fn full_body(p: &Payload) -> Body {
+fn full_body(p: Open) -> Body {
     match p {
-        Payload::Memory(b) => Body::from(b.clone()),
-        Payload::File(path) => match tokio::fs::File::open(path).await {
-            Ok(f) => Body::from_stream(ReaderStream::new(f)),
-            Err(_) => Body::empty(),
-        },
+        Open::Memory(b) => Body::from(b),
+        Open::File(f) => Body::from_stream(ReaderStream::new(f)),
     }
 }
 
-async fn range_body(p: &Payload, start: u64, len: u64) -> Body {
+async fn range_body(p: Open, start: u64, len: u64) -> Body {
     match p {
-        Payload::Memory(b) => {
+        Open::Memory(b) => {
             let s = start as usize;
             let e = (start + len) as usize;
             Body::from(b.slice(s..e.min(b.len())))
         }
-        Payload::File(path) => match tokio::fs::File::open(path).await {
-            Ok(mut f) => {
-                let _ = f.seek(std::io::SeekFrom::Start(start)).await;
-                Body::from_stream(ReaderStream::new(f.take(len)))
-            }
-            Err(_) => Body::empty(),
-        },
+        Open::File(mut f) => {
+            let _ = f.seek(std::io::SeekFrom::Start(start)).await;
+            Body::from_stream(ReaderStream::new(f.take(len)))
+        }
     }
 }
 
@@ -476,6 +500,112 @@ mod tests {
         s.identity = Payload::File(missing);
         let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-99")]), s).await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as a 206");
+    }
+
+    /// A gzip variant that has gone missing must fall back to the identity blob, not 503 a request
+    /// the file on disk answers perfectly. The sync deletes a `.gz` the new meta no longer declares
+    /// while the process still serves the old one, so this window is a normal part of a release.
+    #[tokio::test]
+    async fn a_missing_gzip_variant_falls_back_to_identity() {
+        let gone = std::env::temp_dir().join(format!("den-atlas-nogz-{}.gz", std::process::id()));
+        let _ = std::fs::remove_file(&gone);
+        let mut s = servable(true);
+        s.gzip = Some((Payload::File(gone), 40));
+
+        let resp = serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), s).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a readable identity blob was refused");
+        assert!(resp.headers().get("content-encoding").is_none(), "identity bytes were labelled gzip");
+        // ...and under the IDENTITY validator. Serving identity under `"<sha>-gzip"` would hand a
+        // shared cache the wrong bytes for every later gzip request.
+        assert_eq!(resp.headers().get("etag").unwrap(), &format!("\"{SHA}\""));
+        assert_eq!(resp.headers().get("content-length").unwrap(), "1000");
+        assert_eq!(body_bytes(resp).await.len(), 1000);
+    }
+
+    /// ...but a missing IDENTITY blob is still unserveable.
+    #[tokio::test]
+    async fn a_missing_identity_blob_is_still_unavailable_even_with_a_gzip_variant() {
+        let gone = std::env::temp_dir().join(format!("den-atlas-noid-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&gone);
+        let mut s = servable(true);
+        s.identity = Payload::File(gone);
+        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The blob is opened ONCE and the handle carries the body. Checking readability and then
+    /// reopening leaves a window in which the file vanishes: the body helper's empty fallback has a
+    /// size hint of 0, so hyper rewrites content-length and the response goes out as a complete,
+    /// self-consistent 200 with the blob's real ETag and no bytes — measured at 3 in 900 requests
+    /// against an unlink-and-recreate loop. An open descriptor keeps reading an unlinked file, so
+    /// holding it removes the window entirely.
+    #[tokio::test]
+    async fn a_blob_unlinked_after_the_response_starts_is_still_served_whole() {
+        let path = std::env::temp_dir().join(format!("den-atlas-unlink-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![b'x'; 1000]).unwrap();
+        let mut s = servable(false);
+        s.identity = Payload::File(path.clone());
+
+        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Gone before a single byte of the body is read.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            body_bytes(resp).await.len(),
+            1000,
+            "the body came back short after the file was unlinked mid-response"
+        );
+    }
+
+    /// A 416 must not be cacheable: it is determined by the Range header, which no shared cache keys
+    /// on, and it inherited the blob's year-long `immutable`.
+    #[tokio::test]
+    async fn an_unsatisfiable_range_is_not_cacheable() {
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), servable(false)).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(cc.contains("no-store"), "a 416 was made cacheable: {cc}");
+        assert!(!cc.contains("immutable"), "a 416 inherited the blob's immutable: {cc}");
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */1000");
+    }
+
+    /// `bytes=-0` asks for the last zero bytes. Without the guard the suffix branch produces
+    /// `start = size, end = size - 1`, and `serve`'s `end - start + 1` then underflows — a panic in
+    /// debug, a wrapped length in release. Nothing else in that branch checks `start > end`.
+    #[tokio::test]
+    async fn a_zero_length_suffix_range_is_unsatisfiable_not_an_underflow() {
+        assert!(matches!(parse_range("bytes=-0", 1000), RangeResult::Unsatisfiable));
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=-0")]), servable(false)).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    /// A zero-byte blob is reachable — `resolve_blob` takes the on-disk length, whatever the meta
+    /// declares — and every range against it must be unsatisfiable rather than underflowing `size - 1`.
+    #[tokio::test]
+    async fn every_range_against_an_empty_representation_is_unsatisfiable() {
+        for r in ["bytes=0-0", "bytes=0-", "bytes=-1", "bytes=-0", "bytes=5-9"] {
+            assert!(
+                matches!(parse_range(r, 0), RangeResult::Unsatisfiable),
+                "{r} was satisfiable on an empty blob"
+            );
+        }
+        let mut s = servable(false);
+        s.identity = Payload::Memory(Bytes::new());
+        s.size = 0;
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=0-0")]), s).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */0");
+    }
+
+    /// A malformed or multi-range header degrades to the full 200 the RFC allows, rather than a 416
+    /// — a client asking for something we cannot parse still gets the representation.
+    #[tokio::test]
+    async fn an_unparseable_range_serves_the_whole_representation() {
+        for r in ["bytes=0-10,20-30", "items=0-10", "bytes=abc-def", "garbage"] {
+            let resp = serve(&Method::GET, &hdrs(&[("range", r)]), servable(false)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{r} was answered with {}", resp.status());
+            assert_eq!(body_bytes(resp).await.len(), 1000, "{r}");
+        }
     }
 
     /// Both halves of a range are already known to be all-digits, so a parse failure means the number

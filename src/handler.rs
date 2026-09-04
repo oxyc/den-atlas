@@ -634,6 +634,72 @@ mod tests {
         }
     }
 
+    /// A source whose charts look like schema breaks, so the /health wiring can be exercised end to
+    /// end rather than a step at a time.
+    struct SuspectSource {
+        age: Option<std::time::Duration>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::justwatch::TrendingSource for SuspectSource {
+        async fn popular(
+            &self,
+            _p: &str,
+            _o: crate::justwatch::ObjectType,
+            _c: &str,
+            _s: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            Err(())
+        }
+        async fn new_titles(
+            &self,
+            _p: &str,
+            _o: crate::justwatch::ObjectType,
+            _c: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            Err(())
+        }
+        async fn packages(&self, _c: &str) -> Result<Vec<(i64, String)>, ()> {
+            Err(())
+        }
+        fn last_schema_break_age(&self) -> Option<std::time::Duration> {
+            self.age
+        }
+    }
+
+    /// The whole chain: source → CatalogState → /health. Asserting `health_body` in isolation and
+    /// the source's counter in isolation left the WIRING between them untested — `schema_suspect()`
+    /// could return a constant `false` and every test still passed, which is verbatim the failure
+    /// the counter's own doc comment says it exists to prevent.
+    #[tokio::test]
+    async fn a_suspected_schema_break_reaches_health() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-hsuspect-{}", std::process::id()));
+        // A dataset has to be present, or `dataset_unavailable` outranks and hides the state.
+        let health_for = |age| {
+            let mut st = AppState::for_test_with_source(Arc::new(SuspectSource { age }));
+            st.dataset = Some(fixture(&dir));
+            Arc::new(st)
+        };
+
+        // Recent: inside the cache TTL, so the short rows are still being served.
+        let state = health_for(Some(std::time::Duration::from_secs(60)));
+        let body = body_of(get(&state, "/health").await).await;
+        assert!(body.contains("catalog_schema_suspect"), "a live schema break never reached /health: {body}");
+
+        // Old: past the TTL, so every affected row has been refetched since and the claim would be
+        // stale. A lifetime count would still be reporting it here, for the life of the process.
+        let state = health_for(Some(std::time::Duration::from_secs(7 * 3600)));
+        let body = body_of(get(&state, "/health").await).await;
+        assert!(!body.contains("catalog_schema_suspect"), "an expired schema break still reported: {body}");
+
+        // Never seen.
+        let state = health_for(None);
+        let body = body_of(get(&state, "/health").await).await;
+        assert!(body.contains(r#""status":"ok""#), "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A cold burst must end with every row served and cached, however long the queue gets.
     ///
     /// This is the test that was missing when a 20s `REQUEST_DEADLINE` shipped in `handle`. The

@@ -115,8 +115,11 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    /// Read `dir/dataset.meta.json` + resolve the two blobs. Fails loudly if the meta or a blob is missing —
-    /// a misconfigured deploy should not serve half a dataset.
+    /// Read `dir/dataset.meta.json` and resolve the blobs it declares.
+    ///
+    /// Fails loudly on the meta or either MANDATORY blob — without labels and vectors there is no
+    /// dataset to serve. Every optional blob degrades instead: a missing premise index costs
+    /// premise-based More Like This, not the whole addon (see the call site below).
     pub fn load(dir: &Path) -> Result<Dataset, String> {
         let meta_path = dir.join("dataset.meta.json");
         let raw = std::fs::read(&meta_path).map_err(|e| format!("read {}: {e}", meta_path.display()))?;
@@ -405,6 +408,41 @@ mod tests {
         assert!(ds.premise_labels.is_none() && ds.premise_vectors.is_none());
         // ...and a usable optional blob is still served.
         assert!(ds.facets.is_some(), "a perfectly good facets blob was dropped with the broken ones");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The gz variants are wired to the right blobs. Every gz test called `resolve_blob` directly, so
+    /// crossing the wires in `load` — serving the metadata sidecar's gz as the labels variant —
+    /// passed, and so did dropping `metadataGzFile` entirely.
+    #[test]
+    fn each_gz_variant_is_wired_to_its_own_blob() {
+        let root = std::env::temp_dir().join(format!("den-atlas-gzwire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
+        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
+        std::fs::write(root.join("meta.json"), b"METADATA").unwrap();
+        std::fs::write(root.join("labels.json.gz"), b"LGZ").unwrap();
+        std::fs::write(root.join("meta.json.gz"), b"MGZ").unwrap();
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                 "labelsGzFile":"labels.json.gz",
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                 "metadataFile":"meta.json","metadataBytes":8,"metadataSha256":"c",
+                 "metadataGzFile":"meta.json.gz"}"#,
+        )
+        .unwrap();
+
+        let ds = Dataset::load(&root).expect("fixture must load");
+        let gz_name =
+            |b: &Blob| b.gz.as_ref().map(|g| g.path.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(gz_name(&ds.labels).as_deref(), Some("labels.json.gz"), "labels got the wrong gz variant");
+        let md = ds.metadata.as_ref().expect("the sidecar must resolve");
+        assert_eq!(gz_name(md).as_deref(), Some("meta.json.gz"), "the sidecar's gz variant is not wired up");
+        assert!(ds.vectors.gz.is_none(), "a binary blob was given a gz variant");
         let _ = std::fs::remove_dir_all(&root);
     }
 

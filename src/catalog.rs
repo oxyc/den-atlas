@@ -161,6 +161,9 @@ pub struct CatalogState {
     /// request. Separate from `packages` because a failure is not an answer to cache — it is a
     /// reason to wait before asking again.
     packages_failed: Mutex<HashMap<String, Instant>>,
+    /// How long a rendered row stays fresh — also the window in which a suspected schema break is
+    /// still describing rows we are serving.
+    ttl: Duration,
     // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
     // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
     // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
@@ -187,7 +190,10 @@ struct InflightSweep<'a> {
 
 impl Drop for InflightSweep<'_> {
     fn drop(&mut self) {
-        let mut map = self.map.lock().unwrap();
+        // `unwrap()` here would double-panic and abort: this runs during unwind, and the profile is
+        // `panic = unwind` precisely so one bad request drops its connection instead of the process.
+        // A poisoned map is still a perfectly usable map for this.
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(gate) = map.get(self.key) {
             // Two handles = the map's and this task's. Every waiter cloned its own before awaiting,
             // so a key that anyone else still wants counts higher and stays. Cloning goes through
@@ -247,6 +253,7 @@ impl CatalogState {
         Self {
             source,
             cache: TtlCache::new(ttl),
+            ttl,
             inflight: Mutex::new(HashMap::new()),
             packages: Mutex::new(HashMap::new()),
             packages_failed: Mutex::new(HashMap::new()),
@@ -260,11 +267,16 @@ impl CatalogState {
         self.last_refresh_ok.load(Ordering::Relaxed)
     }
 
-    /// Whether any chart has come back looking like a schema break. Distinct from `fresh()`: a
-    /// partial break IS a successful refresh — the row is short but non-empty, so it caches as
-    /// complete and everything else reports healthy.
+    /// Whether a chart we are STILL SERVING came back looking like a schema break. Distinct from
+    /// `fresh()`: a partial break is a successful refresh — the row is short but non-empty, so it
+    /// caches as complete and everything else reports healthy.
+    ///
+    /// Scoped to the cache TTL rather than the process lifetime. A count never clears, so one
+    /// transient would leave `/health` saying "rows may be short" in the present tense for weeks,
+    /// which makes it a signal to ignore. Within the TTL is exactly the window where a short row is
+    /// still being handed out; past it the row has been refetched and the claim would be stale.
     pub fn schema_suspect(&self) -> bool {
-        self.source.suspected_schema_breaks() > 0
+        self.source.last_schema_break_age().is_some_and(|age| age < self.ttl)
     }
 
     /// The `{ "metas": [...] }` body for a catalog id + Stremio type in a given `country`, restricted to
@@ -636,7 +648,7 @@ mod tests {
         /// Records which arm the router picked, so a test can prove "-new" reaches `new_titles`.
         new_calls: AtomicUsize,
         /// Fail the package lookup, and count how often it is asked.
-        no_packages: bool,
+        no_packages: AtomicBool,
         package_calls: AtomicUsize,
         /// Answer the package lookup successfully with an EMPTY list (a small market).
         empty_packages: std::sync::atomic::AtomicBool,
@@ -698,7 +710,7 @@ mod tests {
         /// Mirrors a real country list: Prime is 119 here (as in UY/FI), never 9.
         async fn packages(&self, _country: &str) -> Result<Vec<(i64, String)>, ()> {
             self.package_calls.fetch_add(1, Ordering::SeqCst);
-            if self.no_packages {
+            if self.no_packages.load(Ordering::SeqCst) {
                 return Err(());
             }
             if self.empty_packages.load(Ordering::SeqCst) {
@@ -719,7 +731,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_after,
             new_calls: AtomicUsize::new(0),
-            no_packages,
+            no_packages: AtomicBool::new(no_packages),
             package_calls: AtomicUsize::new(0),
             empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
@@ -825,7 +837,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_after: 9,
             new_calls: AtomicUsize::new(0),
-            no_packages: false,
+            no_packages: AtomicBool::new(false),
             package_calls: AtomicUsize::new(0),
             empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
@@ -861,7 +873,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             fail_after: 9,
             new_calls: AtomicUsize::new(0),
-            no_packages: false,
+            no_packages: AtomicBool::new(false),
             package_calls: AtomicUsize::new(0),
             empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
@@ -1161,6 +1173,52 @@ mod tests {
             "the country was re-asked on every request; each one takes a permit and waits out the client timeout"
         );
         assert_eq!(s.package_failures(), 1);
+    }
+
+    /// The backoff must EXPIRE. Blocking a country until restart is the exact failure the empty-list
+    /// path is written to avoid — 14 provider rows 404ing from a manifest that advertises them —
+    /// and deleting the elapsed check left every test passing.
+    #[tokio::test]
+    async fn a_backed_off_country_is_retried_once_the_window_passes() {
+        let f = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
+        let s = CatalogState::new(f.clone(), Duration::from_secs(3600));
+        let _ = s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(f.package_calls.load(Ordering::SeqCst), 1);
+
+        // Blocked while the window holds.
+        let _ = s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(f.package_calls.load(Ordering::SeqCst), 1, "the window is not blocking at all");
+
+        // Age the record past the window rather than sleeping a minute.
+        s.packages_failed
+            .lock()
+            .unwrap()
+            .insert("ZZ".to_owned(), Instant::now() - FAILED_PACKAGES_TTL - Duration::from_secs(1));
+        let _ = s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(
+            f.package_calls.load(Ordering::SeqCst),
+            2,
+            "the country stayed blocked past the window — that is 'dead until restart' again"
+        );
+    }
+
+    /// ...and a country that recovers must not carry its block around. The record is dropped on the
+    /// success, so the next failure starts a fresh window instead of inheriting an expired one.
+    #[tokio::test]
+    async fn a_recovered_country_drops_its_failure_record() {
+        let f = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
+        let s = CatalogState::new(f.clone(), Duration::from_secs(3600));
+        let _ = s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(s.package_failures(), 1);
+
+        // Upstream comes back, and the window is over.
+        f.no_packages.store(false, Ordering::SeqCst);
+        s.packages_failed
+            .lock()
+            .unwrap()
+            .insert("ZZ".to_owned(), Instant::now() - FAILED_PACKAGES_TTL - Duration::from_secs(1));
+        let _ = s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await;
+        assert_eq!(s.package_failures(), 0, "the failure record outlived the failure");
     }
 
     /// ...but an EMPTY list is not backed off. It is a fast, cheap, nonsense answer rather than the

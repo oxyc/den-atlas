@@ -15,13 +15,18 @@ mkdir -p data
 
 # The meta names the blobs (version-agnostic), so fetch it first, then the files it points at.
 curl -fsSL "$BASE/dataset.meta.json" -o data/dataset.meta.json
-read -r LABELS VECTORS GZ METADATA PLABELS PVECTORS FACETS < <(python3 - <<'PY'
+# EVERY "<name>File" the meta declares, newline-delimited. A positional list had to be extended by
+# hand for each new artifact and silently skipped anything missed: metadataGzFile was added to the
+# server and never fetched here, so a dev's ./data had no gz variant and the server logged one
+# missing. deploy/atlas-dataset-sync.sh has been generic over these keys for exactly this reason.
+FILES="$(python3 - <<'PY'
 import json
 m = json.load(open("data/dataset.meta.json"))
-print(m["labelsFile"], m["vectorsFile"], m.get("labelsGzFile", ""), m.get("metadataFile", ""),
-      m.get("premiseLabelsFile", ""), m.get("premiseVectorsFile", ""), m.get("facetsFile", ""))
+for k, v in m.items():
+    if k.endswith("File") and isinstance(v, str) and v:
+        print(v)
 PY
-)
+)"
 # The names come from a release meta we do not control, and are used as `-o "data/$f"` — so
 # "../../../x" writes outside the repo. den-atlas rejects the same shapes when it loads them.
 # An allowlist: "not a path" is the right question for the server, where `*` is a legal file name,
@@ -42,10 +47,16 @@ safe_name() {
   esac
 }
 
-for f in "$LABELS" "$VECTORS" ${GZ:+"$GZ"} ${METADATA:+"$METADATA"} ${PLABELS:+"$PLABELS"} ${PVECTORS:+"$PVECTORS"} ${FACETS:+"$FACETS"}; do
+# Newline-delimited via a redirect, so a name is never word-split or glob-expanded and `set -e` can
+# still abort the script (a pipe would put this loop in a subshell).
+[ -n "$FILES" ] || { echo "release meta declares no blobs — refusing" >&2; exit 1; }
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
   safe_name "$f" || { echo "refusing unsafe blob name: $f" >&2; exit 1; }
   echo "fetching $f …"
   curl -fsSL "$BASE/$f" -o "data/$f"
-done
+done <<EOF
+$FILES
+EOF
 echo "fetched → ./data:"
 ls -la data/*.json data/*.bin data/*.gz 2>/dev/null | awk '{print $5, $NF}'

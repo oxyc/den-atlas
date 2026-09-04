@@ -169,13 +169,57 @@ async fn main() {
         ),
         None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
     }
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    if let Err(e) = serve.await {
-        eprintln!("den-atlas: serve error: {e}");
-        std::process::exit(1);
+    match serve_until(listener, app, shutdown_signal(), DRAIN_GRACE).await {
+        None => eprintln!("den-atlas: shut down cleanly"),
+        Some(why) => {
+            eprintln!("den-atlas: {why}");
+            std::process::exit(1);
+        }
     }
-    eprintln!("den-atlas: shut down cleanly");
 }
+
+/// Serve until `shutdown` resolves, then drain for at most `grace`. `None` on a clean drain, or the
+/// reason it ended otherwise.
+///
+/// The bound is the point. `with_graceful_shutdown` waits for every connection task, and hyper waits
+/// on a connection that is mid-request — but there is no header-read timeout and no request deadline
+/// anywhere, so a client that opens a socket and sends half a request head holds the process open
+/// for as long as it likes. Measured before this: an unterminated
+/// `GET /health HTTP/1.1\r\nHost: x\r\n` was still holding shutdown at 60 seconds. The listener is
+/// released the moment the signal arrives, so that is pure downtime, and it was decided by an
+/// arbitrary client rather than by us — worse than the fixed 10s hard kill it replaced.
+///
+/// `shutdown` is a parameter rather than a direct call to `shutdown_signal()` so a test can trigger
+/// the drain without signalling the test runner itself.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Option<String> {
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = signalled_tx.send(());
+    });
+    tokio::select! {
+        r = serve => r.err().map(|e| format!("serve error: {e}")),
+        _ = async {
+            // The clock starts when the signal arrives, not when the server does.
+            let _ = signalled_rx.await;
+            tokio::time::sleep(grace).await;
+        } => Some(format!("drain deadline ({grace:?}) reached with requests still in flight")),
+    }
+}
+
+/// How long in-flight requests get to finish after a stop signal.
+///
+/// Every real request is milliseconds; the long tail is a blob download, which can legitimately run
+/// for minutes on a slow link. Waiting for that tail is not worth it: a restart is rare, blob
+/// requests are resumable (`Range` + `If-Range`, both honoured), and the alternative is letting one
+/// slow or stuck client decide how long the addon is down. The container's stop timeout sits above
+/// this so podman never preempts the drain — but this, not podman, is what bounds it.
+const DRAIN_GRACE: Duration = Duration::from_secs(15);
 
 /// Resolves when the process is asked to stop.
 ///
@@ -188,19 +232,114 @@ async fn main() {
 /// SIGINT as well, so a foreground `docker run` in a terminal behaves the same way.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    // A handler that cannot be registered must never resolve: returning immediately would shut the
-    // server down the moment it started. Never resolving is the old behaviour — a hard kill — which
-    // is bad but not self-inflicted.
-    let (mut term, mut int) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
-        (Ok(t), Ok(i)) => (t, i),
-        (t, i) => {
-            let e = t.err().or_else(|| i.err()).map(|e| e.to_string()).unwrap_or_default();
-            eprintln!("den-atlas: signal handlers unavailable ({e}); shutdown will be a hard kill");
-            return std::future::pending::<()>().await;
+
+    /// One signal, or a future that never resolves if it could not be registered — returning
+    /// immediately would shut the server down the moment it started.
+    ///
+    /// Registered INDEPENDENTLY. Handling them as a pair meant one failure discarded the other, and
+    /// tokio does not restore the default disposition when a `Signal` is dropped — so a registered
+    /// SIGINT would have become caught-and-discarded, and ^C on a foreground `docker run` would
+    /// stop working. Whichever one registers still does its job.
+    async fn on(kind: SignalKind, name: &str) {
+        match signal(kind) {
+            Ok(mut sig) => {
+                sig.recv().await;
+                eprintln!("den-atlas: {name} — draining in-flight requests");
+            }
+            Err(e) => {
+                eprintln!("den-atlas: {name} handler unavailable ({e}); it will be a hard kill");
+                std::future::pending::<()>().await
+            }
         }
-    };
+    }
+
     tokio::select! {
-        _ = term.recv() => eprintln!("den-atlas: SIGTERM — draining in-flight requests"),
-        _ = int.recv() => eprintln!("den-atlas: SIGINT — draining in-flight requests"),
+        _ = on(SignalKind::terminate(), "SIGTERM") => {}
+        _ = on(SignalKind::interrupt(), "SIGINT") => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        (l, a)
+    }
+
+    fn app() -> axum::Router {
+        axum::Router::new().fallback(handler::handle).with_state(Arc::new(AppState::for_test(None)))
+    }
+
+    /// A client that opens a socket and sends HALF a request head held the whole process open —
+    /// measured still running at 60s — because nothing in the stack times out a partial head. The
+    /// listener is released immediately, so every second of that is downtime chosen by whoever
+    /// opened the socket, and the container stop timeout was the only bound.
+    #[tokio::test]
+    async fn a_client_holding_a_partial_request_cannot_hold_shutdown_open() {
+        let (l, addr) = listener().await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let grace = Duration::from_millis(300);
+        let server =
+            tokio::spawn(async move { serve_until(l, app(), async { rx.await.unwrap_or(()) }, grace).await });
+
+        // Head deliberately unterminated: no blank line, so hyper is still waiting for the rest.
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let _ = tx.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown never returned — the drain is unbounded again")
+            .unwrap();
+        let took = started.elapsed();
+
+        assert!(outcome.is_some_and(|w| w.contains("drain deadline")), "the deadline did not fire");
+        assert!(took < grace * 4, "shutdown took {took:?}, far past the {grace:?} grace");
+        drop(sock);
+    }
+
+    /// The grace clock starts at the SIGNAL, not at boot, and costs nothing when there is nothing to
+    /// drain.
+    ///
+    /// Both halves matter. A clock started at boot would end the process one grace period into
+    /// ordinary uptime — so this server is deliberately left running for longer than its own grace
+    /// before anything is asked of it, and is expected to answer normally afterwards.
+    #[tokio::test]
+    async fn the_grace_starts_at_the_signal_and_costs_nothing_when_idle() {
+        let (l, addr) = listener().await;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let grace = Duration::from_millis(200);
+        let server =
+            tokio::spawn(async move { serve_until(l, app(), async { rx.await.unwrap_or(()) }, grace).await });
+
+        // Well past the grace, with no signal sent. The server must still be serving.
+        tokio::time::sleep(grace * 5).await;
+        assert!(
+            !server.is_finished(),
+            "the server exited during ordinary uptime — the grace clock started at boot"
+        );
+
+        // One completed request, so a connection has actually been handled.
+        let (mut sock, _) = (tokio::net::TcpStream::connect(addr).await.unwrap(), ());
+        sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf).contains("200 OK"));
+
+        let started = std::time::Instant::now();
+        let _ = tx.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("an idle server never shut down")
+            .unwrap();
+        assert!(outcome.is_none(), "a clean drain reported a failure: {outcome:?}");
+        assert!(started.elapsed() < grace, "an idle drain waited out the grace: {:?}", started.elapsed());
     }
 }
