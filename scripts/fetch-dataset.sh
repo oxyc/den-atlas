@@ -25,12 +25,16 @@ PY
 # The names come from a release meta we do not control, and are used as `-o "data/$f"` — so
 # "../../../x" writes outside the repo. den-atlas rejects the same shapes when it loads them.
 # An allowlist: "not a path" is the right question for the server, where `*` is a legal file name,
-# but not for a shell, which expands it. Same guard as deploy/atlas-dataset-sync.sh.
+# but not for a shell, which expands it.
+#
+# deploy/atlas-dataset-sync.sh has the same guard over a LONGER reserved list — it also keeps
+# `.needs-restart`, the pre-move location of its container-restart marker, which has no counterpart
+# here. Claiming the two are "the same guard" is what let them drift apart last time, so the
+# difference is stated rather than asserted away.
 safe_name() {
   case "$1" in
     # dataset.meta.json is this script's own working copy in data/: a release declaring it as a blob
-    # overwrites the meta mid-fetch and Dataset::load then fails outright. Kept in step with
-    # deploy/atlas-dataset-sync.sh, which reserves the same name (that claim had drifted).
+    # overwrites the meta mid-fetch and Dataset::load then fails outright.
     "" | . | .. | dataset.meta.json) return 1 ;;
     *[!A-Za-z0-9._-]*) return 1 ;;
     -*) return 1 ;;
