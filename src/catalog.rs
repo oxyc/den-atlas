@@ -130,6 +130,12 @@ pub struct CatalogResponse {
     pub fresh: bool,
 }
 
+/// A union plus whether every provider that was asked actually answered.
+struct Aggregate {
+    items: Vec<TrendingItem>,
+    complete: bool,
+}
+
 pub struct CatalogState {
     source: Arc<dyn TrendingSource>,
     cache: TtlCache,
@@ -157,6 +163,13 @@ pub struct CatalogState {
 /// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
 /// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
+/// How long a request will WAIT for a permit before giving up and degrading.
+///
+/// A cap without a deadline is a queue without a deadline: 100 concurrent cold requests measured a
+/// p50 of 11.75s and a p95 of 19.65s, and the queue grows linearly with load because axum has no
+/// request timeout and reqwest's only starts once a permit is granted. Shedding is the point — a
+/// stale or empty row now beats a client that has already given up and retried.
+const UPSTREAM_WAIT: Duration = Duration::from_secs(2);
 
 impl CatalogState {
     #[cfg(test)]
@@ -225,7 +238,7 @@ impl CatalogState {
             return Some(CatalogResponse { body: v, fresh: true }); // filled while we waited
         }
 
-        let fetched = if is_trending {
+        let fetched: Option<Aggregate> = if is_trending {
             self.aggregate(obj, country, providers).await
         } else {
             let (provider, is_new) = resolved.unwrap();
@@ -239,33 +252,58 @@ impl CatalogState {
                 Err(()) => None,
                 Ok(map) => match self.code_in(provider, &map) {
                     Some(code) if is_new => {
-                        let _permit = self.upstream.acquire().await;
+                        let Ok(Ok(_permit)) =
+                            tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
+                        else {
+                            return None;
+                        };
                         // Arrivals come back most-recently-added first; that order IS the row.
-                        self.source.new_titles(&code, obj, country).await.ok()
+                        self.source
+                            .new_titles(&code, obj, country)
+                            .await
+                            .ok()
+                            .map(|items| Aggregate { items, complete: true })
                     }
                     Some(code) => {
-                        let _permit = self.upstream.acquire().await;
+                        let Ok(Ok(_permit)) =
+                            tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
+                        else {
+                            return None;
+                        };
                         // "Popular on <service>" = JustWatch's POPULAR sort, not TRENDING.
-                        self.source.popular(&code, obj, country, "POPULAR").await.ok()
+                        self.source
+                            .popular(&code, obj, country, "POPULAR")
+                            .await
+                            .ok()
+                            .map(|items| Aggregate { items, complete: true })
                     }
-                // A country that genuinely doesn't carry the service has no row — absent, not
-                // empty-but-present. But an EMPTY map means we could not ask, which is a refresh
-                // failure: returning None there 404'd a catalog the manifest advertises, and did it
-                // before the arm that clears last_refresh_ok, so /health still said ok while the row
-                // the user asked for was failing upstream.
                     // We asked and got an answer: this country simply doesn't carry the service,
-                    // so the row is absent rather than empty-but-present.
+                    // so the row is absent rather than empty-but-present. (An answer we could NOT
+                    // get is the Err arm above, which degrades instead of 404ing a row the manifest
+                    // advertises.)
                     None => return None,
                 },
             }
         };
 
         match fetched {
-            Some(items) => {
-                let body = render_metas(&items, stremio_type);
+            // Complete: cache it and call it fresh.
+            Some(a) if a.complete => {
+                let body = render_metas(&a.items, stremio_type);
                 self.cache.put(&key, body.clone());
                 self.last_refresh_ok.store(true, Ordering::Relaxed);
                 Some(CatalogResponse { body, fresh: true })
+            }
+            // Partial: better than nothing, but never pinned as the complete union. A stale copy is
+            // a COMPLETE union from before, so it wins; otherwise serve this one uncached, so the
+            // next request re-checks instead of the row going dead for as long as one provider is.
+            Some(a) => {
+                self.last_refresh_ok.store(false, Ordering::Relaxed);
+                let body = match self.cache.get(&key) {
+                    Lookup::Fresh(v) | Lookup::Stale(v) => v,
+                    Lookup::Miss => render_metas(&a.items, stremio_type),
+                };
+                Some(CatalogResponse { body, fresh: false })
             }
             // Refresh failed → serve stale if we have it, else an empty list (graceful degradation).
             // Not fresh → the handler uses a short TTL so recovery isn't masked at the CDN, and `/health`
@@ -286,21 +324,29 @@ impl CatalogState {
     /// The country's package list, fetched at most once per call. An empty result (JustWatch down)
     /// is NOT cached — otherwise one outage blanks every row until restart — so callers must resolve
     /// it once and reuse it rather than per provider.
-    /// `Err(())` = we could not ask. `Ok(list)` = JustWatch answered, and the list may legitimately
-    /// be empty for a small market once the monetization filter runs. `unwrap_or_default()` flattened
-    /// those together, so a country JustWatch genuinely serves nothing for was treated as an outage:
-    /// permanently `degraded: stale_catalog`, and re-fetched on every single request forever.
+    /// `Err(())` = we could not ask, OR asked and got something we should not believe.
+    ///
+    /// An empty package list is the second kind. The premise that it means "a small market carrying
+    /// nothing" does not hold — every JustWatch country carries Netflix — while everything that
+    /// really produces `Ok(vec![])` is a bug or a transient: a 200 with `{}`, `data: null`, a renamed
+    /// field, a new monetization enum. `JustWatchClient::packages` already logs that case as a
+    /// possible schema change. Caching it pinned the country dead for the process lifetime: 14
+    /// provider rows 404ing from a manifest that advertises them, trending permanently stale, only a
+    /// restart to clear it. So empties are not cached and not trusted.
     async fn packages_for(&self, country: &str) -> Result<Arc<Vec<(i64, String)>>, ()> {
         if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
             return Ok(m);
         }
         let fetched = {
-            let _permit = self.upstream.acquire().await;
+            let Ok(Ok(_permit)) = tokio::time::timeout(UPSTREAM_WAIT, self.upstream.acquire()).await
+            else {
+                return Err(()); // shed rather than queue
+            };
             Arc::new(self.source.packages(country).await?)
         };
-        // Cache the answer either way, including a legitimately empty one — otherwise every request
-        // for such a country re-asks, which is the loop that pushes hardest exactly when the upstream
-        // is already refusing us.
+        if fetched.is_empty() {
+            return Err(()); // asked, but the answer is not one to act on
+        }
         self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
         Ok(fetched)
     }
@@ -339,7 +385,7 @@ impl CatalogState {
         obj: ObjectType,
         country: &str,
         providers: &[&'static Provider],
-    ) -> Option<Vec<TrendingItem>> {
+    ) -> Option<Aggregate> {
         let mut slots: Vec<Option<Vec<TrendingItem>>> = vec![None; providers.len()];
         let mut set: JoinSet<(usize, Result<Vec<TrendingItem>, ()>)> = JoinSet::new();
         // ONE package fetch for the whole aggregate. This was awaited per provider, and a failing
@@ -357,7 +403,10 @@ impl CatalogState {
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
             let permits = Arc::clone(&self.upstream);
             set.spawn(async move {
-                let _permit = permits.acquire().await;
+                let Ok(Ok(_permit)) = tokio::time::timeout(UPSTREAM_WAIT, permits.acquire()).await
+                else {
+                    return (i, Err(()));
+                };
                 (i, src.popular(&code, obj, &country, "TRENDING").await)
             });
         }
@@ -370,23 +419,20 @@ impl CatalogState {
                 slots[i] = Some(items);
             }
         }
-        // A PARTIAL union is not the union. Dropping the failures and rendering the survivors turned
-        // "Trending Everywhere" into one service's chart — cached fresh for 6h plus an hour of CDN,
-        // with /health green — and the 7 requests fire at one host on one 8s timeout, so a single
-        // slow provider is enough. It is the same principle graphql_error is built on: a partial
-        // chart is not a chart. Serve the last good union instead.
-        if answered < asked {
-            eprintln!(
-                "den-atlas: aggregate for {country} had {answered}/{asked} providers answer — \
-                 not publishing a partial union"
-            );
-            return None;
-        }
+        // A partial union must not be PINNED as the complete one — that quietly turned "Trending
+        // Everywhere" into one service's chart for 6h plus an hour of CDN, with /health green.
+        // But refusing it outright was worse: nothing was cached, so one persistently broken
+        // provider re-fanned all seven on every single request (measured 70 calls where 7 would do)
+        // and the row was dead for as long as that provider was. Serve it, don't trust it: the
+        // caller keeps any better stale copy, and otherwise publishes this uncached and not-fresh.
         let lists: Vec<Vec<TrendingItem>> = slots.into_iter().flatten().collect();
         if lists.is_empty() {
             return None;
         }
-        Some(aggregate_inverse_rank(&lists))
+        if answered < asked {
+            eprintln!("den-atlas: aggregate for {country}: {answered}/{asked} providers answered");
+        }
+        Some(Aggregate { items: aggregate_inverse_rank(&lists), complete: answered == asked })
     }
 }
 
@@ -471,7 +517,7 @@ mod tests {
         no_packages: bool,
         package_calls: AtomicUsize,
         /// Answer the package lookup successfully with an EMPTY list (a small market).
-        empty_packages: bool,
+        empty_packages: std::sync::atomic::AtomicBool,
         /// Fail `popular` for every provider after the first — a partial aggregate.
         popular_ok_first_only: bool,
         /// Observe how many upstream calls are in flight at once, and the high-water mark.
@@ -521,7 +567,7 @@ mod tests {
             if self.no_packages {
                 return Err(());
             }
-            if self.empty_packages {
+            if self.empty_packages.load(Ordering::SeqCst) {
                 return Ok(Vec::new()); // asked, answered, this market carries nothing
             }
             Ok(vec![
@@ -545,7 +591,7 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages,
             package_calls: AtomicUsize::new(0),
-            empty_packages: false,
+            empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -640,7 +686,7 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages: false,
             package_calls: AtomicUsize::new(0),
-            empty_packages: false,
+            empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -675,7 +721,7 @@ mod tests {
             new_calls: AtomicUsize::new(0),
             no_packages: false,
             package_calls: AtomicUsize::new(0),
-            empty_packages: false,
+            empty_packages: std::sync::atomic::AtomicBool::new(false),
             popular_ok_first_only: false,
             live: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -783,11 +829,12 @@ mod tests {
         );
     }
 
-    /// "Trending Everywhere" is a union. Rendering the survivors of a partial fetch turned it into
-    /// one service's chart — cached fresh for 6h plus an hour of CDN, with /health green — and the
-    /// providers fire simultaneously at one host on one timeout, so a single slow one is enough.
+    /// A partial union must not be PINNED as the complete one — that turned "Trending Everywhere"
+    /// into one service's chart for 6h plus an hour of CDN with /health green. But refusing it
+    /// outright cached nothing, so one persistently broken provider re-fanned all seven on every
+    /// request (70 calls where 7 would do) and the row stayed dead for as long as it was.
     #[tokio::test]
-    async fn a_partial_aggregate_is_not_published_as_the_union() {
+    async fn a_partial_union_is_served_but_never_pinned() {
         let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
         f.popular_ok_first_only = true;
         let fake = Arc::new(f);
@@ -796,9 +843,23 @@ mod tests {
         let r = s
             .metas_json(TRENDING_ID, "movie", "US", selected_providers())
             .await
-            .expect("a failed refresh degrades, it does not 404");
-        assert!(!r.fresh, "a partial union was published as a complete, fresh answer");
-        assert!(!s.fresh(), "/health stayed green while most providers failed");
+            .expect("a partial union still beats an empty row");
+        assert!(!r.fresh, "a partial union was published as the complete one");
+        assert!(!s.fresh(), "/health stayed green while providers failed");
+        // Not cached: the next request must re-check rather than serve a pinned partial.
+        assert_eq!(s.cache_len(), 0, "a partial union was pinned in the cache");
+    }
+
+    /// ...and a complete union still caches, so a healthy row costs one fan-out, not one per request.
+    #[tokio::test]
+    async fn a_complete_union_is_cached() {
+        let fake = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, false));
+        let s = CatalogState::new(fake.clone(), Duration::from_secs(3600));
+        let r = s.metas_json(TRENDING_ID, "movie", "US", selected_providers()).await.unwrap();
+        assert!(r.fresh);
+        let after = fake.calls.load(Ordering::SeqCst);
+        let _ = s.metas_json(TRENDING_ID, "movie", "US", selected_providers()).await;
+        assert_eq!(fake.calls.load(Ordering::SeqCst), after, "a healthy row re-fanned out");
     }
 
     /// The health flag is what /health reports (ADDON-02), and it is a different field from the
@@ -814,28 +875,29 @@ mod tests {
         assert!(!s.fresh(), "an upstream failure left /health reporting ok");
     }
 
-    /// A small market whose package list is legitimately empty is an ANSWER, not an outage. Flattening
-    /// `Ok(vec![])` and `Err(())` together made such a country permanently `degraded: stale_catalog`
-    /// and re-fetched on every single request, which pushes hardest exactly when upstream is refusing.
+    /// An empty package list is a transient or a schema change, not a market that carries nothing —
+    /// every JustWatch country carries Netflix, and everything that really produces `Ok(vec![])` is a
+    /// 200 we should not believe. Caching it pinned the country dead for the process lifetime: 14
+    /// rows 404ing from a manifest that advertises them, with only a restart to clear it.
     #[tokio::test]
-    async fn a_country_that_carries_nothing_is_an_answer_not_an_outage() {
+    async fn an_empty_package_list_is_not_pinned() {
         let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
-        f.empty_packages = true;
+        f.empty_packages = std::sync::atomic::AtomicBool::new(true);
         let fake = Arc::new(f);
         let s = CatalogState::new(fake.clone(), Duration::from_secs(3600));
 
-        // No row for a service the market doesn't carry...
-        assert!(s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await.is_none());
-        assert!(s.fresh(), "an empty market was reported as an upstream outage");
+        // During the blip the row degrades rather than 404ing a catalog the manifest advertises.
+        let r = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await;
+        assert!(r.is_some_and(|r| !r.fresh), "an unusable package answer 404'd an advertised row");
 
-        // ...and the answer is cached, rather than re-asked on every request.
-        let after = fake.package_calls.load(Ordering::SeqCst);
-        let _ = s.metas_json("jw-mxx", "movie", "ZZ", selected_providers()).await;
-        assert_eq!(
-            fake.package_calls.load(Ordering::SeqCst),
-            after,
-            "an empty package list was re-fetched on every request"
-        );
+        // Upstream recovers — and the next request must actually recover with it.
+        fake.empty_packages.store(false, Ordering::SeqCst);
+        let r = s
+            .metas_json("jw-nfx", "movie", "US", selected_providers())
+            .await
+            .expect("the row must come back");
+        assert!(r.fresh, "the empty answer was pinned; the country stayed dead after recovery");
+        assert!(s.fresh(), "/health stayed degraded after upstream recovered");
     }
 
     /// Bounding the fan-out PER REQUEST is not a bound on the process. The caller picks the cache
