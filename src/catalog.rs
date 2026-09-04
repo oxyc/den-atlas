@@ -64,6 +64,12 @@ const STREMIO_TYPES: [&str; 2] = ["movie", "series"];
 
 /// Look up a provider by its JustWatch short-code (for parsing a per-install config). `None` for an
 /// unknown code, so a garbled config segment simply drops that provider.
+/// How many services the table carries — the ceiling on any install's selection.
+#[cfg(test)]
+pub fn provider_count() -> usize {
+    PROVIDERS.len()
+}
+
 pub fn provider_by_code(code: &str) -> Option<&'static Provider> {
     PROVIDERS.iter().find(|p| p.code == code)
 }
@@ -210,14 +216,28 @@ impl CatalogState {
             self.aggregate(obj, country, providers).await
         } else {
             let (provider, is_new) = resolved.unwrap();
-            if is_new {
-                // Arrivals come back most-recently-added first; that order IS the row.
-                let code = self.code_for(provider, country).await?;
-                self.source.new_titles(&code, obj, country).await.ok()
-            } else {
-                // A "Popular on <service>" row = JustWatch's POPULAR sort (matches their site), not TRENDING.
-                let code = self.code_for(provider, country).await?;
-                self.source.popular(&code, obj, country, "POPULAR").await.ok()
+            // A code we cannot resolve is a REFRESH failure, not an unknown route. Propagating None
+            // with `?` returned 404 from a catalog the manifest advertises, and did it BEFORE the
+            // arm below that clears last_refresh_ok — so the row a user asked for failed upstream
+            // while /health still said ok. It falls through to the same serve-stale/empty
+            // degradation as any other failed fetch now, which is also what the aggregate row does.
+            let map = self.packages_for(country).await;
+            match self.code_in(provider, &map) {
+                Some(code) if is_new => {
+                    // Arrivals come back most-recently-added first; that order IS the row.
+                    self.source.new_titles(&code, obj, country).await.ok()
+                }
+                Some(code) => {
+                    // "Popular on <service>" = JustWatch's POPULAR sort (their site), not TRENDING.
+                    self.source.popular(&code, obj, country, "POPULAR").await.ok()
+                }
+                // A country that genuinely doesn't carry the service has no row — absent, not
+                // empty-but-present. But an EMPTY map means we could not ask, which is a refresh
+                // failure: returning None there 404'd a catalog the manifest advertises, and did it
+                // before the arm that clears last_refresh_ok, so /health still said ok while the row
+                // the user asked for was failing upstream.
+                None if map.is_empty() => None, // fetch failed → fall through to degradation below
+                None => return None,            // country lacks the service → no such row
             }
         };
 
@@ -261,7 +281,7 @@ impl CatalogState {
     /// The country-local short code for a provider, or `None` when that country doesn't carry the
     /// service, or when we could not resolve the list — in which case its row is simply absent
     /// rather than wrong.
-    fn code_in(&self, provider: &Provider, country: &str, map: &[(i64, String)]) -> Option<String> {
+    fn code_in(&self, provider: &Provider, map: &[(i64, String)]) -> Option<String> {
         if map.is_empty() {
             // No row rather than a wrong one. The fallback used to send `provider.code` upstream
             // unvalidated, and JustWatch does NOT reject a code it doesn't recognise — verified
@@ -269,7 +289,10 @@ impl CatalogState {
             // sending no filter. So a stale or mistyped code published the whole country's chart
             // under a service's name, and because that response is non-empty the "0 usable items"
             // schema-change guard never fired. (prv/119 is already not the US Prime code.)
-            eprintln!("den-atlas: no package list for {country}; skipping {} rather than guessing", provider.code);
+            // No per-provider line here: this runs inside the aggregate loop, so one request with a
+            // country JustWatch cannot serve emitted a line per provider — measured at ~260 KB of
+            // stderr for a single crafted request, which buried the 429/403 lines that mattered.
+            // packages_for logs the lookup failure once.
             return None;
         }
         provider
@@ -278,11 +301,6 @@ impl CatalogState {
             .find_map(|id| map.iter().find(|(pid, _)| pid == id).map(|(_, code)| code.clone()))
     }
 
-    /// One fetch, then resolve — the single-provider rows go through here too.
-    async fn code_for(&self, provider: &Provider, country: &str) -> Option<String> {
-        let map = self.packages_for(country).await;
-        self.code_in(provider, country, &map)
-    }
 
     /// "Trending Everywhere": union across providers, re-ranked by inverse-rank-sum. Providers are
     /// fetched concurrently so a cold miss costs ~one provider's latency, not the sum. `None` when no
@@ -305,7 +323,7 @@ impl CatalogState {
         let map = self.packages_for(country).await;
         for (i, p) in providers.iter().enumerate() {
             let src = Arc::clone(&self.source);
-            let Some(code) = self.code_in(p, country, &map) else { continue };
+            let Some(code) = self.code_in(p, &map) else { continue };
             let country = country.to_owned();
             // The aggregate IS "Trending Everywhere" → TRENDING, on purpose (distinct from the Popular rows).
             set.spawn(async move { (i, src.popular(&code, obj, &country, "TRENDING").await) });
@@ -600,11 +618,20 @@ mod tests {
         let a = s.metas_json(TRENDING_ID, "movie", "US", &one).await.unwrap();
         let b = s.metas_json(TRENDING_ID, "movie", "US", &two).await.unwrap();
         assert!(a.fresh && b.fresh);
-        // The fake returns the same rows either way, so prove it by the upstream call count: a
-        // shared key would have served the first install's body without asking again.
+        assert!(s.cache_len() >= 2, "two different selections shared one entry");
+
+        // Same SIZE, different membership — the case that matters and the one a count-based key
+        // gets wrong. Keying on `codes.len()` passes everything above while serving a Netflix
+        // install's chart to an HBO Max install, which is the whole bug.
+        let nfx_only: Vec<&'static Provider> = vec![provider_by_code("nfx").unwrap()];
+        let mxx_only: Vec<&'static Provider> = vec![provider_by_code("mxx").unwrap()];
+        let before = s.cache_len();
+        let _ = s.metas_json(TRENDING_ID, "series", "US", &nfx_only).await.unwrap();
+        let mid = s.cache_len();
+        let _ = s.metas_json(TRENDING_ID, "series", "US", &mxx_only).await.unwrap();
         assert!(
-            s.cache_len() >= 2,
-            "one install's Trending row was served to an install with a different selection"
+            s.cache_len() > mid && mid > before,
+            "two same-size selections with different members shared a cache entry"
         );
 
         // ...and the selection is a SET: order must not split the cache into duplicates.
@@ -621,13 +648,32 @@ mod tests {
     /// published everything under one service's name, and the non-empty response meant the
     /// "0 usable items" schema-change guard never fired either.
     #[tokio::test]
-    async fn an_unresolvable_provider_is_skipped_rather_than_guessed() {
+    async fn an_unresolvable_provider_is_never_guessed() {
         let fake = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
         let s = CatalogState::new(fake.clone(), Duration::from_secs(60));
-        assert!(
-            s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.is_none(),
-            "a guessed code would have published the country's whole chart as a Netflix row"
+        let r = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await;
+
+        // Never a guessed code: JustWatch does not reject one it doesn't know, it returns the
+        // country's whole chart, so a guess publishes everything under one service's name.
+        assert_eq!(
+            fake.calls.load(Ordering::SeqCst),
+            0,
+            "an unresolved code was sent upstream anyway"
         );
+        // ...and it degrades rather than 404ing a catalog the manifest advertises — the manifest
+        // promises the row, and a lookup we could not make is a refresh failure, not a missing route.
+        let r = r.expect("an advertised row must not 404 because the upstream was unreachable");
+        assert!(!r.fresh, "a failed lookup was reported as a fresh answer");
+        assert!(r.body.contains(r#""metas":[]"#), "{}", r.body);
+    }
+
+    /// ...while a country that genuinely does not carry the service still has NO row — absent, not
+    /// empty-but-present. The two look identical at the call site and must not be conflated.
+    #[tokio::test]
+    async fn a_service_the_country_lacks_still_has_no_row() {
+        let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(60), usize::MAX);
+        // SkyShowtime (1773) isn't in the stub's package list, which IS resolvable.
+        assert!(s.metas_json("jw-sst", "movie", "UY", selected_providers()).await.is_none());
     }
 
     /// The package list is fetched once per aggregate, not once per provider. A failing lookup is

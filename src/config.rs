@@ -36,11 +36,19 @@ impl Config {
     pub fn parse(segment: &str) -> Option<Config> {
         let (region_str, codes_str) = segment.split_once('_')?;
         let region = parse_region(region_str)?;
-        let providers = codes_str
-            .split('-')
-            .filter(|c| !c.is_empty())
-            .filter_map(provider_by_code)
-            .collect();
+        // DEDUPED. The selection is a set, and this comes straight off the URL: repeats were kept,
+        // so `US_nfx-nfx-nfx…` was a distinct cache key per repetition count AND spawned one
+        // upstream POST per element. A single crafted GET opened ~4,000 simultaneous connections to
+        // JustWatch, earned 6,687 429s and then a 403 on the host IP — from an unauthenticated
+        // request. Deduping bounds the fan-out and the keyspace by the provider table itself.
+        let mut providers: Vec<&'static Provider> = Vec::new();
+        for code in codes_str.split('-').filter(|c| !c.is_empty()) {
+            if let Some(p) = provider_by_code(code) {
+                if !providers.iter().any(|q| q.code == p.code) {
+                    providers.push(p);
+                }
+            }
+        }
         Some(Config { region, providers })
     }
 
@@ -113,5 +121,28 @@ mod tests {
         assert_eq!(auto.country(Some("de"), "US"), "DE"); // forwarded, uppercased
         assert_eq!(auto.country(None, "US"), "US"); // fallback to operator default
         assert_eq!(auto.country(Some("bogus"), "US"), "US"); // invalid extra → default
+    }
+
+    /// The selection comes off the URL and is a SET. Keeping repeats meant `US_nfx-nfx-nfx…` was a
+    /// distinct cache key per repetition count AND spawned one upstream POST per element: a single
+    /// crafted GET opened ~4,000 simultaneous connections to JustWatch, took 6,687 429s, and got the
+    /// host IP 403'd — unauthenticated, and repeatable because each URL was a fresh key.
+    #[test]
+    fn a_repeated_provider_code_is_counted_once() {
+        let one = Config::parse("US_nfx").unwrap();
+        for repeated in ["US_nfx-nfx", "US_nfx-nfx-nfx-nfx-nfx", "US_nfx-nfx-mxx-nfx"] {
+            let c = Config::parse(repeated).unwrap();
+            let codes: Vec<&str> = c.providers.iter().map(|p| p.code).collect();
+            let mut uniq = codes.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            assert_eq!(codes.len(), uniq.len(), "{repeated} kept a duplicate: {codes:?}");
+        }
+        // ...and the ordinary case is untouched.
+        assert_eq!(one.providers.len(), 1);
+        assert_eq!(Config::parse("US_nfx-mxx").unwrap().providers.len(), 2);
+        // The upper bound is now the provider table itself, whatever the URL says.
+        let huge = format!("US_{}", vec!["nfx"; 4000].join("-"));
+        assert!(Config::parse(&huge).unwrap().providers.len() <= crate::catalog::provider_count());
     }
 }
