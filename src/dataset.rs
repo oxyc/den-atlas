@@ -28,6 +28,12 @@ pub struct Meta {
     pub vectors_file: String,
     #[serde(rename = "labelsGzFile")]
     pub labels_gz_file: Option<String>,
+    /// The metadata sidecar's precompressed variant. The sidecar is the only other JSON blob, so it
+    /// is the only other one compression pays for — vectors, premise vectors and facets are packed
+    /// binary and gzip buys nothing on them. Absent unless the producer publishes it, in which case
+    /// this serves it exactly like the labels variant; the server never compresses anything itself.
+    #[serde(rename = "metadataGzFile")]
+    pub metadata_gz_file: Option<String>,
     #[serde(rename = "labelsSha256")]
     pub labels_sha256: String,
     #[serde(rename = "labelsBytes")]
@@ -132,35 +138,61 @@ impl Dataset {
             "application/octet-stream",
             None,
         )?;
-        // Resolve the optional sidecar only when the meta fully declares it (file + sha + bytes).
-        let metadata = match (&meta.metadata_file, &meta.metadata_sha256, meta.metadata_bytes) {
-            (Some(file), Some(sha), Some(bytes)) => {
-                Some(resolve_blob(dir, file, bytes, sha, "application/json", None)?)
-            }
-            _ => None,
-        };
-        // DT-H premise index — resolved only when the meta fully declares BOTH blobs (labels + vectors).
-        let (premise_labels, premise_vectors) = match (
+        // The OPTIONAL blobs degrade; they do not take the dataset with them.
+        //
+        // These used to propagate with `?`, so one missing or unreadable sidecar failed the whole
+        // load: the addon then served no labels, no vectors, 503 on /dataset.json and 404 on every
+        // blob route, because a secondary index was absent. The mandatory pair above still fails
+        // hard — without those there is no dataset — but the difference between "no premise index"
+        // and "no dataset at all" is the difference between plot-only More Like This and an addon
+        // that does nothing. Each is reported so an absent feature is never silent.
+        let metadata = optional_blob(
+            dir,
+            "metadata",
+            &meta.metadata_file,
+            &meta.metadata_sha256,
+            meta.metadata_bytes,
+            "application/json",
+            meta.metadata_gz_file.as_deref(),
+        );
+        // DT-H premise index — both halves or neither; one without the other is not a usable index.
+        let premise_labels = optional_blob(
+            dir,
+            "premiseLabels",
             &meta.premise_labels_file,
             &meta.premise_labels_sha256,
             meta.premise_labels_bytes,
+            "application/json",
+            None,
+        );
+        let premise_vectors = optional_blob(
+            dir,
+            "premiseVectors",
             &meta.premise_vectors_file,
             &meta.premise_vectors_sha256,
             meta.premise_vectors_bytes,
-        ) {
-            (Some(lf), Some(ls), Some(lb), Some(vf), Some(vs), Some(vb)) => (
-                Some(resolve_blob(dir, lf, lb, ls, "application/json", None)?),
-                Some(resolve_blob(dir, vf, vb, vs, "application/octet-stream", None)?),
-            ),
-            _ => (None, None),
-        };
-        // DT-I facet blob — resolved only when the meta fully declares it.
-        let facets = match (&meta.facets_file, &meta.facets_sha256, meta.facets_bytes) {
-            (Some(file), Some(sha), Some(bytes)) => {
-                Some(resolve_blob(dir, file, bytes, sha, "application/octet-stream", None)?)
+            "application/octet-stream",
+            None,
+        );
+        let (premise_labels, premise_vectors) = match (premise_labels, premise_vectors) {
+            (Some(l), Some(v)) => (Some(l), Some(v)),
+            (l, v) => {
+                if l.is_some() || v.is_some() {
+                    eprintln!("den-atlas: premise index incomplete (one of its two blobs is unusable) — serving without it");
+                }
+                (None, None)
             }
-            _ => None,
         };
+        // DT-I facet blob.
+        let facets = optional_blob(
+            dir,
+            "facets",
+            &meta.facets_file,
+            &meta.facets_sha256,
+            meta.facets_bytes,
+            "application/octet-stream",
+            None,
+        );
         let last_modified = meta.last_modified_http.clone();
         Ok(Dataset {
             meta,
@@ -185,6 +217,31 @@ fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
         return Err(format!("blob name {name:?} is not a plain file name"));
     }
     Ok(dir.join(name))
+}
+
+/// An optional blob: resolved only when the meta fully declares it (file + sha + bytes), and
+/// reported-then-dropped when it is declared but unusable. Never fatal — see the call site.
+fn optional_blob(
+    dir: &Path,
+    label: &str,
+    file: &Option<String>,
+    sha256: &Option<String>,
+    bytes: Option<u64>,
+    content_type: &'static str,
+    gz_file: Option<&str>,
+) -> Option<Blob> {
+    let (file, sha256, bytes) = match (file, sha256, bytes) {
+        (Some(f), Some(s), Some(b)) => (f, s, b),
+        // Not declared, or declared incompletely. Absent by design, so nothing to report.
+        _ => return None,
+    };
+    match resolve_blob(dir, file, bytes, sha256, content_type, gz_file) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("den-atlas: optional blob {label} ({file}) is unusable ({e}) — serving without it");
+            None
+        }
+    }
 }
 
 fn resolve_blob(
@@ -313,6 +370,68 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{bad:?} took the whole dataset down: {e}"));
             assert!(blob.gz.is_none(), "{bad:?} produced a gz variant");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An optional blob that is declared but unusable must cost that ONE feature, not the dataset.
+    /// These propagated with `?`, so a missing premise index — a secondary "More Like This" signal —
+    /// meant no labels, no vectors, 503 on /dataset.json and 404 on every blob route.
+    #[test]
+    fn an_unusable_optional_blob_does_not_take_the_dataset_down() {
+        let root = std::env::temp_dir().join(format!("den-atlas-optblob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
+        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
+        std::fs::write(root.join("facets.bin"), b"FACETS").unwrap();
+        // metadata, and both premise blobs, are DECLARED but never written.
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                 "metadataFile":"gone.json","metadataBytes":8,"metadataSha256":"c",
+                 "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d",
+                 "premiseLabelsFile":"gone-pl.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
+                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}"#,
+        )
+        .unwrap();
+
+        let ds = Dataset::load(&root).expect("a missing optional blob took the whole dataset down");
+        assert_eq!(ds.labels.name, "labels.json", "the mandatory blobs must still be there");
+        assert_eq!(ds.vectors.size, 8);
+        assert!(ds.metadata.is_none(), "an unreadable metadata sidecar was resolved anyway");
+        assert!(ds.premise_labels.is_none() && ds.premise_vectors.is_none());
+        // ...and a usable optional blob is still served.
+        assert!(ds.facets.is_some(), "a perfectly good facets blob was dropped with the broken ones");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Half a premise index is not an index: the app needs both blobs to cluster by premise, and
+    /// advertising one of them would have it fetch a pair it cannot use.
+    #[test]
+    fn half_a_premise_index_is_dropped_whole() {
+        let root = std::env::temp_dir().join(format!("den-atlas-halfpremise-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
+        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
+        std::fs::write(root.join("premise-labels.json"), b"PLABELS").unwrap();
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                 "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
+                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}"#,
+        )
+        .unwrap();
+
+        let ds = Dataset::load(&root).expect("dataset must still load");
+        assert!(ds.premise_labels.is_none(), "the premise labels were kept without their vectors");
+        assert!(ds.premise_vectors.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

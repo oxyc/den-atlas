@@ -81,7 +81,10 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     if route == "/health" {
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
         // app's Plugins screen (and any monitor) can see a problem.
-        return json_response(health_body(ds.is_some(), state.catalog.fresh()), StatusCode::OK);
+        return json_response(
+            health_body(ds.is_some(), state.catalog.fresh(), state.catalog.schema_suspect()),
+            StatusCode::OK,
+        );
     }
     if route == "/manifest.json" {
         return serve_json(
@@ -210,11 +213,17 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
 /// body carries the real state. Dataset-unavailable outranks a stale catalog (no dataset is the more
 /// severe condition): no dataset ⇒ `dataset_unavailable`; else a failed last JustWatch refresh ⇒
 /// `stale_catalog`; else `ok`. Pure + `&'static str` so the decision is unit-testable without an HTTP round-trip.
-fn health_body(dataset_loaded: bool, catalog_fresh: bool) -> &'static str {
+fn health_body(dataset_loaded: bool, catalog_fresh: bool, schema_suspect: bool) -> &'static str {
     if !dataset_loaded {
         r#"{"status":"degraded","reason":"dataset_unavailable","detail":"dataset failed to load; refresh with scripts/fetch-dataset.sh"}"#
     } else if !catalog_fresh {
         r#"{"status":"degraded","reason":"stale_catalog","detail":"last JustWatch refresh failed; serving stale catalog"}"#
+    } else if schema_suspect {
+        // Ranks below the two above: those mean rows are missing, this means rows are SHORT. It has
+        // to be here at all because a partial break is otherwise invisible — a chart that comes back
+        // with a fifth of its titles is a successful refresh by every other measure, caches as
+        // complete for the full TTL, and serves with an hour of max-age.
+        r#"{"status":"degraded","reason":"catalog_schema_suspect","detail":"a JustWatch chart returned far fewer usable titles than it carried; rows may be short"}"#
     } else {
         r#"{"status":"ok"}"#
     }
@@ -368,23 +377,36 @@ mod tests {
 
     #[test]
     fn health_ok_when_dataset_loaded_and_fresh() {
-        assert_eq!(health_body(true, true), r#"{"status":"ok"}"#);
+        assert_eq!(health_body(true, true, false), r#"{"status":"ok"}"#);
     }
 
     #[test]
     fn health_stale_catalog_when_last_refresh_failed() {
-        let body = health_body(true, false);
+        let body = health_body(true, false, false);
         assert!(body.contains(r#""status":"degraded""#));
         assert!(body.contains(r#""reason":"stale_catalog""#));
+    }
+
+    /// A partial schema break is a SUCCESSFUL refresh by every other measure — the row is short but
+    /// non-empty, so it caches as complete and `fresh()` stays true. Without this state the only
+    /// trace was a line on stderr that nothing reads.
+    #[test]
+    fn health_reports_a_suspected_schema_break() {
+        let body = health_body(true, true, true);
+        assert!(body.contains(r#""status":"degraded""#), "{body}");
+        assert!(body.contains(r#""reason":"catalog_schema_suspect""#), "{body}");
+        // It ranks BELOW the two that mean rows are missing entirely.
+        assert!(health_body(true, false, true).contains(r#""reason":"stale_catalog""#));
+        assert!(health_body(false, true, true).contains(r#""reason":"dataset_unavailable""#));
     }
 
     #[test]
     fn health_dataset_unavailable_when_dataset_missing() {
         // Dataset-unavailable outranks stale: even with a fresh catalog, no dataset is the reported reason.
-        let body = health_body(false, true);
+        let body = health_body(false, true, false);
         assert!(body.contains(r#""reason":"dataset_unavailable""#));
         // …and it still takes precedence when the catalog is also stale (the more severe condition wins).
-        assert!(health_body(false, false).contains(r#""reason":"dataset_unavailable""#));
+        assert!(health_body(false, false, true).contains(r#""reason":"dataset_unavailable""#));
     }
 
     /// The descriptor's Vary depends on ONE bool at its call site, and flipping it left the whole

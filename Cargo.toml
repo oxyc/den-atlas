@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }

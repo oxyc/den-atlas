@@ -169,8 +169,38 @@ async fn main() {
         ),
         None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
     }
-    if let Err(e) = axum::serve(listener, app).await {
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    if let Err(e) = serve.await {
         eprintln!("den-atlas: serve error: {e}");
         std::process::exit(1);
+    }
+    eprintln!("den-atlas: shut down cleanly");
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// Without this the binary is PID 1 in a `scratch` image, and PID 1 gets no default terminate
+/// action — SIGTERM is simply ignored, so `podman restart` waited its full StopTimeout and then
+/// SIGKILLed: a measured 10.03s of downtime on every dataset refresh, every auto-update and every
+/// reboot, with each in-flight response cut mid-body. Blob downloads legitimately run past a
+/// minute on a slow link, so that is a real truncation, not a theoretical one.
+///
+/// SIGINT as well, so a foreground `docker run` in a terminal behaves the same way.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    // A handler that cannot be registered must never resolve: returning immediately would shut the
+    // server down the moment it started. Never resolving is the old behaviour — a hard kill — which
+    // is bad but not self-inflicted.
+    let (mut term, mut int) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+        (Ok(t), Ok(i)) => (t, i),
+        (t, i) => {
+            let e = t.err().or_else(|| i.err()).map(|e| e.to_string()).unwrap_or_default();
+            eprintln!("den-atlas: signal handlers unavailable ({e}); shutdown will be a hard kill");
+            return std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => eprintln!("den-atlas: SIGTERM — draining in-flight requests"),
+        _ = int.recv() => eprintln!("den-atlas: SIGINT — draining in-flight requests"),
     }
 }

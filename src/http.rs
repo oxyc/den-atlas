@@ -69,23 +69,37 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     }
 
     if let Some(rh) = &range_header {
-        match parse_range(rh, s.size) {
-            RangeResult::Unsatisfiable => {
-                let mut h = base.clone();
-                h.push(("content-range", format!("bytes */{}", s.size)));
-                h.push(("content-type", s.content_type.clone()));
-                return build(StatusCode::RANGE_NOT_SATISFIABLE, &h, Body::empty());
+        // RFC 9110 §13.1.5: a Range with an If-Range that does not match the current representation
+        // must be answered with the WHOLE thing, not the requested slice. Ignoring it meant a client
+        // resuming a partial download across a dataset refresh spliced two datasets' bytes together
+        // under the new ETag — and since Range wins over gzip, a client that had received the gzip
+        // labels variant resumed with identity bytes spliced into a gzip stream. The sha256 check
+        // catches it, so the cost is a wasted download rather than corruption; this makes the resume
+        // work instead.
+        // A non-matching If-Range falls through to the full 200 below.
+        if if_range_matches(headers, &etag, s.last_modified.as_deref()) {
+            match parse_range(rh, s.size) {
+                RangeResult::Unsatisfiable => {
+                    let mut h = base.clone();
+                    h.push(("content-range", format!("bytes */{}", s.size)));
+                    h.push(("content-type", s.content_type.clone()));
+                    return build(StatusCode::RANGE_NOT_SATISFIABLE, &h, Body::empty());
+                }
+                RangeResult::Range { start, end } => {
+                    if !readable(&s.identity).await {
+                        return unavailable();
+                    }
+                    let len = end - start + 1;
+                    let mut h = base.clone();
+                    h.push(("content-type", s.content_type.clone()));
+                    h.push(("content-range", format!("bytes {start}-{end}/{}", s.size)));
+                    h.push(("content-length", len.to_string()));
+                    let body =
+                        if is_head { Body::empty() } else { range_body(&s.identity, start, len).await };
+                    return build(StatusCode::PARTIAL_CONTENT, &h, body);
+                }
+                RangeResult::None => {} // malformed / multi-range → full 200
             }
-            RangeResult::Range { start, end } => {
-                let len = end - start + 1;
-                let mut h = base.clone();
-                h.push(("content-type", s.content_type.clone()));
-                h.push(("content-range", format!("bytes {start}-{end}/{}", s.size)));
-                h.push(("content-length", len.to_string()));
-                let body = if is_head { Body::empty() } else { range_body(&s.identity, start, len).await };
-                return build(StatusCode::PARTIAL_CONTENT, &h, body);
-            }
-            RangeResult::None => {} // malformed / multi-range → full 200
         }
     }
 
@@ -95,6 +109,9 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     } else {
         (&s.identity, s.size, None)
     };
+    if !readable(payload).await {
+        return unavailable();
+    }
     let mut h = base;
     h.push(("content-type", s.content_type.clone()));
     h.push(("content-length", size.to_string()));
@@ -116,6 +133,33 @@ fn build(status: StatusCode, headers: &[(&'static str, String)], body: Body) -> 
         }
     }
     b.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Whether the bytes this response promises can actually be read.
+///
+/// The body helpers below fall back to an empty body when the file is gone, and by then the status
+/// and `content-length` are already chosen — so a missing blob went out as a 200 declaring N bytes
+/// and carrying none, under the blob's real ETag. With `?v=<version>` that response is
+/// `immutable, max-age=1y`, so a CDN pins a zero-length file as the valid representation of that
+/// blob for a year, and every client behind it fails the sha256 check with no way to recover.
+/// Checked before the response is built so the failure is a status, not a truncated success.
+async fn readable(p: &Payload) -> bool {
+    match p {
+        Payload::Memory(_) => true,
+        Payload::File(path) => tokio::fs::File::open(path).await.is_ok(),
+    }
+}
+
+/// The blob is declared by the meta but not on disk. `no-store`, because the whole problem with the
+/// old behaviour was a broken answer being cached; this one must never outlive the condition.
+fn unavailable() -> Response {
+    build(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &[("content-type", "application/json".to_owned()), ("cache-control", "no-store".to_owned())],
+        Body::from(
+            r#"{"error":"blob_unavailable","detail":"the dataset declares this blob but it is not readable on disk; refresh it with scripts/fetch-dataset.sh"}"#,
+        ),
+    )
 }
 
 async fn full_body(p: &Payload) -> Body {
@@ -143,6 +187,25 @@ async fn range_body(p: &Payload, start: u64, len: u64) -> Body {
             Err(_) => Body::empty(),
         },
     }
+}
+
+/// Whether an `If-Range` precondition allows the range to be served.
+///
+/// Absent ⇒ yes (an unconditional Range). Present ⇒ it is either the entity-tag or the
+/// last-modified date the client already holds, and only an exact match permits the partial
+/// response. RFC 9110 requires a strong comparison here, so a `W/` weak tag never matches — unlike
+/// `If-None-Match`, where weak comparison is correct.
+fn if_range_matches(headers: &HeaderMap, etag_quoted: &str, last_modified: Option<&str>) -> bool {
+    let Some(ir) = headers.get("if-range").and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let ir = ir.trim();
+    if ir.starts_with('"') {
+        return ir == etag_quoted;
+    }
+    // Not an entity-tag ⇒ an HTTP-date, compared against Last-Modified. No date to compare against
+    // means the client cannot have a valid one either.
+    last_modified.is_some_and(|lm| lm == ir)
 }
 
 /// `If-None-Match` (precedence, RFC 9110 §13.1.3), else `If-Modified-Since`.
@@ -205,20 +268,30 @@ pub fn parse_range(header: &str, size: u64) -> RangeResult {
     if a.is_empty() && b.is_empty() {
         return RangeResult::None;
     }
+    // Both halves are already known to be all-digits, so a parse failure means one thing: the number
+    // does not fit in u64. `unwrap_or(0)` treated that as zero, which is the opposite of what the
+    // client asked for — `bytes=99999999999999999999999-` became "from byte 0", so a request for a
+    // range past the end of the file was answered with the WHOLE file under a 206.
     let (start, end);
     if a.is_empty() {
-        let suffix: u64 = b.parse().unwrap_or(0);
+        // A suffix larger than u64 is larger than the file, so it selects all of it.
+        let suffix: u64 = b.parse().unwrap_or(u64::MAX);
         if suffix == 0 {
             return RangeResult::Unsatisfiable;
         }
         start = size.saturating_sub(suffix);
         end = size - 1;
     } else {
-        start = a.parse().unwrap_or(0);
+        // A start beyond u64 is beyond the file.
+        let Ok(s) = a.parse::<u64>() else {
+            return RangeResult::Unsatisfiable;
+        };
+        start = s;
         if start >= size {
             return RangeResult::Unsatisfiable;
         }
-        end = if b.is_empty() { size - 1 } else { b.parse::<u64>().unwrap_or(0).min(size - 1) };
+        // An end beyond u64 is beyond the file, which RFC 9110 says to clamp, not reject.
+        end = if b.is_empty() { size - 1 } else { b.parse::<u64>().unwrap_or(u64::MAX).min(size - 1) };
         if start > end {
             return RangeResult::Unsatisfiable;
         }
@@ -381,6 +454,90 @@ mod tests {
     /// A body that embeds the request's own host/scheme must name them in Vary, or a shared cache
     /// serves one requester's chosen origin to everyone under the plain URL. The descriptor's blob
     /// URLs are built from those headers and it goes out `public, max-age=300`.
+    /// A blob the meta declares but disk does not have used to go out as a 200 with the real ETag,
+    /// the declared content-length and NO bytes. Under `?v=<version>` that carries
+    /// `immutable, max-age=1y`, so a CDN pins a zero-length file as the valid representation for a
+    /// year and every client behind it fails its sha256 check with no way to recover.
+    #[tokio::test]
+    async fn a_declared_but_missing_blob_is_unavailable_not_an_empty_200() {
+        let missing = std::env::temp_dir().join(format!("den-atlas-gone-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let mut s = servable(false);
+        s.identity = Payload::File(missing.clone());
+
+        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as success");
+        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
+        assert!(cc.contains("no-store"), "a broken answer was made cacheable: {cc}");
+        assert!(resp.headers().get("etag").is_none(), "the blob's ETag was attached to a failure");
+
+        // The range path too — it built its own 206 with the same empty body.
+        let mut s = servable(false);
+        s.identity = Payload::File(missing);
+        let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-99")]), s).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as a 206");
+    }
+
+    /// Both halves of a range are already known to be all-digits, so a parse failure means the number
+    /// does not fit in u64. `unwrap_or(0)` read that as zero — the opposite of what was asked — so a
+    /// range starting past the end of the file was answered with the WHOLE file under a 206.
+    #[test]
+    fn a_range_too_large_for_u64_is_unsatisfiable_not_the_whole_file() {
+        let huge = "99999999999999999999999";
+        assert!(matches!(parse_range(&format!("bytes={huge}-"), 1000), RangeResult::Unsatisfiable));
+        assert!(matches!(parse_range(&format!("bytes={huge}-{huge}"), 1000), RangeResult::Unsatisfiable));
+        // An END past u64 is clamped rather than rejected, per RFC 9110.
+        assert!(matches!(
+            parse_range(&format!("bytes=10-{huge}"), 1000),
+            RangeResult::Range { start: 10, end: 999 }
+        ));
+        // A SUFFIX past u64 is longer than the file, so it selects all of it.
+        assert!(matches!(
+            parse_range(&format!("bytes=-{huge}"), 1000),
+            RangeResult::Range { start: 0, end: 999 }
+        ));
+    }
+
+    /// RFC 9110 §13.1.5: a Range whose If-Range does not match must get the whole representation.
+    /// Ignoring it spliced two datasets' bytes together when a client resumed across a refresh —
+    /// and because Range wins over gzip, a client resuming a gzip download got identity bytes
+    /// spliced into a gzip stream.
+    #[tokio::test]
+    async fn a_stale_if_range_gets_the_whole_thing_not_a_slice() {
+        let etag = format!("\"{SHA}\"");
+        let range = ("range", "bytes=0-9");
+
+        let stale =
+            serve(&Method::GET, &hdrs(&[range, ("if-range", "\"an-older-dataset\"")]), servable(false)).await;
+        assert_eq!(stale.status(), StatusCode::OK, "a stale If-Range still got a partial response");
+        assert_eq!(body_bytes(stale).await.len(), 1000);
+
+        let current = serve(&Method::GET, &hdrs(&[range, ("if-range", &etag)]), servable(false)).await;
+        assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT, "a matching If-Range was ignored");
+        assert_eq!(body_bytes(current).await.len(), 10);
+
+        // The date form, against Last-Modified.
+        let by_date =
+            serve(&Method::GET, &hdrs(&[range, ("if-range", LAST_MODIFIED)]), servable(false)).await;
+        assert_eq!(by_date.status(), StatusCode::PARTIAL_CONTENT);
+        let wrong_date = serve(
+            &Method::GET,
+            &hdrs(&[range, ("if-range", "Tue, 01 Jul 2025 00:00:00 GMT")]),
+            servable(false),
+        )
+        .await;
+        assert_eq!(wrong_date.status(), StatusCode::OK);
+
+        // A weak tag never satisfies If-Range — strong comparison only.
+        let weak =
+            serve(&Method::GET, &hdrs(&[range, ("if-range", &format!("W/{etag}"))]), servable(false)).await;
+        assert_eq!(weak.status(), StatusCode::OK, "a weak validator satisfied If-Range");
+
+        // No If-Range at all is still an ordinary range request.
+        let plain = serve(&Method::GET, &hdrs(&[range]), servable(false)).await;
+        assert_eq!(plain.status(), StatusCode::PARTIAL_CONTENT);
+    }
+
     #[tokio::test]
     async fn a_body_built_from_the_request_origin_varies_on_it() {
         let mut s = servable(false);

@@ -145,6 +145,7 @@ mod tests {
                 labels_file: "labels-t02.json".into(),
                 vectors_file: "vectors-bge-m3.bin".into(),
                 labels_gz_file: None,
+                metadata_gz_file: None,
                 labels_sha256: "l".into(),
                 labels_bytes: 10,
                 vectors_sha256: "v".into(),

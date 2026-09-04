@@ -7,7 +7,7 @@ use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 #[derive(Debug)]
@@ -151,11 +151,16 @@ pub struct CatalogState {
     source: Arc<dyn TrendingSource>,
     cache: TtlCache,
     // Per-key refresh gate (single-flight): coalesces concurrent misses so a cold-cache burst makes one
-    // upstream fetch per key, not N. Keyspace is bounded (ids × types × the handful of live countries).
+    // upstream fetch per key, not N. Entries are removed once the last waiter leaves (`InflightSweep`);
+    // it used to be insert-only, so it grew a permanent entry per key ever requested.
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// `country -> (packageId -> shortName)`. Both identifiers are per-country, so the local code for a
     /// provider has to be looked up rather than hardcoded. Cached because it changes on the order of months.
     packages: Mutex<HashMap<String, PackageList>>,
+    /// When each country's package lookup last failed, so a broken country is not re-asked on every
+    /// request. Separate from `packages` because a failure is not an answer to cache — it is a
+    /// reason to wait before asking again.
+    packages_failed: Mutex<HashMap<String, Instant>>,
     // Whether the most recent upstream refresh succeeded. Starts optimistic (true); every actual fetch
     // attempt flips it (success ⇒ true, failure ⇒ false), while a plain cache hit (no refresh) leaves it
     // as-is. Read by `/health` to report `stale_catalog` (ADDON-02) — distinct from the per-response
@@ -171,6 +176,29 @@ pub struct CatalogState {
     upstream: Arc<tokio::sync::Semaphore>,
 }
 
+/// Removes a single-flight gate once nobody is using it.
+///
+/// The map was insert-only, so it kept one entry per key ever requested for the life of the
+/// process — the same unbounded-growth shape as the row cache, just cheaper per entry.
+struct InflightSweep<'a> {
+    map: &'a Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    key: &'a str,
+}
+
+impl Drop for InflightSweep<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        if let Some(gate) = map.get(self.key) {
+            // Two handles = the map's and this task's. Every waiter cloned its own before awaiting,
+            // so a key that anyone else still wants counts higher and stays. Cloning goes through
+            // this same lock, so no one can join between the count and the removal.
+            if Arc::strong_count(gate) <= 2 {
+                map.remove(self.key);
+            }
+        }
+    }
+}
+
 /// A country's services as JustWatch reports them: `(packageId, shortName)`, shared between the
 /// cache and every caller that resolves a provider for that country.
 type PackageList = Arc<Vec<(i64, String)>>;
@@ -178,6 +206,11 @@ type PackageList = Arc<Vec<(i64, String)>>;
 /// Enough to keep a cold cache filling briskly (the default selection is 7 providers, so one
 /// aggregate refresh fits inside this), far below anything JustWatch would read as abuse.
 const MAX_UPSTREAM_INFLIGHT: usize = 8;
+
+/// How long a country whose package list failed is left alone. Long enough that a sustained outage
+/// costs one attempt per country per minute rather than one per request; short enough that a
+/// recovered country comes back without a restart.
+const FAILED_PACKAGES_TTL: Duration = Duration::from_secs(60);
 
 // The cap is the protection, not a tuning knob: raising it is what earned this host a 403. The
 // concurrency tests assert this same number as a literal for the same reason, but a test only
@@ -200,12 +233,23 @@ impl CatalogState {
         self.cache.len()
     }
 
+    #[cfg(test)]
+    fn inflight_len(&self) -> usize {
+        self.inflight.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn package_failures(&self) -> usize {
+        self.packages_failed.lock().unwrap().len()
+    }
+
     pub fn new(source: Arc<dyn TrendingSource>, ttl: Duration) -> Self {
         Self {
             source,
             cache: TtlCache::new(ttl),
             inflight: Mutex::new(HashMap::new()),
             packages: Mutex::new(HashMap::new()),
+            packages_failed: Mutex::new(HashMap::new()),
             last_refresh_ok: AtomicBool::new(true),
             upstream: Arc::new(tokio::sync::Semaphore::new(MAX_UPSTREAM_INFLIGHT)),
         }
@@ -214,6 +258,13 @@ impl CatalogState {
     /// Whether the last JustWatch refresh succeeded — the `/health` freshness signal (ADDON-02).
     pub fn fresh(&self) -> bool {
         self.last_refresh_ok.load(Ordering::Relaxed)
+    }
+
+    /// Whether any chart has come back looking like a schema break. Distinct from `fresh()`: a
+    /// partial break IS a successful refresh — the row is short but non-empty, so it caches as
+    /// complete and everything else reports healthy.
+    pub fn schema_suspect(&self) -> bool {
+        self.source.suspected_schema_breaks() > 0
     }
 
     /// The `{ "metas": [...] }` body for a catalog id + Stremio type in a given `country`, restricted to
@@ -256,6 +307,9 @@ impl CatalogState {
             let mut map = self.inflight.lock().unwrap();
             Arc::clone(map.entry(key.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
         };
+        // Declared BEFORE the lock is taken so it drops after it: locals drop in reverse order, and
+        // the entry must not be removed while this task still holds the gate.
+        let _sweep = InflightSweep { map: &self.inflight, key: &key };
         let _hold = gate.lock().await;
         if let Lookup::Fresh(v) = self.cache.get(&key) {
             return Some(CatalogResponse { body: v, fresh: true }); // filled while we waited
@@ -358,36 +412,74 @@ impl CatalogState {
         if let Some(m) = self.packages.lock().unwrap().get(country).cloned() {
             return Ok(m);
         }
+        // A country whose lookup could not be COMPLETED is not re-asked for a while. Without this,
+        // every request for such a country takes an upstream permit and waits out the full 8s client
+        // timeout — one unreachable country starves the cap for every other row, for as long as the
+        // traffic lasts. It is also what keeps the catalog path two-phase under load: a country
+        // whose package list never caches makes every later request pay for it again.
+        //
+        // Only that case. An answer we merely disbelieve (an empty list) is handled below without a
+        // backoff, because it is cheap to repeat and must recover the moment upstream does.
+        if let Some(at) = self.packages_failed.lock().unwrap().get(country) {
+            if at.elapsed() < FAILED_PACKAGES_TTL {
+                return Err(());
+            }
+        }
         let fetched = {
             // A closed semaphore must not silently proceed UNCAPPED — the bare `let _permit =`
             // bound the Result and ran anyway.
-            let Ok(_permit) = self.upstream.acquire().await else { return Err(()) };
-            Arc::new(self.source.packages(country).await?)
+            let Ok(_permit) = self.upstream.acquire().await else {
+                return Err(());
+            };
+            match self.source.packages(country).await {
+                Ok(v) => Arc::new(v),
+                Err(()) => {
+                    self.note_package_failure(country);
+                    return Err(());
+                }
+            }
         };
         if fetched.is_empty() {
+            // Deliberately NOT backed off. An empty list means we asked and got a fast, cheap,
+            // nonsense answer — it costs a permit for the length of one quick call, not the 8s
+            // timeout the backoff exists to stop repeating. And this path is exactly the one that
+            // must recover the instant upstream does: pinning it is what left 14 provider rows
+            // 404ing until a restart.
             return Err(()); // asked, but the answer is not one to act on
         }
         self.packages.lock().unwrap().insert(country.to_owned(), Arc::clone(&fetched));
+        // A country can recover; drop the block so the next request after the TTL retries cleanly.
+        self.packages_failed.lock().unwrap().remove(country);
         Ok(fetched)
     }
 
-    /// The country-local short code for a provider, or `None` when that country doesn't carry the
-    /// service, or when we could not resolve the list — in which case its row is simply absent
-    /// rather than wrong.
-    fn code_in(&self, provider: &Provider, map: &[(i64, String)]) -> Option<String> {
-        if map.is_empty() {
-            // No row rather than a wrong one. The fallback used to send `provider.code` upstream
-            // unvalidated, and JustWatch does NOT reject a code it doesn't recognise — verified
-            // live: `packages:["bogus_xyz"]` returns the country's overall chart, byte-identical to
-            // sending no filter. So a stale or mistyped code published the whole country's chart
-            // under a service's name, and because that response is non-empty the "0 usable items"
-            // schema-change guard never fired. (prv/119 is already not the US Prime code.)
-            // No per-provider line here: this runs inside the aggregate loop, so one request with a
-            // country JustWatch cannot serve emitted a line per provider — measured at ~260 KB of
-            // stderr for a single crafted request, which buried the 429/403 lines that mattered.
-            // packages_for logs the lookup failure once.
-            return None;
+    /// Remember that this country's package list just failed, so the next requests degrade
+    /// immediately instead of each buying another permit and another 8s wait.
+    fn note_package_failure(&self, country: &str) {
+        let mut failed = self.packages_failed.lock().unwrap();
+        // Bounded: countries are validated to two letters, so this cannot exceed 676 entries, but
+        // an unbounded map is how the row cache got into trouble. Cheapest possible reclaim — the
+        // whole point is that entries are short-lived.
+        if failed.len() >= 1024 {
+            failed.retain(|_, at: &mut Instant| at.elapsed() < FAILED_PACKAGES_TTL);
         }
+        failed.insert(country.to_owned(), Instant::now());
+    }
+
+    /// The country-local short code for a provider, or `None` when that country doesn't carry the
+    /// service — in which case its row is simply absent rather than wrong.
+    ///
+    /// There is deliberately NO fallback to `provider.code`. JustWatch does not reject a code it
+    /// doesn't recognise — verified live: `packages:["bogus_xyz"]` returns the country's overall
+    /// chart, byte-identical to sending no filter — so a stale or mistyped code published the whole
+    /// country's chart under one service's name, and because that response is non-empty the
+    /// schema-change guard never fired either. (`prv`/119 is already not the US Prime code.)
+    ///
+    /// An `is_empty` guard here was dead twice over: `packages_for` returns `Err` on an empty list
+    /// so this is never called with one, and `find_map` over an empty slice already yields `None`.
+    /// Note there is no logging on this path — it runs inside the aggregate loop, so a line here is
+    /// a line per provider per request.
+    fn code_in(&self, provider: &Provider, map: &[(i64, String)]) -> Option<String> {
         provider
             .package_ids
             .iter()
@@ -980,6 +1072,110 @@ mod tests {
         // this host was 403'd — passed every test. The literal has to be the cap itself, too: at
         // `<= 16` a doubling of the concurrency against that same host still passed both of these.
         assert!(peak <= 8, "{peak} simultaneous upstream calls — the process-wide cap is not holding");
+    }
+
+    /// The single-flight map was insert-only: one entry per key ever requested, kept for the life of
+    /// the process. Cheap per entry, but the same unbounded shape as the row cache.
+    #[tokio::test]
+    async fn the_single_flight_map_does_not_accumulate_keys() {
+        let s = state(vec![item("tt1", "A", 0)], Duration::from_secs(3600), usize::MAX);
+        for i in 0..40 {
+            let country = format!("{}{}", (b'A' + (i / 26) as u8) as char, (b'A' + (i % 26) as u8) as char);
+            let _ = s.metas_json("jw-nfx", "movie", &country, selected_providers()).await;
+        }
+        assert_eq!(s.inflight_len(), 0, "{} single-flight gates outlived their requests", s.inflight_len());
+        assert_eq!(s.cache_len(), 40, "the rows themselves should still be cached");
+    }
+
+    /// ...but a gate still in USE must survive the sweep.
+    ///
+    /// Removing it unconditionally is subtly wrong rather than obviously wrong: a waiter holds its
+    /// own `Arc`, so it keeps working, and the call count and ordering come out identical — which is
+    /// why asserting either proves nothing. What changes is that the map stops describing reality:
+    /// the entry disappears while a request is still behind it, and the next arrival builds a second
+    /// gate for a key that already has one. So the assertion has to be made DURING the burst.
+    #[tokio::test]
+    async fn a_gate_still_in_use_is_not_swept() {
+        // fail_after 0 ⇒ every fetch fails, so nothing is cached and every waiter really does run.
+        let mut f = fake(vec![item("tt1", "A", 0)], 0, false);
+        f.dwell = true;
+        f.dwell_ms = 300;
+        let fake = Arc::new(f);
+        let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
+
+        let mut set = JoinSet::new();
+        for _ in 0..3 {
+            let s = Arc::clone(&s);
+            set.spawn(async move { s.metas_json("jw-nfx", "movie", "US", selected_providers()).await });
+        }
+
+        // Past the FIRST request's completion, so a sweep has run, but well inside the second — two
+        // requests are still queued on that gate. The first holds it for TWO upstream calls (the
+        // country's package list, then the chart), so it runs ~600ms; the rest find packages cached
+        // and take ~300ms each.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert_eq!(
+            s.inflight_len(),
+            1,
+            "the gate was swept while requests were still behind it, so the next arrival would build a second one"
+        );
+
+        while set.join_next().await.is_some() {}
+        assert_eq!(s.inflight_len(), 0, "the gate outlived the last request");
+    }
+
+    /// The coalescing itself, on the happy path: eight concurrent misses on one key are one fetch.
+    #[tokio::test]
+    async fn concurrent_misses_on_one_key_make_one_fetch() {
+        let mut f = fake(vec![item("tt1", "A", 0)], usize::MAX, false);
+        f.dwell = true;
+        f.dwell_ms = 200;
+        let fake = Arc::new(f);
+        let s = Arc::new(CatalogState::new(fake.clone(), Duration::from_secs(3600)));
+
+        let mut set = JoinSet::new();
+        for _ in 0..8 {
+            let s = Arc::clone(&s);
+            set.spawn(async move { s.metas_json("jw-nfx", "movie", "US", selected_providers()).await });
+        }
+        while set.join_next().await.is_some() {}
+
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1, "the single-flight gate stopped coalescing");
+        assert_eq!(s.inflight_len(), 0, "the gate was not swept once everyone left");
+    }
+
+    /// A country whose lookup could not COMPLETE is backed off, so a sustained outage costs one
+    /// attempt per country per minute instead of one per request — each of which takes an upstream
+    /// permit and waits out the full client timeout.
+    #[tokio::test]
+    async fn an_unreachable_country_is_not_re_asked_every_request() {
+        // `no_packages` makes the packages lookup return Err — "could not ask", the expensive case.
+        let f = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, true));
+        let s = CatalogState::new(f.clone(), Duration::from_secs(3600));
+        for _ in 0..10 {
+            assert!(s.metas_json("jw-nfx", "movie", "ZZ", selected_providers()).await.is_some());
+        }
+        assert_eq!(
+            f.package_calls.load(Ordering::SeqCst),
+            1,
+            "the country was re-asked on every request; each one takes a permit and waits out the client timeout"
+        );
+        assert_eq!(s.package_failures(), 1);
+    }
+
+    /// ...but an EMPTY list is not backed off. It is a fast, cheap, nonsense answer rather than the
+    /// 8s timeout the backoff exists to stop repeating, and this is the path that must recover the
+    /// instant upstream does — pinning it is what left 14 provider rows 404ing until a restart.
+    #[tokio::test]
+    async fn an_empty_package_list_is_retried_immediately() {
+        let f = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, false));
+        f.empty_packages.store(true, Ordering::SeqCst);
+        let s = CatalogState::new(f.clone(), Duration::from_secs(3600));
+        for _ in 0..5 {
+            let _ = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await;
+        }
+        assert_eq!(f.package_calls.load(Ordering::SeqCst), 5, "an empty answer was backed off");
+        assert_eq!(s.package_failures(), 0, "an empty answer must not enter the failure map");
     }
 
     /// A cold burst must end with every row COMPLETE and CACHED. Capping upstream concurrency is

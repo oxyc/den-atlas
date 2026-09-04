@@ -76,6 +76,16 @@ pub trait TrendingSource: Send + Sync {
     /// "Popular on Prime Video" shipped empty. Providers are declared by their stable ids and the local code is
     /// looked up here.
     async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()>;
+
+    /// How many charts have come back looking like a schema break rather than an answer.
+    ///
+    /// A partial break is invisible in every other signal: the row is short but non-empty, so it
+    /// caches as complete for the full TTL, serves with a long max-age, and the refresh counts as a
+    /// success. Without this the only trace was a line on stderr, which nothing monitors.
+    /// Default 0, so a source that cannot detect it simply never reports one.
+    fn suspected_schema_breaks(&self) -> usize {
+        0
+    }
 }
 
 const ENDPOINT: &str = "https://apis.justwatch.com/graphql";
@@ -118,10 +128,10 @@ pub struct JustWatchClient {
     /// Always ENDPOINT in production; a test points it at a local socket so the 200-with-errors
     /// path can be exercised against a real response rather than asserted on a helper in isolation.
     endpoint: String,
-    /// How many charts have come back looking like a schema break. The warning is a log line, and a
-    /// log line cannot be asserted on — so testing the predicate alone left the CALL SITE free to
-    /// drop it, which is the failure this file already documents for `graphql_error`. Counting makes
-    /// the decision observable at the place it is actually made.
+    /// How many charts have come back looking like a schema break. Read by `/health`, and by the
+    /// tests: the warning is a log line, and a log line cannot be asserted on — so testing the
+    /// predicate alone left the CALL SITE free to drop it, which is the failure this file already
+    /// documents for `graphql_error`.
     suspected_schema_breaks: AtomicUsize,
 }
 
@@ -134,11 +144,6 @@ impl JustWatchClient {
             .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
             .ok();
         Self { http, endpoint: ENDPOINT.to_string(), suspected_schema_breaks: AtomicUsize::new(0) }
-    }
-
-    #[cfg(test)]
-    fn suspected_schema_breaks(&self) -> usize {
-        self.suspected_schema_breaks.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -510,6 +515,10 @@ impl TrendingSource for JustWatchClient {
             eprintln!("{w}");
         }
         Ok(chart.items)
+    }
+
+    fn suspected_schema_breaks(&self) -> usize {
+        self.suspected_schema_breaks.load(Ordering::Relaxed)
     }
 
     async fn packages(&self, country: &str) -> Result<Vec<(i64, String)>, ()> {
