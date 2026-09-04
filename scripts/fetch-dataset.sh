@@ -13,21 +13,28 @@ REPO="${DEN_DATASET_REPO:-oxyc/den-dataset}"
 BASE="https://github.com/$REPO/releases/download/data-latest"
 mkdir -p data
 
-# The meta names the blobs (version-agnostic), so fetch it first, then the files it points at.
-curl -fsSL "$BASE/dataset.meta.json" -o data/dataset.meta.json
+# The meta names the blobs (version-agnostic), so fetch it first — but to a STAGING path, not into
+# ./data. Writing it straight to data/dataset.meta.json meant the pre-flight below could refuse a
+# half-published release, print "refusing, ./data untouched", and exit 1 having ALREADY replaced the
+# meta: ./data was left with a manifest naming blobs it does not have, which is worse than either the
+# old or the new state and is exactly what the message promises did not happen. atlas-dataset-sync.sh
+# has always staged for this reason.
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+curl -fsSL "$BASE/dataset.meta.json" -o "$STAGE/dataset.meta.json"
 # EVERY "<name>File" the meta declares, newline-delimited. A positional list had to be extended by
 # hand for each new artifact and silently skipped anything missed: metadataGzFile was added to the
 # server and never fetched here, so a dev's ./data had no gz variant and the server logged one
 # missing. deploy/atlas-dataset-sync.sh has been generic over these keys for exactly this reason.
-FILES="$(python3 - <<'PY'
-import json
-m = json.load(open("data/dataset.meta.json"))
+FILES="$(STAGE="$STAGE" python3 - <<'PY'
+import json, os
+m = json.load(open(os.environ["STAGE"] + "/dataset.meta.json"))
 for k, v in m.items():
     if k.endswith("File") and isinstance(v, str) and v:
         print(v)
 PY
 )"
-# The names come from a release meta we do not control, and are used as `-o "data/$f"` — so
+# The names come from a release meta we do not control, and are used as a path — so
 # "../../../x" writes outside the repo. den-atlas rejects the same shapes when it loads them.
 # An allowlist: "not a path" is the right question for the server, where `*` is a legal file name,
 # but not for a shell, which expands it.
@@ -52,9 +59,9 @@ safe_name() {
 # with a ./data den-atlas cannot load.
 REQUIRED="labels vectors"
 for r in $REQUIRED; do
-  python3 - "${r}File" <<'PY' || { echo "release meta declares no ${r}File — refusing" >&2; exit 1; }
-import json, sys
-m = json.load(open("data/dataset.meta.json"))
+  STAGE="$STAGE" python3 - "${r}File" <<'PY' || { echo "release meta declares no ${r}File — refusing" >&2; exit 1; }
+import json, os, sys
+m = json.load(open(os.environ["STAGE"] + "/dataset.meta.json"))
 sys.exit(0 if m.get(sys.argv[1]) else 1)
 PY
 done
@@ -78,7 +85,7 @@ while IFS= read -r f; do
     200 | 206) continue ;;
   esac
   for r in $REQUIRED; do
-    if [ "$f" = "$(python3 -c 'import json,sys; print(json.load(open("data/dataset.meta.json")).get(sys.argv[1], ""))' "${r}File")" ]; then
+    if [ "$f" = "$(STAGE="$STAGE" python3 -c 'import json,os,sys; print(json.load(open(os.environ["STAGE"] + "/dataset.meta.json")).get(sys.argv[1], ""))' "${r}File")" ]; then
       FATAL="$FATAL $f($code)"
       continue 2
     fi
@@ -95,14 +102,43 @@ EOF
 
 # Newline-delimited via a redirect, so a name is never word-split or glob-expanded and `set -e` can
 # still abort the script (a pipe would put this loop in a subshell).
+# Staged and VERIFIED before anything lands in ./data. This was the only one of the three consumers
+# that did neither: a fetch landing inside a publish window gets the old meta (uploaded last, by design)
+# with new blob bytes, and den-atlas does not hash at load either — it checks size and warns — so the
+# wrong bytes would be served under the advertised sha until the app rejected the whole dataset.
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   case " $MISSING " in *" $f("*) continue ;; esac
   echo "fetching $f …"
-  curl -fsSL "$BASE/$f" -o "data/$f"
+  curl -fsSL "$BASE/$f" -o "$STAGE/$f"
+  want="$(SF="$f" STAGE="$STAGE" python3 -c '
+import json, os
+m = json.load(open(os.environ["STAGE"] + "/dataset.meta.json"))
+name = os.environ["SF"]
+print(next((m.get(k[:-4] + "Sha256", "") for k, v in m.items()
+            if k.endswith("File") and v == name), ""))')"
+  if [ -n "$want" ]; then
+    got="$(shasum -a 256 "$STAGE/$f" | cut -d' ' -f1)"
+    [ "$got" = "$want" ] || {
+      echo "$f hashes to $got but the meta declares $want — refusing, ./data untouched" >&2
+      exit 1
+    }
+  fi
 done <<EOF
 $FILES
 EOF
+
+# Everything verified — now publish into ./data, blobs before the meta, so a kill here leaves the old
+# meta pointing at blobs that are all still present.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case " $MISSING " in *" $f("*) continue ;; esac
+  mv "$STAGE/$f" "data/$f"
+done <<EOF
+$FILES
+EOF
+mv "$STAGE/dataset.meta.json" data/dataset.meta.json
+
 echo "fetched → ./data:"
 # `|| true`: an unmatched glob makes `ls` exit 2, and under `set -o pipefail` that failed the whole
 # script AFTER a completely successful fetch — a release with no .gz was enough.
