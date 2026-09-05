@@ -51,9 +51,9 @@ This matches `den-dataset/out-t02` exactly, so that directory is what is being s
 
 Three things about the data that keep being got wrong — see `den-dataset/README.md` for the measurements:
 
-- **37,533 is not the catalogue.** den-dataset enriches ~56k titles; the ~18.6k without a Wikipedia plot
+- **37,533 is not the catalogue.** den-dataset enriches 57,715 titles; the 20,182 without a Wikipedia plot
   are dropped by a ToS rule, and they have **no labels and no vectors** — the two cover the identical ids.
-  Consumers must degrade for a third of the catalogue, not treat it as an edge case.
+  Consumers must degrade for 35% of the catalogue, not treat it as an edge case.
 - **There are two vector spaces.** The plot index (`vectors-bge-m3.bin`) and the premise index
   (`vectors-premise.bin`, Sonnet-generated premise tags embedded with the same model) are complements, not
   duplicates — measured mean |cos| 0.43. The app's "More Like This" leads with premise.
