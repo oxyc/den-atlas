@@ -36,11 +36,32 @@ descriptor, so the app verifies what it downloads and a mismatch keeps the prior
 | `GET /catalog/<type>/<id>.json` | a "most popular" row of `{id,type,name,poster}` metas |
 
 ## The dataset
-The blobs are the **same artifacts the Den app currently bundles** — `labels-t01.json` +
-`vectors-e02.bin` (57,872 titles × 384-dim int8, L2-normalized ×127). Atlas is the migration off bundling
-30 MB in the app: same bytes, now downloaded + refreshed instead of shipped. The descriptor declares
-`embeddingModel` opaquely, so a future semantic re-embed (bge-m3) is a drop-in — publish new blobs, bump
-the version, and the app re-syncs. See `docs`/the Den EPIC for the FP-2 embedding upgrade.
+
+**Verified live 2026-09-05** by fetching `/dataset.json` from the deployed addon:
+
+| field | value |
+|---|---|
+| `datasetVersion` | `ebe9ab936444` (a **content hash**, not a semver — it moves when content moves, and that is what triggers client re-sync) |
+| `taxonomyVersion` | `t02` |
+| `embeddingModel` / `dims` | `bge-m3` / **1024** |
+| `count` | 37,533 |
+| `quantization` | `int8-symmetric-x127` |
+
+This matches `den-dataset/out-t02` exactly, so that directory is what is being served.
+
+Three things about the data that keep being got wrong — see `den-dataset/README.md` for the measurements:
+
+- **37,533 is not the catalogue.** den-dataset enriches ~56k titles; the ~18.6k without a Wikipedia plot
+  are dropped by a ToS rule, and they have **no labels and no vectors** — the two cover the identical ids.
+  Consumers must degrade for a third of the catalogue, not treat it as an edge case.
+- **There are two vector spaces.** The plot index (`vectors-bge-m3.bin`) and the premise index
+  (`vectors-premise.bin`, Sonnet-generated premise tags embedded with the same model) are complements, not
+  duplicates — measured mean |cos| 0.43. The app's "More Like This" leads with premise.
+- **A bare TMDB id is ambiguous**: movie and TV namespaces overlap (tv 95 is Buffy, movie 95 is
+  Armageddon). Key every per-title map on `(mediaType, id)`.
+
+*(This section previously described `labels-t01.json` + 384-dim `vectors-e02.bin` and called bge-m3 a
+future upgrade. That was two taxonomy generations out of date.)*
 
 ## Catalogs (JustWatch)
 Alongside the dataset, Atlas serves Stremio **catalog** rows of "most popular" titles per streaming
