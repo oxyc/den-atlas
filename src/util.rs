@@ -64,7 +64,6 @@ pub fn json_response(body: &'static str, status: StatusCode) -> Response {
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*") // public data, no credentials
         .body(Body::from(body))
         .unwrap()
 }

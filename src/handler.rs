@@ -19,6 +19,17 @@ use std::sync::Arc;
 /// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
+/// Every response leaves through here, so every one carries `Access-Control-Allow-Origin: *` — the
+/// 404, a refused /metrics, a 304 and an /embed error included. Setting it per helper left out
+/// whatever was built outside those helpers (the /metrics body was), and a browser reports a missing
+/// header as a CORS failure rather than the status the server actually sent. The data is public and
+/// credential-free, so a wildcard origin gives nothing away.
+pub async fn handle(state: State<Arc<AppState>>, req: Request) -> Response {
+    let mut resp = route(state, req).await;
+    resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    resp
+}
+
 // There is deliberately NO server-side request deadline, and this is the third and last thing tried
 // here. A 20s one shipped and was measured strictly worse than nothing at the load it was added for.
 //
@@ -36,13 +47,12 @@ const CONFIGURE_PAGE: &str = include_str!("configure.html");
 // that has given up already stops holding a slot; the queue's length costs latency, which the
 // client bounds itself, not resources. Slow-and-correct beats fast-and-empty here — and a 5xx would
 // also bypass the serve-stale path that `handle_catalog` promises never returns one.
-pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
     // CORS preflight for browser-based Stremio clients (public, credential-free data).
     if method == Method::OPTIONS {
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
-            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS")
             .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "*")
             // Let browsers cache the preflight for a day so they stop re-preflighting every request.
@@ -207,7 +217,6 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
             Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 // A POST proxy of per-query vectors — never let a heuristic/intermediary cache these.
                 .header(header::CACHE_CONTROL, "no-store")
                 .body(Body::from(bytes))
@@ -767,6 +776,63 @@ mod tests {
             req = req.header("authorization", a);
         }
         handle(State(Arc::clone(state)), req.body(Body::empty()).unwrap()).await
+    }
+
+    /// An unknown path and a refused /metrics are the same 404, byte for byte, so a prober cannot
+    /// tell a configured-but-refused /metrics from one that does not exist.
+    #[tokio::test]
+    async fn an_unknown_path_and_a_refused_metrics_are_the_same_404() {
+        let mut st = AppState::for_test(None);
+        st.metrics_token = Some("s3cret".to_owned());
+        let state = Arc::new(st);
+        for (what, resp) in [
+            ("unknown path", get(&state, "/nope").await),
+            ("refused /metrics", get_metrics(&state, Some("Bearer wrong")).await),
+        ] {
+            assert_eq!(resp.status(), 404, "{what}");
+            assert_eq!(resp.headers().get("content-type").unwrap(), "application/json", "{what}");
+            assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store", "{what}");
+            assert_eq!(body_of(resp).await, r#"{"error":"not_found"}"#, "{what}");
+        }
+    }
+
+    /// The wildcard origin is on EVERY response, not just those built by a helper that remembered
+    /// it. /metrics built its own and went out without one, so a browser saw a CORS failure instead
+    /// of the 200 or 404 that was actually sent.
+    #[tokio::test]
+    async fn every_response_allows_any_origin() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-cors-{}", std::process::id()));
+        let mut st = AppState::for_test(Some(fixture(&dir)));
+        st.metrics_token = Some("s3cret".to_owned());
+        let state = Arc::new(st);
+        let send = |method: &str, uri: &str, header: Option<(&str, String)>, body: &'static str| {
+            let mut req = HttpRequest::builder().method(method).uri(uri);
+            if let Some((k, v)) = header {
+                req = req.header(k, v);
+            }
+            handle(State(Arc::clone(&state)), req.body(Body::from(body)).unwrap())
+        };
+
+        let etag = get(&state, "/manifest.json").await.headers()["etag"].to_str().unwrap().to_owned();
+        for (what, resp, status) in [
+            ("/metrics", get_metrics(&state, Some("Bearer s3cret")).await, 200),
+            ("refused /metrics", get_metrics(&state, Some("Bearer wrong")).await, 404),
+            ("unknown path", get(&state, "/nope").await, 404),
+            ("/health", get(&state, "/health").await, 200),
+            ("blob", get(&state, "/labels.json").await, 200),
+            ("304", send("GET", "/manifest.json", Some(("if-none-match", etag)), "").await, 304),
+            ("unconfigured /embed", send("POST", "/embed", None, r#"{"text":"x"}"#).await, 503),
+            ("wrong method", send("PUT", "/health", None, "").await, 405),
+            ("preflight", send("OPTIONS", "/manifest.json", None, "").await, 204),
+        ] {
+            assert_eq!(resp.status(), status, "{what}");
+            let acao: Vec<_> = resp.headers().get_all("access-control-allow-origin").iter().collect();
+            assert_eq!(acao, ["*"], "{what} did not carry exactly one wildcard origin");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// No token configured means no route, whatever the request carries.

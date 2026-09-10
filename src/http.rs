@@ -173,8 +173,8 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
 }
 
 fn build(status: StatusCode, headers: &[(&'static str, String)], body: Body) -> Response {
-    // Public, credential-free data — allow cross-origin reads (e.g. a browser-based Stremio client).
-    let mut b = Response::builder().status(status).header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+    // `Access-Control-Allow-Origin` is added once, for every response, by `handler::handle`.
+    let mut b = Response::builder().status(status);
     for (k, v) in headers {
         // Skip a header whose value isn't a valid HTTP field value (e.g. a junk sha256/date from a bad
         // meta with a newline/control byte) rather than letting `body().unwrap()` panic the task.
