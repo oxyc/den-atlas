@@ -146,7 +146,7 @@ No cache crate — hand-roll a tiny TTL map (§4) to avoid pulling in `moka`. `t
 
 - `.env.example`: `JW_COUNTRY` (default US), `JW_PROVIDERS` (default set), optional `JW_CACHE_TTL_SECS`
   (default 21600). No secrets — JustWatch's endpoint is unauthenticated.
-- `DEPLOY.md`: note the new outbound dependency (apis.justwatch.com) and that a JW outage degrades to
+- README (Deploy): note the new outbound dependency (apis.justwatch.com) and that a JW outage degrades to
   empty rows without affecting the dataset resource.
 - README: den-atlas now serves `dataset` + `catalog`; add the row list + attribution.
 

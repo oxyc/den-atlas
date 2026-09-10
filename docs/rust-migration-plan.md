@@ -154,7 +154,7 @@ DenKit import.
 `RecipeCatalog`, `DiscoverQuery`, `GenreCatalog`, `GenreRarity`, `TMDBClient`/`TMDBWire`, `LLMClient` (used by
 `SubtitleTranslator`/`AIRecoProvider` — only the classifier's use leaves).
 
-**Source-of-truth flip + fallback (kept):** `den-dataset`'s `finalize` output becomes the master; den-atlas
+**Source-of-truth flip + fallback (kept):** `den-dataset`'s `finalize` output becomes the source of truth; den-atlas
 serves it; the app bundles a **snapshot** from atlas (a `make sync-dataset`, replacing `import-dataset.mjs`'s
 role). The tvOS bundled fallback is **kept** (offline/out-of-box). Today's `t01`/`e02` bytes are relocated,
 not rebuilt. **Gate:** `make verify` green after the extraction.

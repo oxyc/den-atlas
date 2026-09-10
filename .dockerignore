@@ -1,10 +1,9 @@
+# The build copies only Cargo.toml, Cargo.lock, src/ and data/; everything below is context it never reads.
 target
-node_modules
-dist
-coverage
 .git
 .github
+.env
 *.log
-test
+tests
 docs
 # NB: data/ is NOT ignored — the dataset blobs go into the image (empty in CI → mounted at runtime).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the published dataset artifact from the den-dataset `data-latest` release into ./data. This is the
 # source-of-truth flip: den-atlas no longer imports from the Den app repo — den-dataset's finalize output
-# (published as a GitHub Release) is the master, and both den-atlas and the Den app fetch from it.
+# (published as a GitHub Release) is the source of truth, and both den-atlas and the Den app fetch from it.
 #
 #   scripts/fetch-dataset.sh          # populates ./data for `cargo run` or a data-included `docker build`
 #
