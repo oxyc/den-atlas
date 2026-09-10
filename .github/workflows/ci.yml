@@ -35,17 +35,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Tests
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       # Denied, not reported. The lint set here is small and the codebase is clean, so a new warning
       # is a real signal rather than background noise to scroll past.
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # rustfmt.toml is tuned to how this codebase was already written (see the comments there), so
       # this gate holds the existing style rather than imposing a new one.
       - name: Formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       # The catalog talks to JustWatch over the network at runtime, and an audit probe once put
       # enough load on it to earn the host a 403. Nothing in CI should reach it.
@@ -72,6 +72,21 @@ jobs:
       # grep cannot see — a test reaching the host through a default-constructed client — is closed
       # in the code instead: AppState::for_test wires an offline source, so no route test can reach
       # JustWatch however it is written. A guard that cannot be run here is not a guard.
+
+  # den-titlesearch is meant to be pulled into a future Rust core linked into the tvOS app (UniFFI) and
+  # the web app (Wasm), so it has to keep compiling for both. A check, not a build: nothing links.
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, aarch64-apple-tvos
+      - uses: Swatinem/rust-cache@v2
+      - name: den-titlesearch compiles for Wasm and tvOS
+        run: |
+          cargo check --locked -p den-titlesearch --target wasm32-unknown-unknown
+          cargo check --locked -p den-titlesearch --target aarch64-apple-tvos
 
   # The image is what actually ships, and it builds differently from `cargo build` (musl target,
   # scratch base). Catching a Dockerfile break on the PR rather than at `git tag` time, without

@@ -100,6 +100,7 @@ origin.
 | `GET /vectors-<embed>.bin` | the quantized int8 vectors blob |
 | `GET /<blob>` | the optional blobs the descriptor names: metadata sidecar, premise labels + vectors, facets |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
+| `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -116,6 +117,14 @@ served after a failed JustWatch refresh says `stale_catalog`. Normal answers car
 returns its int8 vector (`{"vector":…,"dims":1024,"model":"bge-m3"}`), so a query embeds through the SAME
 bge-m3 + quantizer that built the corpus and the two are comparable. den-embed stays internal — only Atlas
 is exposed.
+
+Title search (`TITLE_SEARCH`) builds an in-memory index of the 100k most popular movies and series in
+TMDB's daily ID exports — downloaded once a day, gunzipped straight into the scanner, nothing written to
+disk — and ranks by the share of the query's trigrams a title contains, blended with popularity, as the Den
+TV app's on-device index does. The index lives in the `den-titlesearch` crate (`crates/`), which has no
+async runtime, IO or global state, so it also compiles for Wasm and tvOS. Until the first build lands a
+search answers empty with `X-Den-Degraded: title_index_building`. The request log shows the query as
+`<query>`.
 
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
@@ -135,6 +144,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
+| `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |
 

@@ -7,6 +7,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY crates ./crates
 # rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
 RUN cargo build --release --locked
 

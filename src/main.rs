@@ -11,6 +11,7 @@ mod http;
 mod justwatch;
 mod manifest;
 mod metrics;
+mod titles;
 mod util;
 
 use std::sync::Arc;
@@ -29,6 +30,9 @@ pub struct AppState {
     pub default_country: String,
     /// Upstream den-embed for the `/embed` search proxy (env `EMBED_URL`). `None` disables search embeds.
     pub embed: Option<EmbedProxy>,
+    /// Fuzzy title search over TMDB's daily exports (env `TITLE_SEARCH`). `None` — off — declares no
+    /// search catalog.
+    pub titles: Option<Arc<titles::TitleSearch>>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
     /// One stderr line per request (env `LOG_REQUESTS`: off when unset, empty or `0`, on for anything
@@ -90,6 +94,7 @@ impl AppState {
             ),
             default_country: "US".to_owned(),
             embed: None,
+            titles: None,
             metrics_token: None,
             log_requests: false,
             health: std::sync::Mutex::new("ok"),
@@ -160,6 +165,16 @@ async fn main() {
         }
     });
 
+    // Off unless TITLE_SEARCH is set (on for anything but empty or 0): the tvOS app fuses every addon search
+    // catalog into its text search as soon as one is declared, so turning this on changes the TV's search.
+    let title_search = std::env::var("TITLE_SEARCH")
+        .is_ok_and(|v| !v.is_empty() && v != "0")
+        .then(|| titles::TitleSearch::new(titles::EXPORT_BASE))
+        .and_then(|built| {
+            built.map_err(|e| eprintln!("title search disabled (reqwest build failed: {e})")).ok()
+        })
+        .map(Arc::new);
+
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
     let health = handler::health_state(dataset.is_some(), true, false).map_or("ok", |(reason, _)| reason);
@@ -169,10 +184,14 @@ async fn main() {
         catalog,
         default_country,
         embed,
+        titles: title_search,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
+    if let Some(search) = &state.titles {
+        tokio::spawn(titles::refresh_forever(Arc::clone(search)));
+    }
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
 
@@ -200,7 +219,7 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s public_base={} embed={}",
+         catalog_ttl={}s public_base={} embed={} title_search={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -209,6 +228,7 @@ async fn main() {
         ttl.as_secs(),
         state.public_base.as_deref().unwrap_or("derived"),
         on(state.embed.is_some()),
+        on(state.titles.is_some()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());

@@ -22,6 +22,12 @@ httpdate = "1"
 # async-trait so the source is injectable/mockable. Isolated to the catalog resource.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 async-trait = "0.1"
+# Fuzzy title search (TITLE_SEARCH): the portable index crate, and a pure-Rust gunzip for TMDB's exports.
+den-titlesearch = { path = "crates/den-titlesearch" }
+flate2 = "1"
+
+[workspace]
+members = ["crates/den-titlesearch"]
 
 # `start_paused` — the cold-burst test simulates ~45s of queued upstream work, which has to cost no
 # wall clock to be worth running. Tests only; the shipped binary's tokio features are unchanged.

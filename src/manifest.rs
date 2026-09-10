@@ -4,6 +4,7 @@
 
 use crate::catalog;
 use crate::config::{Config, Region};
+use crate::titles;
 use serde::Serialize;
 
 // Single source of truth: the Cargo package version (bumped per release, asserted == the v* tag in
@@ -62,10 +63,12 @@ struct Manifest {
     behavior_hints: BehaviorHints,
 }
 
-pub fn manifest_json(config: &Config) -> String {
+/// `title_search` adds the fuzzy title-search catalogs (one per type, `search` required, so a client that
+/// browses catalogs as rows skips them).
+pub fn manifest_json(config: &Config, title_search: bool) -> String {
     // Region `auto` → each catalog accepts a `country` extra the app forwards; a fixed country needs none.
     let auto = config.region == Region::Auto;
-    let catalogs = catalog::catalog_entries(&config.providers)
+    let mut catalogs: Vec<Catalog> = catalog::catalog_entries(&config.providers)
         .into_iter()
         .map(|e| Catalog {
             type_: e.type_.to_owned(),
@@ -76,6 +79,18 @@ pub fn manifest_json(config: &Config) -> String {
             extra: if auto { vec![CatalogExtra { name: "country", is_required: false }] } else { Vec::new() },
         })
         .collect();
+    if title_search {
+        for type_ in ["movie", "series"] {
+            catalogs.push(Catalog {
+                type_: type_.to_owned(),
+                id: titles::CATALOG_ID.to_owned(),
+                name: titles::CATALOG_NAME.to_owned(),
+                extra: vec![CatalogExtra { name: "search", is_required: true }],
+                den_provider_id: None,
+                den_provider_ids: Vec::new(),
+            });
+        }
+    }
     let m = Manifest {
         id: "com.den.atlas",
         version: VERSION,
@@ -99,7 +114,7 @@ mod tests {
 
     #[test]
     fn catalogs_publish_the_tmdb_provider_id() {
-        let json = manifest_json(&Config::default_config());
+        let json = manifest_json(&Config::default_config(), false);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let cats = v["catalogs"].as_array().unwrap();
         let by = |id: &str| cats.iter().find(|c| c["id"] == id).unwrap_or_else(|| panic!("missing {id}"));
@@ -110,5 +125,22 @@ mod tests {
         assert_eq!(by("jw-nfx-new")["denProviderId"], 8);
         // The cross-provider aggregate has no single provider, so the field is absent (not null).
         assert!(by(catalog::TRENDING_ID).get("denProviderId").is_none());
+    }
+
+    /// Title search is declared only when on, as a required `search` extra per type — required, so a
+    /// client that shows catalogs as rows (the tvOS app's Browse) never tries to render it as one.
+    #[test]
+    fn title_search_catalogs_are_declared_only_when_on() {
+        let off = manifest_json(&Config::default_config(), false);
+        assert!(!off.contains(titles::CATALOG_ID));
+        let on: serde_json::Value =
+            serde_json::from_str(&manifest_json(&Config::default_config(), true)).unwrap();
+        let search: Vec<&serde_json::Value> =
+            on["catalogs"].as_array().unwrap().iter().filter(|c| c["id"] == titles::CATALOG_ID).collect();
+        assert_eq!(search.len(), 2);
+        assert_eq!(search[0]["type"], "movie");
+        assert_eq!(search[1]["type"], "series");
+        assert_eq!(search[0]["extra"][0]["name"], "search");
+        assert_eq!(search[0]["extra"][0]["isRequired"], true);
     }
 }

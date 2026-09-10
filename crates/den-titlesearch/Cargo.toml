@@ -1,0 +1,10 @@
+[package]
+name = "den-titlesearch"
+version = "0.1.0"
+edition = "2021"
+description = "Fuzzy, typo-tolerant title search over TMDB's daily ID exports — portable: no async, no IO, no global state."
+license = "MIT"
+publish = false
+
+[dependencies]
+unicode-normalization = "0.1"

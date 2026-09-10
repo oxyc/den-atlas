@@ -6,6 +6,7 @@ use crate::dataset::{Blob, Dataset};
 use crate::descriptor::build_descriptor;
 use crate::http::{serve, Payload, Servable};
 use crate::manifest::manifest_json;
+use crate::titles;
 use crate::util::{fnv1a, json_response, public_origin};
 use crate::AppState;
 use axum::body::Body;
@@ -97,18 +98,30 @@ fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
 /// The request path as the log may show it. A leading per-install config segment becomes `<config>`
 /// — it is a user's region and service choice, which a log has no need to keep — and the query string
 /// is never read, so nothing in it can reach the log. Redacted by the same `Config::parse` the router
-/// uses, so exactly the segments treated as a config are the ones hidden.
+/// uses, so exactly the segments treated as a config are the ones hidden. A search catalog's query is
+/// what someone typed, so it becomes `<query>`.
 fn loggable_path(uri: &axum::http::Uri) -> String {
     let path = uri.path();
     let trimmed = path.trim_start_matches('/');
     let (first, rest) = trimmed.split_once('/').map_or((trimmed, None), |(f, r)| (f, Some(r)));
-    if Config::parse(first).is_none() {
-        return path.to_owned();
-    }
-    match rest {
-        Some(r) => format!("/<config>/{r}"),
-        None => "/<config>".to_owned(),
-    }
+    let shown = if Config::parse(first).is_none() {
+        path.to_owned()
+    } else {
+        match rest {
+            Some(r) => format!("/<config>/{r}"),
+            None => "/<config>".to_owned(),
+        }
+    };
+    redact_search(shown)
+}
+
+/// Replace the value of a `search=` path extra with `<query>`; the value ends at `&`, `/` or `.json`.
+fn redact_search(path: String) -> String {
+    let Some(start) = path.find("search=").map(|i| i + "search=".len()) else { return path };
+    let tail = &path[start..];
+    let len =
+        tail.find(['&', '/']).unwrap_or_else(|| tail.strip_suffix(".json").map_or(tail.len(), str::len));
+    format!("{}<query>{}", &path[..start], &tail[len..])
 }
 
 // There is deliberately NO server-side request deadline, and this is the third and last thing tried
@@ -193,7 +206,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return serve_json(
             &method,
             &headers,
-            manifest_json(&config),
+            manifest_json(&config, state.titles.is_some()),
             "public, max-age=3600, stale-while-revalidate=600",
             None,
             false,
@@ -387,6 +400,9 @@ async fn handle_catalog(
     let type_ = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("");
     let extra = parts.next().unwrap_or("");
+    if id == titles::CATALOG_ID {
+        return handle_title_search(method, headers, type_, extra, state).await;
+    }
     // A fixed-country config wins; an `auto` config takes the forwarded `country` extra; else default.
     let forwarded = extra_value(extra, "country");
     let country = config.country(forwarded.as_deref(), &state.default_country);
@@ -421,6 +437,38 @@ async fn handle_catalog(
         }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
+}
+
+/// `GET /catalog/{movie|series}/den-titles/search={q}.json` — fuzzy title search, answered from memory.
+/// Until the first index lands it answers empty with `X-Den-Degraded: title_index_building`; with
+/// `TITLE_SEARCH` off the catalog doesn't exist.
+async fn handle_title_search(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    type_: &str,
+    extra: &str,
+    state: &Arc<AppState>,
+) -> Response {
+    let started = Instant::now();
+    let media_type = match type_ {
+        "movie" => den_titlesearch::MediaType::Movie,
+        "series" => den_titlesearch::MediaType::Tv,
+        _ => return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
+    };
+    let Some(search) = state.titles.as_ref() else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let Some(index) = search.index() else {
+        let mut resp =
+            serve_json(method, headers, r#"{"metas":[]}"#.to_owned(), "no-store", None, false).await;
+        resp.headers_mut().insert(DEGRADED, header::HeaderValue::from_static("title_index_building"));
+        return resp;
+    };
+    let query = extra_value(extra, "search").map(|q| percent_decode(&q)).unwrap_or_default();
+    let body = titles::metas_json(&index, &query, media_type);
+    let searched = started.elapsed();
+    let resp = serve_json(method, headers, body, "public, max-age=3600", None, false).await;
+    with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
 /// The embedded landing/configure page — served through the conditional layer so it gets a strong ETag
@@ -533,6 +581,28 @@ fn extra_value(extra: &str, key: &str) -> Option<String> {
         let mut it = kv.splitn(2, '=');
         (it.next()? == key).then(|| it.next().unwrap_or("").to_owned()).filter(|v| !v.is_empty())
     })
+}
+
+/// Decode `%XX` escapes in a path-extra value (a search query arrives encoded); a malformed escape is
+/// kept as written.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high << 4) | low);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -743,6 +813,70 @@ mod tests {
     async fn body_of(resp: axum::response::Response) -> String {
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         String::from_utf8_lossy(&b).into_owned()
+    }
+
+    fn title_state() -> Arc<AppState> {
+        use den_titlesearch::{MediaType, TitleIndex, TitleRecord};
+        let index = TitleIndex::build(vec![TitleRecord {
+            tmdb_id: 603,
+            media_type: MediaType::Movie,
+            title: "The Matrix".into(),
+            popularity: 80.0,
+        }]);
+        Arc::new(AppState {
+            titles: Some(Arc::new(crate::titles::TitleSearch::with_index(index))),
+            ..AppState::for_test(None)
+        })
+    }
+
+    /// Title search answers from the index — typos and an encoded query included — per type, and the
+    /// manifest declares it.
+    #[tokio::test]
+    async fn title_search_answers_from_the_index() {
+        let state = title_state();
+        let hit = body_of(get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await).await;
+        assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
+        let other_type =
+            body_of(get(&state, "/catalog/series/den-titles/search=the%20matrix.json").await).await;
+        assert_eq!(other_type, r#"{"metas":[]}"#);
+        let manifest = body_of(get(&state, "/manifest.json").await).await;
+        assert!(manifest.contains(r#""id":"den-titles""#), "{manifest}");
+    }
+
+    /// Off by default: no catalog in the manifest, and the route is a 404 like any unknown catalog.
+    #[tokio::test]
+    async fn title_search_is_off_unless_configured() {
+        let state = Arc::new(AppState::for_test(None));
+        assert_eq!(get(&state, "/catalog/movie/den-titles/search=x.json").await.status(), 404);
+        assert!(!body_of(get(&state, "/manifest.json").await).await.contains("den-titles"));
+    }
+
+    /// Before the first build lands the answer is empty and says why, and it isn't cached.
+    #[tokio::test]
+    async fn title_search_says_it_is_building_before_the_first_index() {
+        let search = crate::titles::TitleSearch::new("http://127.0.0.1:9/").unwrap();
+        let state = Arc::new(AppState { titles: Some(Arc::new(search)), ..AppState::for_test(None) });
+        let resp = get(&state, "/catalog/movie/den-titles/search=matrix.json").await;
+        assert_eq!(resp.headers().get(DEGRADED).unwrap(), "title_index_building");
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(body_of(resp).await, r#"{"metas":[]}"#);
+    }
+
+    #[test]
+    fn the_log_hides_a_search_query() {
+        let uri: axum::http::Uri = "/catalog/movie/den-titles/search=the%20matrix.json".parse().unwrap();
+        assert_eq!(loggable_path(&uri), "/catalog/movie/den-titles/search=<query>.json");
+        let uri: axum::http::Uri = "/US_nfx/catalog/movie/x/search=q&skip=5.json".parse().unwrap();
+        assert_eq!(loggable_path(&uri), "/<config>/catalog/movie/x/search=<query>&skip=5.json");
+        let uri: axum::http::Uri = "/catalog/movie/jw-nfx.json".parse().unwrap();
+        assert_eq!(loggable_path(&uri), "/catalog/movie/jw-nfx.json");
+    }
+
+    #[test]
+    fn percent_decodes_the_search_extra() {
+        assert_eq!(percent_decode("the%20matrix"), "the matrix");
+        assert_eq!(percent_decode("am%C3%A9lie"), "amélie");
+        assert_eq!(percent_decode("100%zz%2"), "100%zz%2");
     }
 
     /// What each route SERVES, not merely that it answers. Every test in this file anchored a
