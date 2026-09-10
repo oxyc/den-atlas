@@ -45,3 +45,8 @@ codegen-units = 1
 strip = true
 # Unwind (not abort): a stray panic in a request task drops that one connection instead of aborting the
 # whole process into a crash-loop. Header/body builds are also made non-panicking (src/http.rs).
+
+# Speed over size for the index scans: every More Like This / search query walks tens of thousands of
+# 1024-dim int8 rows, and "z" keeps the dot-product loop from vectorising.
+[profile.release.package.den-index]
+opt-level = 3

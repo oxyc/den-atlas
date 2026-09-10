@@ -6,9 +6,11 @@
 //! output. The caller reads the dataset blobs and passes the bytes in, so the same crate can run in a
 //! server, in a browser as Wasm, or linked into the tvOS app.
 
+mod facets;
 mod index;
 mod similar;
 
+pub use facets::{FacetIndex, FacetQuery};
 pub use index::{Index, Labels, LoadError, Neighbor, DISPLAY_CONFIDENCE_FLOOR};
 pub use similar::more_like_this;
 

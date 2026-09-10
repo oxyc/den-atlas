@@ -167,6 +167,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if method == Method::POST {
         return if route == "/embed" {
             handle_embed(&state, req).await
+        } else if let Some(rest) = route.strip_prefix("/index/") {
+            handle_index_post(&state, rest, req).await
         } else {
             json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED)
         };
@@ -449,8 +451,23 @@ const MAX_ROW_PAGE: usize = 100;
 /// One `/index/…` question, parsed before the index loads, so a malformed path never pays for a load.
 enum IndexQuestion {
     Taxonomy,
-    Rows { media_type: den_index::MediaType, mood: bool, label: String },
-    Similar { media_type: den_index::MediaType, tmdb_id: u32 },
+    Rows {
+        media_type: den_index::MediaType,
+        mood: bool,
+        label: String,
+    },
+    Similar {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
+    Neighbours {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
+    /// Answered in `handle_index`, because it waits on den-embed.
+    Search,
+    /// Answered in `handle_index`, because a leftover theme waits on den-embed.
+    Facets,
 }
 
 impl IndexQuestion {
@@ -469,6 +486,11 @@ impl IndexQuestion {
             ["similar", type_, id] => {
                 Some(Self::Similar { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
+            ["neighbours", type_, id] => {
+                Some(Self::Neighbours { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["search"] => Some(Self::Search),
+            ["facets"] => Some(Self::Facets),
             _ => None,
         }
     }
@@ -497,6 +519,17 @@ impl IndexQuestion {
             Self::Similar { media_type, tmdb_id } => serde_json::json!({
                 "ids": den_index::more_like_this(Some(plot), indexes.premise.as_ref(), *tmdb_id, *media_type),
             }),
+            // The plain plot neighbours the tvOS app splices in after an exact title match.
+            Self::Neighbours { media_type, tmdb_id } => {
+                let k = query_param(query, "k")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(NEIGHBOUR_K)
+                    .min(MAX_NEIGHBOUR_K);
+                let ids: Vec<u32> =
+                    plot.nearest(*tmdb_id, *media_type, k).iter().map(|n| n.tmdb_id).collect();
+                serde_json::json!({ "ids": ids })
+            }
+            Self::Search | Self::Facets => unreachable!("answered in handle_index"),
         };
         body.to_string()
     }
@@ -509,6 +542,311 @@ fn index_media_type(type_: &str) -> Option<den_index::MediaType> {
         "series" => Some(den_index::MediaType::Tv),
         _ => None,
     }
+}
+
+/// How many titles semantic search returns (the tvOS app's own `k`); plain neighbours by default and at most;
+/// the facet lane's cap; pooled suggestions by default.
+const SEMANTIC_K: usize = 24;
+const NEIGHBOUR_K: usize = 12;
+const MAX_NEIGHBOUR_K: usize = 50;
+const FACET_LIMIT: usize = 50;
+const SUGGEST_LIMIT: usize = 20;
+/// The most titles one POST may name, and the most seeds a suggestion takes (the tvOS app's own cap).
+const MAX_TITLES: usize = 500;
+const MAX_SEEDS: usize = 8;
+
+fn stremio_type(media_type: den_index::MediaType) -> &'static str {
+    match media_type {
+        den_index::MediaType::Movie => "movie",
+        den_index::MediaType::Tv => "series",
+    }
+}
+
+/// Titles of mixed types, as `[{"type","id"}]`.
+fn titles_json(titles: &[(u32, den_index::MediaType)]) -> serde_json::Value {
+    titles
+        .iter()
+        .map(|&(id, media_type)| serde_json::json!({ "type": stremio_type(media_type), "id": id }))
+        .collect()
+}
+
+/// A query-string value as text: `+` is a space there (a browser's URLSearchParams writes one), then `%XX`
+/// escapes.
+fn query_text(query: &str, key: &str) -> String {
+    query_param(query, key).map(|v| percent_decode(&v.replace('+', " "))).unwrap_or_default()
+}
+
+/// Embed text through den-embed the way `/embed` does — the corpus's own model and quantiser — under the same
+/// permits and deadline.
+async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
+    #[derive(serde::Deserialize)]
+    struct Embedded {
+        vector: Vec<i8>,
+    }
+    let proxy = state.embed.as_ref().ok_or("EMBED_URL is unset")?;
+    let _permit = tokio::time::timeout(crate::EMBED_WAIT, proxy.inflight.clone().acquire_owned())
+        .await
+        .map_err(|_| "den-embed is busy")?
+        .map_err(|_| "den-embed permits are closed")?;
+    let resp = proxy
+        .client
+        .post(format!("{}/embed", proxy.base))
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .map_err(|e| format!("den-embed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("den-embed answered HTTP {}", resp.status()));
+    }
+    resp.json::<Embedded>().await.map(|e| e.vector).map_err(|e| format!("den-embed body: {e}"))
+}
+
+/// Semantic search in one request: embed the query, then the plot index's nearest titles to it — the tvOS
+/// app's `semanticSearch`. A 503 when den-embed can't be reached.
+async fn search_answer(
+    state: &AppState,
+    indexes: &crate::queries::Indexes,
+    query: &str,
+) -> Result<String, Response> {
+    let text = query_text(query, "q");
+    if text.trim().chars().count() < 2 {
+        return Ok(serde_json::json!({ "titles": [] }).to_string());
+    }
+    let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
+    let vector = embed_query(state, &text).await.map_err(|e| {
+        eprintln!("semantic search unavailable: {e}");
+        json_response(r#"{"error":"embed_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE)
+    })?;
+    let titles: Vec<(u32, den_index::MediaType)> = indexes
+        .plot
+        .nearest_to_vector(&vector, media_type, SEMANTIC_K)
+        .into_iter()
+        .map(|n| (n.tmdb_id, n.media_type))
+        .collect();
+    Ok(serde_json::json!({ "titles": titles_json(&titles) }).to_string())
+}
+
+/// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
+/// most-voted first, with any leftover words ranked semantically to the front. `facet` is null when the query
+/// names none. Without den-embed the matches still come back, unranked.
+async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> String {
+    let facet = den_index::FacetQuery::parse(&query_text(query, "q"));
+    let (Some(facets), true) = (indexes.facets.as_ref(), facet.has_facet()) else {
+        return serde_json::json!({ "facet": null, "titles": [] }).to_string();
+    };
+    let mut titles = facets.filter(facet.media_type, facet.country, facet.decade);
+    if !facet.leftover.is_empty() && !titles.is_empty() {
+        match embed_query(state, &facet.leftover).await {
+            Ok(vector) => {
+                let matched: std::collections::HashSet<_> = titles.iter().copied().collect();
+                let head: Vec<_> = indexes
+                    .plot
+                    .nearest_to_vector(&vector, None, SEMANTIC_K)
+                    .into_iter()
+                    .map(|n| (n.tmdb_id, n.media_type))
+                    .filter(|t| matched.contains(t))
+                    .collect();
+                let lifted: std::collections::HashSet<_> = head.iter().copied().collect();
+                titles = head.into_iter().chain(titles.into_iter().filter(|t| !lifted.contains(t))).collect();
+            }
+            Err(e) => eprintln!("facet leftover left unranked: {e}"),
+        }
+    }
+    titles.truncate(FACET_LIMIT);
+    serde_json::json!({
+        "facet": {
+            "mediaType": facet.media_type.map(stremio_type),
+            "country": facet.country,
+            "decade": facet.decade,
+            "leftover": facet.leftover,
+        },
+        "titles": titles_json(&titles),
+    })
+    .to_string()
+}
+
+/// A title named in a POST body: `{"type":"movie"|"series","id":…}`.
+#[derive(serde::Deserialize)]
+struct TitleRef {
+    #[serde(rename = "type")]
+    type_: String,
+    id: u32,
+}
+
+impl TitleRef {
+    fn key(&self) -> Option<(u32, den_index::MediaType)> {
+        Some((self.id, index_media_type(&self.type_)?))
+    }
+}
+
+fn keys(titles: &[TitleRef]) -> Vec<(u32, den_index::MediaType)> {
+    titles.iter().filter_map(TitleRef::key).collect()
+}
+
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    serde_json::from_slice(body).map_err(|e| e.to_string())
+}
+
+fn at_most(titles: &[TitleRef], max: usize, what: &str) -> Result<(), String> {
+    if titles.len() > max {
+        return Err(format!("at most {max} {what}"));
+    }
+    Ok(())
+}
+
+/// `{"titles":[…]}` → each title's labels (null when the index doesn't hold it), for the top-genres rollup and
+/// More Like This's theme rerank.
+fn answer_labels(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        titles: Vec<TitleRef>,
+    }
+    let body: Body = parse_body(body)?;
+    at_most(&body.titles, MAX_TITLES, "titles")?;
+    let labels: Vec<serde_json::Value> = body
+        .titles
+        .iter()
+        .map(|t| {
+            t.key().and_then(|(id, media_type)| indexes.plot.labels(id, media_type)).map_or(
+                serde_json::Value::Null,
+                |l| {
+                    serde_json::json!({
+                        "primaryGenre": l.primary_genre,
+                        "animated": l.animated,
+                        "subgenres": l.subgenres,
+                        "moods": l.moods,
+                    })
+                },
+            )
+        })
+        .collect();
+    Ok(serde_json::json!({ "labels": labels }))
+}
+
+/// `{"space"?,"liked","disliked","candidates"}` → per candidate, its taste boost toward the liked titles and
+/// its closeness to the disliked ones — both the tvOS app's `TasteVector.boost` (cosine to the centroid,
+/// clamped at 0; 0 when the index lacks the title). The client applies its weights. `space` is `plot` (the
+/// browse tilt) or `premise` (More Like This; plot when the dataset has no premise index).
+fn answer_score(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        #[serde(default)]
+        space: Option<String>,
+        #[serde(default)]
+        liked: Vec<TitleRef>,
+        #[serde(default)]
+        disliked: Vec<TitleRef>,
+        candidates: Vec<TitleRef>,
+    }
+    let body: Body = parse_body(body)?;
+    for (list, what) in
+        [(&body.liked, "liked"), (&body.disliked, "disliked"), (&body.candidates, "candidates")]
+    {
+        at_most(list, MAX_TITLES, what)?;
+    }
+    let (space, index) = match body.space.as_deref() {
+        None | Some("plot") => ("plot", &indexes.plot),
+        Some("premise") => indexes.premise.as_ref().map_or(("plot", &indexes.plot), |p| ("premise", p)),
+        Some(other) => return Err(format!("unknown space {other:?}")),
+    };
+    let liked = index.centroid(&keys(&body.liked));
+    let disliked = index.centroid(&keys(&body.disliked));
+    let boost = |centroid: &Option<Vec<f64>>, (id, media_type): (u32, den_index::MediaType)| {
+        centroid.as_ref().map_or(0.0, |c| index.taste_boost(id, media_type, c))
+    };
+    let scores: Vec<serde_json::Value> = body
+        .candidates
+        .iter()
+        .map(|t| match t.key() {
+            Some(key) => serde_json::json!({ "taste": boost(&liked, key), "dislike": boost(&disliked, key) }),
+            None => serde_json::json!({ "taste": 0.0, "dislike": 0.0 }),
+        })
+        .collect();
+    Ok(serde_json::json!({ "space": space, "scores": scores }))
+}
+
+/// `{"seeds","exclude"?,"limit"?}` → More Like This for each seed (ids of the seed's type), minus the seeds and
+/// the excluded titles, and those lists pooled in seed order — the atlas half of Because you watched and You
+/// Might Also Like; the client blends in TMDB's.
+fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_json::Value, String> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        seeds: Vec<TitleRef>,
+        #[serde(default)]
+        exclude: Vec<TitleRef>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    let body: Body = parse_body(body)?;
+    at_most(&body.seeds, MAX_SEEDS, "seeds")?;
+    at_most(&body.exclude, MAX_TITLES, "excluded titles")?;
+    let seeds = keys(&body.seeds);
+    let mut excluded: std::collections::HashSet<_> = keys(&body.exclude).into_iter().collect();
+    excluded.extend(seeds.iter().copied());
+    let limit = body.limit.unwrap_or(SUGGEST_LIMIT).min(MAX_TITLES);
+    let per_seed: Vec<((u32, den_index::MediaType), Vec<u32>)> = seeds
+        .iter()
+        .map(|&(id, media_type)| {
+            let similar =
+                den_index::more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, media_type);
+            (
+                (id, media_type),
+                similar.into_iter().filter(|&n| !excluded.contains(&(n, media_type))).collect(),
+            )
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut pooled = Vec::new();
+    'pool: for &((_, media_type), ref ids) in &per_seed {
+        for &id in ids {
+            if seen.insert((id, media_type)) {
+                pooled.push((id, media_type));
+                if pooled.len() == limit {
+                    break 'pool;
+                }
+            }
+        }
+    }
+    let per_seed: Vec<serde_json::Value> = per_seed
+        .iter()
+        .map(|(seed, ids)| serde_json::json!({ "seed": titles_json(&[*seed])[0], "ids": ids }))
+        .collect();
+    Ok(serde_json::json!({ "perSeed": per_seed, "pooled": titles_json(&pooled) }))
+}
+
+/// `POST /index/labels|score|suggest` — the questions that name many titles at once. JSON in, JSON out,
+/// uncached. Off (404) unless `INDEX_QUERIES` is set; a malformed body is a 400.
+async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> Response {
+    let started = Instant::now();
+    let question = rest.strip_suffix(".json").unwrap_or(rest);
+    let (Some(queries), true) = (state.index.as_ref(), matches!(question, "labels" | "score" | "suggest"))
+    else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
+        return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST);
+    };
+    let (indexes, loaded_in) = match queries.get().await {
+        Ok(got) => got,
+        Err(e) => {
+            eprintln!("index load failed: {e}");
+            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let answer = match question {
+        "labels" => answer_labels(&indexes, &body),
+        "score" => answer_score(&indexes, &body),
+        _ => answer_suggest(&indexes, &body),
+    };
+    let resp = match answer {
+        Ok(value) => json_response(value.to_string(), StatusCode::OK),
+        Err(detail) => json_response(
+            serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    };
+    let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
+    with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
 }
 
 /// `/index/…` — TMDB ids only; the Den apps hydrate titles themselves. Off (404) unless `INDEX_QUERIES` is
@@ -533,7 +871,14 @@ async fn handle_index(
             return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
         }
     };
-    let body = question.answer(&indexes, query);
+    let body = match question {
+        IndexQuestion::Search => match search_answer(state, &indexes, query).await {
+            Ok(body) => body,
+            Err(resp) => return resp,
+        },
+        IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
+        question => question.answer(&indexes, query),
+    };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
     let resp = serve_json(method, headers, body, "public, max-age=300", None, false).await;
     with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
@@ -1007,6 +1352,118 @@ mod tests {
         ] {
             assert_eq!(get(&state, path).await.status(), 404, "{path}");
         }
+    }
+
+    /// A stand-in den-embed answering every request with `vector`.
+    async fn fake_embed(vector: &'static str) -> crate::EmbedProxy {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(r#"{{"vector":{vector},"dims":3,"model":"m"}}"#);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        crate::EmbedProxy {
+            client: reqwest::Client::new(),
+            base: format!("http://{addr}"),
+            inflight: Arc::new(tokio::sync::Semaphore::new(4)),
+        }
+    }
+
+    async fn post(state: &Arc<AppState>, uri: &str, body: &str) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        handle(State(Arc::clone(state)), req).await
+    }
+
+    /// Plain neighbours, semantic search through den-embed, and the facet lane — with and without a theme to
+    /// rank the matches by.
+    #[tokio::test]
+    async fn neighbours_semantic_search_and_the_facet_lane() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-search-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await),
+            ..AppState::for_test(Some(ds))
+        });
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+
+        let neighbours = json(body_of(get(&state, "/index/neighbours/movie/1.json").await).await);
+        assert_eq!(neighbours["ids"], serde_json::json!([2, 3]));
+        // The embedded query sits on movie 3.
+        let search = json(body_of(get(&state, "/index/search.json?q=campy+fun").await).await);
+        assert_eq!(search["titles"][0], serde_json::json!({"type": "movie", "id": 3}));
+
+        let korean = json(body_of(get(&state, "/index/facets.json?q=korean%20movies").await).await);
+        assert_eq!(korean["facet"]["country"], "KR");
+        assert_eq!(
+            korean["titles"],
+            serde_json::json!([{"type": "movie", "id": 2}, {"type": "movie", "id": 1}])
+        );
+        // By votes the Korean titles are 2, 4, 1; the leftover theme ranks them toward the query: 2, 1, 4.
+        let themed = json(body_of(get(&state, "/index/facets.json?q=korean+heist").await).await);
+        assert_eq!(
+            themed["titles"],
+            serde_json::json!([{"type": "movie", "id": 2}, {"type": "movie", "id": 1}, {"type": "series", "id": 4}])
+        );
+        let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
+        assert_eq!(none["facet"], serde_json::Value::Null);
+    }
+
+    /// Batch labels, taste scores and suggestions, and how a bad POST is refused.
+    #[tokio::test]
+    async fn labels_scores_and_suggestions_answer_by_post() {
+        let state = index_state("den-atlas-post");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+
+        let labels = r#"{"titles":[{"type":"movie","id":3},{"type":"movie","id":99}]}"#;
+        let labels = json(body_of(post(&state, "/index/labels.json", labels).await).await);
+        assert_eq!(labels["labels"][0]["primaryGenre"], "Comedy");
+        assert_eq!(labels["labels"][0]["subgenres"][1], serde_json::json!(["Campy/Cult", 0.9]));
+        assert_eq!(labels["labels"][1], serde_json::Value::Null);
+
+        let score = r#"{"liked":[{"type":"movie","id":1}],"disliked":[{"type":"movie","id":3}],
+                        "candidates":[{"type":"movie","id":2},{"type":"movie","id":3}]}"#;
+        let score = json(body_of(post(&state, "/index/score.json", score).await).await);
+        assert_eq!(score["space"], "plot");
+        assert!(score["scores"][0]["taste"].as_f64().unwrap() > 0.9, "2 sits by the liked 1");
+        assert!(
+            (score["scores"][1]["dislike"].as_f64().unwrap() - 1.0).abs() < 1e-9,
+            "3 is the disliked one"
+        );
+        let premise = json(
+            body_of(post(&state, "/index/score.json", r#"{"space":"premise","candidates":[]}"#).await).await,
+        );
+        assert_eq!(premise["space"], "premise");
+
+        let suggest = r#"{"seeds":[{"type":"movie","id":1}],"exclude":[{"type":"movie","id":2}]}"#;
+        let suggest = json(body_of(post(&state, "/index/suggest.json", suggest).await).await);
+        assert_eq!(suggest["perSeed"][0]["seed"], serde_json::json!({"type": "movie", "id": 1}));
+        assert_eq!(suggest["perSeed"][0]["ids"], serde_json::json!([3]));
+        assert_eq!(suggest["pooled"], serde_json::json!([{"type": "movie", "id": 3}]));
+
+        assert_eq!(post(&state, "/index/labels.json", "not json").await.status(), 400);
+        assert_eq!(post(&state, "/index/score.json", r#"{"space":"x","candidates":[]}"#).await.status(), 400);
+        assert_eq!(post(&state, "/index/nope.json", "{}").await.status(), 404);
     }
 
     #[test]

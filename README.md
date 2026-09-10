@@ -104,6 +104,12 @@ origin.
 | `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{taxonomyVersion,subgenres,moods}`, each list most-populated first |
 | `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100 |
 | `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours |
+| `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
+| `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
+| `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
+| `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
+| `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
+| `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -134,6 +140,9 @@ Index queries (`INDEX_QUERIES`) answer from the dataset's plot and premise index
 index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load on the first
 query — the answer's `Server-Timing` carries `load;dur=<ms>` then — and are released after 10 idle minutes,
 so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries":true` when they're on.
+Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`); the
+facet lane reads the dataset's `facets.bin`. Taste weights stay with the client: `score` returns the raw
+boosts.
 
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
@@ -153,7 +162,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
-| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This); the indexes load on first use and are released after 10 idle minutes |
+| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |

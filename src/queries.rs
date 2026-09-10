@@ -5,7 +5,7 @@
 
 use crate::dataset::Dataset;
 use crate::util::lock;
-use den_index::Index;
+use den_index::{FacetIndex, Index};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,8 @@ pub struct Indexes {
     pub plot: Index,
     /// The premise index, when the dataset ships one that loads; without it More Like This is plot-only.
     pub premise: Option<Index>,
+    /// The facet index, when the dataset ships `facets.bin`; without it the facet lane answers nothing.
+    pub facets: Option<FacetIndex>,
 }
 
 /// A labels blob and its vectors blob.
@@ -27,6 +29,7 @@ type BlobPair = (PathBuf, PathBuf);
 pub struct IndexQueries {
     plot: BlobPair,
     premise: Option<BlobPair>,
+    facets: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
@@ -42,6 +45,7 @@ impl IndexQueries {
         IndexQueries {
             plot: (ds.labels.path.clone(), ds.vectors.path.clone()),
             premise,
+            facets: ds.facets.as_ref().map(|f| f.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
         }
@@ -58,14 +62,15 @@ impl IndexQueries {
             return Ok((indexes, None));
         }
         let started = Instant::now();
-        let (plot, premise) = (self.plot.clone(), self.premise.clone());
-        let indexes = tokio::task::spawn_blocking(move || load(&plot, premise.as_ref()))
+        let (plot, premise, facets) = (self.plot.clone(), self.premise.clone(), self.facets.clone());
+        let indexes = tokio::task::spawn_blocking(move || load(&plot, premise.as_ref(), facets.as_ref()))
             .await
             .map_err(|e| format!("load task: {e}"))??;
         let took = started.elapsed();
         let premise = indexes.premise.as_ref().map_or("none".to_owned(), |p| format!("{} titles", p.len()));
+        let facets = indexes.facets.as_ref().map_or("none".to_owned(), |f| format!("{} titles", f.len()));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, in {:.1}s",
+            "index loaded: {} titles, premise {premise}, facets {facets}, in {:.1}s",
             indexes.plot.len(),
             took.as_secs_f64()
         );
@@ -104,15 +109,26 @@ pub async fn release_when_idle(queries: Arc<IndexQueries>) {
     }
 }
 
-fn load(plot: &BlobPair, premise: Option<&BlobPair>) -> Result<Indexes, String> {
+fn load(plot: &BlobPair, premise: Option<&BlobPair>, facets: Option<&PathBuf>) -> Result<Indexes, String> {
     let plot = read_index(plot)?;
+    // Like the premise index, an unusable facet blob costs only its own feature.
+    let facets = facets.and_then(|path| match std::fs::read(path) {
+        Ok(blob) => FacetIndex::from_blob(&blob).or_else(|| {
+            eprintln!("facet index {} is not a DFI2 blob — facet search is off", path.display());
+            None
+        }),
+        Err(e) => {
+            eprintln!("read {}: {e} — facet search is off", path.display());
+            None
+        }
+    });
     // A broken premise index costs premise-led More Like This, not the whole feature.
     let premise = premise.and_then(|pair| {
         read_index(pair)
             .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
             .ok()
     });
-    Ok(Indexes { plot, premise })
+    Ok(Indexes { plot, premise, facets })
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {
@@ -162,6 +178,23 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
     std::fs::write(dir.join("vectors.bin"), &plot.1).unwrap();
     std::fs::write(dir.join("premise-labels.json"), &premise.0).unwrap();
     std::fs::write(dir.join("premise-vectors.bin"), &premise.1).unwrap();
+    // Korean movies 1 (1985, 100 votes) and 2 (1995, 500), Spanish movie 3 (1985), Korean series 4 (2010, 300).
+    let mut facets = b"DFI2".to_vec();
+    facets.extend_from_slice(&4u32.to_le_bytes());
+    for (id, tv, country, year, votes) in [
+        (1i32, 0u8, b"KR", 1985u16, 100u32),
+        (2, 0, b"KR", 1995, 500),
+        (3, 0, b"ES", 1985, 50),
+        (4, 1, b"KR", 2010, 300),
+    ] {
+        facets.extend_from_slice(&id.to_le_bytes());
+        facets.push(tv);
+        facets.extend_from_slice(b"xx");
+        facets.extend_from_slice(country);
+        facets.extend_from_slice(&year.to_le_bytes());
+        facets.extend_from_slice(&votes.to_le_bytes());
+    }
+    std::fs::write(dir.join("facets.bin"), &facets).unwrap();
     let meta = serde_json::json!({
         "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 4,
         "quantization": "int8",
@@ -172,6 +205,7 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
         "premiseLabelsSha256": "c",
         "premiseVectorsFile": "premise-vectors.bin", "premiseVectorsBytes": premise.1.len(),
         "premiseVectorsSha256": "d",
+        "facetsFile": "facets.bin", "facetsBytes": facets.len(), "facetsSha256": "e",
     });
     std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
     Dataset::load(dir).expect("fixture dataset must load")
