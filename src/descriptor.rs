@@ -51,13 +51,17 @@ struct Descriptor {
     /// reads it as `decodeIfPresent`, so absent ⇒ no semantic query search.
     #[serde(skip_serializing_if = "Option::is_none")]
     embed: Option<bool>,
+    /// Declares the index query routes (`/index/…`, `INDEX_QUERIES` on). Omitted when off, so the descriptor
+    /// stays byte-identical to before; the app reads it as `decodeIfPresent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queries: Option<bool>,
     /// FP-3 — the producer's signature, verbatim from the meta. Omitted when unsigned, so an unsigned
     /// descriptor stays byte-identical to before and the app reads it as `decodeIfPresent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
 }
 
-pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> String {
+pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool, queries_enabled: bool) -> String {
     // `datasetVersion` is a content-hash hex / safe token, so `encodeURIComponent` is the identity here.
     let v = &ds.meta.dataset_version;
     let d = Descriptor {
@@ -110,6 +114,7 @@ pub fn build_descriptor(origin: &str, ds: &Dataset, embed_enabled: bool) -> Stri
             bytes: f.size,
         }),
         embed: embed_enabled.then_some(true),
+        queries: queries_enabled.then_some(true),
         signature: ds.meta.signature.clone(),
     };
     serde_json::to_string(&d).unwrap()
@@ -183,15 +188,24 @@ mod tests {
     /// pinned. An addon able to mint its own signature would prove nothing.
     #[test]
     fn signature_is_passed_through_verbatim() {
-        let json = build_descriptor("https://atlas.test", &dataset(Some("ed25519:AAAA")), false);
+        let json = build_descriptor("https://atlas.test", &dataset(Some("ed25519:AAAA")), false, false);
         assert!(json.contains(r#""signature":"ed25519:AAAA""#), "got {json}");
+    }
+
+    /// The query routes are declared only when on; off, the descriptor is byte-identical to before.
+    #[test]
+    fn queries_are_declared_only_when_on() {
+        assert!(
+            build_descriptor("https://atlas.test", &dataset(None), false, true).contains(r#""queries":true"#)
+        );
+        assert!(!build_descriptor("https://atlas.test", &dataset(None), false, false).contains("queries"));
     }
 
     /// An unsigned dataset must serialize byte-identically to before the field existed, so existing
     /// providers keep decoding unchanged (the app reads it as `decodeIfPresent`).
     #[test]
     fn unsigned_dataset_omits_the_field_entirely() {
-        let json = build_descriptor("https://atlas.test", &dataset(None), false);
+        let json = build_descriptor("https://atlas.test", &dataset(None), false, false);
         assert!(!json.contains("signature"), "got {json}");
     }
 }

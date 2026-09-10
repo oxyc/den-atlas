@@ -101,6 +101,9 @@ origin.
 | `GET /<blob>` | the optional blobs the descriptor names: metadata sidecar, premise labels + vectors, facets |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
 | `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
+| `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{taxonomyVersion,subgenres,moods}`, each list most-populated first |
+| `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100 |
+| `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -126,6 +129,12 @@ async runtime, IO or global state, so it also compiles for Wasm and tvOS. Until 
 search answers empty with `X-Den-Degraded: title_index_building`. The request log shows the query as
 `<query>`.
 
+Index queries (`INDEX_QUERIES`) answer from the dataset's plot and premise indexes through the
+`den-index` crate (`crates/`, portable like `den-titlesearch`), the same way the Den TV app's on-device
+index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load on the first
+query — the answer's `Server-Timing` carries `load;dur=<ms>` then — and are released after 10 idle minutes,
+so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries":true` when they're on.
+
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
 `atlas_dataset_titles`, and the two catalog signals behind `/health` — `atlas_catalog_fresh` and
@@ -144,6 +153,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
+| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This); the indexes load on first use and are released after 10 idle minutes |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |

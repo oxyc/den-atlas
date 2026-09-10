@@ -24,10 +24,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 async-trait = "0.1"
 # Fuzzy title search (TITLE_SEARCH): the portable index crate, and a pure-Rust gunzip for TMDB's exports.
 den-titlesearch = { path = "crates/den-titlesearch" }
+# Index queries (INDEX_QUERIES): label rows and More Like This over the dataset, the portable crate.
+den-index = { path = "crates/den-index" }
 flate2 = "1"
 
 [workspace]
-members = ["crates/den-titlesearch"]
+members = ["crates/den-index", "crates/den-titlesearch"]
 
 # `start_paused` — the cold-burst test simulates ~45s of queued upstream work, which has to cost no
 # wall clock to be worth running. Tests only; the shipped binary's tokio features are unchanged.

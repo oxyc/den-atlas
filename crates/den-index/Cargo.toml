@@ -1,0 +1,11 @@
+[package]
+name = "den-index"
+version = "0.1.0"
+edition = "2021"
+description = "The Den dataset index (labels + int8 vectors) and its queries — portable: no async, no IO, no global state."
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

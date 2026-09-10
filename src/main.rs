@@ -11,6 +11,7 @@ mod http;
 mod justwatch;
 mod manifest;
 mod metrics;
+mod queries;
 mod titles;
 mod util;
 
@@ -33,6 +34,9 @@ pub struct AppState {
     /// Fuzzy title search over TMDB's daily exports (env `TITLE_SEARCH`). `None` — off — declares no
     /// search catalog.
     pub titles: Option<Arc<titles::TitleSearch>>,
+    /// Index queries over the dataset (env `INDEX_QUERIES`, and a loaded dataset). `None` — off — 404s the
+    /// `/index/…` routes.
+    pub index: Option<Arc<queries::IndexQueries>>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
     /// One stderr line per request (env `LOG_REQUESTS`: off when unset, empty or `0`, on for anything
@@ -95,6 +99,7 @@ impl AppState {
             default_country: "US".to_owned(),
             embed: None,
             titles: None,
+            index: None,
             metrics_token: None,
             log_requests: false,
             health: std::sync::Mutex::new("ok"),
@@ -174,6 +179,12 @@ async fn main() {
             built.map_err(|e| eprintln!("title search disabled (reqwest build failed: {e})")).ok()
         })
         .map(Arc::new);
+    // Off unless INDEX_QUERIES is set, and only over a dataset that loaded. The indexes themselves load on
+    // the first query.
+    let index = std::env::var("INDEX_QUERIES")
+        .is_ok_and(|v| !v.is_empty() && v != "0")
+        .then(|| dataset.as_ref().map(|ds| Arc::new(queries::IndexQueries::new(ds))))
+        .flatten();
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
@@ -185,12 +196,16 @@ async fn main() {
         default_country,
         embed,
         titles: title_search,
+        index,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
     if let Some(search) = &state.titles {
         tokio::spawn(titles::refresh_forever(Arc::clone(search)));
+    }
+    if let Some(index) = &state.index {
+        tokio::spawn(queries::release_when_idle(Arc::clone(index)));
     }
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
@@ -219,7 +234,7 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s public_base={} embed={} title_search={}",
+         catalog_ttl={}s public_base={} embed={} title_search={} index_queries={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -229,6 +244,7 @@ async fn main() {
         state.public_base.as_deref().unwrap_or("derived"),
         on(state.embed.is_some()),
         on(state.titles.is_some()),
+        on(state.index.is_some()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());

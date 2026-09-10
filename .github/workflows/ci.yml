@@ -73,8 +73,9 @@ jobs:
       # in the code instead: AppState::for_test wires an offline source, so no route test can reach
       # JustWatch however it is written. A guard that cannot be run here is not a guard.
 
-  # den-titlesearch is meant to be pulled into a future Rust core linked into the tvOS app (UniFFI) and
-  # the web app (Wasm), so it has to keep compiling for both. A check, not a build: nothing links.
+  # den-index and den-titlesearch are meant to be pulled into a future Rust core linked into the tvOS app
+  # (UniFFI) and the web app (Wasm), so they have to keep compiling for both. A check, not a build: nothing
+  # links.
   portable:
     runs-on: ubuntu-latest
     steps:
@@ -83,10 +84,10 @@ jobs:
         with:
           targets: wasm32-unknown-unknown, aarch64-apple-tvos
       - uses: Swatinem/rust-cache@v2
-      - name: den-titlesearch compiles for Wasm and tvOS
+      - name: The portable crates compile for Wasm and tvOS
         run: |
-          cargo check --locked -p den-titlesearch --target wasm32-unknown-unknown
-          cargo check --locked -p den-titlesearch --target aarch64-apple-tvos
+          cargo check --locked -p den-index -p den-titlesearch --target wasm32-unknown-unknown
+          cargo check --locked -p den-index -p den-titlesearch --target aarch64-apple-tvos
 
   # The image is what actually ships, and it builds differently from `cargo build` (musl target,
   # scratch base). Catching a Dockerfile break on the PR rather than at `git tag` time, without

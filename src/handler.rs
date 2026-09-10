@@ -221,7 +221,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 serve_json(
                     &method,
                     &headers,
-                    build_descriptor(&origin, ds, state.embed.is_some()),
+                    build_descriptor(&origin, ds, state.embed.is_some(), state.index.is_some()),
                     "public, max-age=300",
                     ds.last_modified.clone(),
                     true,
@@ -267,6 +267,9 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
         return handle_catalog(&method, &headers, rest, &config, &state).await;
+    }
+    if let Some(rest) = route.strip_prefix("/index/") {
+        return handle_index(&method, &headers, rest, &query, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
 }
@@ -437,6 +440,103 @@ async fn handle_catalog(
         }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
+}
+
+/// A label row's page size when the caller doesn't say, and the most one page returns.
+const ROW_PAGE: usize = 24;
+const MAX_ROW_PAGE: usize = 100;
+
+/// One `/index/…` question, parsed before the index loads, so a malformed path never pays for a load.
+enum IndexQuestion {
+    Taxonomy,
+    Rows { media_type: den_index::MediaType, mood: bool, label: String },
+    Similar { media_type: den_index::MediaType, tmdb_id: u32 },
+}
+
+impl IndexQuestion {
+    fn parse(route: &str) -> Option<Self> {
+        let parts: Vec<&str> = route.split('/').collect();
+        match parts.as_slice() {
+            ["taxonomy"] => Some(Self::Taxonomy),
+            ["rows", type_, family, label] => {
+                let mood = match *family {
+                    "subgenre" => false,
+                    "mood" => true,
+                    _ => return None,
+                };
+                Some(Self::Rows { media_type: index_media_type(type_)?, mood, label: percent_decode(label) })
+            }
+            ["similar", type_, id] => {
+                Some(Self::Similar { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            _ => None,
+        }
+    }
+
+    fn answer(&self, indexes: &crate::queries::Indexes, query: &str) -> String {
+        let plot = &indexes.plot;
+        let body = match self {
+            Self::Taxonomy => serde_json::json!({
+                "taxonomyVersion": plot.taxonomy_version(),
+                "subgenres": plot.subgenre_labels(),
+                "moods": plot.mood_labels(),
+            }),
+            Self::Rows { media_type, mood, label } => {
+                let number = |key: &str, default: usize| {
+                    query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
+                };
+                let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
+                let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
+                let titles = if *mood {
+                    plot.titles_with_mood(label, Some(*media_type), floor, skip, limit)
+                } else {
+                    plot.titles_with_subgenre(label, Some(*media_type), floor, skip, limit)
+                };
+                serde_json::json!({ "ids": titles.iter().map(|&(id, _)| id).collect::<Vec<u32>>() })
+            }
+            Self::Similar { media_type, tmdb_id } => serde_json::json!({
+                "ids": den_index::more_like_this(Some(plot), indexes.premise.as_ref(), *tmdb_id, *media_type),
+            }),
+        };
+        body.to_string()
+    }
+}
+
+/// A Stremio type in a path, as the index names it.
+fn index_media_type(type_: &str) -> Option<den_index::MediaType> {
+    match type_ {
+        "movie" => Some(den_index::MediaType::Movie),
+        "series" => Some(den_index::MediaType::Tv),
+        _ => None,
+    }
+}
+
+/// `/index/…` — TMDB ids only; the Den apps hydrate titles themselves. Off (404) unless `INDEX_QUERIES` is
+/// set. The indexes load on the first query, and that answer's `Server-Timing` says how long it took.
+async fn handle_index(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    rest: &str,
+    query: &str,
+    state: &Arc<AppState>,
+) -> Response {
+    let started = Instant::now();
+    let not_found = || json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    let Some(queries) = state.index.as_ref() else { return not_found() };
+    let Some(question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
+        return not_found();
+    };
+    let (indexes, loaded_in) = match queries.get().await {
+        Ok(got) => got,
+        Err(e) => {
+            eprintln!("index load failed: {e}");
+            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let body = question.answer(&indexes, query);
+    let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
+    let resp = serve_json(method, headers, body, "public, max-age=300", None, false).await;
+    with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
 }
 
 /// `GET /catalog/{movie|series}/den-titles/search={q}.json` — fuzzy title search, answered from memory.
@@ -860,6 +960,53 @@ mod tests {
         assert_eq!(resp.headers().get(DEGRADED).unwrap(), "title_index_building");
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
         assert_eq!(body_of(resp).await, r#"{"metas":[]}"#);
+    }
+
+    fn index_state(name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
+    /// The taxonomy, label rows (paged, per type, an encoded label) and More Like This, from a real fixture
+    /// index — and the descriptor says the routes exist.
+    #[tokio::test]
+    async fn index_queries_answer_from_the_dataset() {
+        let state = index_state("den-atlas-index");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let taxonomy = json(body_of(get(&state, "/index/taxonomy.json").await).await);
+        assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
+        assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
+
+        for (path, want) in [
+            ("/index/rows/movie/subgenre/Heist.json", serde_json::json!([1, 2, 3])),
+            ("/index/rows/movie/subgenre/Heist.json?skip=1&limit=1", serde_json::json!([2])),
+            ("/index/rows/series/subgenre/Heist.json", serde_json::json!([4])),
+            ("/index/rows/movie/subgenre/Campy%2FCult.json", serde_json::json!([3])),
+            ("/index/rows/movie/mood/Tense.json", serde_json::json!([1])),
+            // Premise leads: 3 (its premise score, +¼ as the plot agrees, −¼ for another genre) beats 2.
+            ("/index/similar/movie/1.json", serde_json::json!([3, 2])),
+        ] {
+            assert_eq!(json(body_of(get(&state, path).await).await)["ids"], want, "{path}");
+        }
+        assert!(body_of(get(&state, "/dataset.json").await).await.contains(r#""queries":true"#));
+    }
+
+    /// Off by default, and a malformed question is a 404 that never loads the index.
+    #[tokio::test]
+    async fn index_queries_are_off_unless_configured_and_refuse_malformed_paths() {
+        let off = Arc::new(AppState::for_test(None));
+        assert_eq!(get(&off, "/index/taxonomy.json").await.status(), 404);
+        let state = index_state("den-atlas-index-bad");
+        for path in [
+            "/index/rows/movie/genre/Heist.json",
+            "/index/rows/anime/subgenre/Heist.json",
+            "/index/similar/movie/abc.json",
+            "/index/nope.json",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 404, "{path}");
+        }
     }
 
     #[test]
