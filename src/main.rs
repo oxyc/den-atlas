@@ -10,6 +10,7 @@ mod handler;
 mod http;
 mod justwatch;
 mod manifest;
+mod metrics;
 mod util;
 
 use std::sync::Arc;
@@ -28,6 +29,8 @@ pub struct AppState {
     pub default_country: String,
     /// Upstream den-embed for the `/embed` search proxy (env `DEN_EMBED_URL`). `None` disables search embeds.
     pub embed: Option<EmbedProxy>,
+    /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
+    pub metrics_token: Option<String>,
 }
 
 /// A `TrendingSource` that answers nothing, so a test can never reach the network by accident.
@@ -80,6 +83,7 @@ impl AppState {
             ),
             default_country: "US".to_owned(),
             embed: None,
+            metrics_token: None,
         }
     }
 
@@ -153,6 +157,7 @@ async fn main() {
         catalog,
         default_country,
         embed,
+        metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
     });
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));

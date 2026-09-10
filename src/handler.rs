@@ -75,6 +75,17 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let origin = public_origin(&headers, state.public_base.as_deref());
     let ds = state.dataset.as_ref();
 
+    if route == "/metrics" {
+        if !crate::metrics::authorized(&headers, state.metrics_token.as_deref()) {
+            return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(crate::metrics::render(&state)))
+            .unwrap();
+    }
     if route == "/" || route == "/configure" || route == "/configure/" {
         return serve_html(&method, &headers, CONFIGURE_PAGE).await;
     }
@@ -746,5 +757,60 @@ mod tests {
         assert_eq!(served, KEYS, "only {served} of {KEYS} cold rows carried titles");
         assert_eq!(state.catalog.cache_len(), KEYS, "the cache did not fill, so the next wave re-fans out");
         assert!(state.catalog.fresh(), "/health went degraded from this server's own queueing");
+    }
+
+    async fn get_metrics(state: &Arc<AppState>, auth: Option<&str>) -> axum::response::Response {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let mut req = HttpRequest::builder().uri("/metrics");
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        handle(State(Arc::clone(state)), req.body(Body::empty()).unwrap()).await
+    }
+
+    /// No token configured means no route, whatever the request carries.
+    #[tokio::test]
+    async fn metrics_are_off_without_a_token() {
+        let state = Arc::new(AppState::for_test(None));
+        assert_eq!(get_metrics(&state, None).await.status(), 404);
+        assert_eq!(get_metrics(&state, Some("Bearer ")).await.status(), 404);
+        assert_eq!(get_metrics(&state, Some("Bearer anything")).await.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn metrics_refuse_a_wrong_token() {
+        let mut st = AppState::for_test(None);
+        st.metrics_token = Some("s3cret".to_owned());
+        let state = Arc::new(st);
+        for auth in
+            [None, Some("Bearer wrong!"), Some("Bearer s3cre"), Some("Bearer s3cret2"), Some("s3cret")]
+        {
+            assert_eq!(get_metrics(&state, auth).await.status(), 404, "{auth:?} was let in");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_answer_the_right_token() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-metrics-{}", std::process::id()));
+        let mut st = AppState::for_test(Some(fixture(&dir)));
+        st.metrics_token = Some("s3cret".to_owned());
+        let state = Arc::new(st);
+
+        let resp = get_metrics(&state, Some("Bearer s3cret")).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain; version=0.0.4; charset=utf-8");
+        let body = body_of(resp).await;
+        let build = format!("atlas_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION"));
+        assert!(body.contains(&build), "{body}");
+        assert!(
+            body.contains(
+                "atlas_dataset_info{dataset_version=\"v9\",taxonomy=\"t\",embedding_model=\"m\"} 1\n"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("atlas_dataset_loaded 1\n"), "{body}");
+        assert!(body.contains("atlas_dataset_titles 1\n"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
