@@ -120,7 +120,7 @@ async fn main() {
     let dataset = match dataset::Dataset::load(std::path::Path::new(&dir)) {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("den-atlas: dataset unavailable ({e}) — serving manifest + catalog only until the data is refreshed (scripts/fetch-dataset.sh)");
+            eprintln!("dataset unavailable ({e}) — serving manifest + catalog only until the data is refreshed (scripts/fetch-dataset.sh)");
             None
         }
     };
@@ -141,7 +141,7 @@ async fn main() {
                 inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT)),
             }),
             Err(e) => {
-                eprintln!("den-atlas: embed proxy disabled (reqwest build failed: {e})");
+                eprintln!("embed proxy disabled (reqwest build failed: {e})");
                 None
             }
         }
@@ -159,7 +159,7 @@ async fn main() {
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap_or_else(|e| {
-        eprintln!("den-atlas: bind :{port} failed: {e}");
+        eprintln!("bind :{port} failed: {e}");
         std::process::exit(1);
     });
     // Before the readiness line below, so nothing can be told we are up while a stop signal would
@@ -170,13 +170,13 @@ async fn main() {
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     match &state.dataset {
         Some(ds) => eprintln!(
-            "den-atlas listening on :{port} — {} titles ({}/{})",
+            "listening on :{port} — {} titles ({}/{})",
             ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version
         ),
-        None => eprintln!("den-atlas listening on :{port} — dataset unavailable (catalog only)"),
+        None => eprintln!("listening on :{port} — dataset unavailable (catalog only)"),
     }
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
-    eprintln!("den-atlas: {}", outcome.describe());
+    eprintln!("{}", outcome.describe());
     let code = outcome.exit_code();
     if code != 0 {
         std::process::exit(code);
@@ -308,7 +308,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
                 _ = quietly(signal(SignalKind::terminate())) => {}
                 _ = quietly(signal(SignalKind::interrupt())) => {}
             }
-            eprintln!("den-atlas: second signal — exiting without finishing the drain");
+            eprintln!("second signal — exiting without finishing the drain");
             std::process::exit(0);
         });
     }
@@ -335,10 +335,10 @@ async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name
     match registered {
         Ok(mut sig) => {
             sig.recv().await;
-            eprintln!("den-atlas: {name} — draining in-flight requests");
+            eprintln!("{name} — draining in-flight requests");
         }
         Err(e) => {
-            eprintln!("den-atlas: {name} handler unavailable ({e}); it will be a hard kill");
+            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
             std::future::pending::<()>().await
         }
     }

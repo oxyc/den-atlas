@@ -158,7 +158,7 @@ impl JustWatchClient {
             .timeout(Duration::from_secs(8))
             .user_agent("den-atlas/0.1 (+https://github.com/oxyc/den)")
             .build()
-            .map_err(|e| eprintln!("den-atlas: reqwest client build failed ({e}); catalog disabled"))
+            .map_err(|e| eprintln!("reqwest client build failed ({e}); catalog disabled"))
             .ok();
         Self {
             http,
@@ -301,9 +301,7 @@ fn schema_break_warning(label: &str, body: &str, chart: &Chart) -> Option<String
         return None;
     }
     if !chart.present {
-        return Some(format!(
-            "den-atlas: justwatch {label} returned no popularTitles node — possible schema change"
-        ));
+        return Some(format!("justwatch {label} returned no popularTitles node — possible schema change"));
     }
     // An empty chart is an answer, so say nothing: `0 of 0` is not a shortfall, and the previous
     // form of this check reported it as one on every cold fetch for any row a provider genuinely
@@ -312,7 +310,7 @@ fn schema_break_warning(label: &str, body: &str, chart: &Chart) -> Option<String
         return None;
     }
     Some(format!(
-        "den-atlas: justwatch {label} yielded {} usable titles from {} edges — possible schema change",
+        "justwatch {label} yielded {} usable titles from {} edges — possible schema change",
         chart.items.len(),
         chart.edges
     ))
@@ -471,18 +469,18 @@ impl JustWatchClient {
         let mut resp = match http.post(&self.endpoint).json(payload).send().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("den-atlas: justwatch request failed ({label}): {e}");
+                eprintln!("justwatch request failed ({label}): {e}");
                 return Err(());
             }
         };
         if !resp.status().is_success() {
-            eprintln!("den-atlas: justwatch http {} ({label})", resp.status());
+            eprintln!("justwatch http {} ({label})", resp.status());
             return Err(());
         }
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
             if buf.len() + chunk.len() > MAX_BODY {
-                eprintln!("den-atlas: justwatch body exceeded {MAX_BODY} bytes ({label}) — dropping");
+                eprintln!("justwatch body exceeded {MAX_BODY} bytes ({label}) — dropping");
                 return Err(());
             }
             buf.extend_from_slice(&chunk);
@@ -493,7 +491,7 @@ impl JustWatchClient {
         // "this row is empty" — which was then stored as a fresh answer over the last-good rows,
         // pinned for the cache TTL and an hour of CDN max-age, with /health still reporting ok.
         if let Some(why) = graphql_error(&body) {
-            eprintln!("den-atlas: justwatch graphql error ({label}): {why}");
+            eprintln!("justwatch graphql error ({label}): {why}");
             return Err(());
         }
         Ok(body)
@@ -559,7 +557,7 @@ impl TrendingSource for JustWatchClient {
         let body = self.post_graphql(&payload, &format!("packages/{country}")).await?;
         let pkgs = parse_packages(&body);
         if pkgs.is_empty() && !body.is_empty() {
-            eprintln!("den-atlas: justwatch packages returned a non-empty body but 0 usable entries ({country}) — possible schema change");
+            eprintln!("justwatch packages returned a non-empty body but 0 usable entries ({country}) — possible schema change");
         }
         Ok(pkgs)
     }
@@ -584,7 +582,7 @@ impl TrendingSource for JustWatchClient {
         let body = self.post_graphql(&payload, &label).await?;
         let items = parse_new_titles(&body, obj);
         if items.is_empty() && !body.is_empty() {
-            eprintln!("den-atlas: justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
+            eprintln!("justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
         }
         Ok(items)
     }

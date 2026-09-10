@@ -181,7 +181,9 @@ impl Dataset {
             (Some(l), Some(v)) => (Some(l), Some(v)),
             (l, v) => {
                 if l.is_some() || v.is_some() {
-                    eprintln!("den-atlas: premise index incomplete (one of its two blobs is unusable) — serving without it");
+                    eprintln!(
+                        "premise index incomplete (one of its two blobs is unusable) — serving without it"
+                    );
                 }
                 (None, None)
             }
@@ -241,7 +243,7 @@ fn optional_blob(
     match resolve_blob(dir, file, bytes, sha256, content_type, gz_file) {
         Ok(b) => Some(b),
         Err(e) => {
-            eprintln!("den-atlas: optional blob {label} ({file}) is unusable ({e}) — serving without it");
+            eprintln!("optional blob {label} ({file}) is unusable ({e}) — serving without it");
             None
         }
     }
@@ -265,10 +267,7 @@ fn resolve_blob(
     // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
     let actual = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?.len();
     if actual != size {
-        eprintln!(
-            "den-atlas: {} is {actual} bytes but meta declares {size} — using the on-disk size",
-            path.display()
-        );
+        eprintln!("{} is {actual} bytes but meta declares {size} — using the on-disk size", path.display());
     }
     // The gz variant is an OPTIMISATION, so an unusable one drops the variant — it does not take the
     // dataset down. Propagating here made a single bad optional name fatal for labels, vectors,
@@ -284,7 +283,7 @@ fn resolve_blob(
         }) {
             Ok(gz) => Some(gz),
             Err(why) => {
-                eprintln!("den-atlas: no gzip variant for {name} ({why}) — serving identity only");
+                eprintln!("no gzip variant for {name} ({why}) — serving identity only");
                 None
             }
         },

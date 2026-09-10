@@ -203,7 +203,7 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
                 .unwrap()
         }
         Err(e) => {
-            eprintln!("den-atlas: embed upstream error: {e}");
+            eprintln!("embed upstream error: {e}");
             json_response(r#"{"error":"embed_upstream_failed"}"#, StatusCode::BAD_GATEWAY)
         }
     }

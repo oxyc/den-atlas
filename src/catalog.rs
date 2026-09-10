@@ -548,7 +548,7 @@ impl CatalogState {
             return None;
         }
         if answered < asked {
-            eprintln!("den-atlas: aggregate for {country}: {answered}/{asked} providers answered");
+            eprintln!("aggregate for {country}: {answered}/{asked} providers answered");
         }
         Some(Aggregate { items: aggregate_inverse_rank(&lists), complete: answered == asked })
     }

@@ -151,7 +151,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         // and one line per request is an amplifier.
         static GZ_FALLBACK: AtomicU64 = AtomicU64::new(0);
         if log_due(&GZ_FALLBACK, LOG_EVERY) {
-            eprintln!("den-atlas: serving {} as identity — its gzip variant is unusable", s.etag_base);
+            eprintln!("serving {} as identity — its gzip variant is unusable", s.etag_base);
         }
     }
     let mut h = base;
@@ -215,7 +215,7 @@ async fn open_payload(p: &Payload, what: &str) -> Option<Open> {
                 // journald's rate limiter. One line a minute reports the same fact.
                 static OPEN_FAILED: AtomicU64 = AtomicU64::new(0);
                 if log_due(&OPEN_FAILED, LOG_EVERY) {
-                    eprintln!("den-atlas: cannot open {what} ({}): {e}", path.display());
+                    eprintln!("cannot open {what} ({}): {e}", path.display());
                 }
                 None
             }
