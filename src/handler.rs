@@ -602,21 +602,18 @@ async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
 }
 
 /// Semantic search in one request: embed the query, then the plot index's nearest titles to it — the tvOS
-/// app's `semanticSearch`. A 503 when den-embed can't be reached.
+/// app's `semanticSearch`. The error is why den-embed couldn't answer.
 async fn search_answer(
     state: &AppState,
     indexes: &crate::queries::Indexes,
     query: &str,
-) -> Result<String, Response> {
+) -> Result<String, String> {
     let text = query_text(query, "q");
     if text.trim().chars().count() < 2 {
         return Ok(serde_json::json!({ "titles": [] }).to_string());
     }
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
-    let vector = embed_query(state, &text).await.map_err(|e| {
-        eprintln!("semantic search unavailable: {e}");
-        json_response(r#"{"error":"embed_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE)
-    })?;
+    let vector = embed_query(state, &text).await?;
     let titles: Vec<(u32, den_index::MediaType)> = indexes
         .plot
         .nearest_to_vector(&vector, media_type, SEMANTIC_K)
@@ -874,7 +871,10 @@ async fn handle_index(
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
             Ok(body) => body,
-            Err(resp) => return resp,
+            Err(e) => {
+                eprintln!("semantic search unavailable: {e}");
+                return json_response(r#"{"error":"embed_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+            }
         },
         IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
         question => question.answer(&indexes, query),
