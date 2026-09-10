@@ -14,10 +14,30 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The /configure page, embedded so the binary is self-contained. Region + provider choice is plaintext
 /// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
+
+/// Says why an answer is not the normal one, using /health's reason slugs; absent on a normal answer.
+/// The Den app reads it the same way from every addon, so a stale row can be flagged on the row itself
+/// instead of the app having to poll /health and guess which rows that affects.
+const DEGRADED: &str = "x-den-degraded";
+
+/// A duration in Server-Timing's unit: milliseconds, to a tenth.
+fn ms(d: std::time::Duration) -> String {
+    format!("{:.1}", d.as_secs_f64() * 1000.0)
+}
+
+/// Attach `Server-Timing` — how long each phase of this answer took, readable in browser devtools
+/// and by the app. Phase names and durations only; nothing about what was asked.
+fn with_timing(mut resp: Response, timing: &str) -> Response {
+    if let Ok(v) = header::HeaderValue::from_str(timing) {
+        resp.headers_mut().insert("server-timing", v);
+    }
+    resp
+}
 
 /// Every response leaves through here, so every one carries `Access-Control-Allow-Origin: *` — the
 /// 404, a refused /metrics, a 304 and an /embed error included. Setting it per helper left out
@@ -207,6 +227,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
 /// the model, so a query embeds through the SAME bge-m3 + int8 quantizer as the corpus (the alignment rule),
 /// and den-embed stays internal. Absent `EMBED_URL` ⇒ 503 (dataset serving is unaffected).
 async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
+    let started = Instant::now();
     let Some(proxy) = state.embed.as_ref() else {
         return json_response(
             r#"{"error":"embed_unavailable","detail":"search embeds are not configured (EMBED_URL unset)"}"#,
@@ -229,7 +250,8 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
         );
     };
-    match proxy
+    let upstream = Instant::now();
+    let resp = match proxy
         .client
         .post(format!("{}/embed", proxy.base))
         .header(header::CONTENT_TYPE, "application/json")
@@ -252,7 +274,8 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
             eprintln!("embed upstream error: {e}");
             json_response(r#"{"error":"embed_upstream_failed"}"#, StatusCode::BAD_GATEWAY)
         }
-    }
+    };
+    with_timing(resp, &format!("embed;dur={}, total;dur={}", ms(upstream.elapsed()), ms(started.elapsed())))
 }
 
 /// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
@@ -285,6 +308,7 @@ async fn handle_catalog(
     config: &Config,
     state: &Arc<AppState>,
 ) -> Response {
+    let started = Instant::now();
     let rest = rest.strip_suffix(".json").unwrap_or(rest);
     let mut parts = rest.splitn(3, '/'); // type / id / optional extra
     let type_ = parts.next().unwrap_or("");
@@ -302,7 +326,22 @@ async fn handle_catalog(
             } else {
                 "public, max-age=60"
             };
-            serve_json(method, headers, r.body, cc, None, false).await
+            // The phase that produced the row: a JustWatch refresh (timed), or the cache hit that
+            // avoided one — and, when the refresh failed, that the body is the last-good copy.
+            let mut timing = match r.upstream {
+                Some(d) => format!("justwatch;dur={}", ms(d)),
+                None => "cache;desc=hit".to_owned(),
+            };
+            if r.stale {
+                timing.push_str(", cache;desc=stale");
+            }
+            let mut resp = serve_json(method, headers, r.body, cc, None, false).await;
+            // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
+            // state /health calls `stale_catalog`, so the row carries the same slug.
+            if !r.fresh {
+                resp.headers_mut().insert(DEGRADED, header::HeaderValue::from_static("stale_catalog"));
+            }
+            with_timing(resp, &format!("{timing}, total;dur={}", ms(started.elapsed())))
         }
         None => json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND),
     }
@@ -366,12 +405,13 @@ async fn serve_blob(
     ds: &Dataset,
     blob: &Blob,
 ) -> Response {
+    let started = Instant::now();
     // `?v=<current datasetVersion>` ⇒ immutable for a year; a bare request revalidates.
     let pinned = query_param(query, "v").as_deref() == Some(ds.meta.dataset_version.as_str());
     let cache_control =
         if pinned { "public, max-age=31536000, immutable" } else { "public, max-age=3600" }.to_owned();
     let gzip = blob.gz.as_ref().map(|g| (Payload::File(g.path.clone()), g.size));
-    serve(
+    let resp = serve(
         method,
         headers,
         Servable {
@@ -385,7 +425,9 @@ async fn serve_blob(
             vary_on_origin: false, // a blob body carries no origin-derived URLs
         },
     )
-    .await
+    .await;
+    // A blob has one phase — the body streams after this, so `total` is time to the response head.
+    with_timing(resp, &format!("total;dur={}", ms(started.elapsed())))
 }
 
 /// First value of `key` in a `k=v&k2=v2` query string (the datasetVersion is hex, so no percent-decoding).
@@ -691,6 +733,87 @@ mod tests {
             tokio::time::sleep(self.dwell).await;
             Ok(vec![(8, "nfx".into()), (119, "prv".into()), (1899, "mxx".into()), (531, "pmp".into())])
         }
+    }
+
+    /// Answers the first chart and fails every one after, so a test reaches the real
+    /// serve-stale-on-error path: a good row cached, then a refresh that fails.
+    struct FlakySource {
+        charts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::justwatch::TrendingSource for FlakySource {
+        async fn popular(
+            &self,
+            _p: &str,
+            _o: crate::justwatch::ObjectType,
+            _c: &str,
+            _s: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            if self.charts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Err(());
+            }
+            Ok(vec![crate::justwatch::TrendingItem {
+                imdb: "tt1".into(),
+                moviedb: Some(42),
+                title: "A".into(),
+                rank: 0,
+                rating: None,
+                year: None,
+            }])
+        }
+        async fn new_titles(
+            &self,
+            _p: &str,
+            _o: crate::justwatch::ObjectType,
+            _c: &str,
+        ) -> Result<Vec<crate::justwatch::TrendingItem>, ()> {
+            Err(())
+        }
+        async fn packages(&self, _c: &str) -> Result<Vec<(i64, String)>, ()> {
+            Ok(vec![(8, "nfx".into())])
+        }
+    }
+
+    fn timing_of(resp: &axum::response::Response) -> String {
+        resp.headers().get("server-timing").map(|v| v.to_str().unwrap().to_owned()).unwrap_or_default()
+    }
+
+    /// Server-Timing names the phase that produced the row — the JustWatch fetch on a miss, the
+    /// cache on a hit — and the total either way.
+    #[tokio::test]
+    async fn a_catalog_row_names_its_phases_in_server_timing() {
+        let state = Arc::new(AppState::for_test_with_source(Arc::new(SlowSource {
+            dwell: std::time::Duration::ZERO,
+        })));
+        let t = timing_of(&get(&state, "/catalog/movie/jw-nfx.json").await);
+        assert!(t.starts_with("justwatch;dur=") && t.contains(", total;dur="), "{t}");
+        let t = timing_of(&get(&state, "/catalog/movie/jw-nfx.json").await);
+        assert!(t.starts_with("cache;desc=hit") && t.contains(", total;dur="), "{t}");
+        assert!(!t.contains("justwatch"), "a cache hit claimed an upstream fetch: {t}");
+    }
+
+    /// X-Den-Degraded marks the stale answer and only that: a fresh row carries none, and the
+    /// last-good copy served after a failed refresh says `stale_catalog`, /health's slug for it.
+    #[tokio::test]
+    async fn a_stale_catalog_answer_says_so_and_a_fresh_one_does_not() {
+        let state = Arc::new(AppState {
+            // A zero TTL, so the row the first request caches is already due for a refresh.
+            catalog: crate::catalog::CatalogState::new(
+                Arc::new(FlakySource { charts: Default::default() }),
+                std::time::Duration::ZERO,
+            ),
+            ..AppState::for_test(None)
+        });
+        let fresh = get(&state, "/catalog/movie/jw-nfx.json").await;
+        assert_eq!(fresh.status(), 200);
+        assert!(fresh.headers().get(DEGRADED).is_none(), "a fresh row was flagged degraded");
+
+        let stale = get(&state, "/catalog/movie/jw-nfx.json").await;
+        assert_eq!(stale.headers().get(DEGRADED).map(|v| v.to_str().unwrap()), Some("stale_catalog"));
+        let t = timing_of(&stale);
+        assert!(t.contains("justwatch;dur=") && t.contains("cache;desc=stale"), "{t}");
+        assert!(body_of(stale).await.contains("tt1"), "the stale answer was not the last-good row");
     }
 
     /// A source whose charts look like schema breaks, so the /health wiring can be exercised end to

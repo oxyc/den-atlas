@@ -106,6 +106,12 @@ origin.
 Every response carries `Access-Control-Allow-Origin: *` and `OPTIONS` answers the CORS preflight. An
 unknown path — and a refused `/metrics` — is a `404` `{"error":"not_found"}` with `cache-control: no-store`.
 
+Catalog rows, `/embed` and the dataset blobs carry `Server-Timing`: `justwatch;dur=<ms>` when the row
+was fetched upstream or `cache;desc=hit` when it came from the cache (plus `cache;desc=stale` when the
+last-good copy was served), `embed;dur=<ms>` for the den-embed call, and `total;dur=<ms>`. An answer that
+is stale or a fallback carries `X-Den-Degraded: <reason>` with /health's reason slug — a catalog row
+served after a failed JustWatch refresh says `stale_catalog`. Normal answers carry no `X-Den-Degraded`.
+
 `POST /embed` forwards the query to the internal [den-embed](https://github.com/oxyc/den-embed) service and
 returns its int8 vector (`{"vector":…,"dims":1024,"model":"bge-m3"}`), so a query embeds through the SAME
 bge-m3 + quantizer that built the corpus and the two are comparable. den-embed stays internal — only Atlas

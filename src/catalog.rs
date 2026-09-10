@@ -140,6 +140,10 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
 pub struct CatalogResponse {
     pub body: String,
     pub fresh: bool,
+    /// How long the upstream refresh took, or `None` when the row came straight from the cache.
+    pub upstream: Option<Duration>,
+    /// The body is the last-good copy from the cache, served because the refresh failed or was partial.
+    pub stale: bool,
 }
 
 /// A union plus whether every provider that was asked actually answered.
@@ -308,7 +312,7 @@ impl CatalogState {
             format!("jw:{}:{}:{}", country, catalog_id, stremio_type)
         };
         if let Lookup::Fresh(v) = self.cache.get(&key) {
-            return Some(CatalogResponse { body: v, fresh: true });
+            return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
         }
 
         // Single-flight: one refresh per key runs; the rest wait and then hit the warm cache. The std
@@ -322,9 +326,11 @@ impl CatalogState {
         let _sweep = InflightSweep { map: &self.inflight, key: &key };
         let _hold = gate.lock().await;
         if let Lookup::Fresh(v) = self.cache.get(&key) {
-            return Some(CatalogResponse { body: v, fresh: true }); // filled while we waited
+            // Filled while we waited.
+            return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
         }
 
+        let started = Instant::now();
         let fetched: Option<Aggregate> = if is_trending {
             self.aggregate(obj, country, providers).await
         } else {
@@ -371,37 +377,36 @@ impl CatalogState {
             }
         };
 
+        let upstream = Some(started.elapsed());
         match fetched {
             // Complete: cache it and call it fresh.
             Some(a) if a.complete => {
                 let body = render_metas(&a.items, stremio_type);
                 self.cache.put(&key, body.clone());
                 self.last_refresh_ok.store(true, Ordering::Relaxed);
-                Some(CatalogResponse { body, fresh: true })
+                Some(CatalogResponse { body, fresh: true, upstream, stale: false })
             }
             // Partial: better than nothing, but never pinned as the complete union. A stale copy is
             // a COMPLETE union from before, so it wins; otherwise serve this one uncached, so the
             // next request re-checks instead of the row going dead for as long as one provider is.
             Some(a) => {
                 self.last_refresh_ok.store(false, Ordering::Relaxed);
-                let body = match self.cache.get(&key) {
-                    Lookup::Fresh(v) | Lookup::Stale(v) => v,
-                    Lookup::Miss => render_metas(&a.items, stremio_type),
+                let (body, stale) = match self.cache.get(&key) {
+                    Lookup::Fresh(v) | Lookup::Stale(v) => (v, true),
+                    Lookup::Miss => (render_metas(&a.items, stremio_type), false),
                 };
-                Some(CatalogResponse { body, fresh: false })
+                Some(CatalogResponse { body, fresh: false, upstream, stale })
             }
             // Refresh failed → serve stale if we have it, else an empty list (graceful degradation).
             // Not fresh → the handler uses a short TTL so recovery isn't masked at the CDN, and `/health`
             // reports `stale_catalog`.
             None => {
                 self.last_refresh_ok.store(false, Ordering::Relaxed);
-                Some(CatalogResponse {
-                    body: match self.cache.get(&key) {
-                        Lookup::Fresh(v) | Lookup::Stale(v) => v,
-                        Lookup::Miss => render_metas(&[], stremio_type),
-                    },
-                    fresh: false,
-                })
+                let (body, stale) = match self.cache.get(&key) {
+                    Lookup::Fresh(v) | Lookup::Stale(v) => (v, true),
+                    Lookup::Miss => (render_metas(&[], stremio_type), false),
+                };
+                Some(CatalogResponse { body, fresh: false, upstream, stale })
             }
         }
     }
