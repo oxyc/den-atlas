@@ -70,7 +70,8 @@ pub fn json_response(body: &'static str, status: StatusCode) -> Response {
 }
 
 /// The public origin for descriptor blob URLs — `PUBLIC_BASE_URL` override, else `X-Forwarded-Proto` +
-/// `X-Forwarded-Host`/`Host` (Caddy sets these), else `http`/`localhost`. Port of `publicOrigin`.
+/// `X-Forwarded-Host`/`Host` (a reverse proxy sets these; on the LAN it is the request's own `Host`), else
+/// `http`/`localhost`. Port of `publicOrigin`.
 pub fn public_origin(headers: &HeaderMap, override_base: Option<&str>) -> String {
     if let Some(base) = override_base {
         return base.trim_end_matches('/').to_owned();
