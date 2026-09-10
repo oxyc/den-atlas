@@ -1,5 +1,5 @@
 //! den-atlas — the Rust serving layer (RUST-1). Streams the derived dataset from disk with the full caching
-//! layer (ETag / Range / gzip / conditional). Data is mounted at `ATLAS_DATA_DIR` (default `data/`).
+//! layer (ETag / Range / gzip / conditional). Data is mounted at `DATA_DIR` (default `data/`).
 
 mod cache;
 mod catalog;
@@ -27,7 +27,7 @@ pub struct AppState {
     /// The operator-default country (env `JW_COUNTRY`) — used when an `auto` install forwards no
     /// `country` extra. A fixed-country install ignores it.
     pub default_country: String,
-    /// Upstream den-embed for the `/embed` search proxy (env `DEN_EMBED_URL`). `None` disables search embeds.
+    /// Upstream den-embed for the `/embed` search proxy (env `EMBED_URL`). `None` disables search embeds.
     pub embed: Option<EmbedProxy>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
@@ -117,7 +117,7 @@ pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
-    let dir = std::env::var("ATLAS_DATA_DIR").unwrap_or_else(|_| "data".to_owned());
+    let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_owned());
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
     // dataset.meta.json must not crash-loop the addon. Keep serving; the dataset routes report 503 and
     // the app surfaces a real reason instead of a connection refusal.
@@ -137,7 +137,7 @@ async fn main() {
 
     // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
-    let embed = std::env::var("DEN_EMBED_URL").ok().and_then(|base| {
+    let embed = std::env::var("EMBED_URL").ok().and_then(|base| {
         match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
             Ok(client) => Some(EmbedProxy {
                 client,

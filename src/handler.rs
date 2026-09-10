@@ -169,11 +169,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
 /// `POST /embed` — the search query-embed proxy. Forwards the JSON body (`{"text":"…"}`) to den-embed and
 /// returns its response verbatim (`{"vector":int8[dims],"dims":Int,"model":String}`). den-atlas never runs
 /// the model, so a query embeds through the SAME bge-m3 + int8 quantizer as the corpus (the alignment rule),
-/// and den-embed stays internal. Absent `DEN_EMBED_URL` ⇒ 503 (dataset serving is unaffected).
+/// and den-embed stays internal. Absent `EMBED_URL` ⇒ 503 (dataset serving is unaffected).
 async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
     let Some(proxy) = state.embed.as_ref() else {
         return json_response(
-            r#"{"error":"embed_unavailable","detail":"search embeds are not configured (DEN_EMBED_URL unset)"}"#,
+            r#"{"error":"embed_unavailable","detail":"search embeds are not configured (EMBED_URL unset)"}"#,
             StatusCode::SERVICE_UNAVAILABLE,
         );
     };

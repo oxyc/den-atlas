@@ -9,7 +9,7 @@
 # from dataset.meta.json and does NOT hash at startup, so this verifies every blob before it lands.
 set -euo pipefail
 
-REPO="${DEN_DATASET_REPO:-oxyc/den-dataset}"
+REPO="${DATASET_REPO:-oxyc/den-dataset}"
 BASE="https://github.com/$REPO/releases/download/data-latest"
 mkdir -p data
 

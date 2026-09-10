@@ -16,7 +16,7 @@ fn start() -> (Child, u16) {
     std::fs::create_dir_all(&dir).unwrap();
     // No dataset: `main` fails soft to catalog-only, which is enough to serve /health.
     let mut child = Command::new(env!("CARGO_BIN_EXE_den-atlas"))
-        .env("ATLAS_DATA_DIR", &dir)
+        .env("DATA_DIR", &dir)
         .env("PORT", "0")
         .stderr(Stdio::piped())
         .stdout(Stdio::null())

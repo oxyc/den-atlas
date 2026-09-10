@@ -36,7 +36,7 @@ verifies what it downloads and a mismatch keeps the prior cache.
 | `GET /vectors-<embed>.bin` | the quantized int8 vectors blob |
 | `GET /<blob>` | the optional blobs the descriptor names: metadata sidecar, premise labels + vectors, facets |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
-| `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `DEN_EMBED_URL` is unset |
+| `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,

@@ -65,7 +65,7 @@ Atlas instead of the bundled copy. Removing the addon falls back to the bundled 
 goes blank.
 
 ## Search embeds (optional)
-Set `DEN_EMBED_URL` (on the homelab, `http://den-embed:8080` over the shared Podman network) to enable
+Set `EMBED_URL` (on the homelab, `http://den-embed:8080` over the shared Podman network) to enable
 `POST /embed` — a proxy that forwards a search query (`{"text":"…"}`) to the internal
 [den-embed](https://github.com/oxyc/den-embed) service and returns its int8 vector
 (`{"vector":…,"dims":1024,"model":"bge-m3"}`). The app embeds its query through Atlas → den-embed, i.e. the

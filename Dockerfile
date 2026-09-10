@@ -11,7 +11,7 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM scratch AS runtime
-ENV ATLAS_DATA_DIR=/app/data \
+ENV DATA_DIR=/app/data \
     PORT=8080
 COPY --from=build /app/target/release/den-atlas /den-atlas
 # The dataset blobs (gitignored; fetched via scripts/fetch-dataset.sh). Empty in CI → mount at runtime.
