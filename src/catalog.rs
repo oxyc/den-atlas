@@ -553,7 +553,7 @@ impl CatalogState {
             return None;
         }
         if answered < asked {
-            eprintln!("aggregate for {country}: {answered}/{asked} providers answered");
+            crate::util::log_throttled!("aggregate for {country}: {answered}/{asked} providers answered");
         }
         Some(Aggregate { items: aggregate_inverse_rank(&lists), complete: answered == asked })
     }

@@ -3,7 +3,7 @@
 //! can affect the dataset resource: every failure returns `Err(())`, which the handler turns into empty
 //! rows. User input never reaches this module — provider codes come from a fixed table.
 
-use crate::util::since_start;
+use crate::util::{log_throttled, since_start};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -469,18 +469,18 @@ impl JustWatchClient {
         let mut resp = match http.post(&self.endpoint).json(payload).send().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("justwatch request failed ({label}): {e}");
+                log_throttled!("justwatch request failed ({label}): {e}");
                 return Err(());
             }
         };
         if !resp.status().is_success() {
-            eprintln!("justwatch http {} ({label})", resp.status());
+            log_throttled!("justwatch http {} ({label})", resp.status());
             return Err(());
         }
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
             if buf.len() + chunk.len() > MAX_BODY {
-                eprintln!("justwatch body exceeded {MAX_BODY} bytes ({label}) — dropping");
+                log_throttled!("justwatch body exceeded {MAX_BODY} bytes ({label}) — dropping");
                 return Err(());
             }
             buf.extend_from_slice(&chunk);
@@ -491,7 +491,7 @@ impl JustWatchClient {
         // "this row is empty" — which was then stored as a fresh answer over the last-good rows,
         // pinned for the cache TTL and an hour of CDN max-age, with /health still reporting ok.
         if let Some(why) = graphql_error(&body) {
-            eprintln!("justwatch graphql error ({label}): {why}");
+            log_throttled!("justwatch graphql error ({label}): {why}");
             return Err(());
         }
         Ok(body)
@@ -533,7 +533,7 @@ impl TrendingSource for JustWatchClient {
         if let Some(w) = schema_break_warning(&label, &body, &chart) {
             self.suspected_schema_breaks.fetch_add(1, Ordering::Relaxed);
             self.last_schema_break.store(since_start().as_millis() as u64 + 1, Ordering::Relaxed);
-            eprintln!("{w}");
+            log_throttled!("{w}");
         }
         Ok(chart.items)
     }
@@ -557,7 +557,7 @@ impl TrendingSource for JustWatchClient {
         let body = self.post_graphql(&payload, &format!("packages/{country}")).await?;
         let pkgs = parse_packages(&body);
         if pkgs.is_empty() && !body.is_empty() {
-            eprintln!("justwatch packages returned a non-empty body but 0 usable entries ({country}) — possible schema change");
+            log_throttled!("justwatch packages returned a non-empty body but 0 usable entries ({country}) — possible schema change");
         }
         Ok(pkgs)
     }
@@ -582,7 +582,7 @@ impl TrendingSource for JustWatchClient {
         let body = self.post_graphql(&payload, &label).await?;
         let items = parse_new_titles(&body, obj);
         if items.is_empty() && !body.is_empty() {
-            eprintln!("justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
+            log_throttled!("justwatch new-titles returned a non-empty body but 0 usable items ({label}) — possible schema change");
         }
         Ok(items)
     }

@@ -34,6 +34,9 @@ pub struct AppState {
     /// One stderr line per request (env `LOG_REQUESTS=1`). Read once at startup, so with it off the
     /// request path pays a single bool check.
     pub log_requests: bool,
+    /// The `/health` reason last logged (`ok` when healthy), so a change is logged once rather than by
+    /// every request that observes it.
+    pub health: std::sync::Mutex<&'static str>,
 }
 
 /// A `TrendingSource` that answers nothing, so a test can never reach the network by accident.
@@ -88,6 +91,7 @@ impl AppState {
             embed: None,
             metrics_token: None,
             log_requests: false,
+            health: std::sync::Mutex::new("ok"),
         }
     }
 
@@ -155,6 +159,9 @@ async fn main() {
         }
     });
 
+    // What /health says at boot, so the first change after it is logged against the real starting
+    // state (a missing dataset is already reported above).
+    let health = handler::health_state(dataset.is_some(), true, false).map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
         public_base: std::env::var("PUBLIC_BASE_URL").ok(),
@@ -163,6 +170,7 @@ async fn main() {
         embed,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| v == "1"),
+        health: std::sync::Mutex::new(health),
     });
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
@@ -178,12 +186,28 @@ async fn main() {
     // The port it actually BOUND, not the one it was asked for: with PORT=0 the kernel picks one,
     // and reporting the request rather than the result made the line useless in exactly that case.
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    // The version and the effective configuration, so a log says what is running without the unit
+    // file beside it. Secret-free by construction: the token and the internal embed address appear
+    // only as on/off.
+    let on = |b: bool| if b { "on" } else { "off" };
+    let providers: Vec<&str> = catalog::selected_providers().iter().map(|p| p.code).collect();
+    let config = format!(
+        "country={} providers={} catalog_ttl={}s public_base={} embed={} metrics={} log_requests={}",
+        state.default_country,
+        providers.join(","),
+        ttl.as_secs(),
+        state.public_base.as_deref().unwrap_or("derived"),
+        on(state.embed.is_some()),
+        on(state.metrics_token.is_some()),
+        on(state.log_requests),
+    );
+    let version = env!("CARGO_PKG_VERSION");
     match &state.dataset {
         Some(ds) => eprintln!(
-            "listening on :{port} — {} titles ({}/{})",
+            "listening on :{port} — v{version}, {} titles ({}/{}); {config}",
             ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version
         ),
-        None => eprintln!("listening on :{port} — dataset unavailable (catalog only)"),
+        None => eprintln!("listening on :{port} — v{version}, dataset unavailable (catalog only); {config}"),
     }
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());

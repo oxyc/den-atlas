@@ -146,6 +146,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return serve_html(&method, &headers, CONFIGURE_PAGE).await;
     }
     if route == "/health" {
+        note_health(&state);
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
         // app's Plugins screen (and any monitor) can see a problem.
         return json_response(
@@ -271,31 +272,68 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
                 .unwrap()
         }
         Err(e) => {
-            eprintln!("embed upstream error: {e}");
+            crate::util::log_throttled!("embed upstream error: {e}");
             json_response(r#"{"error":"embed_upstream_failed"}"#, StatusCode::BAD_GATEWAY)
         }
     };
     with_timing(resp, &format!("embed;dur={}, total;dur={}", ms(upstream.elapsed()), ms(started.elapsed())))
 }
 
-/// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
-/// body carries the real state. Dataset-unavailable outranks a stale catalog (no dataset is the more
-/// severe condition): no dataset ⇒ `dataset_unavailable`; else a failed last JustWatch refresh ⇒
-/// `stale_catalog`; else `ok`. Pure + `&'static str` so the decision is unit-testable without an HTTP round-trip.
-fn health_body(dataset_loaded: bool, catalog_fresh: bool, schema_suspect: bool) -> &'static str {
+/// What `/health` reports: `None` when healthy, else the reason slug and a one-sentence detail.
+/// Dataset-unavailable outranks a stale catalog (no dataset is the more severe condition): no dataset ⇒
+/// `dataset_unavailable`; else a failed last JustWatch refresh ⇒ `stale_catalog`. One function feeds
+/// both the body and the state-change log line, so the two cannot disagree.
+pub(crate) fn health_state(
+    dataset_loaded: bool,
+    catalog_fresh: bool,
+    schema_suspect: bool,
+) -> Option<(&'static str, &'static str)> {
     if !dataset_loaded {
-        r#"{"status":"degraded","reason":"dataset_unavailable","detail":"dataset failed to load; refresh with scripts/fetch-dataset.sh"}"#
+        Some(("dataset_unavailable", "dataset failed to load; refresh with scripts/fetch-dataset.sh"))
     } else if !catalog_fresh {
-        r#"{"status":"degraded","reason":"stale_catalog","detail":"last JustWatch refresh failed; serving stale catalog"}"#
+        Some(("stale_catalog", "last JustWatch refresh failed; serving stale catalog"))
     } else if schema_suspect {
         // Ranks below the two above: those mean rows are missing, this means rows are SHORT. It has
         // to be here at all because a partial break is otherwise invisible — a chart that comes back
         // with a fifth of its titles is a successful refresh by every other measure, caches as
         // complete for the full TTL, and serves with an hour of max-age.
-        r#"{"status":"degraded","reason":"catalog_schema_suspect","detail":"a JustWatch chart returned far fewer usable titles than it carried; rows may be short"}"#
+        Some((
+            "catalog_schema_suspect",
+            "a JustWatch chart returned far fewer usable titles than it carried; rows may be short",
+        ))
     } else {
-        r#"{"status":"ok"}"#
+        None
     }
+}
+
+/// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
+/// body carries the real state. Pure, so the decision is unit-testable without an HTTP round-trip.
+fn health_body(dataset_loaded: bool, catalog_fresh: bool, schema_suspect: bool) -> String {
+    match health_state(dataset_loaded, catalog_fresh, schema_suspect) {
+        None => r#"{"status":"ok"}"#.to_owned(),
+        Some((reason, detail)) => {
+            format!(r#"{{"status":"degraded","reason":"{reason}","detail":"{detail}"}}"#)
+        }
+    }
+}
+
+/// Log `/health`'s answer when it changes, and only then: one line when the addon goes degraded (with
+/// the reason), one when it recovers. The state is what an operator needs; a line per request would
+/// repeat it thousands of times. Checked where the answer can move — after a catalog refresh — and
+/// where it is read, so a schema-break window that has quietly expired is reported the next time
+/// anyone looks, with no timer running.
+fn note_health(state: &AppState) {
+    let now = health_state(state.dataset.is_some(), state.catalog.fresh(), state.catalog.schema_suspect());
+    let slug = now.map_or("ok", |(reason, _)| reason);
+    let mut last = crate::util::lock(&state.health);
+    if *last == slug {
+        return;
+    }
+    match now {
+        Some((reason, detail)) => eprintln!("health degraded: {reason} — {detail}"),
+        None => eprintln!("health recovered (was {})", *last),
+    }
+    *last = slug;
 }
 
 /// `GET /catalog/{type}/{id}[/{extra}].json`. The optional extra may carry `country=XX` — the region
@@ -317,7 +355,10 @@ async fn handle_catalog(
     // A fixed-country config wins; an `auto` config takes the forwarded `country` extra; else default.
     let forwarded = extra_value(extra, "country");
     let country = config.country(forwarded.as_deref(), &state.default_country);
-    match state.catalog.metas_json(id, type_, &country, &config.providers).await {
+    let answer = state.catalog.metas_json(id, type_, &country, &config.providers).await;
+    // A refresh is what moves the catalog's health, so a change is noticed here as it happens.
+    note_health(state);
+    match answer {
         Some(r) => {
             // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
             // CDN doesn't pin a broken row past JustWatch's recovery.

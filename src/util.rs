@@ -35,6 +35,18 @@ pub fn log_due(slot: &std::sync::atomic::AtomicU64, every: std::time::Duration) 
     true
 }
 
+/// `eprintln!`, at most once a minute per call site, through `log_due`. For an upstream failure
+/// reported on a request path: each use gets its own slot, so one noisy failure cannot hide another.
+macro_rules! log_throttled {
+    ($($arg:tt)*) => {{
+        static SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if $crate::util::log_due(&SLOT, std::time::Duration::from_secs(60)) {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+pub(crate) use log_throttled;
+
 /// Lock a mutex, poisoned or not.
 ///
 /// Used wherever the critical section is a short, non-unwinding map or counter update, so a poisoned
@@ -59,12 +71,12 @@ pub fn fnv1a(input: &str) -> String {
 /// A plain JSON response, explicitly uncacheable (used for /health, 404, 405, and the 503
 /// dataset-unavailable body). `no-store` keeps a CDN from pinning a transient error/outage past its
 /// recovery — the same reason the catalog error path shortens its TTL.
-pub fn json_response(body: &'static str, status: StatusCode) -> Response {
+pub fn json_response(body: impl Into<Body>, status: StatusCode) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(body))
+        .body(body.into())
         .unwrap()
 }
 
