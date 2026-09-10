@@ -48,9 +48,9 @@ fn with_timing(mut resp: Response, timing: &str) -> Response {
 /// It is also where the opt-in request log is written. What the line needs is captured before routing
 /// consumes the request, and only when logging is on — off, the whole cost is one bool check.
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    let log = state
-        .log_requests
-        .then(|| (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri())));
+    let log = state.log_requests.then(|| {
+        (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri()), request_id(req.headers()))
+    });
     let mut resp = route(State(state), req).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
@@ -60,10 +60,38 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         header::HeaderValue::from_static("Server-Timing, X-Den-Degraded"),
     );
     resp.headers_mut().insert("timing-allow-origin", header::HeaderValue::from_static("*"));
-    if let Some((started, method, path)) = log {
-        eprintln!("{method} {path} {} {}ms", resp.status().as_u16(), started.elapsed().as_millis());
+    if let Some((started, method, path, rid)) = log {
+        eprintln!(
+            "{}",
+            request_line(
+                &method,
+                &path,
+                resp.status().as_u16(),
+                started.elapsed().as_millis(),
+                rid.as_deref()
+            )
+        );
     }
     resp
+}
+
+/// `<METHOD> <path> <status> <ms>ms`, plus ` rid=<id>` when the caller sent an `X-Request-Id`.
+fn request_line(method: &Method, path: &str, status: u16, ms: u128, rid: Option<&str>) -> String {
+    match rid {
+        Some(rid) => format!("{method} {path} {status} {ms}ms rid={rid}"),
+        None => format!("{method} {path} {status} {ms}ms"),
+    }
+}
+
+/// The caller's `X-Request-Id`, as a log line may carry it. The Den app sends one per addon request and
+/// logs the same id, so a line on each side of a failure can be matched exactly instead of by timestamp.
+/// It comes off the network, so only `[A-Za-z0-9_-]` survives and at most 32 of those: nothing in it can
+/// break the line apart or forge a second one. Nothing left means no id.
+fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let id: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(32).collect();
+    (!id.is_empty()).then_some(id)
 }
 
 /// The request path as the log may show it. A leading per-install config segment becomes `<config>`
@@ -242,6 +270,8 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
         );
     };
+    // Passed on to den-embed, so its log line for this query carries the same id as the app's and ours.
+    let rid = request_id(req.headers());
     // A search query is short — cap the body so this can't relay large payloads to the internal service.
     let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
         Ok(b) => b,
@@ -259,14 +289,12 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
         );
     };
     let upstream = Instant::now();
-    let resp = match proxy
-        .client
-        .post(format!("{}/embed", proxy.base))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-    {
+    let mut upstream_req =
+        proxy.client.post(format!("{}/embed", proxy.base)).header(header::CONTENT_TYPE, "application/json");
+    if let Some(rid) = &rid {
+        upstream_req = upstream_req.header("x-request-id", rid.as_str());
+    }
+    let resp = match upstream_req.body(body).send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let bytes = resp.bytes().await.unwrap_or_default();
@@ -522,6 +550,81 @@ mod tests {
         assert_eq!(p("/health"), "/health");
         // Not a config (no valid region), so the router treats it as a path and so does the log.
         assert_eq!(p("/zz9_nfx/manifest.json"), "/zz9_nfx/manifest.json");
+    }
+
+    fn rid_of(value: &str) -> Option<String> {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-request-id", axum::http::HeaderValue::from_str(value).unwrap());
+        request_id(&h)
+    }
+
+    #[test]
+    fn a_request_line_carries_the_callers_request_id() {
+        let line =
+            request_line(&Method::GET, "/<config>/catalog/movie/jw-nfx.json", 200, 12, Some("a1b2c3d4"));
+        assert_eq!(line, "GET /<config>/catalog/movie/jw-nfx.json 200 12ms rid=a1b2c3d4");
+        assert_eq!(rid_of("a1b2-c3_d4").as_deref(), Some("a1b2-c3_d4"));
+    }
+
+    #[test]
+    fn a_request_line_without_an_id_is_unchanged() {
+        assert_eq!(request_line(&Method::HEAD, "/health", 200, 0, None), "HEAD /health 200 0ms");
+        assert_eq!(request_id(&axum::http::HeaderMap::new()), None);
+    }
+
+    /// The id comes off the network and lands in a log line: nothing may split the line, forge a second
+    /// field, or grow it without bound. A value with nothing usable is no id at all.
+    #[test]
+    fn a_hostile_request_id_is_sanitized_and_truncated() {
+        assert_eq!(rid_of("ab cd\tef rid=x").as_deref(), Some("abcdefridx"));
+        assert_eq!(rid_of(&"z".repeat(100)).as_deref(), Some("z".repeat(32).as_str()));
+        assert_eq!(rid_of("!!! ;;; "), None);
+    }
+
+    /// The proxy passes the id on, so den-embed's line for the query can be matched to this one.
+    #[tokio::test]
+    async fn the_embed_proxy_forwards_the_request_id() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = r#"{"vector":[],"dims":0,"model":"m"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let state = Arc::new(AppState {
+            embed: Some(crate::EmbedProxy {
+                client: reqwest::Client::new(),
+                base: format!("http://{addr}"),
+                inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+            }),
+            ..AppState::for_test(None)
+        });
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/embed")
+            .header("x-request-id", "q7-search_1 junk")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"heist"}"#))
+            .unwrap();
+        let resp = handle(State(state), req).await;
+        assert_eq!(resp.status(), 200);
+        let upstream_head = rx.await.unwrap().to_ascii_lowercase();
+        assert!(upstream_head.contains("x-request-id: q7-search_1junk\r\n"), "{upstream_head}");
     }
 
     #[test]
