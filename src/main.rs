@@ -31,8 +31,9 @@ pub struct AppState {
     pub embed: Option<EmbedProxy>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
-    /// One stderr line per request (env `LOG_REQUESTS=1`). Read once at startup, so with it off the
-    /// request path pays a single bool check.
+    /// One stderr line per request (env `LOG_REQUESTS`: off when unset, empty or `0`, on for anything
+    /// else — the rule every den addon uses). Read once at startup, so with it off the request path pays
+    /// a single bool check.
     pub log_requests: bool,
     /// The `/health` reason last logged (`ok` when healthy), so a change is logged once rather than by
     /// every request that observes it.
@@ -169,7 +170,7 @@ async fn main() {
         default_country,
         embed,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
-        log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| v == "1"),
+        log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
 
