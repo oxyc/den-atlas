@@ -17,7 +17,8 @@ COPY --from=build /app/target/release/den-atlas /den-atlas
 # The dataset blobs (gitignored; fetched via scripts/fetch-dataset.sh). Empty in CI → mount at runtime.
 COPY data /app/data
 EXPOSE 8080
-# scratch has no /etc/passwd; run as the numeric `nobody`. (No Docker HEALTHCHECK — scratch has no shell;
-# health is a plain `GET /health`, checked by the reverse proxy / compose.)
-USER 65534:65534
+# scratch has no /etc/passwd, so the uid is numeric: 65532, the one every den addon image runs as
+# (distroless's `nonroot`). No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake, and
+# health is checked by the deploy (den/deploy/den-update.sh) against /health and /manifest.json.
+USER 65532:65532
 ENTRYPOINT ["/den-atlas"]
