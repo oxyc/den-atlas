@@ -53,6 +53,13 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         .then(|| (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri())));
     let mut resp = route(State(state), req).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
+    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static("Server-Timing, X-Den-Degraded"),
+    );
+    resp.headers_mut().insert("timing-allow-origin", header::HeaderValue::from_static("*"));
     if let Some((started, method, path)) = log {
         eprintln!("{method} {path} {} {}ms", resp.status().as_u16(), started.elapsed().as_millis());
     }
