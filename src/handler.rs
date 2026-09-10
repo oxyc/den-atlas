@@ -24,10 +24,36 @@ const CONFIGURE_PAGE: &str = include_str!("configure.html");
 /// whatever was built outside those helpers (the /metrics body was), and a browser reports a missing
 /// header as a CORS failure rather than the status the server actually sent. The data is public and
 /// credential-free, so a wildcard origin gives nothing away.
-pub async fn handle(state: State<Arc<AppState>>, req: Request) -> Response {
-    let mut resp = route(state, req).await;
+///
+/// It is also where the opt-in request log is written. What the line needs is captured before routing
+/// consumes the request, and only when logging is on — off, the whole cost is one bool check.
+pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let log = state
+        .log_requests
+        .then(|| (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri())));
+    let mut resp = route(State(state), req).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    if let Some((started, method, path)) = log {
+        eprintln!("{method} {path} {} {}ms", resp.status().as_u16(), started.elapsed().as_millis());
+    }
     resp
+}
+
+/// The request path as the log may show it. A leading per-install config segment becomes `<config>`
+/// — it is a user's region and service choice, which a log has no need to keep — and the query string
+/// is never read, so nothing in it can reach the log. Redacted by the same `Config::parse` the router
+/// uses, so exactly the segments treated as a config are the ones hidden.
+fn loggable_path(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    let trimmed = path.trim_start_matches('/');
+    let (first, rest) = trimmed.split_once('/').map_or((trimmed, None), |(f, r)| (f, Some(r)));
+    if Config::parse(first).is_none() {
+        return path.to_owned();
+    }
+    match rest {
+        Some(r) => format!("/<config>/{r}"),
+        None => "/<config>".to_owned(),
+    }
 }
 
 // There is deliberately NO server-side request deadline, and this is the third and last thing tried
@@ -394,6 +420,19 @@ fn extra_value(extra: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request log must not keep an install's config segment or anything from the query.
+    #[test]
+    fn a_logged_path_hides_the_install_config_and_the_query() {
+        let p = |s: &str| loggable_path(&s.parse::<axum::http::Uri>().unwrap());
+        assert_eq!(p("/US_nfx-mxx/catalog/movie/jw-nfx.json?x=1"), "/<config>/catalog/movie/jw-nfx.json");
+        assert_eq!(p("/auto_nfx/manifest.json"), "/<config>/manifest.json");
+        assert_eq!(p("/auto_nfx"), "/<config>");
+        assert_eq!(p("/labels.json?v=abc&token=s3cret"), "/labels.json");
+        assert_eq!(p("/health"), "/health");
+        // Not a config (no valid region), so the router treats it as a path and so does the log.
+        assert_eq!(p("/zz9_nfx/manifest.json"), "/zz9_nfx/manifest.json");
+    }
 
     #[test]
     fn health_ok_when_dataset_loaded_and_fresh() {

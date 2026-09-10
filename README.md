@@ -130,6 +130,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
+| `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |
 
 ## Run
 ```sh

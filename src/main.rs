@@ -31,6 +31,9 @@ pub struct AppState {
     pub embed: Option<EmbedProxy>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
+    /// One stderr line per request (env `LOG_REQUESTS=1`). Read once at startup, so with it off the
+    /// request path pays a single bool check.
+    pub log_requests: bool,
 }
 
 /// A `TrendingSource` that answers nothing, so a test can never reach the network by accident.
@@ -84,6 +87,7 @@ impl AppState {
             default_country: "US".to_owned(),
             embed: None,
             metrics_token: None,
+            log_requests: false,
         }
     }
 
@@ -158,6 +162,7 @@ async fn main() {
         default_country,
         embed,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
+        log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| v == "1"),
     });
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
