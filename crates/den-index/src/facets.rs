@@ -37,7 +37,7 @@ impl FacetIndex {
             by_decade: HashMap::new(),
             by_type: HashMap::new(),
         };
-        for (position, r) in records.chunks_exact(RECORD).enumerate() {
+        for (position, r) in records.as_chunks::<RECORD>().0.iter().enumerate() {
             let position = position as u32;
             let media_type = if r[4] == 1 { MediaType::Tv } else { MediaType::Movie };
             let country = [r[7].to_ascii_uppercase(), r[8].to_ascii_uppercase()];
