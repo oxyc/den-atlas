@@ -9,8 +9,8 @@ and does the nearest-neighbour + ranking locally.
 ```
 Den (Apple TV) ──GET /manifest.json──►  atlas   { resources: ["dataset"] }
                ──GET /dataset.json───►          { version, sha256, dims, labels{url}, vectors{url} }
-               ──GET /labels-t01.json─►          derived labels  (≈11 MB)
-               ──GET /vectors-e02.bin─►          int8 vectors    (≈21 MB)
+               ──GET /labels-t02.json─►          derived labels
+               ──GET /vectors-bge-m3.bin─►       int8 vectors
 Den (on-device) ── sha256-gated cache, stale-while-revalidate ──► ANN + categories + billboard
 ```
 
@@ -20,20 +20,29 @@ installing Atlas there is harmless; only Den acts on it.
 
 ## Facts, not tokens
 Atlas ships **derived data only** — no raw TMDB overviews/posters/text (ToS-clean, exactly what the Den
-backfill asserts) and **nothing personal**. There is no per-user state, no token, and no `/configure`.
-Personalisation (your taste vector) never leaves your device. Every blob is **sha256-pinned** in the
-descriptor, so the app verifies what it downloads and a mismatch keeps the prior cache.
+backfill asserts) and **nothing personal**. There is no per-user state and no token; `/configure` only
+picks the catalog region and services, carried in plaintext in the install URL. Personalisation (your
+taste vector) never leaves your device. Every blob is **sha256-pinned** in the descriptor, so the app
+verifies what it downloads and a mismatch keeps the prior cache.
 
 ## Routes
 | Route | Returns |
 |---|---|
-| `GET /` | landing page with the install URL |
-| `GET /health` | `{ "status": "ok" }` |
-| `GET /manifest.json` | the `dataset` + `catalog` manifest |
-| `GET /dataset.json` | the descriptor (absolute blob URLs from the request origin) |
+| `GET /`, `GET /configure` | landing/configure page: pick region + services, get the install URL |
+| `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `stale_catalog` (last JustWatch refresh failed) or `catalog_schema_suspect` (a served chart came back mostly empty) |
+| `GET /manifest.json` | the `dataset` + `catalog` manifest (also under a `/<region>_<codes>/` install prefix) |
+| `GET /dataset.json` | the descriptor (absolute blob URLs from the request origin); `503` when the dataset did not load |
 | `GET /labels-<tax>.json` | the derived labels blob |
 | `GET /vectors-<embed>.bin` | the quantized int8 vectors blob |
-| `GET /catalog/<type>/<id>.json` | a "most popular" row of `{id,type,name,poster}` metas |
+| `GET /<blob>` | the optional blobs the descriptor names: metadata sidecar, premise labels + vectors, facets |
+| `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
+| `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `DEN_EMBED_URL` is unset |
+| `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
+
+`/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
+`atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
+`atlas_dataset_titles`, and the two catalog signals behind `/health` — `atlas_catalog_fresh` and
+`atlas_catalog_schema_suspect`. Every variable is described in [`.env.example`](.env.example).
 
 ## The dataset
 
@@ -76,7 +85,7 @@ dataset resource is unaffected. Tunables: `JW_COUNTRY`, `JW_PROVIDERS`, `JW_CACH
 JustWatch.
 
 ## Implementation
-A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** serving 33 MB of data.
+A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** whatever the dataset size.
 Blob bodies are **streamed from disk** (never loaded into RAM), gzip is precomputed to a file, and sha256 is
 read from the `dataset.meta.json` sidecar (no startup hashing). (The original TypeScript server is preserved
 at the `legacy-ts` git tag.)
@@ -85,10 +94,10 @@ at the `legacy-ts` git tag.)
 Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the blob's sha256, distinct `-gzip`
 variant) + `Last-Modified`, honoring `If-None-Match` and `If-Modified-Since` (→ `304`), plus `HEAD`. Blob
 URLs in the descriptor are version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable`
-for a year while a bare path revalidates. The 22 MB vectors blob is **range-resumable** (`Accept-Ranges` /
-`206`); the 11 MB labels JSON is **gzipped** (~18×, to ~0.5 MB) transparently — the ETag/checksum is over the
-raw bytes, so the Den app (which validates the decompressed payload) is unaffected. Sit a CDN in front and it
-caches everything by URL with correct revalidation.
+for a year while a bare path revalidates. Every blob is **range-resumable** (`Accept-Ranges` / `206`); the
+labels JSON (and the metadata sidecar, when the release publishes a `.gz`) is **gzipped** transparently — the
+ETag/checksum is over the raw bytes, so the Den app (which validates the decompressed payload) is
+unaffected. Sit a CDN in front and it caches everything by URL with correct revalidation.
 
 ## Develop
 ```sh
@@ -101,5 +110,6 @@ The dataset is produced by [den-dataset](https://github.com/oxyc/den-dataset) (`
 Den app both fetch. den-atlas no longer reads the Den repo.
 
 ## Deploy
-Self-hosted, Docker, behind a reverse proxy (Caddy) that terminates TLS and forwards
-`X-Forwarded-Proto`/`Host` — same shape as `den-scout` / `den-trailer-service`. See [DEPLOY.md](DEPLOY.md).
+Runs on the Den homelab box as a Podman Quadlet unit (host port 8081), with the dataset bind-mounted
+read-only and kept current by a sync timer. The stack mechanics live in the den repo's
+`deploy/README.md`; [DEPLOY.md](DEPLOY.md) covers what is specific to atlas and running it yourself.

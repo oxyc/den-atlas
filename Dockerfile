@@ -1,7 +1,7 @@
 # den-atlas — the Rust serving layer. Multi-stage: a static musl binary built on Alpine, copied into
-# `scratch` → a ~few-MB, dependency-free image. No TLS / no outbound (it sits behind Caddy), so scratch is
-# enough. CI builds this with an empty data/ (blobs gitignored) → the published image is the SERVER ONLY;
-# mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
+# `scratch` → a ~few-MB, dependency-free image. The server speaks plain HTTP, and its outbound HTTPS
+# (JustWatch) uses rustls with bundled roots, so scratch needs no CA bundle. CI builds this with an empty
+# data/ (blobs gitignored) → the published image is the SERVER ONLY; mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /app
