@@ -67,6 +67,10 @@ pub struct Meta {
     pub premise_labels_sha256: Option<String>,
     #[serde(rename = "premiseLabelsBytes")]
     pub premise_labels_bytes: Option<u64>,
+    /// The premise labels' precompressed variant — the other large JSON blob, served exactly like the
+    /// labels one when the producer publishes it.
+    #[serde(rename = "premiseLabelsGzFile")]
+    pub premise_labels_gz_file: Option<String>,
     #[serde(rename = "premiseVectorsFile")]
     pub premise_vectors_file: Option<String>,
     #[serde(rename = "premiseVectorsSha256")]
@@ -166,7 +170,7 @@ impl Dataset {
             &meta.premise_labels_sha256,
             meta.premise_labels_bytes,
             "application/json",
-            None,
+            meta.premise_labels_gz_file.as_deref(),
         );
         let premise_vectors = optional_blob(
             dir,
@@ -442,6 +446,51 @@ mod tests {
         let md = ds.metadata.as_ref().expect("the sidecar must resolve");
         assert_eq!(gz_name(md).as_deref(), Some("meta.json.gz"), "the sidecar's gz variant is not wired up");
         assert!(ds.vectors.gz.is_none(), "a binary blob was given a gz variant");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The premise labels' gz variant is wired to the premise labels, and an escaping name for it is
+    /// refused the same way — dropping the variant, not the index.
+    #[test]
+    fn the_premise_labels_gz_variant_is_wired_and_guarded() {
+        let root = std::env::temp_dir().join(format!("den-atlas-premisegz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for (name, body) in [
+            ("labels.json", &b"LABELS"[..]),
+            ("vectors.bin", b"VECTORS!"),
+            ("premise-labels.json", b"PLABELS"),
+            ("premise-vectors.bin", b"PVECTORS"),
+            ("premise-labels.json.gz", b"PGZ"),
+        ] {
+            std::fs::write(data.join(name), body).unwrap();
+        }
+        std::fs::write(root.join("secret.gz"), b"not for the wire").unwrap();
+        let meta = |gz: &str| {
+            format!(
+                r#"{{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                 "quantization":"int8",
+                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                 "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
+                 "premiseLabelsGzFile":"{gz}",
+                 "premiseVectorsFile":"premise-vectors.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
+            )
+        };
+
+        std::fs::write(data.join("dataset.meta.json"), meta("premise-labels.json.gz")).unwrap();
+        let ds = Dataset::load(&data).expect("fixture must load");
+        let pl = ds.premise_labels.as_ref().expect("the premise labels must resolve");
+        let gz = pl.gz.as_ref().expect("the premise labels' gz variant is not wired up");
+        assert_eq!(gz.path, data.join("premise-labels.json.gz"));
+        assert!(ds.labels.gz.is_none(), "the premise variant was handed to the plot labels");
+        assert!(ds.premise_vectors.as_ref().unwrap().gz.is_none(), "a binary blob was given a gz variant");
+
+        std::fs::write(data.join("dataset.meta.json"), meta("../secret.gz")).unwrap();
+        let ds = Dataset::load(&data).expect("a bad optional gz name must not take the dataset down");
+        let pl = ds.premise_labels.as_ref().expect("an escaping gz name dropped the whole premise index");
+        assert!(pl.gz.is_none(), "a premise gz variant resolved outside the dataset directory");
         let _ = std::fs::remove_dir_all(&root);
     }
 

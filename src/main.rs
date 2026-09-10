@@ -146,7 +146,7 @@ async fn main() {
 
     // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
-    let embed = std::env::var("EMBED_URL").ok().and_then(|base| {
+    let embed = env_opt("EMBED_URL").and_then(|base| {
         match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
             Ok(client) => Some(EmbedProxy {
                 client,
@@ -165,7 +165,7 @@ async fn main() {
     let health = handler::health_state(dataset.is_some(), true, false).map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
-        public_base: std::env::var("PUBLIC_BASE_URL").ok(),
+        public_base: env_opt("PUBLIC_BASE_URL"),
         catalog,
         default_country,
         embed,
@@ -192,30 +192,36 @@ async fn main() {
     // only as on/off.
     let on = |b: bool| if b { "on" } else { "off" };
     let providers: Vec<&str> = catalog::selected_providers().iter().map(|p| p.code).collect();
-    let config = format!(
-        "country={} providers={} catalog_ttl={}s public_base={} embed={} metrics={} log_requests={}",
+    let dataset = match &state.dataset {
+        Some(ds) => {
+            format!("titles={} index={}/{}", ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version)
+        }
+        None => "dataset=unavailable".to_owned(),
+    };
+    eprintln!(
+        "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
+         catalog_ttl={}s public_base={} embed={}",
+        env!("CARGO_PKG_VERSION"),
+        on(state.metrics_token.is_some()),
+        on(state.log_requests),
         state.default_country,
         providers.join(","),
         ttl.as_secs(),
         state.public_base.as_deref().unwrap_or("derived"),
         on(state.embed.is_some()),
-        on(state.metrics_token.is_some()),
-        on(state.log_requests),
     );
-    let version = env!("CARGO_PKG_VERSION");
-    match &state.dataset {
-        Some(ds) => eprintln!(
-            "listening on :{port} — v{version}, {} titles ({}/{}); {config}",
-            ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version
-        ),
-        None => eprintln!("listening on :{port} — v{version}, dataset unavailable (catalog only); {config}"),
-    }
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());
     let code = outcome.exit_code();
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// An env var's value, with unset and empty both meaning "not configured" — the rule every den addon
+/// uses. `PUBLIC_BASE_URL=` read as set produced an empty origin, and `EMBED_URL=` a proxy to "".
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// How serving ended. Separate from the message because the exit code differs: a drain that ran out

@@ -157,6 +157,7 @@ mod tests {
                 premise_embedding_model: None,
                 premise_dims: None,
                 premise_count: None,
+                premise_labels_gz_file: None,
                 premise_labels_file: None,
                 premise_labels_sha256: None,
                 premise_labels_bytes: None,

@@ -18,10 +18,11 @@ pub fn authorized(headers: &HeaderMap, token: Option<&str>) -> bool {
     let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    // The scheme is case-insensitive (RFC 9110 §11.1); the token is not.
+    // The scheme is case-insensitive (RFC 9110 §11.1); the token is not. Surrounding whitespace is
+    // trimmed, as every den addon does.
     match value.get(..7) {
         Some(scheme) if scheme.eq_ignore_ascii_case("bearer ") => {
-            constant_time_eq(&value.as_bytes()[7..], token.as_bytes())
+            constant_time_eq(value[7..].trim().as_bytes(), token.as_bytes())
         }
         _ => false,
     }

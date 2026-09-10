@@ -370,7 +370,7 @@ async fn handle_catalog(
             // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
             // CDN doesn't pin a broken row past JustWatch's recovery.
             let cc = if r.fresh {
-                "public, max-age=3600, stale-while-revalidate=600"
+                "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400"
             } else {
                 "public, max-age=60"
             };
@@ -407,7 +407,7 @@ async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'st
         Servable {
             etag_base: etag,
             content_type: "text/html; charset=utf-8".to_owned(),
-            cache_control: "public, max-age=3600".to_owned(),
+            cache_control: "public, max-age=3600, stale-while-revalidate=600".to_owned(),
             last_modified: None,
             size,
             identity: Payload::Memory(bytes),
@@ -1073,6 +1073,8 @@ mod tests {
         st.metrics_token = Some("s3cret".to_owned());
         let state = Arc::new(st);
 
+        // Whitespace around the token is trimmed, as every den addon does.
+        assert_eq!(get_metrics(&state, Some("Bearer  s3cret ")).await.status(), 200);
         let resp = get_metrics(&state, Some("Bearer s3cret")).await;
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain; version=0.0.4; charset=utf-8");
