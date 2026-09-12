@@ -868,6 +868,13 @@ async fn handle_index(
             return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+    // Search and facets can rank through den-embed, so they stay short. Every other answer is the dataset
+    // alone, which changes at most once a day: fresh for an hour, and served stale while it revalidates.
+    let cache_control = if matches!(question, IndexQuestion::Search | IndexQuestion::Facets) {
+        "public, max-age=300"
+    } else {
+        "public, max-age=3600, stale-while-revalidate=86400"
+    };
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
             Ok(body) => body,
@@ -880,7 +887,7 @@ async fn handle_index(
         question => question.answer(&indexes, query),
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
-    let resp = serve_json(method, headers, body, "public, max-age=300", None, false).await;
+    let resp = serve_json(method, headers, body, cache_control, None, false).await;
     with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
 }
 
@@ -912,7 +919,9 @@ async fn handle_title_search(
     let query = extra_value(extra, "search").map(|q| percent_decode(&q)).unwrap_or_default();
     let body = titles::metas_json(&index, &query, media_type);
     let searched = started.elapsed();
-    let resp = serve_json(method, headers, body, "public, max-age=3600", None, false).await;
+    let resp =
+        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=600", None, false)
+            .await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
@@ -1279,7 +1288,9 @@ mod tests {
     #[tokio::test]
     async fn title_search_answers_from_the_index() {
         let state = title_state();
-        let hit = body_of(get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await).await;
+        let hit = get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await;
+        assert_eq!(hit.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=600");
+        let hit = body_of(hit).await;
         assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
         let other_type =
             body_of(get(&state, "/catalog/series/den-titles/search=the%20matrix.json").await).await;
@@ -1320,7 +1331,9 @@ mod tests {
     async fn index_queries_answer_from_the_dataset() {
         let state = index_state("den-atlas-index");
         let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
-        let taxonomy = json(body_of(get(&state, "/index/taxonomy.json").await).await);
+        let taxonomy = get(&state, "/index/taxonomy.json").await;
+        assert_eq!(taxonomy.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        let taxonomy = json(body_of(taxonomy).await);
         assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
         assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
 
@@ -1410,7 +1423,9 @@ mod tests {
         let neighbours = json(body_of(get(&state, "/index/neighbours/movie/1.json").await).await);
         assert_eq!(neighbours["ids"], serde_json::json!([2, 3]));
         // The embedded query sits on movie 3.
-        let search = json(body_of(get(&state, "/index/search.json?q=campy+fun").await).await);
+        let search = get(&state, "/index/search.json?q=campy+fun").await;
+        assert_eq!(search.headers()["cache-control"], "public, max-age=300", "an embedded query stays short");
+        let search = json(body_of(search).await);
         assert_eq!(search["titles"][0], serde_json::json!({"type": "movie", "id": 3}));
 
         let korean = json(body_of(get(&state, "/index/facets.json?q=korean%20movies").await).await);
