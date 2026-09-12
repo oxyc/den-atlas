@@ -131,6 +131,8 @@ mod tests {
             name: name.into(),
             path: PathBuf::from(name),
             size: 10,
+            // Descriptor tests never open the payload; only its advertised fields matter here.
+            identity: crate::http::FileIdentity::from_metadata(&std::fs::metadata(".").unwrap()).unwrap(),
             sha256: format!("sha-{name}"),
             content_type: "application/octet-stream",
             gz: None,

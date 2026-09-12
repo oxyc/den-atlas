@@ -979,7 +979,7 @@ async fn serve_blob(
     let pinned = query_param(query, "v").as_deref() == Some(ds.meta.dataset_version.as_str());
     let cache_control =
         if pinned { "public, max-age=31536000, immutable" } else { "public, max-age=3600" }.to_owned();
-    let gzip = blob.gz.as_ref().map(|g| (Payload::File(g.path.clone()), g.size));
+    let gzip = blob.gz.as_ref().map(|g| (Payload::VerifiedFile(g.path.clone(), g.identity.clone()), g.size));
     let resp = serve(
         method,
         headers,
@@ -989,7 +989,7 @@ async fn serve_blob(
             cache_control,
             last_modified: ds.last_modified.clone(),
             size: blob.size,
-            identity: Payload::File(blob.path.clone()),
+            identity: Payload::VerifiedFile(blob.path.clone(), blob.identity.clone()),
             gzip,
             vary_on_origin: false, // a blob body carries no origin-derived URLs
         },

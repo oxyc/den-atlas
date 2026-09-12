@@ -179,6 +179,14 @@ index and `facets.bin` — verifies each against the meta's sha256, and only the
 The server reads all of that at startup; it never hashes or compresses. To pick up a new release, re-run it
 and restart the server.
 
+Refreshes stage on the destination filesystem and replace files by rename. An open response keeps
+its original file; subsequent requests check the opened file's size, modification time and Unix
+file identity against startup metadata. A changed file returns `503`, `no-store`, including for
+HEAD and conditional requests, until the server reloads it. This prevents new bytes inheriting an
+old SHA or immutable URL without hashing on requests. The deployment sync stops Atlas after all
+downloads verify, replaces the data, then restarts it. An interrupted replacement stays stopped
+with a recovery marker and no live descriptor until the next successful refresh.
+
 The dataset is produced by [den-dataset](https://github.com/oxyc/den-dataset) (`taxonomy-backfill finalize`
 → `publish-dataset.sh`) and published as a GitHub Release — the single source of truth this server and the
 Den app both fetch. den-atlas no longer reads the Den repo.
