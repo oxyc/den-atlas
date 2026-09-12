@@ -90,6 +90,7 @@ pub struct Meta {
 pub struct Gz {
     pub path: PathBuf,
     pub size: u64,
+    pub identity: crate::http::FileIdentity,
 }
 
 pub struct Blob {
@@ -97,6 +98,7 @@ pub struct Blob {
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
+    pub identity: crate::http::FileIdentity,
     pub sha256: String,
     pub content_type: &'static str,
     pub gz: Option<Gz>,
@@ -125,8 +127,16 @@ impl Dataset {
     /// dataset to serve. Every optional blob degrades instead: a missing premise index costs
     /// premise-based More Like This, not the whole addon (see the call site below).
     pub fn load(dir: &Path) -> Result<Dataset, String> {
+        use std::io::Read;
         let meta_path = dir.join("dataset.meta.json");
-        let raw = std::fs::read(&meta_path).map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+        let mut file =
+            std::fs::File::open(&meta_path).map_err(|e| format!("read {}: {e}", meta_path.display()))?;
+        let meta_identity = file
+            .metadata()
+            .and_then(|m| crate::http::FileIdentity::from_metadata(&m))
+            .map_err(|e| e.to_string())?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).map_err(|e| e.to_string())?;
         let meta: Meta = serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
 
         let labels = resolve_blob(
@@ -203,6 +213,13 @@ impl Dataset {
             None,
         );
         let last_modified = meta.last_modified_http.clone();
+        // Writers withdraw the descriptor before replacing any blob and publish it last. A load
+        // that overlaps that interval must not bind new files to a descriptor read before it.
+        let current_meta =
+            std::fs::metadata(&meta_path).and_then(|m| crate::http::FileIdentity::from_metadata(&m));
+        if current_meta.as_ref().ok() != Some(&meta_identity) {
+            return Err("dataset changed while loading; retry after the refresh completes".into());
+        }
         Ok(Dataset {
             meta,
             labels,
@@ -269,7 +286,9 @@ fn resolve_blob(
     let path = safe_blob_path(dir, name)?;
     // Use the on-disk length, not the meta's declared size: if a refreshed/stale meta disagrees with the
     // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
-    let actual = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?.len();
+    let stat = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let actual = stat.len();
+    let identity = crate::http::FileIdentity::from_metadata(&stat).map_err(|e| e.to_string())?;
     if actual != size {
         eprintln!("{} is {actual} bytes but meta declares {size} — using the on-disk size", path.display());
     }
@@ -282,7 +301,13 @@ fn resolve_blob(
     let gz = match gz_file {
         Some(gzname) => match safe_blob_path(dir, gzname).and_then(|p| {
             std::fs::metadata(&p)
-                .map(|m| Gz { path: p.clone(), size: m.len() })
+                .and_then(|m| {
+                    Ok(Gz {
+                        path: p.clone(),
+                        size: m.len(),
+                        identity: crate::http::FileIdentity::from_metadata(&m)?,
+                    })
+                })
                 .map_err(|e| format!("stat {}: {e}", p.display()))
         }) {
             Ok(gz) => Some(gz),
@@ -293,7 +318,15 @@ fn resolve_blob(
         },
         None => None,
     };
-    Ok(Blob { name: name.to_owned(), path, size: actual, sha256: sha256.to_owned(), content_type, gz })
+    Ok(Blob {
+        name: name.to_owned(),
+        path,
+        size: actual,
+        identity,
+        sha256: sha256.to_owned(),
+        content_type,
+        gz,
+    })
 }
 
 #[cfg(test)]

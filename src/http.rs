@@ -17,7 +17,37 @@ use tokio_util::io::ReaderStream;
 #[derive(Clone)]
 pub enum Payload {
     Memory(Bytes),
+    #[cfg(test)]
     File(PathBuf),
+    VerifiedFile(PathBuf, FileIdentity),
+}
+
+/// The file generation described by the startup metadata. A replacement must not inherit its
+/// predecessor's SHA, length or immutable URL. Writers stage on the same filesystem and rename,
+/// so an already-open response keeps its original inode while new requests refuse the replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileIdentity {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileIdentity {
+    pub fn from_metadata(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            #[cfg(unix)]
+            dev: meta.dev(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+        })
+    }
 }
 
 pub struct Servable {
@@ -55,6 +85,14 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     let gz_open =
         if wants_gzip { open_payload(&s.gzip.as_ref().unwrap().0, "the gzip variant").await } else { None };
     let use_gzip = gz_open.is_some();
+    // Validate identity before a conditional 304 or HEAD too. Otherwise replacement bytes could
+    // still be blessed with the old validator without ever reaching the body-opening branch.
+    let mut identity_open = if !use_gzip {
+        let Some(open) = open_payload(&s.identity, "the blob").await else { return unavailable() };
+        Some(open)
+    } else {
+        None
+    };
     // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
     let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
 
@@ -110,9 +148,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
                 RangeResult::Range { start, end } => {
                     // Opened before the 206 is built, and the handle carries the body, so the file
                     // cannot vanish between the check and the read.
-                    let Some(open) = open_payload(&s.identity, "the blob").await else {
-                        return unavailable();
-                    };
+                    let open = identity_open.take().expect("range selected identity");
                     let len = end - start + 1;
                     let mut h = base.clone();
                     h.push(("content-type", s.content_type.clone()));
@@ -135,9 +171,7 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         Some(o) => (o, s.gzip.as_ref().unwrap().1, Some("gzip")),
         None => {
             // Only a missing IDENTITY blob is unserveable.
-            let Some(o) = open_payload(&s.identity, "the blob").await else {
-                return unavailable();
-            };
+            let o = identity_open.take().expect("identity was opened before validators");
             (o, s.size, None)
         }
     };
@@ -203,23 +237,44 @@ enum Open {
 async fn open_payload(p: &Payload, what: &str) -> Option<Open> {
     match p {
         Payload::Memory(b) => Some(Open::Memory(b.clone())),
-        Payload::File(path) => match tokio::fs::File::open(path).await {
-            Ok(f) => Some(Open::File(f)),
-            Err(e) => {
-                // The real errno, not just "gone". EACCES and EMFILE both land here and neither is
-                // fixed by re-fetching the dataset, which is what the 503's detail text tells the
-                // operator to do. Swallowing it left the whole runtime blob path silent.
-                // Throttled: an unreadable blob is a standing condition, and a client can ask for
-                // it in a loop — measured at 28k lines and 4.8 MB of stderr per second on loopback,
-                // which fills a json-file log driver's disk and pushes everything else out of
-                // journald's rate limiter. One line a minute reports the same fact.
-                static OPEN_FAILED: AtomicU64 = AtomicU64::new(0);
-                if log_due(&OPEN_FAILED, LOG_EVERY) {
-                    eprintln!("cannot open {what} ({}): {e}", path.display());
+        #[cfg(test)]
+        Payload::File(path) => open_file(path, None, what).await,
+        Payload::VerifiedFile(path, identity) => open_file(path, Some(identity), what).await,
+    }
+}
+
+async fn open_file(path: &std::path::Path, expected: Option<&FileIdentity>, what: &str) -> Option<Open> {
+    match tokio::fs::File::open(path).await {
+        Ok(f) => {
+            if let Some(expected) = expected {
+                let actual = f.metadata().await.and_then(|m| FileIdentity::from_metadata(&m));
+                if actual.as_ref().ok() != Some(expected) {
+                    static CHANGED: AtomicU64 = AtomicU64::new(0);
+                    if log_due(&CHANGED, LOG_EVERY) {
+                        eprintln!(
+                            "dataset file changed since load ({}); reload the dataset before serving it",
+                            path.display()
+                        );
+                    }
+                    return None;
                 }
-                None
             }
-        },
+            Some(Open::File(f))
+        }
+        Err(e) => {
+            // The real errno, not just "gone". EACCES and EMFILE both land here and neither is
+            // fixed by re-fetching the dataset, which is what the 503's detail text tells the
+            // operator to do. Swallowing it left the whole runtime blob path silent.
+            // Throttled: an unreadable blob is a standing condition, and a client can ask for
+            // it in a loop — measured at 28k lines and 4.8 MB of stderr per second on loopback,
+            // which fills a json-file log driver's disk and pushes everything else out of
+            // journald's rate limiter. One line a minute reports the same fact.
+            static OPEN_FAILED: AtomicU64 = AtomicU64::new(0);
+            if log_due(&OPEN_FAILED, LOG_EVERY) {
+                eprintln!("cannot open {what} ({}): {e}", path.display());
+            }
+            None
+        }
     }
 }
 
@@ -232,7 +287,7 @@ fn unavailable() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         &[("content-type", "application/json".to_owned()), ("cache-control", "no-store".to_owned())],
         Body::from(
-            r#"{"error":"blob_unavailable","detail":"the dataset declares this blob but it could not be opened (missing, or unreadable); see the server log for the reason"}"#,
+            r#"{"error":"blob_unavailable","detail":"the dataset blob is missing, unreadable, or changed since load; see the server log and reload the dataset"}"#,
         ),
     )
 }
@@ -401,6 +456,57 @@ mod tests {
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
         axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_replaced_file_cannot_inherit_the_loaded_generation() {
+        let dir = std::env::temp_dir().join(format!("atlas-generation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+        std::fs::write(&path, b"old-bytes!").unwrap();
+        let stat = std::fs::metadata(&path).unwrap();
+        let identity = FileIdentity::from_metadata(&stat).unwrap();
+        let old = || {
+            let mut s = servable(false);
+            s.size = 10;
+            s.identity = Payload::VerifiedFile(path.clone(), identity.clone());
+            s.cache_control = "public, max-age=31536000, immutable".into();
+            s
+        };
+        let in_flight = serve(&Method::GET, &HeaderMap::new(), old()).await;
+        let next = dir.join("next");
+        std::fs::write(&next, b"new-bytes!").unwrap();
+        // Even equal length and mtime cannot disguise a replacement inode on deployment targets.
+        #[cfg(unix)]
+        std::fs::File::options()
+            .write(true)
+            .open(&next)
+            .unwrap()
+            .set_modified(stat.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&next, &path).unwrap();
+        assert_eq!(body_bytes(in_flight).await, b"old-bytes!", "the open response retains its generation");
+        for (method, headers) in [
+            (Method::GET, HeaderMap::new()),
+            (Method::HEAD, HeaderMap::new()),
+            (Method::GET, hdrs(&[("if-none-match", "*")])),
+            (Method::GET, hdrs(&[("range", "bytes=0-2")])),
+        ] {
+            let resp = serve(&method, &headers, old()).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{method}");
+            assert_eq!(resp.headers()["cache-control"], "no-store");
+            assert!(!resp.headers().contains_key("etag"));
+        }
+        let mut reloaded = old();
+        reloaded.identity = Payload::VerifiedFile(
+            path.clone(),
+            FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap(),
+        );
+        reloaded.etag_base = "new-sha".into();
+        let resp = serve(&Method::GET, &HeaderMap::new(), reloaded).await;
+        assert_eq!(resp.headers()["etag"], "\"new-sha\"");
+        assert_eq!(body_bytes(resp).await, b"new-bytes!");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

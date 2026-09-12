@@ -19,7 +19,9 @@ mkdir -p data
 # meta: ./data was left with a manifest naming blobs it does not have, which is worse than either the
 # old or the new state and is exactly what the message promises did not happen. atlas-dataset-sync.sh
 # has always staged for this reason.
-STAGE="$(mktemp -d)"
+# Keep staged blobs on data's filesystem: publishing is an atomic rename, preserving an existing
+# response's open inode. A running server rejects replacement files until restarted (FileIdentity).
+STAGE="$(mktemp -d data/.fetch.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 curl -fsSL "$BASE/dataset.meta.json" -o "$STAGE/dataset.meta.json"
 # EVERY "<name>File" the meta declares, newline-delimited. A positional list had to be extended by
@@ -47,7 +49,7 @@ safe_name() {
   case "$1" in
     # dataset.meta.json is this script's own working copy in data/: a release declaring it as a blob
     # overwrites the meta mid-fetch and Dataset::load then fails outright.
-    "" | . | .. | dataset.meta.json) return 1 ;;
+    "" | . | .. | dataset.meta.json | .fetch.*) return 1 ;;
     *[!A-Za-z0-9._-]*) return 1 ;;
     -*) return 1 ;;
     *) return 0 ;;
@@ -135,8 +137,10 @@ done <<EOF
 $FILES
 EOF
 
-# Everything verified — now publish into ./data, blobs before the meta, so a kill here leaves the old
-# meta pointing at blobs that are all still present.
+# Everything verified. Remove the live descriptor while replacing blobs, so starting a server
+# mid-refresh cannot load a mixture under the previous generation. Existing responses retain their
+# open files; new requests refuse changed files until the server reloads the completed descriptor.
+rm -f data/dataset.meta.json
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   case " $MISSING " in *" $f("*) continue ;; esac
@@ -146,7 +150,7 @@ $FILES
 EOF
 mv "$STAGE/dataset.meta.json" data/dataset.meta.json
 
-echo "fetched → ./data:"
+echo "fetched → ./data (restart a running den-atlas to load this generation):"
 # `|| true`: an unmatched glob makes `ls` exit 2, and under `set -o pipefail` that failed the whole
 # script AFTER a completely successful fetch — a release with no .gz was enough.
 ls -la data/*.json data/*.bin data/*.gz 2>/dev/null | awk '{print $5, $NF}' || true
