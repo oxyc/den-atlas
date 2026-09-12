@@ -264,6 +264,11 @@ impl CatalogState {
         }
     }
 
+    /// The same, with its rows kept in `dir` across restarts (`CACHE_DIR`).
+    pub fn kept_in(self, dir: &std::path::Path) -> Self {
+        Self { cache: TtlCache::persisted(self.ttl, dir), ..self }
+    }
+
     /// Whether the last JustWatch refresh succeeded — the `/health` freshness signal (ADDON-02).
     pub fn fresh(&self) -> bool {
         self.last_refresh_ok.load(Ordering::Relaxed)

@@ -152,7 +152,11 @@ async fn main() {
     let ttl = Duration::from_secs(
         std::env::var("JW_CACHE_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(21_600),
     );
-    let catalog = catalog::CatalogState::new(Arc::new(justwatch::JustWatchClient::new()), ttl);
+    let cache_dir = env_opt("CACHE_DIR");
+    let mut catalog = catalog::CatalogState::new(Arc::new(justwatch::JustWatchClient::new()), ttl);
+    if let Some(dir) = &cache_dir {
+        catalog = catalog.kept_in(std::path::Path::new(dir));
+    }
 
     // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
@@ -234,13 +238,14 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s public_base={} embed={} title_search={} index_queries={}",
+         catalog_ttl={}s catalog_cache={} public_base={} embed={} title_search={} index_queries={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
         state.default_country,
         providers.join(","),
         ttl.as_secs(),
+        cache_dir.as_deref().unwrap_or("memory"),
         state.public_base.as_deref().unwrap_or("derived"),
         on(state.embed.is_some()),
         on(state.titles.is_some()),

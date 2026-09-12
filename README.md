@@ -161,6 +161,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_COUNTRY` | `US` | catalog country when an `auto` install forwards none |
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
+| `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |

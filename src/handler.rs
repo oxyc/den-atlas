@@ -416,10 +416,11 @@ async fn handle_catalog(
     note_health(state);
     match answer {
         Some(r) => {
-            // Fresh/stale-good rows cache for an hour; an outage-empty/stale fallback caches briefly so a
-            // CDN doesn't pin a broken row past JustWatch's recovery.
+            // Fresh/stale-good rows cache for an hour, and for a day after that a browser shows the row it has
+            // while it asks again — a chart a day old is still the chart; an outage-empty/stale fallback caches
+            // briefly so a CDN doesn't pin a broken row past JustWatch's recovery.
             let cc = if r.fresh {
-                "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400"
+                "public, max-age=3600, stale-while-revalidate=86400, stale-if-error=86400"
             } else {
                 "public, max-age=60"
             };
