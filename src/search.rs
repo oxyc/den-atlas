@@ -500,6 +500,12 @@ pub fn answer(
                 "f": {"t": round(s.t), "sem": round(s.sem), "lab": round(s.lab), "pf": round(s.pf), "p": s.person,
                       "pop": round(s.pop), "phi": s.phi},
             });
+            // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
+            // for it, a request a card.
+            if let Some(imdb) = indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
+            {
+                hit["imdbId"] = serde_json::json!(imdb);
+            }
             if let Some(language) =
                 indexes.facets.as_ref().and_then(|f| f.title(id, kind)).and_then(|t| t.language)
             {

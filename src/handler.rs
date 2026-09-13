@@ -1670,6 +1670,7 @@ mod tests {
         assert_eq!(keys(&one)[..3], ["movie:1", "movie:3", "movie:2"], "{one}");
         assert_eq!(one["hits"][0]["title"], "One");
         assert_eq!(one["hits"][0]["posterPath"], "/1.jpg");
+        assert_eq!(one["hits"][0]["imdbId"], "tt0000001", "from the facts, so a client needn't ask TMDB");
         assert!(one["hits"][0]["f"]["t"].as_f64().unwrap() >= 0.6);
 
         let typo = json(body_of(get(&state, &ask("thre")).await).await);
@@ -1753,6 +1754,8 @@ mod tests {
         assert_eq!(ids(&heist), vec![2, 1, 3], "{heist}");
         assert_eq!(heist["total"], 3);
         assert_eq!(heist["titles"][0]["title"], "Two");
+        assert_eq!(heist["titles"][1]["imdbId"], "tt0000001");
+        assert!(heist["titles"][0].get("imdbId").is_none(), "a title the facts give no IMDb id carries none");
         // With bleak: movie 1 is sure of both, movie 2 low on tone; movie 3 isn't bleak.
         let bleak = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist&tone=bleak").await).await);
         assert_eq!(ids(&bleak), vec![1, 2], "{bleak}");

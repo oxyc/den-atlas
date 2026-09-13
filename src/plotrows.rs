@@ -189,6 +189,13 @@ pub fn row(
                 "year": card.year,
                 "genreIds": genres(indexes, key),
             });
+            // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
+            // for it, a request a card.
+            if let Some(imdb) =
+                indexes.facts.as_ref().and_then(|f| f.get(id, media_type)).and_then(|r| r.imdb_id.as_deref())
+            {
+                title["imdbId"] = serde_json::json!(imdb);
+            }
             if let Some(language) =
                 indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).and_then(|t| t.language)
             {
