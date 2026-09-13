@@ -1,5 +1,6 @@
 //! Browse rows from the dataset's plot facets (`plotFacetsFile`): closed axes read from Wikipedia plots — how a
-//! story ends, when it is set, how it is told — which cut across genre in a way a primary genre can't.
+//! story ends, when it is set, how it is told — which cut across genre in a way a primary genre can't. A row may
+//! also name a mood or subgenre from the labels, alone or with the facets.
 //!
 //! Rows only, never filters. The file describes a fraction of the corpus, and a title it doesn't describe is
 //! unknown, not a negative: a row lists what the file covers, and nothing may read it as exhaustive. Not
@@ -118,7 +119,8 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
 
 /// A row: the titles of `media_type` carrying every constraint, most confident first, then most voted — each as
 /// the card a client draws, with what its hide rules read — `skip` then `limit` of them, and how many there are.
-/// A title with no card is left out, since there is nothing to draw.
+/// A constraint is a plot facet (`tone=bleak`) or one of the labels (`mood=Feel-good`, `subgenre=Heist`), and
+/// they combine. A title with no card is left out, since there is nothing to draw.
 pub fn row(
     indexes: &Indexes,
     media_type: MediaType,
@@ -126,16 +128,37 @@ pub fn row(
     skip: usize,
     limit: usize,
 ) -> serde_json::Value {
-    let (Some(facets), Some(cards)) = (indexes.plot_facets.as_ref(), indexes.cards.as_ref()) else {
-        return serde_json::json!({ "titles": [], "total": 0 });
+    let empty = || serde_json::json!({ "titles": [], "total": 0 });
+    let Some(cards) = indexes.cards.as_ref() else { return empty() };
+    let (labels, plot): (Vec<_>, Vec<_>) =
+        constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
+    let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
+        let Some(facets) = indexes.plot_facets.as_ref() else { return empty() };
+        facets.matching(media_type, &plot)
+    } else if let Some((family, label)) = labels.first() {
+        let titles = if family == "mood" {
+            indexes.plot.titles_with_mood(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+        } else {
+            indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+        };
+        titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
+    } else {
+        return empty();
     };
     let votes = |(media_type, id): Key| {
         indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes)
     };
-    let mut matched: Vec<(Key, u8)> = facets
-        .matching(media_type, constraints)
+    let mut matched: Vec<(Key, u8)> = candidates
         .into_iter()
         .filter(|(key, _)| cards.contains_key(key))
+        .filter_map(|(key, confidence)| {
+            labels
+                .iter()
+                .try_fold(confidence, |lowest, (family, label)| {
+                    label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
+                })
+                .map(|lowest| (key, lowest))
+        })
         .collect();
     matched.sort_by_key(|&(key, confidence)| {
         (std::cmp::Reverse(confidence), std::cmp::Reverse(votes(key)), key.1)
@@ -164,6 +187,23 @@ pub fn row(
         })
         .collect();
     serde_json::json!({ "titles": titles, "total": total })
+}
+
+/// The confidence a label row needs (the label rows' own floor).
+const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
+
+/// How sure the labels are that a title carries a mood or subgenre, on the plot facets' scale (3 high, 2 medium,
+/// 1 low), or `None` under the floor.
+fn label_confidence(indexes: &Indexes, (media_type, id): Key, family: &str, label: &str) -> Option<u8> {
+    let labels = indexes.plot.labels(id, media_type)?;
+    let pairs = if family == "mood" { &labels.moods } else { &labels.subgenres };
+    let &(_, confidence) = pairs.iter().find(|(name, _)| *name == label)?;
+    match confidence {
+        c if c >= 0.8 => Some(3),
+        c if c >= 0.7 => Some(2),
+        c if c >= LABEL_FLOOR => Some(1),
+        _ => None,
+    }
 }
 
 /// Every genre anything names for a title, as TMDB genre ids: the labels' primary genre and animation, and the

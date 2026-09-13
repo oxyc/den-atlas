@@ -501,7 +501,7 @@ impl IndexQuestion {
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
             ["query"] => Some(Self::Query),
-            ["plot", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
+            ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
         }
     }
@@ -548,7 +548,8 @@ impl IndexQuestion {
                     .split('&')
                     .filter_map(|pair| pair.split_once('='))
                     .filter(|(key, _)| !matches!(*key, "skip" | "limit"))
-                    .map(|(key, value)| (percent_decode(key), percent_decode(value)))
+                    // Form-encoded, as a browser's URLSearchParams writes it: a space is a `+`.
+                    .map(|(key, value)| (percent_decode(key), percent_decode(&value.replace('+', " "))))
                     .collect();
                 crate::plotrows::row(
                     indexes,
@@ -1656,6 +1657,37 @@ mod tests {
             assert_eq!(json(body_of(resp).await)["titles"], serde_json::json!([]), "{path}");
         }
         assert_eq!(get(&state, "/index/plot/anime.json?ending=happy").await.status(), 404);
+    }
+
+    /// A row may name a mood or subgenre, alone or with the plot facets: the surest first, then the most voted.
+    #[tokio::test]
+    async fn rows_name_labels_alone_or_with_plot_facets() {
+        let state = index_state("den-atlas-label-rows");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        // Heist: movies 1 (0.9) and 2 (0.8) are sure of it, 2 has more votes; movie 3 only just (0.6).
+        let heist = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist").await).await);
+        assert_eq!(ids(&heist), vec![2, 1, 3], "{heist}");
+        assert_eq!(heist["total"], 3);
+        assert_eq!(heist["titles"][0]["title"], "Two");
+        // With bleak: movie 1 is sure of both, movie 2 low on tone; movie 3 isn't bleak.
+        let bleak = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist&tone=bleak").await).await);
+        assert_eq!(ids(&bleak), vec![1, 2], "{bleak}");
+        let tense = json(body_of(get(&state, "/index/row/movie.json?mood=Tense").await).await);
+        assert_eq!(ids(&tense), vec![1]);
+        let cult = json(body_of(get(&state, "/index/row/movie.json?subgenre=Campy%2FCult").await).await);
+        assert_eq!(ids(&cult), vec![3], "a label with a slash, percent-encoded");
+        let series = json(body_of(get(&state, "/index/row/series.json?subgenre=Heist").await).await);
+        assert_eq!(ids(&series), vec![4]);
+        for path in ["/index/row/series.json?mood=Tense", "/index/row/movie.json?mood=Nope"] {
+            assert_eq!(
+                json(body_of(get(&state, path).await).await)["titles"],
+                serde_json::json!([]),
+                "{path}"
+            );
+        }
     }
 
     /// A ranked answer from a real fixture index and facts: never what the library owns, another type, or a
