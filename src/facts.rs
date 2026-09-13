@@ -175,7 +175,7 @@ impl Facts {
             }
             let production = codes(raw.production_countries, u8::to_ascii_uppercase);
             let record = Record {
-                imdb_id: raw.imdb_id.filter(|id| id.starts_with("tt")),
+                imdb_id: raw.imdb_id.and_then(OneOrMany::first).filter(|id| id.starts_with("tt")),
                 released: raw.released.and_then(|r| Released::parse(&r.date, &r.precision)),
                 genres,
                 countries: if production.is_empty() {
@@ -186,7 +186,7 @@ impl Facts {
                 languages: codes(raw.languages, u8::to_ascii_lowercase),
                 makers,
                 cast: entities(raw.cast),
-                franchise: raw.franchise.as_deref().and_then(qid),
+                franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
             };
             // The first record wins a duplicate, as in the labels index.
             records.entry((media_type, raw.tmdb_id)).or_insert(record);
@@ -234,7 +234,7 @@ struct RawGenre {
 struct RawRecord {
     media_type: String,
     tmdb_id: u32,
-    imdb_id: Option<String>,
+    imdb_id: Option<OneOrMany>,
     released: Option<RawReleased>,
     genres: Option<Vec<String>>,
     countries: Option<Vec<String>>,
@@ -243,7 +243,25 @@ struct RawRecord {
     directors: Option<Vec<String>>,
     creators: Option<Vec<String>>,
     cast: Option<Vec<String>>,
-    franchise: Option<String>,
+    franchise: Option<OneOrMany>,
+}
+
+/// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
+/// list of them. The first is read.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn first(self) -> Option<String> {
+        match self {
+            OneOrMany::One(value) => Some(value),
+            OneOrMany::Many(values) => values.into_iter().next(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -263,10 +281,10 @@ pub(crate) mod tests {
       "entities": {"Q1": {"en": "A Director"}},
       "genreMap": {"Q100": {"movie": 80, "tv": 80}, "Q101": {"movie": 18, "tv": 18}, "Q102": {"tv": 10765}},
       "records": [
-        {"mediaType": "movie", "tmdbId": 1, "imdbId": "tt0000001",
+        {"mediaType": "movie", "tmdbId": 1, "imdbId": ["tt0000001", "tt9999999"],
          "released": {"date": "2026-09-01", "precision": "day"},
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
-         "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": "Q50"},
+         "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"]},
         {"mediaType": "tv", "tmdbId": 1, "released": {"date": "2010-00-00", "precision": "year"},
          "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "hasVector": false},
         {"mediaType": "movie", "tmdbId": 2}

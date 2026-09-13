@@ -406,37 +406,36 @@ impl<'a> Knowledge<'a> {
         let record = self.facts().and_then(|f| f.get(id, media_type));
         let mut title = Title::default();
 
-        let mut genres: Vec<u16> = record.map(|r| r.genres.clone()).unwrap_or_default();
-        if let Some(labels) = &labels {
-            let primary = genre_named(labels.primary_genre).into_iter();
-            for genre in primary.chain(labels.animated.then_some(ANIMATION)) {
-                if !genres.contains(&genre) {
-                    genres.push(genre);
-                }
-            }
-        }
-        if genres.is_empty() {
-            // A list names every genre it knows, where the labels name one. Without the facts' fuller
-            // genres to match, only a list's first genre is read, so that a title atlas has never seen isn't
-            // favoured over the library's own for carrying three genres where they carry one.
-            let hinted = hint.and_then(|h| h.genre_ids.as_deref()).unwrap_or_default();
-            let take = if self.facts().is_some() { hinted.len() } else { 1 };
-            for &genre in hinted.iter().take(take) {
-                for &folded in fold_genre(genre) {
-                    if !genres.contains(&folded) {
-                        genres.push(folded);
-                    }
-                }
-            }
-        }
-        title.genres = genres;
+        // Every genre anything named, for the hide rules.
+        let mut named: Vec<u16> = record.map(|r| r.genres.clone()).unwrap_or_default();
+        let from_facts = named.len();
         for &genre in hint.and_then(|h| h.genre_ids.as_deref()).unwrap_or_default() {
             for &folded in fold_genre(genre) {
-                if !title.hint_genres.contains(&folded) {
-                    title.hint_genres.push(folded);
+                if !named.contains(&folded) {
+                    named.push(folded);
                 }
             }
         }
+        // Taste reads one genre a title until the facts describe most of what atlas holds. The labels name one,
+        // and a title the facts or a client's list described with three would otherwise be favoured over the
+        // rest for it, whatever it is. Until then the facts are a delta for titles the corpus lacks.
+        let rich = self.facts().is_some_and(|f| f.len() * 2 >= self.indexes.plot.len());
+        let mut genres: Vec<u16> = Vec::new();
+        if let Some(labels) = &labels {
+            genres.extend(genre_named(labels.primary_genre));
+            if labels.animated && !genres.contains(&ANIMATION) {
+                genres.push(ANIMATION);
+            }
+            if rich {
+                genres.extend(named[..from_facts].iter().filter(|g| !genres.contains(g)).collect::<Vec<_>>());
+            }
+        } else {
+            // The facts' genres before a list's: a record says what the title is, a list only what it was filed as.
+            let source = if from_facts > 0 { &named[..from_facts] } else { &named[..] };
+            genres = source.iter().take(if rich { source.len() } else { 1 }).copied().collect();
+        }
+        title.genres = genres;
+        title.hint_genres = named;
 
         let language = |code: &str| -> Option<[u8; 2]> {
             match code.as_bytes() {
