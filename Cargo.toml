@@ -36,17 +36,14 @@ members = ["crates/den-index", "crates/den-titlesearch"]
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 
-# Small static binary. The dataset serving layer is dependency-light; the catalog feature adds reqwest
-# (rustls, no OpenSSL) + async-trait for the JustWatch source.
+# Speed over size, everywhere: every More Like This, search and row walks tens of thousands of records, the
+# index load parses tens of megabytes of JSON, and a size-optimised build ("z", with a per-crate override that
+# the LTO link didn't honour) left the dot-product loop at scalar speed. The binary is a few MB larger, next to
+# 75 MB of vectors it holds. The catalog feature adds reqwest (rustls, no OpenSSL) + async-trait.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
 # Unwind (not abort): a stray panic in a request task drops that one connection instead of aborting the
 # whole process into a crash-loop. Header/body builds are also made non-panicking (src/http.rs).
-
-# Speed over size for the index scans: every More Like This / search query walks tens of thousands of
-# 1024-dim int8 rows, and "z" keeps the dot-product loop from vectorising.
-[profile.release.package.den-index]
-opt-level = 3

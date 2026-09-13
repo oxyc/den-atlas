@@ -419,10 +419,46 @@ impl ScanStats {
     }
 }
 
-/// int8 · int8, accumulated in i32 (1024 dims × 127² fits with room to spare). The bytes are int8 stored as
-/// u8, so each is reinterpreted before the multiply.
+/// int8 · int8, accumulated in i32 (1024 dims × 128² fits with room to spare). The bytes are int8 stored as
+/// u8, so each is reinterpreted before the multiply. Every scan is this ~38k times over, so on a CPU with AVX2
+/// it runs sixteen dimensions at a time; the image stays portable, since the check is made where it runs.
 fn dot(a: &[u8], b: &[u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU supports AVX2, checked just above.
+        return unsafe { dot_avx2(a, b) };
+    }
+    dot_scalar(a, b)
+}
+
+fn dot_scalar(a: &[u8], b: &[u8]) -> i32 {
     a.iter().zip(b).map(|(&x, &y)| i32::from(x as i8) * i32::from(y as i8)).sum()
+}
+
+/// `dot` sixteen bytes at a time: both sides sign-extended to 16 bits, multiplied and added pairwise into 32 bits
+/// (`madd`), the eight lanes summed at the end, and a tail under sixteen bytes done one at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(a: &[u8], b: &[u8]) -> i32 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm_loadu_si128,
+    };
+    let n = a.len().min(b.len());
+    let mut sum = _mm256_setzero_si256();
+    let mut at = 0;
+    while at + 16 <= n {
+        // SAFETY: `at + 16 <= n`, and both slices hold at least `n` bytes; `loadu` reads unaligned.
+        let (x, y) = unsafe {
+            (_mm_loadu_si128(a.as_ptr().add(at).cast()), _mm_loadu_si128(b.as_ptr().add(at).cast()))
+        };
+        sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_cvtepi8_epi16(x), _mm256_cvtepi8_epi16(y)));
+        at += 16;
+    }
+    let mut lanes = [0i32; 8];
+    // SAFETY: `lanes` is 32 bytes, the width of one __m256i; `storeu` writes unaligned.
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sum) };
+    lanes.iter().fold(0i32, |total, &lane| total.wrapping_add(lane)) + dot_scalar(&a[at..n], &b[at..n])
 }
 
 /// The label → titles buckets for one label family. A record joins each label once, with the confidence of
@@ -463,6 +499,22 @@ fn vector_dimension(blob: &[u8], rows: usize) -> Result<usize, LoadError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_simd_dot_product_matches_the_scalar_one() {
+        let bytes = |multiplier: u32, n: usize| -> Vec<u8> {
+            (0..n as u32)
+                .map(|i| (i.wrapping_mul(multiplier).wrapping_add(0x9e37_79b9) >> 11) as u8)
+                .collect()
+        };
+        for n in [0, 1, 15, 16, 17, 1024, 1027] {
+            let (a, b) = (bytes(2_654_435_761, n), bytes(40_503, n));
+            assert_eq!(dot(&a, &b), dot_scalar(&a, &b), "{n} dimensions");
+        }
+        // -128 everywhere: the largest product there is, 1024 times over.
+        let extreme = vec![0x80u8; 1024];
+        assert_eq!(dot(&extreme, &extreme), 1024 * 16384);
+    }
 
     /// One fixture title: id, type, primary genre, animated, subgenres, moods, vector.
     pub(crate) type Row<'a> =
