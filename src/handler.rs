@@ -628,7 +628,9 @@ async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
 }
 
 /// Semantic search in one request: embed the query, then the plot index's nearest titles to it — the tvOS
-/// app's `semanticSearch`. The error is why den-embed couldn't answer.
+/// app's `semanticSearch` — each with its score, and the mean and standard deviation of the whole scan, so a
+/// client can drop what barely stands out from this query's own spread. The error is why den-embed couldn't
+/// answer.
 async fn search_answer(
     state: &AppState,
     indexes: &crate::queries::Indexes,
@@ -640,13 +642,13 @@ async fn search_answer(
     }
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
     let vector = embed_query(state, &text).await?;
-    let titles: Vec<(u32, den_index::MediaType)> = indexes
-        .plot
-        .nearest_to_vector(&vector, media_type, SEMANTIC_K)
-        .into_iter()
-        .map(|n| (n.tmdb_id, n.media_type))
+    let (neighbours, stats) =
+        indexes.plot.scan_vector(&vector, |_, kind| media_type.is_none_or(|want| want == kind), SEMANTIC_K);
+    let titles: Vec<serde_json::Value> = neighbours
+        .iter()
+        .map(|n| serde_json::json!({ "type": stremio_type(n.media_type), "id": n.tmdb_id, "score": n.score }))
         .collect();
-    Ok(serde_json::json!({ "titles": titles_json(&titles) }).to_string())
+    Ok(serde_json::json!({ "titles": titles, "mean": stats.mean, "sd": stats.sd }).to_string())
 }
 
 /// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
@@ -661,13 +663,15 @@ async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, quer
     if !facet.leftover.is_empty() && !titles.is_empty() {
         match embed_query(state, &facet.leftover).await {
             Ok(vector) => {
+                // Ranked within the facet's own titles. Taking the corpus-wide nearest and keeping those that
+                // match the facet left "korean heist" with a title or two lifted and the rest in vote order.
                 let matched: std::collections::HashSet<_> = titles.iter().copied().collect();
                 let head: Vec<_> = indexes
                     .plot
-                    .nearest_to_vector(&vector, None, SEMANTIC_K)
+                    .scan_vector(&vector, |id, kind| matched.contains(&(id, kind)), FACET_LIMIT)
+                    .0
                     .into_iter()
                     .map(|n| (n.tmdb_id, n.media_type))
-                    .filter(|t| matched.contains(t))
                     .collect();
                 let lifted: std::collections::HashSet<_> = head.iter().copied().collect();
                 titles = head.into_iter().chain(titles.into_iter().filter(|t| !lifted.contains(t))).collect();
@@ -1519,7 +1523,13 @@ mod tests {
         let search = get(&state, "/index/search.json?q=campy+fun").await;
         assert_eq!(search.headers()["cache-control"], "public, max-age=300", "an embedded query stays short");
         let search = json(body_of(search).await);
-        assert_eq!(search["titles"][0], serde_json::json!({"type": "movie", "id": 3}));
+        assert_eq!(
+            (&search["titles"][0]["type"], &search["titles"][0]["id"]),
+            (&serde_json::json!("movie"), &serde_json::json!(3))
+        );
+        // Each hit carries its score, and the scan its spread, so a client can floor what barely stands out.
+        assert_eq!(search["titles"][0]["score"], 10_000);
+        assert!(search["mean"].is_f64() && search["sd"].as_f64().unwrap() > 0.0, "{search}");
 
         let korean = json(body_of(get(&state, "/index/facets.json?q=korean%20movies").await).await);
         assert_eq!(korean["facet"]["country"], "KR");

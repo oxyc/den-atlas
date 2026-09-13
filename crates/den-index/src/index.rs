@@ -345,11 +345,42 @@ impl Index {
             .collect()
     }
 
+    /// The `k` titles nearest to an outside vector among those `include` admits, best first, and the mean and
+    /// standard deviation of every admitted title's score — so a caller can read a score against this query's own
+    /// spread instead of calibrating raw dot products, which shift with the query. Empty on a dimension mismatch.
+    pub fn scan_vector(
+        &self,
+        query: &[i8],
+        include: impl Fn(u32, MediaType) -> bool,
+        k: usize,
+    ) -> (Vec<Neighbor>, ScanStats) {
+        if query.len() != self.dim {
+            return (Vec::new(), ScanStats::default());
+        }
+        let query: Vec<u8> = query.iter().map(|&v| v as u8).collect();
+        let scored = self.scores(
+            |row| {
+                let record = &self.records[row];
+                record.media_type.is_some_and(|kind| include(record.tmdb_id, kind))
+            },
+            &query,
+        );
+        let stats = ScanStats::of(&scored);
+        (self.best(scored, k), stats)
+    }
+
     fn top_k(&self, k: usize, include: impl Fn(usize) -> bool, query: &[u8]) -> Vec<Neighbor> {
-        let mut scored: Vec<(i32, u32)> = (0..self.records.len())
+        self.best(self.scores(include, query), k)
+    }
+
+    fn scores(&self, include: impl Fn(usize) -> bool, query: &[u8]) -> Vec<(i32, u32)> {
+        (0..self.records.len())
             .filter(|&row| include(row))
             .map(|row| (dot(query, self.row_vector(row)), row as u32))
-            .collect();
+            .collect()
+    }
+
+    fn best(&self, mut scored: Vec<(i32, u32)>, k: usize) -> Vec<Neighbor> {
         let order = |a: &(i32, u32), b: &(i32, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
         if scored.len() > k {
             if k == 0 {
@@ -366,6 +397,25 @@ impl Index {
                 Some(Neighbor { tmdb_id: record.tmdb_id, media_type: record.media_type?, score })
             })
             .collect()
+    }
+}
+
+/// The spread of one scan's scores: their mean and standard deviation, zero when nothing was scanned.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScanStats {
+    pub mean: f64,
+    pub sd: f64,
+}
+
+impl ScanStats {
+    fn of(scored: &[(i32, u32)]) -> ScanStats {
+        if scored.is_empty() {
+            return ScanStats::default();
+        }
+        let n = scored.len() as f64;
+        let mean = scored.iter().map(|&(s, _)| f64::from(s)).sum::<f64>() / n;
+        let variance = scored.iter().map(|&(s, _)| (f64::from(s) - mean).powi(2)).sum::<f64>() / n;
+        ScanStats { mean, sd: variance.sqrt() }
     }
 }
 
@@ -470,6 +520,24 @@ pub(crate) mod tests {
         assert_eq!(idx.titles_with_subgenre("Survival", None, 0.55, 0, 10), vec![(4, MediaType::Movie)]);
         assert_eq!(idx.titles_with_subgenre("Heist", None, 0.0, 1, 1), vec![(1, MediaType::Movie)], "paging");
         assert!(idx.titles_with_mood("Nope", None, 0.0, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn a_scan_ranks_only_what_it_admits_and_reports_their_spread() {
+        let idx = sample();
+        let (near, stats) = idx.scan_vector(&[100, 0, 0], |_, kind| kind == MediaType::Movie, 2);
+        assert_eq!(near.iter().map(|n| n.tmdb_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(near[0].score, 10_000);
+        // Over the three films admitted: 10000, 9000 and 0.
+        assert!((stats.mean - 19_000.0 / 3.0).abs() < 1e-9);
+        let variance =
+            [10_000.0f64, 9_000.0, 0.0].iter().map(|s| (s - stats.mean).powi(2)).sum::<f64>() / 3.0;
+        assert!((stats.sd - variance.sqrt()).abs() < 1e-9);
+        assert_eq!(
+            idx.scan_vector(&[1, 2], |_, _| true, 5),
+            (Vec::new(), ScanStats::default()),
+            "another space"
+        );
     }
 
     #[test]

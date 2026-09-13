@@ -11,7 +11,7 @@ mod index;
 mod similar;
 
 pub use facets::{FacetIndex, FacetQuery, TitleFacets};
-pub use index::{Index, Labels, LoadError, Neighbor, DISPLAY_CONFIDENCE_FLOOR};
+pub use index::{Index, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
 pub use similar::more_like_this;
 
 /// The two kinds of title in the index (`"movie"` / `"tv"` in the labels blob).
