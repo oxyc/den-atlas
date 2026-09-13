@@ -343,6 +343,9 @@ pub struct Title<'a> {
     pub people: Vec<(u32, f64)>,
     pub franchise: Option<u32>,
     pub labels: Option<LabelSet<'a>>,
+    /// Every genre a client's hint named, folded like `genres`. Taste may read only the first of them; the hide
+    /// rules read them all, so a hidden genre named second still hides the title.
+    pub hint_genres: Vec<u16>,
     pub adult: bool,
     pub imdb_id: Option<String>,
 }
@@ -427,6 +430,13 @@ impl<'a> Knowledge<'a> {
             }
         }
         title.genres = genres;
+        for &genre in hint.and_then(|h| h.genre_ids.as_deref()).unwrap_or_default() {
+            for &folded in fold_genre(genre) {
+                if !title.hint_genres.contains(&folded) {
+                    title.hint_genres.push(folded);
+                }
+            }
+        }
 
         let language = |code: &str| -> Option<[u8; 2]> {
             match code.as_bytes() {
@@ -840,6 +850,7 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
             people: either(x.people, y.people),
             franchise: x.franchise.or(y.franchise),
             labels: x.labels.or(y.labels),
+            hint_genres: either(x.hint_genres, y.hint_genres),
             adult: x.adult || y.adult,
             imdb_id: x.imdb_id.or(y.imdb_id),
         },
@@ -860,9 +871,6 @@ pub fn pick<'a>(
     let mut order: Vec<Key> = Vec::new();
     let mut by_key: HashMap<Key, Candidate<'a>> = HashMap::new();
     for candidate in candidates {
-        if !keep(&candidate) || stranger_here(&candidate.title, taste) {
-            continue;
-        }
         let merged = match by_key.remove(&candidate.key) {
             Some(already) => merge(already, candidate),
             None => {
@@ -872,7 +880,13 @@ pub fn pick<'a>(
         };
         by_key.insert(merged.key, merged);
     }
-    let running: Vec<Candidate<'a>> = order.into_iter().filter_map(|key| by_key.remove(&key)).collect();
+    // Judged once everything known about a title is together: filtering each copy first let a copy that knew
+    // nothing — atlas's own lists name a title by id — through a rule its described copy was dropped by.
+    let running: Vec<Candidate<'a>> = order
+        .into_iter()
+        .filter_map(|key| by_key.remove(&key))
+        .filter(|c| keep(c) && !stranger_here(&c.title, taste))
+        .collect();
     let busiest = running.iter().filter_map(|c| c.title.popularity).fold(0.0, f64::max);
     let mut scored: Vec<(Candidate<'a>, Why)> = running
         .into_iter()
@@ -904,6 +918,7 @@ fn hidden(candidate: &Candidate<'_>, hide: &Hide) -> bool {
     // A series' genres as TMDB names them for series as well as for films, so a rule written against either
     // name catches it.
     let mut genres = title.genres.clone();
+    genres.extend(title.hint_genres.iter().filter(|g| !title.genres.contains(g)));
     if candidate.key.0 == MediaType::Tv {
         for (series, films) in [(10759, [28, 12]), (10765, [878, 14]), (10768, [10752, 10752])] {
             if films.iter().any(|g| genres.contains(g)) {
@@ -1554,6 +1569,20 @@ mod tests {
         assert!(hidden(&cand(1, anime), &rules));
         assert!(hidden(&cand(1, Title { adult: true, ..Title::default() }), &Hide::default()));
         assert!(!hidden(&cand(1, Title::default()), &rules));
+        // Taste read only the first genre a hint named; the rules read them all.
+        let hinted = Title { hint_genres: vec![18, 14], ..film(&[18], "") };
+        assert!(hidden(&series(hinted), &rules));
+    }
+
+    #[test]
+    fn a_rule_hides_a_title_even_when_a_copy_that_knew_nothing_came_first() {
+        let rules = Hide { languages: vec!["ta".into()], ..Hide::default() };
+        let listed =
+            Candidate { arrival: Some(Placing { rank: 0.0, of: 10.0 }), ..cand(7, Title::default()) };
+        let described = cand(7, Title { original_language: Some(*b"ta"), ..film(&[DRAMA], "") });
+        let other = cand(8, Title { released: on("2026-09-01"), ..Title::default() });
+        let picked = pick(vec![listed, described, other], now(), 40, |c| !hidden(c, &rules), None);
+        assert_eq!(ids(&picked), vec![8]);
     }
 
     #[test]
