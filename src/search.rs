@@ -5,12 +5,16 @@
 //! display titles atlas draws with), the facet's titles, a label's or plot facet's titles, and the plot vectors'
 //! nearest to the leftover. Every candidate is scored on every signal, whichever lane found it:
 //!
-//! `S = Φ · [2.0·T + w_sem·Sem + 0.25·L + 0.10·PF + 0.15·Pop]`, `w_sem = 0.6·(0.3 + 0.7·λ)·(1 − 0.7·exact)`
+//! `S = Φ · [2.0·T + w_sem·Sem + 0.25·L + 0.10·PF + 0.15·Pop·R]`, `w_sem = 0.6·(0.3 + 0.7·λ)·(1 − 0.7·exact)`
 //!
 //! A title match is weighted so that an exact title (T ≥ 0.6, so ≥ 1.2) always beats a match on theme alone (at
 //! most 0.6 + 0.25 + 0.10 + 0.15 = 1.10); the plot vectors count for more the more of the query is left over (λ),
 //! and far less once an exact title answered, since they hold no titles and would only add what sounds alike.
-//! The weights are starting values, to be tuned against a judged query set.
+//! A near title match counts only for the leftover's share (T·λ): a query of words atlas reads ("bleak") asks for
+//! the theme, not for "Leak" or "Bleach". Popularity counts only as far as the title is relevant at all (R, the
+//! strongest of its other signals), so a famous title that merely sounds alike doesn't pass a closer one.
+//! A candidate relevant to nothing is dropped. The weights are starting values, to be tuned against a judged
+//! query set.
 
 use crate::queries::Indexes;
 use den_index::{FacetQuery, MediaType};
@@ -333,9 +337,9 @@ pub fn answer(
     let exact_answered = scored.iter().any(|s| s.exact && s.pop >= EXACT_POPULAR);
     let w_sem = W_SEMANTIC * (0.3 + 0.7 * parsed.lambda) * if exact_answered { 0.3 } else { 1.0 };
     for s in &mut scored {
-        s.score = s.phi
-            * (W_TITLE * s.t + w_sem * s.sem + W_LABEL * s.lab + W_PLOT_FACET * s.pf + W_POPULARITY * s.pop);
+        s.score = score(s, w_sem, facet_set.as_ref().is_some_and(|set| set.contains(&s.key)));
     }
+    scored.retain(|s| s.score > 0.0);
     let votes =
         |(kind, id): Key| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
     scored.sort_by(|a, b| {
@@ -379,6 +383,8 @@ pub fn answer(
             });
             spliced.extend(s);
         }
+        // Best first among them; those found only as similar (score 0) keep More Like This's order.
+        spliced[1..].sort_by(|a, b| b.score.total_cmp(&a.score));
         spliced.extend(rest.into_iter().filter(|s| placed.insert(s.key)));
         scored = spliced;
     }
@@ -428,6 +434,20 @@ pub fn answer(
         "hits": hits,
         "total": total,
     })
+}
+
+/// `S`, with `in_facet` for a title inside the country or decade the query names.
+fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
+    let relevance = [s.t / EXACT_TITLE, s.sem, s.lab, s.pf, if in_facet { 1.0 } else { 0.0 }]
+        .into_iter()
+        .fold(0.0, f64::max)
+        .min(1.0);
+    s.phi
+        * (W_TITLE * s.t
+            + w_sem * s.sem
+            + W_LABEL * s.lab
+            + W_PLOT_FACET * s.pf
+            + W_POPULARITY * s.pop * relevance)
 }
 
 /// A candidate's features, or `None` when a facet it has a record of contradicts the query.
@@ -482,7 +502,7 @@ fn features(
     for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card) {
         let (score, is_exact) = title_match(&parsed.text, title);
         exact |= is_exact;
-        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score });
+        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
     }
 
     let sem = found.z.map_or(0.0, |z| ((z - SEMANTIC_FLOOR_Z) / SEMANTIC_SPAN_Z).clamp(0.0, 1.0));
@@ -565,5 +585,25 @@ mod tests {
         let theme = W_SEMANTIC + W_LABEL + W_PLOT_FACET + W_POPULARITY;
         assert!(exact > theme, "{exact} {theme}");
         assert!(W_TITLE * FUZZY_CAP < exact);
+    }
+
+    #[test]
+    fn popularity_counts_only_as_far_as_a_title_is_relevant() {
+        let hit = |sem, pop| Scored {
+            key: (MediaType::Movie, 1),
+            score: 0.0,
+            exact: false,
+            t: 0.0,
+            sem,
+            lab: 0.0,
+            pf: 0.0,
+            pop,
+            phi: 1.0,
+        };
+        // "movies about grief": a closer, less voted film against a famous one that merely sounds alike.
+        let w_sem = W_SEMANTIC * (0.3 + 0.7 * 0.67);
+        assert!(score(&hit(0.37, 0.67), w_sem, false) > score(&hit(0.30, 0.95), w_sem, false));
+        assert_eq!(score(&hit(0.0, 1.0), w_sem, false), 0.0);
+        assert!(score(&hit(0.0, 1.0), w_sem, true) > 0.0, "a facet's titles rank by popularity");
     }
 }
