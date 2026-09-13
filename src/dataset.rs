@@ -96,6 +96,12 @@ pub struct Meta {
     pub facts_slim_file: Option<String>,
     #[serde(rename = "factsSlimGzFile")]
     pub facts_slim_gz_file: Option<String>,
+    // Plot facets (optional) — closed browse axes read from Wikipedia plots (ending, era, structure, …) for
+    // `/index/plot` rows. Read from disk, never served. Absent ⇒ those rows are empty.
+    #[serde(rename = "plotFacetsFile")]
+    pub plot_facets_file: Option<String>,
+    #[serde(rename = "plotFacetsGzFile")]
+    pub plot_facets_gz_file: Option<String>,
 }
 
 pub struct Gz {
@@ -127,6 +133,8 @@ pub struct Dataset {
     pub premise_vectors: Option<Blob>,
     /// The Wikidata facts file `/recommend` reads (optional; never served).
     pub facts: Option<PathBuf>,
+    /// The plot facets file `/index/plot` rows read (optional; never served).
+    pub plot_facets: Option<PathBuf>,
     /// DT-I compact facet blob (optional).
     pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
@@ -231,6 +239,11 @@ impl Dataset {
             .flatten()
             .filter_map(|name| safe_blob_path(dir, name).ok())
             .find(|path| path.is_file());
+        let plot_facets = [&meta.plot_facets_file, &meta.plot_facets_gz_file]
+            .into_iter()
+            .flatten()
+            .filter_map(|name| safe_blob_path(dir, name).ok())
+            .find(|path| path.is_file());
         let last_modified = meta.last_modified_http.clone();
         // Writers withdraw the descriptor before replacing any blob and publish it last. A load
         // that overlaps that interval must not bind new files to a descriptor read before it.
@@ -247,6 +260,7 @@ impl Dataset {
             premise_labels,
             premise_vectors,
             facts,
+            plot_facets,
             facets,
             last_modified,
         })

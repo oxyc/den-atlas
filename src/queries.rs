@@ -5,8 +5,10 @@
 
 use crate::dataset::Dataset;
 use crate::facts::Facts;
+use crate::plotrows::{read_cards, Card, PlotFacets};
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +27,9 @@ pub struct Indexes {
     /// The Wikidata facts, when the dataset ships a file that reads; without them `/recommend` reads labels and
     /// facets alone.
     pub facts: Option<Facts>,
+    /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
+    pub plot_facets: Option<PlotFacets>,
+    pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
 }
 
 /// A labels blob and its vectors blob.
@@ -35,6 +40,8 @@ pub struct IndexQueries {
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
     facts: Option<PathBuf>,
+    plot_facets: Option<PathBuf>,
+    metadata: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
@@ -52,6 +59,8 @@ impl IndexQueries {
             premise,
             facets: ds.facets.as_ref().map(|f| f.path.clone()),
             facts: ds.facts.clone(),
+            plot_facets: ds.plot_facets.clone(),
+            metadata: ds.metadata.as_ref().map(|m| m.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
         }
@@ -68,19 +77,25 @@ impl IndexQueries {
             return Ok((indexes, None));
         }
         let started = Instant::now();
-        let (plot, premise, facets, facts) =
-            (self.plot.clone(), self.premise.clone(), self.facets.clone(), self.facts.clone());
-        let indexes = tokio::task::spawn_blocking(move || {
-            load(&plot, premise.as_ref(), facets.as_ref(), facts.as_ref())
-        })
-        .await
-        .map_err(|e| format!("load task: {e}"))??;
+        let sources = Sources {
+            plot: self.plot.clone(),
+            premise: self.premise.clone(),
+            facets: self.facets.clone(),
+            facts: self.facts.clone(),
+            plot_facets: self.plot_facets.clone(),
+            metadata: self.metadata.clone(),
+        };
+        let indexes = tokio::task::spawn_blocking(move || load(&sources))
+            .await
+            .map_err(|e| format!("load task: {e}"))??;
         let took = started.elapsed();
-        let premise = indexes.premise.as_ref().map_or("none".to_owned(), |p| format!("{} titles", p.len()));
-        let facets = indexes.facets.as_ref().map_or("none".to_owned(), |f| format!("{} titles", f.len()));
-        let facts = indexes.facts.as_ref().map_or("none".to_owned(), |f| format!("{} titles", f.len()));
+        let count = |n: Option<usize>| n.map_or("none".to_owned(), |n| format!("{n} titles"));
+        let premise = count(indexes.premise.as_ref().map(Index::len));
+        let facets = count(indexes.facets.as_ref().map(FacetIndex::len));
+        let facts = count(indexes.facts.as_ref().map(Facts::len));
+        let plot_facets = count(indexes.plot_facets.as_ref().map(PlotFacets::len));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, in {:.1}s",
+            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, in {:.1}s",
             indexes.plot.len(),
             took.as_secs_f64()
         );
@@ -119,15 +134,20 @@ pub async fn release_when_idle(queries: Arc<IndexQueries>) {
     }
 }
 
-fn load(
-    plot: &BlobPair,
-    premise: Option<&BlobPair>,
-    facets: Option<&PathBuf>,
-    facts: Option<&PathBuf>,
-) -> Result<Indexes, String> {
-    let plot = read_index(plot)?;
+/// Where each part of the indexes is read from.
+struct Sources {
+    plot: BlobPair,
+    premise: Option<BlobPair>,
+    facets: Option<PathBuf>,
+    facts: Option<PathBuf>,
+    plot_facets: Option<PathBuf>,
+    metadata: Option<PathBuf>,
+}
+
+fn load(sources: &Sources) -> Result<Indexes, String> {
+    let plot = read_index(&sources.plot)?;
     // Like the premise index, an unusable facet blob costs only its own feature.
-    let facets = facets.and_then(|path| match std::fs::read(path) {
+    let facets = sources.facets.as_ref().and_then(|path| match std::fs::read(path) {
         Ok(blob) => FacetIndex::from_blob(&blob).or_else(|| {
             eprintln!("facet index {} is not a DFI2 blob — facet search is off", path.display());
             None
@@ -138,18 +158,25 @@ fn load(
         }
     });
     // A broken premise index costs premise-led More Like This, not the whole feature.
-    let premise = premise.and_then(|pair| {
+    let premise = sources.premise.as_ref().and_then(|pair| {
         read_index(pair)
             .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
             .ok()
     });
     // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
-    let facts = facts.and_then(|path| {
+    let facts = sources.facts.as_ref().and_then(|path| {
         Facts::read(path)
             .map_err(|e| eprintln!("facts unusable ({e}) — /recommend reads labels and facets only"))
             .ok()
     });
-    Ok(Indexes { plot, premise, facets, facts })
+    // Plot facet rows need both the facets and the cards to draw them with.
+    let plot_facets = sources.plot_facets.as_ref().and_then(|path| {
+        PlotFacets::read(path).map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty")).ok()
+    });
+    let cards = plot_facets.as_ref().and(sources.metadata.as_ref()).and_then(|path| {
+        read_cards(path).map_err(|e| eprintln!("metadata unusable ({e}) — plot rows are empty")).ok()
+    });
+    Ok(Indexes { plot, premise, facets, facts, plot_facets, cards })
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {
@@ -217,8 +244,19 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
     }
     std::fs::write(dir.join("facets.bin"), &facets).unwrap();
     std::fs::write(dir.join("facts-slim.json"), crate::facts::tests::SAMPLE).unwrap();
+    std::fs::write(dir.join("plot-facets.json"), crate::plotrows::tests::SAMPLE).unwrap();
+    let metadata = serde_json::json!([
+        {"tmdbId": 1, "mediaType": "movie", "title": "One", "posterPath": "/1.jpg", "year": 1985},
+        {"tmdbId": 2, "mediaType": "movie", "title": "Two", "posterPath": "/2.jpg", "year": 1995},
+        {"tmdbId": 3, "mediaType": "movie", "title": "Three", "posterPath": null, "year": 1985},
+        {"tmdbId": 4, "mediaType": "tv", "title": "Four", "posterPath": "/4.jpg", "year": 2010},
+    ])
+    .to_string();
+    std::fs::write(dir.join("metadata.json"), &metadata).unwrap();
     let meta = serde_json::json!({
         "factsSlimFile": "facts-slim.json",
+        "plotFacetsFile": "plot-facets.json",
+        "metadataFile": "metadata.json", "metadataBytes": metadata.len(), "metadataSha256": "f",
         "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 4,
         "quantization": "int8",
         "labelsFile": "labels.json", "labelsBytes": plot.0.len(), "labelsSha256": "a",

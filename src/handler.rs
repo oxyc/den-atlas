@@ -471,6 +471,10 @@ enum IndexQuestion {
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
     Facets,
+    /// A row of the plot facets named in the query (`?ending=bittersweet&tone=bleak`).
+    Plot {
+        media_type: den_index::MediaType,
+    },
 }
 
 impl IndexQuestion {
@@ -494,6 +498,7 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
+            ["plot", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
         }
     }
@@ -531,6 +536,24 @@ impl IndexQuestion {
                 let ids: Vec<u32> =
                     plot.nearest(*tmdb_id, *media_type, k).iter().map(|n| n.tmdb_id).collect();
                 serde_json::json!({ "ids": ids })
+            }
+            Self::Plot { media_type } => {
+                let number = |key: &str, default: usize| {
+                    query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
+                };
+                let constraints: Vec<(String, String)> = query
+                    .split('&')
+                    .filter_map(|pair| pair.split_once('='))
+                    .filter(|(key, _)| !matches!(*key, "skip" | "limit"))
+                    .map(|(key, value)| (percent_decode(key), percent_decode(value)))
+                    .collect();
+                crate::plotrows::row(
+                    indexes,
+                    *media_type,
+                    &constraints,
+                    number("skip", 0),
+                    number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
+                )
             }
             Self::Search | Self::Facets => unreachable!("answered in handle_index"),
         };
@@ -1512,6 +1535,40 @@ mod tests {
         );
         let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
         assert_eq!(none["facet"], serde_json::Value::Null);
+    }
+
+    /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards
+    /// with what a client's hide rules read, paged — and empty, not an error, for a facet nobody carries.
+    #[tokio::test]
+    async fn plot_rows_answer_from_the_plot_facets() {
+        let state = index_state("den-atlas-plot-rows");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        // High confidence first (2 and 3), then by votes: 2 has 500, 3 has 50; movie 1 is only medium.
+        let bittersweet = json(body_of(get(&state, "/index/plot/movie.json?ending=bittersweet").await).await);
+        assert_eq!(ids(&bittersweet), vec![2, 3, 1]);
+        assert_eq!(bittersweet["total"], 3);
+        assert_eq!(bittersweet["titles"][0]["title"], "Two");
+        assert_eq!(bittersweet["titles"][0]["posterPath"], "/2.jpg");
+        // Movie 1: primary genre Drama, and crime and drama from its facts.
+        assert_eq!(bittersweet["titles"][2]["genreIds"], serde_json::json!([18, 80]));
+        let paged = json(
+            body_of(get(&state, "/index/plot/movie.json?ending=bittersweet&skip=1&limit=1").await).await,
+        );
+        assert_eq!(ids(&paged), vec![3]);
+        let bleak =
+            json(body_of(get(&state, "/index/plot/movie.json?ending=bittersweet&tone=bleak").await).await);
+        assert_eq!(ids(&bleak), vec![1, 2], "movie 1 is medium on both; movie 2 is low on tone");
+        let series = json(body_of(get(&state, "/index/plot/series.json?ending=bittersweet").await).await);
+        assert_eq!(ids(&series), vec![4]);
+        for path in ["/index/plot/movie.json?ending=sad", "/index/plot/movie.json"] {
+            let resp = get(&state, path).await;
+            assert_eq!(resp.status(), 200, "{path}");
+            assert_eq!(json(body_of(resp).await)["titles"], serde_json::json!([]), "{path}");
+        }
+        assert_eq!(get(&state, "/index/plot/anime.json?ending=happy").await.status(), 404);
     }
 
     /// A ranked answer from a real fixture index and facts: never what the library owns, another type, or a

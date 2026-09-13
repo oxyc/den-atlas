@@ -12,6 +12,7 @@ mod http;
 mod justwatch;
 mod manifest;
 mod metrics;
+mod plotrows;
 mod queries;
 mod recommend;
 mod titles;

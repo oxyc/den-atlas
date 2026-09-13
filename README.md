@@ -107,6 +107,7 @@ origin.
 | `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
+| `GET /index/plot/<movie\|series>.json?<axis>=<value>…&skip=&limit=` | with `INDEX_QUERIES` on: a browse row from the dataset's plot facets (`plotFacetsFile`: ending, era, structure, pacing, tone, …) — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total}`, the titles carrying every facet named, most confident then most voted, 24 a page, at most 100. Rows only: the facets cover part of the corpus, so a missing facet is unknown and nothing filters on them |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |

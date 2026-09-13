@@ -290,7 +290,7 @@ const GENRE_IDS: &[u16] = &[
 ];
 
 /// The labels' primary genre (TMDB's film genre names) as its id. Never "Animation": that is `animated`.
-fn genre_named(name: &str) -> Option<u16> {
+pub(crate) fn genre_named(name: &str) -> Option<u16> {
     Some(match name {
         "Action" => 28,
         "Adventure" => 12,

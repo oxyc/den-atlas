@@ -178,6 +178,8 @@ mod tests {
                 facts_gz_file: None,
                 facts_slim_file: None,
                 facts_slim_gz_file: None,
+                plot_facets_file: None,
+                plot_facets_gz_file: None,
             },
             labels: blob("labels-t02.json"),
             vectors: blob("vectors-bge-m3.bin"),
@@ -185,6 +187,7 @@ mod tests {
             premise_labels: None,
             premise_vectors: None,
             facts: None,
+            plot_facets: None,
             facets: None,
             last_modified: None,
         }
