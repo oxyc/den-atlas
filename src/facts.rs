@@ -8,7 +8,7 @@
 use den_index::MediaType;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::Path;
 
 /// The file layout this reader understands (`"schema"` in the file).
@@ -107,25 +107,30 @@ pub struct Record {
     pub franchise: Option<u32>,
     /// Where a series first aired (P449): its network or service.
     pub broadcasters: Vec<u32>,
-    /// Every name it goes by: its English title, its original title and its aliases.
-    pub titles: Vec<String>,
 }
 
 /// Someone the facts credit as a director, creator or cast member.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Person {
-    pub name: String,
+    pub name: Box<str>,
     /// Their TMDB person id (P4985), when Wikidata has it.
     pub tmdb_id: Option<u32>,
 }
 
+/// The names each title goes by besides the one it is displayed under: its English title, original title and
+/// aliases.
+pub type Titles = HashMap<(MediaType, u32), Vec<Box<str>>>;
+
 pub struct Facts {
     records: HashMap<(MediaType, u32), Record>,
-    people: HashMap<u32, Person>,
-    /// Names and aliases as `name_key` reads them → the people going by each, most credited first.
-    named: HashMap<String, Vec<u32>>,
-    /// Each person's titles, as maker or cast.
-    credits: HashMap<u32, Vec<(MediaType, u32)>>,
+    /// The credited people, sorted by Q-id.
+    people: Vec<(u32, Person)>,
+    /// Each name and alias, as a hash of its `name_key`, and who goes by it: sorted by hash, then most credited
+    /// first. A hash rather than the name keeps ~170k strings out of memory; two of them sharing a 64-bit hash is
+    /// a one-in-a-billion chance.
+    named: Vec<(u64, u32)>,
+    /// Every title's other names, until the display title index takes them (`take_titles`).
+    titles: Titles,
 }
 
 /// How a name is looked up: folded, and its words joined by single spaces, so "Bong Joon-ho" is "bong joon ho".
@@ -146,38 +151,66 @@ impl Facts {
 
     /// A credited person, by Q-id.
     pub fn person(&self, qid: u32) -> Option<&Person> {
-        self.people.get(&qid)
+        self.people.binary_search_by_key(&qid, |(q, _)| *q).ok().map(|i| &self.people[i].1)
     }
 
     /// The people going by a name (`name_key`), most credited first.
-    pub fn people_named(&self, key: &str) -> &[u32] {
-        self.named.get(key).map_or(&[], Vec::as_slice)
+    pub fn people_named(&self, key: &str) -> Vec<u32> {
+        let hash = fnv1a(key);
+        let start = self.named.partition_point(|&(h, _)| h < hash);
+        self.named[start..].iter().take_while(|&&(h, _)| h == hash).map(|&(_, qid)| qid).collect()
     }
 
-    /// A person's titles, as maker or cast.
-    pub fn credits(&self, qid: u32) -> &[(MediaType, u32)] {
-        self.credits.get(&qid).map_or(&[], Vec::as_slice)
+    /// A person's titles, each with whether they made it (directed or created) rather than only appeared in it.
+    /// Read off the records rather than kept, since a query asks about a person or two.
+    pub fn credits(&self, qid: u32) -> Vec<((MediaType, u32), bool)> {
+        self.records
+            .iter()
+            .filter_map(|(&key, r)| {
+                if r.makers.contains(&qid) {
+                    Some((key, true))
+                } else {
+                    r.cast.contains(&qid).then_some((key, false))
+                }
+            })
+            .collect()
+    }
+
+    /// Every title's other names, handed over once: the display title index keeps them, so the facts don't.
+    pub fn take_titles(&mut self) -> Titles {
+        std::mem::take(&mut self.titles)
     }
 
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
-    /// Read a facts file, plain or gzipped.
+    /// Read a facts file, plain or gzipped, as a stream: the file itself is never held in memory.
     pub fn read(path: &Path) -> Result<Facts, String> {
-        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        Facts::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
+        let file = std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let gzipped = reader
+            .fill_buf()
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .starts_with(&[0x1f, 0x8b]);
+        let facts = if gzipped {
+            Facts::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(reader)))
+        } else {
+            Facts::from_reader(reader)
+        };
+        facts.map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn from_bytes(raw: &[u8]) -> Result<Facts, String> {
-        let mut plain = Vec::new();
-        let json = if raw.starts_with(&[0x1f, 0x8b]) {
-            flate2::read::GzDecoder::new(raw).read_to_end(&mut plain).map_err(|e| format!("gunzip: {e}"))?;
-            plain.as_slice()
+        if raw.starts_with(&[0x1f, 0x8b]) {
+            Facts::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(raw)))
         } else {
-            raw
-        };
-        let mut file: RawFile = serde_json::from_slice(json).map_err(|e| format!("parse: {e}"))?;
+            Facts::from_reader(raw)
+        }
+    }
+
+    fn from_reader(reader: impl Read) -> Result<Facts, String> {
+        let file: RawFile = serde_json::from_reader(reader).map_err(|e| format!("parse: {e}"))?;
         if file.schema != SCHEMA {
             return Err(format!("schema {} (this atlas reads {SCHEMA})", file.schema));
         }
@@ -187,6 +220,7 @@ impl Facts {
             .filter_map(|(q, genre)| Some((qid(q)?, genre.movie.or(genre.tv)?)))
             .collect();
         let mut records = HashMap::with_capacity(file.records.len());
+        let mut titles: Titles = HashMap::new();
         for raw in file.records {
             let media_type = match raw.media_type.as_str() {
                 "movie" => MediaType::Movie,
@@ -217,12 +251,15 @@ impl Facts {
                 }
             }
             let production = codes(raw.production_countries, u8::to_ascii_uppercase);
-            let mut titles: Vec<String> = Vec::new();
             if let Some(t) = raw.titles {
+                let mut names: Vec<Box<str>> = Vec::new();
                 for title in t.en.into_iter().chain(t.orig).chain(t.aliases.unwrap_or_default()) {
-                    if !title.trim().is_empty() && !titles.contains(&title) {
-                        titles.push(title);
+                    if !title.trim().is_empty() && !names.iter().any(|n| **n == *title) {
+                        names.push(title.into_boxed_str());
                     }
+                }
+                if !names.is_empty() {
+                    titles.entry((media_type, raw.tmdb_id)).or_insert(names);
                 }
             }
             let record = Record {
@@ -240,45 +277,35 @@ impl Facts {
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
                 broadcasters: entities(raw.broadcaster),
-                titles,
             };
             // The first record wins a duplicate, as in the labels index.
             records.entry((media_type, raw.tmdb_id)).or_insert(record);
         }
-        let mut credits: HashMap<u32, Vec<(MediaType, u32)>> = HashMap::new();
-        for (&key, record) in &records {
-            for &qid in record.makers.iter().chain(&record.cast) {
-                let titles = credits.entry(qid).or_default();
-                if !titles.contains(&key) {
-                    titles.push(key);
-                }
+        // Only the people a record credits are kept; the entities also name genres and franchises.
+        let mut credited: HashMap<u32, u32> = HashMap::new();
+        for record in records.values() {
+            for &qid in record.makers.iter().chain(record.cast.iter().filter(|q| !record.makers.contains(q)))
+            {
+                *credited.entry(qid).or_default() += 1;
             }
         }
-        let mut people = HashMap::with_capacity(credits.len());
-        let mut named: HashMap<String, Vec<u32>> = HashMap::new();
-        for &qid in credits.keys() {
-            let Some(RawEntity { en: Some(name), tmdb_person_id, aliases }) =
-                file.entities.remove(&format!("Q{qid}"))
-            else {
-                continue;
-            };
-            for alias in std::iter::once(&name).chain(aliases.iter().flatten()) {
-                let key = name_key(alias);
-                if key.chars().count() < 2 {
-                    continue;
-                }
-                let going_by = named.entry(key).or_default();
-                if !going_by.contains(&qid) {
-                    going_by.push(qid);
-                }
-            }
-            people.insert(qid, Person { name, tmdb_id: tmdb_person_id.and_then(|id| id.parse().ok()) });
-        }
-        for going_by in named.values_mut() {
-            going_by.sort_by_key(|qid| (std::cmp::Reverse(credits[qid].len()), *qid));
-        }
-        Ok(Facts { records, people, named, credits })
+        let RawEntities { mut people, mut named } = file.entities;
+        people.retain(|(qid, _)| credited.contains_key(qid));
+        people.sort_unstable_by_key(|(qid, _)| *qid);
+        people.dedup_by_key(|(qid, _)| *qid);
+        people.shrink_to_fit();
+        named.retain(|(_, qid)| credited.contains_key(qid));
+        named.sort_unstable_by_key(|&(hash, qid)| (hash, std::cmp::Reverse(credited[&qid]), qid));
+        named.dedup();
+        named.shrink_to_fit();
+        Ok(Facts { records, people, named, titles })
     }
+}
+
+/// FNV-1a, 64-bit: the hash names are kept by.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// `Q42` → 42.
@@ -309,7 +336,47 @@ struct RawFile {
     records: Vec<RawRecord>,
     /// Q-id → the names of what the records refer to.
     #[serde(default)]
-    entities: HashMap<String, RawEntity>,
+    entities: RawEntities,
+}
+
+/// The file's `entities`, read straight into what atlas keeps of them — each one's name and TMDB person id, and a
+/// hash of every name and alias — so a map of 100k-odd string keys never exists.
+#[derive(Default)]
+struct RawEntities {
+    people: Vec<(u32, Person)>,
+    named: Vec<(u64, u32)>,
+}
+
+impl<'de> Deserialize<'de> for RawEntities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entities;
+        impl<'de> serde::de::Visitor<'de> for Entities {
+            type Value = RawEntities;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map of Q-ids to entities")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<RawEntities, A::Error> {
+                let mut out = RawEntities::default();
+                while let Some((key, entity)) = map.next_entry::<String, RawEntity>()? {
+                    let (Some(qid), Some(name)) = (qid(&key), entity.en) else { continue };
+                    for alias in std::iter::once(name.as_str())
+                        .chain(entity.aliases.iter().flatten().map(String::as_str))
+                    {
+                        let key = name_key(alias);
+                        if key.chars().count() >= 2 {
+                            out.named.push((fnv1a(&key), qid));
+                        }
+                    }
+                    let tmdb_id = entity.tmdb_person_id.and_then(|id| id.parse().ok());
+                    out.people.push((qid, Person { name: name.into_boxed_str(), tmdb_id }));
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(Entities)
+    }
 }
 
 #[derive(Deserialize)]
@@ -429,21 +496,26 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_titles_and_the_people_credited_by_any_name() {
-        let facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
-        assert_eq!(facts.get(1, MediaType::Movie).unwrap().titles, vec!["One", "하나", "Uno"]);
-        assert_eq!(facts.person(1), Some(&Person { name: "A Director".to_owned(), tmdb_id: Some(11) }));
-        assert_eq!(facts.credits(1), &[(MediaType::Movie, 1)]);
-        assert_eq!(facts.people_named("a director"), &[1]);
-        assert_eq!(facts.people_named(&name_key("Bong Joon-ho")), &[2], "an alias, however it is spelled");
+        let mut facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(facts.person(1), Some(&Person { name: "A Director".into(), tmdb_id: Some(11) }));
+        assert_eq!(facts.credits(1), vec![((MediaType::Movie, 1), true)]);
+        assert_eq!(facts.credits(2), vec![((MediaType::Movie, 1), false)], "a cast member didn't make it");
+        assert_eq!(facts.people_named("a director"), vec![1]);
+        assert_eq!(facts.people_named(&name_key("Bong Joon-ho")), vec![2], "an alias, however it is spelled");
         assert_eq!(
             facts.people_named(&name_key("기생충 배우")),
-            &[2],
+            vec![2],
             "a name in another script meets itself"
         );
         // Two people go by one name: both, the one with more titles first (a tie goes to the lower Q-id).
-        assert_eq!(facts.people_named("lead actor"), &[2, 7]);
+        assert_eq!(facts.people_named("lead actor"), vec![2, 7]);
         assert_eq!(facts.person(50), None, "a franchise is no person");
         assert!(facts.people_named("nobody").is_empty());
+        // A title's other names are handed over once, the duplicate English title among its aliases left out.
+        let titles = facts.take_titles();
+        let names: Vec<&str> = titles[&(MediaType::Movie, 1)].iter().map(|name| &**name).collect();
+        assert_eq!(names, vec!["One", "하나", "Uno"]);
+        assert!(facts.take_titles().is_empty());
     }
 
     #[test]

@@ -25,10 +25,11 @@ type Key = (MediaType, u32);
 
 const W_TITLE: f64 = 2.0;
 const W_LABEL: f64 = 0.25;
-/// A title the query names someone behind: a director or creator in full, a cast member a little less, since
-/// Wikidata's cast is unordered and a bit part counts as much as the lead.
+/// A title by someone the query names: in full when they worked on it in the role they mostly work in, a little
+/// less in their other one, so an actor's films come before the few they produced and a director's before their
+/// cameos.
 const W_PERSON: f64 = 0.8;
-const CAST: f64 = 0.9;
+const OTHER_ROLE: f64 = 0.9;
 /// People an answer names at most.
 const PEOPLE: usize = 5;
 const W_PLOT_FACET: f64 = 0.10;
@@ -146,6 +147,8 @@ pub struct Parsed<'a> {
     plot: Vec<(&'static str, &'static str)>,
     /// The people the query names, by Q-id, most credited first.
     people: Vec<u32>,
+    /// Those of them who mostly make titles (direct or create) rather than appear in them.
+    makers: Vec<u32>,
     leftover: String,
     /// The share of the query's words left over: how thematic it is.
     lambda: f64,
@@ -215,7 +218,7 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
             if let Some(facts) = indexes.facts.as_ref().filter(|_| span >= 2 || tokens.len() == 1) {
                 let going_by = facts.people_named(&phrase);
                 matched |= !going_by.is_empty();
-                for &qid in going_by {
+                for qid in going_by {
                     if !people.contains(&qid) {
                         people.push(qid);
                     }
@@ -229,6 +232,17 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
         rest.push(tokens[at].clone());
         at += 1;
     }
+    let makers = indexes
+        .facts
+        .as_ref()
+        .map(|facts| {
+            let made_most = |qid: u32| {
+                let credits = facts.credits(qid);
+                2 * credits.iter().filter(|(_, made)| *made).count() >= credits.len()
+            };
+            people.iter().copied().filter(|&qid| made_most(qid)).collect()
+        })
+        .unwrap_or_default();
     Parsed {
         text: words(text).join(" "),
         lambda: rest.len() as f64 / total as f64,
@@ -238,6 +252,7 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
         labels,
         plot,
         people,
+        makers,
     }
 }
 
@@ -246,6 +261,8 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
 struct Found {
     /// Its title in TMDB's export, and that export's popularity.
     export: Option<(String, f64)>,
+    /// The names it matched by in the display title index: its displayed title, or another name it goes by.
+    names: Vec<String>,
     /// How far its vector stands above the scan's mean, in standard deviations.
     z: Option<f64>,
 }
@@ -292,7 +309,11 @@ pub fn answer(
     }
     if let Some(display) = &indexes.display {
         for hit in display.search_with(&parsed.text, None, TITLE_LANE, MIN_COVERAGE) {
-            found.entry((title_type(hit.media_type), hit.tmdb_id)).or_default();
+            found
+                .entry((title_type(hit.media_type), hit.tmdb_id))
+                .or_default()
+                .names
+                .push(hit.title.to_owned());
         }
     }
     // A country or decade: its titles, most voted first.
@@ -343,7 +364,7 @@ pub fn answer(
     // The titles of the people the query names.
     if let Some(facts) = &indexes.facts {
         for &qid in &parsed.people {
-            for &key in facts.credits(qid) {
+            for (key, _) in facts.credits(qid) {
                 found.entry(key).or_default();
             }
         }
@@ -373,7 +394,12 @@ pub fn answer(
     for s in &mut scored {
         s.score = score(s, w_sem, facet_set.as_ref().is_some_and(|set| set.contains(&s.key)));
     }
-    scored.retain(|s| s.score > 0.0);
+    // A title nothing names — no card, no export title: a facts-only record — has nothing to draw it by.
+    let drawable = |key: &Key| {
+        indexes.cards.as_ref().is_some_and(|cards| cards.contains_key(key))
+            || found.get(key).is_some_and(|f| f.export.is_some())
+    };
+    scored.retain(|s| s.score > 0.0 && drawable(&s.key));
     let votes =
         |(kind, id): Key| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
     scored.sort_by(|a, b| {
@@ -415,7 +441,7 @@ pub fn answer(
                     s
                 })
             });
-            spliced.extend(s);
+            spliced.extend(s.filter(|s| drawable(&s.key)));
         }
         // Best first among them; those found only as similar (score 0) keep More Like This's order.
         spliced[1..].sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -566,7 +592,7 @@ fn features(
     let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
     let mut t: f64 = 0.0;
     let mut exact = false;
-    let also_named = record.into_iter().flat_map(|r| r.titles.iter().map(String::as_str));
+    let also_named = found.names.iter().map(String::as_str);
     for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
         let (score, is_exact) = title_match(&parsed.text, title);
         exact |= is_exact;
@@ -594,10 +620,13 @@ fn features(
         }
     }
     let pf = plot_confidence.get(&key).copied().unwrap_or(0.0);
-    let named = |qids: &[u32]| qids.iter().any(|q| parsed.people.contains(q));
+    // A maker's title they made, an actor's title they appear in: their own role. Anyone named, otherwise: the other.
+    let in_role = |qids: &[u32], making: bool| {
+        qids.iter().any(|q| parsed.people.contains(q) && parsed.makers.contains(q) == making)
+    };
     let person = match record {
-        Some(r) if named(&r.makers) => 1.0,
-        Some(r) if named(&r.cast) => CAST,
+        Some(r) if in_role(&r.makers, true) || in_role(&r.cast, false) => 1.0,
+        Some(r) if r.makers.iter().chain(&r.cast).any(|q| parsed.people.contains(q)) => OTHER_ROLE,
         _ => 0.0,
     };
 

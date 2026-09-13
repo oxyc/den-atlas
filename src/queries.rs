@@ -168,7 +168,7 @@ fn load(sources: &Sources) -> Result<Indexes, String> {
             .ok()
     });
     // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
-    let facts = sources.facts.as_ref().and_then(|path| {
+    let mut facts = sources.facts.as_ref().and_then(|path| {
         Facts::read(path)
             .map_err(|e| eprintln!("facts unusable ({e}) — /recommend reads labels and facets only"))
             .ok()
@@ -184,6 +184,8 @@ fn load(sources: &Sources) -> Result<Indexes, String> {
             })
             .ok()
     });
+    // The facts hand their titles' other names to the display index, which is then the only one holding them.
+    let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
     let display = cards.as_ref().map(|cards| {
         let votes =
             |kind, id| facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes));
@@ -193,22 +195,23 @@ fn load(sources: &Sources) -> Result<Indexes, String> {
             cards
                 .iter()
                 .flat_map(|(&(kind, id), card)| {
-                    let also =
-                        facts.as_ref().and_then(|f| f.get(id, kind)).map_or(&[][..], |r| r.titles.as_slice());
-                    let names = std::iter::once(&card.title).chain(also.iter().filter(|t| **t != card.title));
+                    let also = other_names.get(&(kind, id)).map_or(&[][..], Vec::as_slice);
+                    let names = std::iter::once(card.title.as_str())
+                        .chain(also.iter().map(|name| &**name).filter(|name| *name != card.title));
                     names.map(move |title| TitleRecord {
                         tmdb_id: id,
                         media_type: match kind {
                             den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
                             den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
                         },
-                        title: title.clone(),
+                        title: title.to_owned(),
                         popularity: votes(kind, id),
                     })
                 })
                 .collect(),
         )
     });
+    drop(other_names);
     Ok(Indexes { plot, premise, facets, facts, plot_facets, cards, display })
 }
 

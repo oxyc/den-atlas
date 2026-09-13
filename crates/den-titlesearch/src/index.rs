@@ -41,8 +41,8 @@ pub struct TitleIndex {
     keys: Vec<u64>,
     key_ends: Vec<u32>,
     postings: Vec<u32>,
-    /// Each title's position, by type and id.
-    positions: HashMap<(MediaType, u32), u32>,
+    /// Each title's type, id and position, sorted by type and id.
+    positions: Vec<(MediaType, u32, u32)>,
 }
 
 impl TitleIndex {
@@ -79,12 +79,11 @@ impl TitleIndex {
         if !keys.is_empty() {
             key_ends.push(postings.len() as u32);
         }
+        let mut positions: Vec<(MediaType, u32, u32)> =
+            records.iter().enumerate().map(|(i, r)| (r.media_type, r.tmdb_id, i as u32)).collect();
+        positions.sort_unstable();
         TitleIndex {
-            positions: records
-                .iter()
-                .enumerate()
-                .map(|(i, r)| ((r.media_type, r.tmdb_id), i as u32))
-                .collect(),
+            positions,
             ids: records.iter().map(|r| r.tmdb_id).collect(),
             kinds: records.iter().map(|r| r.media_type).collect(),
             popularity: records.iter().map(|r| r.popularity).collect(),
@@ -106,7 +105,11 @@ impl TitleIndex {
 
     /// A title's popularity in the export, when the export has it.
     pub fn popularity_of(&self, media_type: MediaType, tmdb_id: u32) -> Option<f64> {
-        self.positions.get(&(media_type, tmdb_id)).map(|&i| self.popularity[i as usize])
+        let at = self.positions.partition_point(|&(m, id, _)| (m, id) < (media_type, tmdb_id));
+        match self.positions.get(at) {
+            Some(&(m, id, i)) if (m, id) == (media_type, tmdb_id) => Some(self.popularity[i as usize]),
+            _ => None,
+        }
     }
 
     /// Roughly what the index holds in memory, for logs.
@@ -117,7 +120,7 @@ impl TitleIndex {
             + self.keys.len() * 8
             + self.key_ends.len() * 4
             + self.postings.len() * 4
-            + self.positions.len() * 24
+            + self.positions.len() * 12
     }
 
     /// The best `limit` titles for `query`, optionally of one media type, best first.
