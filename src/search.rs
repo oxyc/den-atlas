@@ -25,6 +25,12 @@ type Key = (MediaType, u32);
 
 const W_TITLE: f64 = 2.0;
 const W_LABEL: f64 = 0.25;
+/// A title the query names someone behind: a director or creator in full, a cast member a little less, since
+/// Wikidata's cast is unordered and a bit part counts as much as the lead.
+const W_PERSON: f64 = 0.8;
+const CAST: f64 = 0.9;
+/// People an answer names at most.
+const PEOPLE: usize = 5;
 const W_PLOT_FACET: f64 = 0.10;
 const W_POPULARITY: f64 = 0.15;
 const W_SEMANTIC: f64 = 0.6;
@@ -138,6 +144,8 @@ pub struct Parsed<'a> {
     /// Label names as the index spells them, and whether each is a mood.
     labels: Vec<(&'a str, bool)>,
     plot: Vec<(&'static str, &'static str)>,
+    /// The people the query names, by Q-id, most credited first.
+    people: Vec<u32>,
     leftover: String,
     /// The share of the query's words left over: how thematic it is.
     lambda: f64,
@@ -148,6 +156,10 @@ impl Parsed<'_> {
     /// `None` for a query too short to mean anything.
     pub fn embed_text(&self) -> Option<&str> {
         if self.text.chars().count() < 2 {
+            return None;
+        }
+        if self.leftover.is_empty() && !self.people.is_empty() {
+            // A name and nothing more: the plot vectors hold no people, so they could only add what sounds alike.
             return None;
         }
         Some(if self.leftover.is_empty() { &self.text } else { &self.leftover })
@@ -174,6 +186,7 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
         .map(|(name, mood)| (words(name).join(" "), name, mood))
         .collect();
     let (mut genres, mut labels, mut plot, mut rest) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut people: Vec<u32> = Vec::new();
     let mut at = 0;
     'words: while at < tokens.len() {
         for span in (1..=4.min(tokens.len() - at)).rev() {
@@ -197,6 +210,17 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
                     matched = true;
                 }
             }
+            // A one-word name ("Nolan", "Common") counts only as the whole query: inside a longer one it is more
+            // likely just a word.
+            if let Some(facts) = indexes.facts.as_ref().filter(|_| span >= 2 || tokens.len() == 1) {
+                let going_by = facts.people_named(&phrase);
+                matched |= !going_by.is_empty();
+                for &qid in going_by {
+                    if !people.contains(&qid) {
+                        people.push(qid);
+                    }
+                }
+            }
             if matched {
                 at += span;
                 continue 'words;
@@ -213,6 +237,7 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
         genres,
         labels,
         plot,
+        people,
     }
 }
 
@@ -234,6 +259,7 @@ struct Scored {
     sem: f64,
     lab: f64,
     pf: f64,
+    person: f64,
     pop: f64,
     phi: f64,
 }
@@ -314,6 +340,14 @@ pub fn answer(
             }
         }
     }
+    // The titles of the people the query names.
+    if let Some(facts) = &indexes.facts {
+        for &qid in &parsed.people {
+            for &key in facts.credits(qid) {
+                found.entry(key).or_default();
+            }
+        }
+    }
     // The plot vectors' nearest to the leftover, within the facet when there is one.
     if let Some(vector) = vector {
         let (near, stats) = indexes.plot.scan_vector(
@@ -390,6 +424,26 @@ pub fn answer(
     }
 
     let total = scored.len();
+    let people: Vec<serde_json::Value> = indexes
+        .facts
+        .as_ref()
+        .map(|facts| {
+            parsed
+                .people
+                .iter()
+                .filter_map(|&qid| {
+                    let person = facts.person(qid)?;
+                    Some(serde_json::json!({
+                        "qid": format!("Q{qid}"),
+                        "id": person.tmdb_id,
+                        "name": person.name,
+                        "credits": facts.credits(qid).len(),
+                    }))
+                })
+                .take(PEOPLE)
+                .collect()
+        })
+        .unwrap_or_default();
     let round = |x: f64| (x * 10_000.0).round() / 10_000.0;
     let hits: Vec<serde_json::Value> = scored
         .iter()
@@ -409,7 +463,7 @@ pub fn answer(
                 "posterPath": card.and_then(|c| c.poster_path.clone()),
                 "year": card.and_then(|c| c.year),
                 "genreIds": crate::plotrows::genres(indexes, s.key),
-                "f": {"t": round(s.t), "sem": round(s.sem), "lab": round(s.lab), "pf": round(s.pf),
+                "f": {"t": round(s.t), "sem": round(s.sem), "lab": round(s.lab), "pf": round(s.pf), "p": s.person,
                       "pop": round(s.pop), "phi": s.phi},
             });
             if let Some(language) =
@@ -431,6 +485,7 @@ pub fn answer(
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
         },
+        "people": people,
         "hits": hits,
         "total": total,
     })
@@ -453,7 +508,7 @@ pub(crate) fn attention(votes: u32, export: Option<f64>) -> f64 {
 
 /// `S`, with `in_facet` for a title inside the country or decade the query names.
 fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
-    let relevance = [s.t / EXACT_TITLE, s.sem, s.lab, s.pf, if in_facet { 1.0 } else { 0.0 }]
+    let relevance = [s.t / EXACT_TITLE, s.sem, s.lab, s.pf, s.person, if in_facet { 1.0 } else { 0.0 }]
         .into_iter()
         .fold(0.0, f64::max)
         .min(1.0);
@@ -462,6 +517,7 @@ fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
             + w_sem * s.sem
             + W_LABEL * s.lab
             + W_PLOT_FACET * s.pf
+            + W_PERSON * s.person
             + W_POPULARITY * s.pop * relevance)
 }
 
@@ -510,7 +566,8 @@ fn features(
     let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
     let mut t: f64 = 0.0;
     let mut exact = false;
-    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card) {
+    let also_named = record.into_iter().flat_map(|r| r.titles.iter().map(String::as_str));
+    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
         let (score, is_exact) = title_match(&parsed.text, title);
         exact |= is_exact;
         t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
@@ -537,8 +594,14 @@ fn features(
         }
     }
     let pf = plot_confidence.get(&key).copied().unwrap_or(0.0);
+    let named = |qids: &[u32]| qids.iter().any(|q| parsed.people.contains(q));
+    let person = match record {
+        Some(r) if named(&r.makers) => 1.0,
+        Some(r) if named(&r.cast) => CAST,
+        _ => 0.0,
+    };
 
-    Some(Scored { key, score: 0.0, exact, t, sem, lab, pf, pop, phi })
+    Some(Scored { key, score: 0.0, exact, t, sem, lab, pf, person, pop, phi })
 }
 
 /// How well a title matches the query: exactly (folded, a leading English article dropped from both), or by the
@@ -596,6 +659,8 @@ mod tests {
         let theme = W_SEMANTIC + W_LABEL + W_PLOT_FACET + W_POPULARITY;
         assert!(exact > theme, "{exact} {theme}");
         assert!(W_TITLE * FUZZY_CAP < exact);
+        // And a title merely by someone the query names.
+        assert!(W_PERSON + W_POPULARITY < exact);
     }
 
     #[test]
@@ -617,6 +682,7 @@ mod tests {
             sem,
             lab: 0.0,
             pf: 0.0,
+            person: 0.0,
             pop,
             phi: 1.0,
         };

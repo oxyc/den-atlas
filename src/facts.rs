@@ -107,15 +107,56 @@ pub struct Record {
     pub franchise: Option<u32>,
     /// Where a series first aired (P449): its network or service.
     pub broadcasters: Vec<u32>,
+    /// Every name it goes by: its English title, its original title and its aliases.
+    pub titles: Vec<String>,
+}
+
+/// Someone the facts credit as a director, creator or cast member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Person {
+    pub name: String,
+    /// Their TMDB person id (P4985), when Wikidata has it.
+    pub tmdb_id: Option<u32>,
 }
 
 pub struct Facts {
     records: HashMap<(MediaType, u32), Record>,
+    people: HashMap<u32, Person>,
+    /// Names and aliases as `name_key` reads them → the people going by each, most credited first.
+    named: HashMap<String, Vec<u32>>,
+    /// Each person's titles, as maker or cast.
+    credits: HashMap<u32, Vec<(MediaType, u32)>>,
+}
+
+/// How a name is looked up: folded, and its words joined by single spaces, so "Bong Joon-ho" is "bong joon ho".
+/// Folding decomposes and drops combining marks the same way for the name and the query, so a name in any script
+/// still meets itself.
+pub fn name_key(name: &str) -> String {
+    den_titlesearch::fold(name)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Facts {
     pub fn get(&self, tmdb_id: u32, media_type: MediaType) -> Option<&Record> {
         self.records.get(&(media_type, tmdb_id))
+    }
+
+    /// A credited person, by Q-id.
+    pub fn person(&self, qid: u32) -> Option<&Person> {
+        self.people.get(&qid)
+    }
+
+    /// The people going by a name (`name_key`), most credited first.
+    pub fn people_named(&self, key: &str) -> &[u32] {
+        self.named.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// A person's titles, as maker or cast.
+    pub fn credits(&self, qid: u32) -> &[(MediaType, u32)] {
+        self.credits.get(&qid).map_or(&[], Vec::as_slice)
     }
 
     pub fn len(&self) -> usize {
@@ -136,7 +177,7 @@ impl Facts {
         } else {
             raw
         };
-        let file: RawFile = serde_json::from_slice(json).map_err(|e| format!("parse: {e}"))?;
+        let mut file: RawFile = serde_json::from_slice(json).map_err(|e| format!("parse: {e}"))?;
         if file.schema != SCHEMA {
             return Err(format!("schema {} (this atlas reads {SCHEMA})", file.schema));
         }
@@ -176,6 +217,14 @@ impl Facts {
                 }
             }
             let production = codes(raw.production_countries, u8::to_ascii_uppercase);
+            let mut titles: Vec<String> = Vec::new();
+            if let Some(t) = raw.titles {
+                for title in t.en.into_iter().chain(t.orig).chain(t.aliases.unwrap_or_default()) {
+                    if !title.trim().is_empty() && !titles.contains(&title) {
+                        titles.push(title);
+                    }
+                }
+            }
             let record = Record {
                 imdb_id: raw.imdb_id.and_then(OneOrMany::first).filter(|id| id.starts_with("tt")),
                 // A film is released; a series starts.
@@ -191,11 +240,44 @@ impl Facts {
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
                 broadcasters: entities(raw.broadcaster),
+                titles,
             };
             // The first record wins a duplicate, as in the labels index.
             records.entry((media_type, raw.tmdb_id)).or_insert(record);
         }
-        Ok(Facts { records })
+        let mut credits: HashMap<u32, Vec<(MediaType, u32)>> = HashMap::new();
+        for (&key, record) in &records {
+            for &qid in record.makers.iter().chain(&record.cast) {
+                let titles = credits.entry(qid).or_default();
+                if !titles.contains(&key) {
+                    titles.push(key);
+                }
+            }
+        }
+        let mut people = HashMap::with_capacity(credits.len());
+        let mut named: HashMap<String, Vec<u32>> = HashMap::new();
+        for &qid in credits.keys() {
+            let Some(RawEntity { en: Some(name), tmdb_person_id, aliases }) =
+                file.entities.remove(&format!("Q{qid}"))
+            else {
+                continue;
+            };
+            for alias in std::iter::once(&name).chain(aliases.iter().flatten()) {
+                let key = name_key(alias);
+                if key.chars().count() < 2 {
+                    continue;
+                }
+                let going_by = named.entry(key).or_default();
+                if !going_by.contains(&qid) {
+                    going_by.push(qid);
+                }
+            }
+            people.insert(qid, Person { name, tmdb_id: tmdb_person_id.and_then(|id| id.parse().ok()) });
+        }
+        for going_by in named.values_mut() {
+            going_by.sort_by_key(|qid| (std::cmp::Reverse(credits[qid].len()), *qid));
+        }
+        Ok(Facts { records, people, named, credits })
     }
 }
 
@@ -225,6 +307,24 @@ struct RawFile {
     genre_map: HashMap<String, RawGenre>,
     #[serde(default)]
     records: Vec<RawRecord>,
+    /// Q-id → the names of what the records refer to.
+    #[serde(default)]
+    entities: HashMap<String, RawEntity>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEntity {
+    en: Option<String>,
+    tmdb_person_id: Option<String>,
+    aliases: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawTitles {
+    en: Option<String>,
+    orig: Option<String>,
+    aliases: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +350,7 @@ struct RawRecord {
     cast: Option<Vec<String>>,
     franchise: Option<OneOrMany>,
     broadcaster: Option<Vec<String>>,
+    titles: Option<RawTitles>,
 }
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
@@ -284,10 +385,12 @@ pub(crate) mod tests {
     pub(crate) const SAMPLE: &str = r#"{
       "schema": 1,
       "datasetVersion": "v1",
-      "entities": {"Q1": {"en": "A Director"}},
+      "entities": {"Q1": {"en": "A Director", "tmdbPersonId": "11"}, "Q2": {"en": "Lead Actor", "aliases": ["Bong Joon-ho", "기생충 배우"]},
+                   "Q7": {"en": "Lead Actor"}, "Q50": {"en": "A Franchise"}},
       "genreMap": {"Q100": {"movie": 80, "tv": 80}, "Q101": {"movie": 18, "tv": 18}, "Q102": {"tv": 10765}},
       "records": [
         {"mediaType": "movie", "tmdbId": 1, "imdbId": ["tt0000001", "tt9999999"],
+         "titles": {"en": "One", "orig": "하나", "aliases": ["Uno", "One"]},
          "released": {"date": "2026-09-01", "precision": "day"},
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
          "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"]},
@@ -322,6 +425,25 @@ pub(crate) mod tests {
 
         // Nothing known is nothing known, not an error.
         assert_eq!(facts.get(2, MediaType::Movie), Some(&Record::default()));
+    }
+
+    #[test]
+    fn reads_titles_and_the_people_credited_by_any_name() {
+        let facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(facts.get(1, MediaType::Movie).unwrap().titles, vec!["One", "하나", "Uno"]);
+        assert_eq!(facts.person(1), Some(&Person { name: "A Director".to_owned(), tmdb_id: Some(11) }));
+        assert_eq!(facts.credits(1), &[(MediaType::Movie, 1)]);
+        assert_eq!(facts.people_named("a director"), &[1]);
+        assert_eq!(facts.people_named(&name_key("Bong Joon-ho")), &[2], "an alias, however it is spelled");
+        assert_eq!(
+            facts.people_named(&name_key("기생충 배우")),
+            &[2],
+            "a name in another script meets itself"
+        );
+        // Two people go by one name: both, the one with more titles first (a tie goes to the lower Q-id).
+        assert_eq!(facts.people_named("lead actor"), &[2, 7]);
+        assert_eq!(facts.person(50), None, "a franchise is no person");
+        assert!(facts.people_named("nobody").is_empty());
     }
 
     #[test]

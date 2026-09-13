@@ -1632,6 +1632,18 @@ mod tests {
 
         let empty = json(body_of(get(&state, &ask("zzzz")).await).await);
         assert_eq!(empty["hits"], serde_json::json!([]));
+
+        // Someone behind a title: the title, and who they are.
+        let director = json(body_of(get(&state, &ask("a director")).await).await);
+        assert_eq!(keys(&director)[0], "movie:1", "{director}");
+        assert_eq!(director["people"][0]["name"], "A Director");
+        assert_eq!(director["people"][0]["id"], 11);
+        assert_eq!(director["hits"][0]["f"]["p"], 1.0);
+
+        // A title by another of its names.
+        let uno = json(body_of(get(&state, &ask("uno")).await).await);
+        assert_eq!(keys(&uno)[0], "movie:1", "{uno}");
+        assert_eq!(uno["people"], serde_json::json!([]));
     }
 
     /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards

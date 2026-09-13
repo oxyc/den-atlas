@@ -187,17 +187,24 @@ fn load(sources: &Sources) -> Result<Indexes, String> {
     let display = cards.as_ref().map(|cards| {
         let votes =
             |kind, id| facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes));
+        // Each title under its display name, and every other name the facts give it: its original title and
+        // aliases ("기생충", "Gisaengchung").
         TitleIndex::build(
             cards
                 .iter()
-                .map(|(&(kind, id), card)| TitleRecord {
-                    tmdb_id: id,
-                    media_type: match kind {
-                        den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
-                        den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
-                    },
-                    title: card.title.clone(),
-                    popularity: votes(kind, id),
+                .flat_map(|(&(kind, id), card)| {
+                    let also =
+                        facts.as_ref().and_then(|f| f.get(id, kind)).map_or(&[][..], |r| r.titles.as_slice());
+                    let names = std::iter::once(&card.title).chain(also.iter().filter(|t| **t != card.title));
+                    names.map(move |title| TitleRecord {
+                        tmdb_id: id,
+                        media_type: match kind {
+                            den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
+                            den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
+                        },
+                        title: title.clone(),
+                        popularity: votes(kind, id),
+                    })
                 })
                 .collect(),
         )
