@@ -506,7 +506,13 @@ impl IndexQuestion {
         }
     }
 
-    fn answer(&self, indexes: &crate::queries::Indexes, query: &str) -> String {
+    /// `export`, TMDB's daily title export, ranks a row's titles facets.bin has no votes for.
+    fn answer(
+        &self,
+        indexes: &crate::queries::Indexes,
+        export: Option<&den_titlesearch::TitleIndex>,
+        query: &str,
+    ) -> String {
         let plot = &indexes.plot;
         let body = match self {
             Self::Taxonomy => serde_json::json!({
@@ -553,6 +559,7 @@ impl IndexQuestion {
                     .collect();
                 crate::plotrows::row(
                     indexes,
+                    export,
                     *media_type,
                     &constraints,
                     number("skip", 0),
@@ -1014,7 +1021,9 @@ async fn handle_index(
         },
         IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
         IndexQuestion::Query => query_answer(state, &indexes, query).await,
-        question => question.answer(&indexes, query),
+        question => {
+            question.answer(&indexes, state.titles.as_ref().and_then(|t| t.index()).as_deref(), query)
+        }
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
     let resp = serve_json(method, headers, body, cache_control, None, false).await;

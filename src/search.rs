@@ -436,6 +436,16 @@ pub fn answer(
     })
 }
 
+/// How popular a title is, 0 to 1: by its votes (facets.bin), else by TMDB's popularity in the daily export, for
+/// a title facets.bin has no record of.
+pub(crate) fn popularity(votes: u32, export: Option<f64>) -> f64 {
+    match export {
+        _ if votes > 0 => (f64::from(votes).ln_1p() / POPULAR_VOTES.ln_1p()).min(1.0),
+        Some(popularity) => (popularity.max(0.0).ln_1p() / POPULAR_POPULARITY.ln_1p()).min(1.0),
+        None => 0.0,
+    }
+}
+
 /// `S`, with `in_facet` for a title inside the country or decade the query names.
 fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
     let relevance = [s.t / EXACT_TITLE, s.sem, s.lab, s.pf, if in_facet { 1.0 } else { 0.0 }]
@@ -489,11 +499,7 @@ fn features(
         }
     }
 
-    let pop = match (facets, &found.export) {
-        (Some(f), _) if f.votes > 0 => (f64::from(f.votes).ln_1p() / POPULAR_VOTES.ln_1p()).min(1.0),
-        (_, Some((_, popularity))) => (popularity.max(0.0).ln_1p() / POPULAR_POPULARITY.ln_1p()).min(1.0),
-        _ => 0.0,
-    };
+    let pop = popularity(facets.map_or(0, |f| f.votes), found.export.as_ref().map(|e| e.1));
 
     // T: the better of its export and display titles against the whole query.
     let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
@@ -585,6 +591,14 @@ mod tests {
         let theme = W_SEMANTIC + W_LABEL + W_PLOT_FACET + W_POPULARITY;
         assert!(exact > theme, "{exact} {theme}");
         assert!(W_TITLE * FUZZY_CAP < exact);
+    }
+
+    #[test]
+    fn popularity_reads_votes_and_else_the_export() {
+        assert_eq!(popularity(5000, Some(1.0)), 1.0, "votes win");
+        assert_eq!(popularity(0, Some(50.0)), 1.0);
+        assert!(popularity(0, Some(1.0)) < 0.2);
+        assert_eq!(popularity(0, None), 0.0);
     }
 
     #[test]

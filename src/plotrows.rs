@@ -120,9 +120,11 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
 /// A row: the titles of `media_type` carrying every constraint, most confident first, then most voted — each as
 /// the card a client draws, with what its hide rules read — `skip` then `limit` of them, and how many there are.
 /// A constraint is a plot facet (`tone=bleak`) or one of the labels (`mood=Feel-good`, `subgenre=Heist`), and
-/// they combine. A title with no card is left out, since there is nothing to draw.
+/// they combine. A title with no card is left out, since there is nothing to draw. "Most voted" reads TMDB's
+/// popularity in its daily `export` for a title facets.bin has no votes for.
 pub fn row(
     indexes: &Indexes,
+    export: Option<&den_titlesearch::TitleIndex>,
     media_type: MediaType,
     constraints: &[(String, String)],
     skip: usize,
@@ -145,10 +147,15 @@ pub fn row(
     } else {
         return empty();
     };
-    let votes = |(media_type, id): Key| {
-        indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes)
+    let popularity = |(media_type, id): Key| {
+        let votes = indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes);
+        let kind = match media_type {
+            MediaType::Movie => den_titlesearch::MediaType::Movie,
+            MediaType::Tv => den_titlesearch::MediaType::Tv,
+        };
+        crate::search::popularity(votes, export.and_then(|e| e.popularity_of(kind, id)))
     };
-    let mut matched: Vec<(Key, u8)> = candidates
+    let mut matched: Vec<(Key, u8, f64)> = candidates
         .into_iter()
         .filter(|(key, _)| cards.contains_key(key))
         .filter_map(|(key, confidence)| {
@@ -157,18 +164,16 @@ pub fn row(
                 .try_fold(confidence, |lowest, (family, label)| {
                     label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
                 })
-                .map(|lowest| (key, lowest))
+                .map(|lowest| (key, lowest, popularity(key)))
         })
         .collect();
-    matched.sort_by_key(|&(key, confidence)| {
-        (std::cmp::Reverse(confidence), std::cmp::Reverse(votes(key)), key.1)
-    });
+    matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
     let total = matched.len();
     let titles: Vec<serde_json::Value> = matched
         .into_iter()
         .skip(skip)
         .take(limit)
-        .map(|(key @ (media_type, id), _)| {
+        .map(|(key @ (media_type, id), _, _)| {
             let card = &cards[&key];
             let mut title = serde_json::json!({
                 "type": if media_type == MediaType::Tv { "series" } else { "movie" },

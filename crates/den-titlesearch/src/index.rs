@@ -41,6 +41,8 @@ pub struct TitleIndex {
     keys: Vec<u64>,
     key_ends: Vec<u32>,
     postings: Vec<u32>,
+    /// Each title's position, by type and id.
+    positions: HashMap<(MediaType, u32), u32>,
 }
 
 impl TitleIndex {
@@ -78,6 +80,11 @@ impl TitleIndex {
             key_ends.push(postings.len() as u32);
         }
         TitleIndex {
+            positions: records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ((r.media_type, r.tmdb_id), i as u32))
+                .collect(),
             ids: records.iter().map(|r| r.tmdb_id).collect(),
             kinds: records.iter().map(|r| r.media_type).collect(),
             popularity: records.iter().map(|r| r.popularity).collect(),
@@ -97,6 +104,11 @@ impl TitleIndex {
         self.ids.is_empty()
     }
 
+    /// A title's popularity in the export, when the export has it.
+    pub fn popularity_of(&self, media_type: MediaType, tmdb_id: u32) -> Option<f64> {
+        self.positions.get(&(media_type, tmdb_id)).map(|&i| self.popularity[i as usize])
+    }
+
     /// Roughly what the index holds in memory, for logs.
     pub fn approx_bytes(&self) -> usize {
         let strings: usize = self.titles.iter().chain(&self.folded).map(|s| s.len() + 16).sum();
@@ -105,6 +117,7 @@ impl TitleIndex {
             + self.keys.len() * 8
             + self.key_ends.len() * 4
             + self.postings.len() * 4
+            + self.positions.len() * 24
     }
 
     /// The best `limit` titles for `query`, optionally of one media type, best first.
@@ -219,6 +232,14 @@ mod tests {
 
     fn ids(hits: &[Hit<'_>]) -> Vec<u32> {
         hits.iter().map(|h| h.tmdb_id).collect()
+    }
+
+    #[test]
+    fn a_titles_popularity_is_found_by_type_and_id() {
+        let idx = index();
+        assert_eq!(idx.popularity_of(MediaType::Tv, 5), Some(60.0));
+        assert_eq!(idx.popularity_of(MediaType::Movie, 5), None, "another type, another title");
+        assert_eq!(idx.popularity_of(MediaType::Movie, 99), None);
     }
 
     #[test]
