@@ -13,10 +13,26 @@ struct Row {
     tmdb_id: u32,
     media_type: MediaType,
     votes: u32,
+    language: [u8; 2],
+    country: [u8; 2],
+    year: u16,
+}
+
+/// What the facet blob says about one title. Each field is `None` where the blob leaves it blank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TitleFacets {
+    /// ISO 3166-1 alpha-2, uppercase.
+    pub country: Option<[u8; 2]>,
+    /// ISO 639-1, lowercase: the title's original language.
+    pub language: Option<[u8; 2]>,
+    pub year: Option<u16>,
+    pub votes: u32,
 }
 
 pub struct FacetIndex {
     rows: Vec<Row>,
+    /// (type, tmdb id) → row; the first row wins a duplicate, as in the labels index.
+    by_title: HashMap<(MediaType, u32), u32>,
     by_country: HashMap<[u8; 2], Vec<u32>>,
     by_decade: HashMap<u16, Vec<u32>>,
     by_type: HashMap<MediaType, Vec<u32>>,
@@ -33,6 +49,7 @@ impl FacetIndex {
         let records = blob.get(8..8 + count.checked_mul(RECORD)?)?;
         let mut index = FacetIndex {
             rows: Vec::with_capacity(count),
+            by_title: HashMap::with_capacity(count),
             by_country: HashMap::new(),
             by_decade: HashMap::new(),
             by_type: HashMap::new(),
@@ -49,10 +66,15 @@ impl FacetIndex {
                 index.by_decade.entry(year / 10 * 10).or_default().push(position);
             }
             index.by_type.entry(media_type).or_default().push(position);
+            let tmdb_id = i32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u32;
+            index.by_title.entry((media_type, tmdb_id)).or_insert(position);
             index.rows.push(Row {
-                tmdb_id: i32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u32,
+                tmdb_id,
                 media_type,
                 votes: u32::from_le_bytes([r[11], r[12], r[13], r[14]]),
+                language: [r[5].to_ascii_lowercase(), r[6].to_ascii_lowercase()],
+                country,
+                year,
             });
         }
         Some(index)
@@ -60,6 +82,18 @@ impl FacetIndex {
 
     pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// One title's facets; `None` when the blob doesn't hold it. TMDB writes `xx` for "no language".
+    pub fn title(&self, tmdb_id: u32, media_type: MediaType) -> Option<TitleFacets> {
+        let row = &self.rows[*self.by_title.get(&(media_type, tmdb_id))? as usize];
+        let letters = |code: [u8; 2]| code.iter().all(u8::is_ascii_alphabetic).then_some(code);
+        Some(TitleFacets {
+            country: letters(row.country),
+            language: letters(row.language).filter(|code| code != b"xx"),
+            year: (row.year >= 1870).then_some(row.year),
+            votes: row.votes,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -305,6 +339,17 @@ mod tests {
         assert_eq!(idx.filter(None, Some("KR"), None).len(), 3);
         assert!(idx.filter(None, Some("SE"), None).is_empty());
         assert!(idx.filter(None, None, None).is_empty(), "no facet, no lane");
+    }
+
+    #[test]
+    fn reads_one_title_by_type_and_id() {
+        let idx = sample();
+        assert_eq!(
+            idx.title(4, MediaType::Tv),
+            Some(TitleFacets { country: Some(*b"KR"), language: None, year: Some(2010), votes: 300 })
+        );
+        // Ids collide across types: movie 4 is not series 4.
+        assert_eq!(idx.title(4, MediaType::Movie), None);
     }
 
     #[test]

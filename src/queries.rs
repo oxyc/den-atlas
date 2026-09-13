@@ -1,9 +1,10 @@
 //! Index queries (`den-index`) over the dataset's plot and premise indexes: the label taxonomy, label rows
-//! and More Like This. The indexes load on the first query and are released after a few idle minutes, so an
-//! atlas nobody is asking holds none of their ~80 MB of vectors; the first query after an idle spell pays
-//! the load from disk.
+//! and More Like This — and the Wikidata facts `/recommend` reads beside them. The indexes load on the first
+//! query and are released after a few idle minutes, so an atlas nobody is asking holds none of their ~80 MB
+//! of vectors; the first query after an idle spell pays the load from disk.
 
 use crate::dataset::Dataset;
+use crate::facts::Facts;
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
 use std::path::PathBuf;
@@ -21,6 +22,9 @@ pub struct Indexes {
     pub premise: Option<Index>,
     /// The facet index, when the dataset ships `facets.bin`; without it the facet lane answers nothing.
     pub facets: Option<FacetIndex>,
+    /// The Wikidata facts, when the dataset ships a file that reads; without them `/recommend` reads labels and
+    /// facets alone.
+    pub facts: Option<Facts>,
 }
 
 /// A labels blob and its vectors blob.
@@ -30,6 +34,7 @@ pub struct IndexQueries {
     plot: BlobPair,
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
+    facts: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
@@ -46,6 +51,7 @@ impl IndexQueries {
             plot: (ds.labels.path.clone(), ds.vectors.path.clone()),
             premise,
             facets: ds.facets.as_ref().map(|f| f.path.clone()),
+            facts: ds.facts.clone(),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
         }
@@ -62,15 +68,19 @@ impl IndexQueries {
             return Ok((indexes, None));
         }
         let started = Instant::now();
-        let (plot, premise, facets) = (self.plot.clone(), self.premise.clone(), self.facets.clone());
-        let indexes = tokio::task::spawn_blocking(move || load(&plot, premise.as_ref(), facets.as_ref()))
-            .await
-            .map_err(|e| format!("load task: {e}"))??;
+        let (plot, premise, facets, facts) =
+            (self.plot.clone(), self.premise.clone(), self.facets.clone(), self.facts.clone());
+        let indexes = tokio::task::spawn_blocking(move || {
+            load(&plot, premise.as_ref(), facets.as_ref(), facts.as_ref())
+        })
+        .await
+        .map_err(|e| format!("load task: {e}"))??;
         let took = started.elapsed();
         let premise = indexes.premise.as_ref().map_or("none".to_owned(), |p| format!("{} titles", p.len()));
         let facets = indexes.facets.as_ref().map_or("none".to_owned(), |f| format!("{} titles", f.len()));
+        let facts = indexes.facts.as_ref().map_or("none".to_owned(), |f| format!("{} titles", f.len()));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, facets {facets}, in {:.1}s",
+            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, in {:.1}s",
             indexes.plot.len(),
             took.as_secs_f64()
         );
@@ -109,7 +119,12 @@ pub async fn release_when_idle(queries: Arc<IndexQueries>) {
     }
 }
 
-fn load(plot: &BlobPair, premise: Option<&BlobPair>, facets: Option<&PathBuf>) -> Result<Indexes, String> {
+fn load(
+    plot: &BlobPair,
+    premise: Option<&BlobPair>,
+    facets: Option<&PathBuf>,
+    facts: Option<&PathBuf>,
+) -> Result<Indexes, String> {
     let plot = read_index(plot)?;
     // Like the premise index, an unusable facet blob costs only its own feature.
     let facets = facets.and_then(|path| match std::fs::read(path) {
@@ -128,7 +143,13 @@ fn load(plot: &BlobPair, premise: Option<&BlobPair>, facets: Option<&PathBuf>) -
             .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
             .ok()
     });
-    Ok(Indexes { plot, premise, facets })
+    // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
+    let facts = facts.and_then(|path| {
+        Facts::read(path)
+            .map_err(|e| eprintln!("facts unusable ({e}) — /recommend reads labels and facets only"))
+            .ok()
+    });
+    Ok(Indexes { plot, premise, facets, facts })
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {
@@ -195,7 +216,9 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
         facets.extend_from_slice(&votes.to_le_bytes());
     }
     std::fs::write(dir.join("facets.bin"), &facets).unwrap();
+    std::fs::write(dir.join("facts-slim.json"), crate::facts::tests::SAMPLE).unwrap();
     let meta = serde_json::json!({
+        "factsSlimFile": "facts-slim.json",
         "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 4,
         "quantization": "int8",
         "labelsFile": "labels.json", "labelsBytes": plot.0.len(), "labelsSha256": "a",
@@ -223,6 +246,7 @@ mod tests {
         let (indexes, first) = queries.get().await.unwrap();
         assert!(first.is_some(), "the first query loads");
         assert!(indexes.premise.is_some());
+        assert_eq!(indexes.facts.as_ref().map(|f| f.len()), Some(3), "the facts load with the indexes");
         let (_, again) = queries.get().await.unwrap();
         assert!(again.is_none(), "a warm query doesn't");
 

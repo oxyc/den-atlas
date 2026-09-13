@@ -6,12 +6,14 @@ mod catalog;
 mod config;
 mod dataset;
 mod descriptor;
+mod facts;
 mod handler;
 mod http;
 mod justwatch;
 mod manifest;
 mod metrics;
 mod queries;
+mod recommend;
 mod titles;
 mod util;
 

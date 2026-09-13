@@ -110,6 +110,7 @@ origin.
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
+| `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -143,6 +144,17 @@ so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries"
 Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`); the
 facet lane reads the dataset's `facets.bin`. Taste weights stay with the client: `score` returns the raw
 boosts.
+
+`POST /recommend` ranks what a featured surface leads with — the Den web app's billboard — so no client
+ranks. It is the web app's `billboard.ts` ported: what is new in the world and new to this library, with
+attention (a place in Trending Everywhere, the household's "new on" lists, and the client's own lists) and
+quality, multiplied by the library's taste and discounted where the library's own More Like This already
+reaches. It describes each title from what atlas holds: the labels, `facets.bin`, and the dataset's Wikidata
+facts file (`factsSlimFile`, else `factsFile`) when the release carries one; a candidate's `hint` (release
+date, genres, popularity, rating) fills only what those leave unknown. `library` is `[{type,id,weight,at}]`,
+`owned` every title the library holds, which never appears; `hide` is the household's rules
+(`minYear`, `genres`, `languages`, `anime`). Each slide's `why` gives its terms. `Server-Timing` carries
+`lists;dur=` and `rank;dur=`. Bodies over 512 KiB are refused.
 
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,

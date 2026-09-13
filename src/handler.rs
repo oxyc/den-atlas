@@ -169,6 +169,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             handle_embed(&state, req).await
         } else if let Some(rest) = route.strip_prefix("/index/") {
             handle_index_post(&state, rest, req).await
+        } else if route == "/recommend" {
+            handle_recommend(&state, config, req).await
         } else {
             json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED)
         };
@@ -812,6 +814,73 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     Ok(serde_json::json!({ "perSeed": per_seed, "pooled": titles_json(&pooled) }))
 }
 
+/// The most a `/recommend` body may carry: a large library and everything it owns, with room to spare.
+const RECOMMEND_BODY: usize = 512 * 1024;
+
+/// `POST /recommend` — the titles a featured surface leads with, ranked (`recommend.rs`). Uncached, and off
+/// (404) unless `INDEX_QUERIES` is set, like the other questions that name a library's titles. The install's
+/// config decides which services' lists are read when the household has picked none.
+async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -> Response {
+    let started = Instant::now();
+    let Some(queries) = state.index.as_ref() else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let bad = |detail: String| {
+        json_response(
+            serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+            StatusCode::BAD_REQUEST,
+        )
+    };
+    let Ok(body) = axum::body::to_bytes(req.into_body(), RECOMMEND_BODY).await else {
+        return bad(format!("a body of at most {RECOMMEND_BODY} bytes"));
+    };
+    let request: crate::recommend::Request = match parse_body(&body) {
+        Ok(request) => request,
+        Err(detail) => return bad(detail),
+    };
+    if let Err(detail) = request.check() {
+        return bad(detail);
+    }
+    let (indexes, loaded_in) = match queries.get().await {
+        Ok(got) => got,
+        Err(e) => {
+            eprintln!("index load failed: {e}");
+            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let listing = Instant::now();
+    let lists = crate::recommend::lists(state, &config, &request).await;
+    let listed = listing.elapsed();
+    let ranking = Instant::now();
+    let version = state.dataset.as_ref().map(|ds| ds.meta.dataset_version.clone());
+    // More Like This for each seed scans the vectors, so the ranking runs off the request threads.
+    let ranked = tokio::task::spawn_blocking(move || {
+        let now = request.now.as_deref().and_then(crate::recommend::parse_now);
+        let mut answer =
+            crate::recommend::answer(&indexes, &request, &lists, now.unwrap_or_else(crate::recommend::today));
+        answer["datasetVersion"] = serde_json::json!(version);
+        answer.to_string()
+    })
+    .await;
+    let resp = match ranked {
+        Ok(body) => json_response(body, StatusCode::OK),
+        Err(e) => {
+            eprintln!("recommend failed: {e}");
+            json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    };
+    let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
+    with_timing(
+        resp,
+        &format!(
+            "{load}lists;dur={}, rank;dur={}, total;dur={}",
+            ms(listed),
+            ms(ranking.elapsed()),
+            ms(started.elapsed())
+        ),
+    )
+}
+
 /// `POST /index/labels|score|suggest` — the questions that name many titles at once. JSON in, JSON out,
 /// uncached. Off (404) unless `INDEX_QUERIES` is set; a malformed body is a 400.
 async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> Response {
@@ -1443,6 +1512,50 @@ mod tests {
         );
         let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
         assert_eq!(none["facet"], serde_json::Value::Null);
+    }
+
+    /// A ranked answer from a real fixture index and facts: never what the library owns, another type, or a
+    /// hidden title, and never cached.
+    #[tokio::test]
+    async fn recommend_ranks_what_the_library_does_not_hold() {
+        let state = index_state("den-atlas-recommend");
+        let body = r#"{"surface":"movies","now":"2026-09-12T00:00:00Z",
+            "library":[{"type":"movie","id":1,"weight":1}],
+            "owned":[{"type":"movie","id":1}],
+            "hide":{"languages":["es"]},
+            "candidates":[
+              {"type":"movie","id":2,"hint":{"releaseDate":"2026-09-01","popularity":40,"genreIds":[18]}},
+              {"type":"movie","id":1,"rank":0,"of":10},
+              {"type":"series","id":4,"rank":1,"of":10},
+              {"type":"movie","id":99,"hint":{"releaseDate":"2026-09-10","originalLanguage":"es"}}
+            ]}"#;
+        let resp = post(&state, "/recommend", body).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let answer: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
+        let slides: Vec<(String, u64)> = answer["slides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["type"].as_str().unwrap().to_owned(), s["id"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(slides, vec![("movie".to_owned(), 2)], "{answer}");
+        assert_eq!(answer["facts"], true);
+        assert_eq!(answer["datasetVersion"], "v1");
+        assert_eq!(answer["libraryUnjudged"], 0);
+    }
+
+    /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.
+    #[tokio::test]
+    async fn recommend_is_off_unless_configured_and_refuses_a_bad_body() {
+        assert_eq!(post(&Arc::new(AppState::for_test(None)), "/recommend", "{}").await.status(), 404);
+        let state = index_state("den-atlas-recommend-bad");
+        assert_eq!(post(&state, "/recommend", "not json").await.status(), 400);
+        let many = format!(
+            r#"{{"candidates":[{}]}}"#,
+            vec![r#"{"type":"movie","id":1}"#; crate::recommend::MAX_CANDIDATES + 1].join(",")
+        );
+        assert_eq!(post(&state, "/recommend", &many).await.status(), 400);
     }
 
     /// Batch labels, taste scores and suggestions, and how a bad POST is refused.

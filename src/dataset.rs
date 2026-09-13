@@ -85,6 +85,17 @@ pub struct Meta {
     pub facets_sha256: Option<String>,
     #[serde(rename = "facetsBytes")]
     pub facets_bytes: Option<u64>,
+    // Wikidata facts (optional) — per-title release dates, genres, makers, cast, countries and languages, for
+    // /recommend; the slim file carries only what ranking reads. Read from disk, never served. Absent ⇒
+    // /recommend reads the labels and facets alone.
+    #[serde(rename = "factsFile")]
+    pub facts_file: Option<String>,
+    #[serde(rename = "factsGzFile")]
+    pub facts_gz_file: Option<String>,
+    #[serde(rename = "factsSlimFile")]
+    pub facts_slim_file: Option<String>,
+    #[serde(rename = "factsSlimGzFile")]
+    pub facts_slim_gz_file: Option<String>,
 }
 
 pub struct Gz {
@@ -114,6 +125,8 @@ pub struct Dataset {
     /// present or both None (the meta must declare the pair fully).
     pub premise_labels: Option<Blob>,
     pub premise_vectors: Option<Blob>,
+    /// The Wikidata facts file `/recommend` reads (optional; never served).
+    pub facts: Option<PathBuf>,
     /// DT-I compact facet blob (optional).
     pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
@@ -212,6 +225,12 @@ impl Dataset {
             "application/octet-stream",
             None,
         );
+        // The Wikidata facts: the slim file when the release has one, and the plain file before its gzip.
+        let facts = [&meta.facts_slim_file, &meta.facts_slim_gz_file, &meta.facts_file, &meta.facts_gz_file]
+            .into_iter()
+            .flatten()
+            .filter_map(|name| safe_blob_path(dir, name).ok())
+            .find(|path| path.is_file());
         let last_modified = meta.last_modified_http.clone();
         // Writers withdraw the descriptor before replacing any blob and publish it last. A load
         // that overlaps that interval must not bind new files to a descriptor read before it.
@@ -227,6 +246,7 @@ impl Dataset {
             metadata,
             premise_labels,
             premise_vectors,
+            facts,
             facets,
             last_modified,
         })
