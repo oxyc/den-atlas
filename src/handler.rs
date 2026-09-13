@@ -1543,6 +1543,9 @@ mod tests {
         assert_eq!(answer["facts"], true);
         assert_eq!(answer["datasetVersion"], "v1");
         assert_eq!(answer["libraryUnjudged"], 0);
+        // Movie 99 is known to nothing but its hint, which names no genre — and it is hidden, so never asked about.
+        assert_eq!(answer["unjudged"], serde_json::json!([]));
+        assert_eq!(answer["unjudgedCount"], 1);
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.

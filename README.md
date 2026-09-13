@@ -110,7 +110,7 @@ origin.
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
-| `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
+| `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged:[{type,id}],unjudgedCount,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -151,7 +151,10 @@ attention (a place in Trending Everywhere, the household's "new on" lists, and t
 quality, multiplied by the library's taste and discounted where the library's own More Like This already
 reaches. It describes each title from what atlas holds: the labels, `facets.bin`, and the dataset's Wikidata
 facts file (`factsSlimFile`, else `factsFile`) when the release carries one; a candidate's `hint` (release
-date, genres, popularity, rating) fills only what those leave unknown. `library` is `[{type,id,weight,at}]`,
+date, genres, countries, popularity, rating) fills only what those leave unknown. `unjudged` names the 20
+titles atlas knows nothing about that are most worth describing; a client that can describe them asks again
+with their hints, since an undescribed title is dropped once enough are judged. `library` is
+`[{type,id,weight,at,hint?}]`,
 `owned` every title the library holds, which never appears; `hide` is the household's rules
 (`minYear`, `genres`, `languages`, `anime`). Each slide's `why` gives its terms. `Server-Timing` carries
 `lists;dur=` and `rank;dur=`. Bodies over 512 KiB are refused.

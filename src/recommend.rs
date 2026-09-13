@@ -89,6 +89,9 @@ const SEEDS: usize = 8;
 const MIN_SEEDS: usize = 3;
 /// Judged candidates enough to drop the unjudged ones.
 const JUDGED_ENOUGH: usize = 20;
+/// Unjudged titles an answer names for the client to describe, best first. Until the facts cover what is new
+/// on the services, a title atlas has never seen is otherwise dropped however much attention it has.
+const UNJUDGED_NAMED: usize = 20;
 /// Slides by default, and at most.
 const SLIDES: usize = 40;
 const MAX_SLIDES: usize = 100;
@@ -177,6 +180,9 @@ pub struct LibraryEntry {
     /// When it was last touched; orders the seeds.
     #[serde(default)]
     pub at: f64,
+    /// What the client knows about the title, for a library title atlas holds nothing on.
+    #[serde(default)]
+    pub hint: Hint,
 }
 
 /// The household's hide rules (the TV's `UserPreferences.isHidden`).
@@ -216,6 +222,8 @@ pub struct Hint {
     pub release_date: Option<String>,
     pub genre_ids: Option<Vec<u16>>,
     pub original_language: Option<String>,
+    /// ISO 3166-1 alpha-2.
+    pub countries: Option<Vec<String>>,
     pub popularity: Option<f64>,
     pub rating: Option<f64>,
     pub votes: Option<f64>,
@@ -437,9 +445,20 @@ impl<'a> Knowledge<'a> {
             (None, Some(r)) if !r.languages.is_empty() => r.languages.clone(),
             _ => title.original_language.into_iter().collect(),
         };
-        title.countries = match record {
-            Some(r) if !r.countries.is_empty() => r.countries.clone(),
-            _ => facets.and_then(|f| f.country).into_iter().collect(),
+        title.countries = match (record, facets.and_then(|f| f.country)) {
+            (Some(r), _) if !r.countries.is_empty() => r.countries.clone(),
+            (_, Some(country)) => vec![country],
+            _ => hint
+                .and_then(|h| h.countries.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|c| match c.as_bytes() {
+                    [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
+                        Some([a.to_ascii_uppercase(), b.to_ascii_uppercase()])
+                    }
+                    _ => None,
+                })
+                .collect(),
         };
         if let Some(r) = record {
             title.people = r.makers.iter().map(|&id| (id, 1.0)).collect();
@@ -945,14 +964,15 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     let only = request.only();
     let slides = request.limit.unwrap_or(SLIDES).clamp(1, MAX_SLIDES);
 
-    let library: Vec<(Key, f64, f64)> = request
+    let weighed: Vec<(Key, &LibraryEntry)> = request
         .library
         .iter()
         .filter(|e| e.weight.is_finite() && e.weight != 0.0)
-        .filter_map(|e| Some(((media_type(&e.type_)?, e.id), e.weight, e.at)))
+        .filter_map(|e| Some(((media_type(&e.type_)?, e.id), e)))
         .collect();
+    let library: Vec<(Key, f64, f64)> = weighed.iter().map(|&(key, e)| (key, e.weight, e.at)).collect();
     let entries: Vec<(Title<'_>, f64)> =
-        library.iter().map(|&(key, weight, _)| (known.title(key, None, None), weight)).collect();
+        weighed.iter().map(|&(key, e)| (known.title(key, Some(&e.hint), None), e.weight)).collect();
     let library_unjudged = entries.iter().filter(|(title, _)| title.genres.is_empty()).count();
     let taste = taste_of(&entries);
     let (answered, hits) = neighbourhood(indexes, &library);
@@ -990,16 +1010,28 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     // not per list entry: a title one list named only by id is judged when another list described it, and keeps the
     // place the first list gave it.
     let judged: HashSet<Key> = pool.iter().filter(|c| !c.title.genres.is_empty()).map(|c| c.key).collect();
-    let unjudged: HashSet<Key> = pool.iter().map(|c| c.key).filter(|key| !judged.contains(key)).collect();
-    if pool.iter().filter(|c| judged.contains(&c.key)).count() >= JUDGED_ENOUGH {
-        pool.retain(|c| judged.contains(&c.key));
-    }
-
+    let unjudged_count =
+        pool.iter().map(|c| c.key).filter(|key| !judged.contains(key)).collect::<HashSet<_>>().len();
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
     let keep = |c: &Candidate<'_>| {
         only.is_none_or(|t| t == c.key.0) && !owned.contains(&c.key) && !hidden(c, &request.hide)
     };
+    // The unjudged titles most worth describing, by what they are worth before taste: a client that can say what
+    // they are asks again with that as their hints.
+    let unjudged: Vec<Key> = pick(
+        pool.iter().filter(|c| !judged.contains(&c.key)).cloned().collect(),
+        now,
+        UNJUDGED_NAMED,
+        keep,
+        None,
+    )
+    .into_iter()
+    .map(|(c, _)| c.key)
+    .collect();
+    if pool.iter().filter(|c| judged.contains(&c.key)).count() >= JUDGED_ENOUGH {
+        pool.retain(|c| judged.contains(&c.key));
+    }
     let picked = pick(pool, now, slides, keep, Some(&taste));
 
     let round = |x: f64| (x * 1000.0).round() / 1000.0;
@@ -1025,7 +1057,11 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         "scorer": SCORER,
         "facts": indexes.facts.is_some(),
         "slides": slides,
-        "unjudged": unjudged.len(),
+        "unjudged": unjudged
+            .iter()
+            .map(|&(media_type, id)| serde_json::json!({ "type": type_name(media_type), "id": id }))
+            .collect::<Vec<_>>(),
+        "unjudgedCount": unjudged_count,
         "libraryUnjudged": library_unjudged,
     })
 }
