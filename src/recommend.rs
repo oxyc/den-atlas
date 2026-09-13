@@ -969,15 +969,21 @@ fn neighbourhood(indexes: &Indexes, library: &[(Key, f64, f64)]) -> (usize, Hash
         }
     }
     keys.truncate(SEEDS);
+    // Every seed at once: each is a scan or two when atlas hasn't worked it out yet (`Indexes::more_like_this`).
+    let similar: Vec<Arc<[u32]>> = std::thread::scope(|scope| {
+        let seeds: Vec<_> = keys
+            .iter()
+            .map(|&(media_type, id)| scope.spawn(move || indexes.more_like_this(id, media_type)))
+            .collect();
+        seeds
+            .into_iter()
+            .map(|seed| seed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect()
+    });
     let mut hits: HashMap<Key, usize> = HashMap::new();
     let mut answered = 0;
-    for &(media_type, id) in &keys {
-        let near: Vec<Key> =
-            den_index::more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, media_type)
-                .into_iter()
-                .map(|n| (media_type, n))
-                .filter(|key| !keys.contains(key))
-                .collect();
+    for (&(media_type, _), ids) in keys.iter().zip(&similar) {
+        let near: Vec<Key> = ids.iter().map(|&n| (media_type, n)).filter(|key| !keys.contains(key)).collect();
         if !near.is_empty() {
             answered += 1;
         }

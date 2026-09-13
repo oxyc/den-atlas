@@ -534,7 +534,7 @@ impl IndexQuestion {
                 serde_json::json!({ "ids": titles.iter().map(|&(id, _)| id).collect::<Vec<u32>>() })
             }
             Self::Similar { media_type, tmdb_id } => serde_json::json!({
-                "ids": den_index::more_like_this(Some(plot), indexes.premise.as_ref(), *tmdb_id, *media_type),
+                "ids": &*indexes.more_like_this(*tmdb_id, *media_type),
             }),
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
@@ -662,31 +662,59 @@ async fn search_answer(
     Ok(serde_json::json!({ "titles": titles, "mean": stats.mean, "sd": stats.sd }).to_string())
 }
 
-/// `GET /index/query.json?q=&type=&skip=&limit=` — search in one request (`search.rs`). The query is embedded
-/// only when den-embed answers; without it the plot vectors simply don't score.
-async fn query_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> String {
+/// `GET /index/query.json?q=&type=&skip=&limit=` — search in one request (`search.rs`), and how long its parts took
+/// as Server-Timing entries. The query is embedded only when den-embed answers; without it the plot vectors simply
+/// don't score. `early` is the whole query's embedding, started as the request arrived (`handle_index`): it is what
+/// the vectors are asked about unless the query names something, and a cold den-embed then loads its model while
+/// the indexes load rather than after. The ranking itself runs off the request threads.
+async fn query_answer(
+    state: &AppState,
+    indexes: Arc<crate::queries::Indexes>,
+    query: &str,
+    early: Option<tokio::task::JoinHandle<Result<Vec<i8>, String>>>,
+) -> Result<(String, String), String> {
     let text = query_text(query, "q");
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
-    let parsed = crate::search::parse(&text, indexes);
-    let vector = match (&state.embed, parsed.embed_text()) {
-        (Some(_), Some(words)) => {
-            embed_query(state, words).await.map_err(|e| eprintln!("search query left unembedded: {e}")).ok()
-        }
-        _ => None,
-    };
     let number =
         |key: &str, default: usize| query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let (skip, limit) =
+        (number("skip", 0), number("limit", crate::search::PAGE).min(crate::search::MAX_PAGE));
+    let parsing = Instant::now();
+    let parsed = crate::search::parse(&text, &indexes);
+    let parsed_in = parsing.elapsed();
+    let embedding = Instant::now();
+    let unembedded = |e: String| eprintln!("search query left unembedded: {e}");
+    let vector = match (parsed.embed_text(), early) {
+        (Some(words), Some(early)) if words == parsed.text() => {
+            early.await.map_err(|e| e.to_string()).and_then(|embedded| embedded).map_err(unembedded).ok()
+        }
+        (Some(words), _) if state.embed.is_some() => embed_query(state, words).await.map_err(unembedded).ok(),
+        _ => None,
+    };
+    let embedded_in = embedding.elapsed();
+    let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());
-    crate::search::answer(
-        indexes,
-        titles.as_deref(),
-        &parsed,
-        media_type,
-        vector.as_deref(),
-        number("skip", 0),
-        number("limit", crate::search::PAGE).min(crate::search::MAX_PAGE),
-    )
-    .to_string()
+    let body = tokio::task::spawn_blocking(move || {
+        crate::search::answer(
+            &indexes,
+            titles.as_deref(),
+            &parsed,
+            media_type,
+            vector.as_deref(),
+            skip,
+            limit,
+        )
+        .to_string()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let timing = format!(
+        "parse;dur={}, embed;dur={}, answer;dur={}",
+        ms(parsed_in),
+        ms(embedded_in),
+        ms(answering.elapsed())
+    );
+    Ok((body, timing))
 }
 
 /// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
@@ -852,11 +880,10 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     let per_seed: Vec<((u32, den_index::MediaType), Vec<u32>)> = seeds
         .iter()
         .map(|&(id, media_type)| {
-            let similar =
-                den_index::more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, media_type);
+            let similar = indexes.more_like_this(id, media_type);
             (
                 (id, media_type),
-                similar.into_iter().filter(|&n| !excluded.contains(&(n, media_type))).collect(),
+                similar.iter().copied().filter(|&n| !excluded.contains(&(n, media_type))).collect(),
             )
         })
         .collect();
@@ -996,6 +1023,18 @@ async fn handle_index(
     let Some(question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
         return not_found();
     };
+    // A search's whole text goes to den-embed at once, while the indexes are got — and loaded, after an idle
+    // spell — so a cold den-embed loads its model alongside them, not after (`query_answer`).
+    let early = match (&question, &state.embed) {
+        (IndexQuestion::Query, Some(_)) => {
+            let whole = crate::search::normalized(&query_text(query, "q"));
+            (whole.chars().count() >= 2).then(|| {
+                let state = Arc::clone(state);
+                tokio::spawn(async move { embed_query(&state, &whole).await })
+            })
+        }
+        _ => None,
+    };
     let (indexes, loaded_in) = match queries.get().await {
         Ok(got) => got,
         Err(e) => {
@@ -1011,6 +1050,7 @@ async fn handle_index(
         } else {
             "public, max-age=3600, stale-while-revalidate=86400"
         };
+    let mut phases = String::new();
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
             Ok(body) => body,
@@ -1020,14 +1060,34 @@ async fn handle_index(
             }
         },
         IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
-        IndexQuestion::Query => query_answer(state, &indexes, query).await,
+        IndexQuestion::Query => match query_answer(state, Arc::clone(&indexes), query, early).await {
+            Ok((body, timing)) => {
+                phases = format!("{timing}, ");
+                body
+            }
+            Err(e) => {
+                eprintln!("search failed: {e}");
+                return json_response(r#"{"error":"search_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        },
+        // The dataset alone, but tens of milliseconds of work for a row or a scan: off the request threads.
         question => {
-            question.answer(&indexes, state.titles.as_ref().and_then(|t| t.index()).as_deref(), query)
+            let titles = state.titles.as_ref().and_then(|t| t.index());
+            let (indexes, query) = (Arc::clone(&indexes), query.to_owned());
+            match tokio::task::spawn_blocking(move || question.answer(&indexes, titles.as_deref(), &query))
+                .await
+            {
+                Ok(body) => body,
+                Err(e) => {
+                    eprintln!("index answer failed: {e}");
+                    return json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
         }
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
     let resp = serve_json(method, headers, body, cache_control, None, false).await;
-    with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
+    with_timing(resp, &format!("{load}{phases}total;dur={}", ms(started.elapsed())))
 }
 
 /// `GET /catalog/{movie|series}/den-titles/search={q}.json` — fuzzy title search, answered from memory.

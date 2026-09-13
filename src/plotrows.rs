@@ -130,50 +130,56 @@ pub fn row(
     skip: usize,
     limit: usize,
 ) -> serde_json::Value {
-    let empty = || serde_json::json!({ "titles": [], "total": 0 });
-    let Some(cards) = indexes.cards.as_ref() else { return empty() };
-    let (labels, plot): (Vec<_>, Vec<_>) =
-        constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
-    let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
-        let Some(facets) = indexes.plot_facets.as_ref() else { return empty() };
-        facets.matching(media_type, &plot)
-    } else if let Some((family, label)) = labels.first() {
-        let titles = if family == "mood" {
-            indexes.plot.titles_with_mood(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+    let Some(cards) = indexes.cards.as_ref() else { return serde_json::json!({ "titles": [], "total": 0 }) };
+    // Worked out once per type and constraints (`Indexes::row_order`): every page of a row asks for the same order.
+    let mut named: Vec<String> = constraints.iter().map(|(axis, value)| format!("{axis}={value}")).collect();
+    named.sort_unstable();
+    let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
+    let order = indexes.row_order(format!("{kind}?{}", named.join("&")), || {
+        let (labels, plot): (Vec<_>, Vec<_>) =
+            constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
+        let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
+            indexes.plot_facets.as_ref().map_or_else(Vec::new, |facets| facets.matching(media_type, &plot))
+        } else if let Some((family, label)) = labels.first() {
+            let titles = if family == "mood" {
+                indexes.plot.titles_with_mood(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+            } else {
+                indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+            };
+            titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
         } else {
-            indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+            Vec::new()
         };
-        titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
-    } else {
-        return empty();
-    };
-    let popularity = |(media_type, id): Key| {
-        let votes = indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes);
-        let kind = match media_type {
-            MediaType::Movie => den_titlesearch::MediaType::Movie,
-            MediaType::Tv => den_titlesearch::MediaType::Tv,
+        let popularity = |(media_type, id): Key| {
+            let votes = indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes);
+            let kind = match media_type {
+                MediaType::Movie => den_titlesearch::MediaType::Movie,
+                MediaType::Tv => den_titlesearch::MediaType::Tv,
+            };
+            crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
         };
-        crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
-    };
-    let mut matched: Vec<(Key, u8, f64)> = candidates
-        .into_iter()
-        .filter(|(key, _)| cards.contains_key(key))
-        .filter_map(|(key, confidence)| {
-            labels
-                .iter()
-                .try_fold(confidence, |lowest, (family, label)| {
-                    label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
-                })
-                .map(|lowest| (key, lowest, popularity(key)))
-        })
-        .collect();
-    matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
-    let total = matched.len();
-    let titles: Vec<serde_json::Value> = matched
-        .into_iter()
+        let mut matched: Vec<(Key, u8, f64)> = candidates
+            .into_iter()
+            .filter(|(key, _)| cards.contains_key(key))
+            .filter_map(|(key, confidence)| {
+                labels
+                    .iter()
+                    .try_fold(confidence, |lowest, (family, label)| {
+                        label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
+                    })
+                    .map(|lowest| (key, lowest, popularity(key)))
+            })
+            .collect();
+        matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
+        matched.into_iter().map(|(key, _, _)| key).collect()
+    });
+    let total = order.len();
+    let titles: Vec<serde_json::Value> = order
+        .iter()
         .skip(skip)
         .take(limit)
-        .map(|(key @ (media_type, id), _, _)| {
+        .map(|&key| {
+            let (media_type, id) = key;
             let card = &cards[&key];
             let mut title = serde_json::json!({
                 "type": if media_type == MediaType::Tv { "series" } else { "movie" },

@@ -8,7 +8,7 @@
 use den_index::MediaType;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::path::Path;
 
 /// The file layout this reader understands (`"schema"` in the file).
@@ -185,32 +185,24 @@ impl Facts {
         self.records.len()
     }
 
-    /// Read a facts file, plain or gzipped, as a stream: the file itself is never held in memory.
+    /// Read a facts file, plain or gzipped. Parsed from memory rather than streamed: a stream parsed about three
+    /// times slower, and the index load waits on it, while the file's ~24 MB are held only until it is parsed.
     pub fn read(path: &Path) -> Result<Facts, String> {
-        let file = std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let mut reader = std::io::BufReader::new(file);
-        let gzipped = reader
-            .fill_buf()
-            .map_err(|e| format!("read {}: {e}", path.display()))?
-            .starts_with(&[0x1f, 0x8b]);
-        let facts = if gzipped {
-            Facts::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(reader)))
-        } else {
-            Facts::from_reader(reader)
-        };
-        facts.map_err(|e| format!("{}: {e}", path.display()))
+        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        Facts::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn from_bytes(raw: &[u8]) -> Result<Facts, String> {
-        if raw.starts_with(&[0x1f, 0x8b]) {
-            Facts::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(raw)))
-        } else {
-            Facts::from_reader(raw)
+        if !raw.starts_with(&[0x1f, 0x8b]) {
+            return Facts::from_json(raw);
         }
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(raw).read_to_end(&mut plain).map_err(|e| format!("gunzip: {e}"))?;
+        Facts::from_json(&plain)
     }
 
-    fn from_reader(reader: impl Read) -> Result<Facts, String> {
-        let file: RawFile = serde_json::from_reader(reader).map_err(|e| format!("parse: {e}"))?;
+    fn from_json(json: &[u8]) -> Result<Facts, String> {
+        let file: RawFile = serde_json::from_slice(json).map_err(|e| format!("parse: {e}"))?;
         if file.schema != SCHEMA {
             return Err(format!("schema {} (this atlas reads {SCHEMA})", file.schema));
         }

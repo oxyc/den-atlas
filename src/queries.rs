@@ -34,6 +34,58 @@ pub struct Indexes {
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
     pub display: Option<TitleIndex>,
+    /// More Like This answers already worked out, by title (`Indexes::more_like_this`).
+    similar: Mutex<HashMap<Key, Arc<[u32]>>>,
+    /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
+    rows: Mutex<HashMap<String, Arc<[Key]>>>,
+}
+
+type Key = (den_index::MediaType, u32);
+
+/// More Like This answers and row orders kept at most: bounded, and simply started over when full. Both are small
+/// (a row order is at most a few thousand titles, an answer twenty ids).
+const SIMILAR_MEMO: usize = 4096;
+const ROW_MEMO: usize = 128;
+
+impl Indexes {
+    /// More Like This for a title (`den_index::more_like_this`), worked out once while the indexes are loaded: it
+    /// is deterministic for the dataset, and asked again and again — a billboard's seeds on every Home load, the
+    /// title a search names, a detail page.
+    pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
+        memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
+            den_index::more_like_this(Some(&self.plot), self.premise.as_ref(), tmdb_id, media_type).into()
+        })
+    }
+
+    /// A browse row's order (`plotrows::row`), worked out once per type and constraints: every page of a row, and
+    /// every visit to a screen, asks for the same one.
+    pub(crate) fn row_order(
+        &self,
+        key: String,
+        work: impl FnOnce() -> Vec<(den_index::MediaType, u32)>,
+    ) -> Arc<[(den_index::MediaType, u32)]> {
+        memoised(&self.rows, key, ROW_MEMO, || work().into())
+    }
+}
+
+/// `memo`'s value for `key`, else what `work` gives, kept. The work runs outside the lock: two requests for one key
+/// may both do it, and get the same answer.
+fn memoised<K: Eq + std::hash::Hash, V: ?Sized>(
+    memo: &Mutex<HashMap<K, Arc<V>>>,
+    key: K,
+    cap: usize,
+    work: impl FnOnce() -> Arc<V>,
+) -> Arc<V> {
+    if let Some(value) = lock(memo).get(&key) {
+        return Arc::clone(value);
+    }
+    let value = work();
+    let mut memo = lock(memo);
+    if memo.len() >= cap {
+        memo.clear();
+    }
+    memo.insert(key, Arc::clone(&value));
+    value
 }
 
 /// A labels blob and its vectors blob.
@@ -89,7 +141,7 @@ impl IndexQueries {
             plot_facets: self.plot_facets.clone(),
             metadata: self.metadata.clone(),
         };
-        let indexes = tokio::task::spawn_blocking(move || load(&sources))
+        let (indexes, phases) = tokio::task::spawn_blocking(move || load(&sources))
             .await
             .map_err(|e| format!("load task: {e}"))??;
         let took = started.elapsed();
@@ -99,7 +151,7 @@ impl IndexQueries {
         let facts = count(indexes.facts.as_ref().map(Facts::len));
         let plot_facets = count(indexes.plot_facets.as_ref().map(PlotFacets::len));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, in {:.1}s",
+            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, in {:.1}s ({phases})",
             indexes.plot.len(),
             took.as_secs_f64()
         );
@@ -148,71 +200,143 @@ struct Sources {
     metadata: Option<PathBuf>,
 }
 
-fn load(sources: &Sources) -> Result<Indexes, String> {
-    let plot = read_index(&sources.plot)?;
-    // Like the premise index, an unusable facet blob costs only its own feature.
-    let facets = sources.facets.as_ref().and_then(|path| match std::fs::read(path) {
-        Ok(blob) => FacetIndex::from_blob(&blob).or_else(|| {
-            eprintln!("facet index {} is not a DFI2 blob — facet search is off", path.display());
-            None
-        }),
-        Err(e) => {
-            eprintln!("read {}: {e} — facet search is off", path.display());
-            None
-        }
-    });
-    // A broken premise index costs premise-led More Like This, not the whole feature.
-    let premise = sources.premise.as_ref().and_then(|pair| {
-        read_index(pair)
-            .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
-            .ok()
-    });
-    // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
-    let mut facts = sources.facts.as_ref().and_then(|path| {
-        Facts::read(path)
-            .map_err(|e| eprintln!("facts unusable ({e}) — /recommend reads labels and facets only"))
-            .ok()
-    });
-    // Plot facet rows need both the facets and the cards to draw them with.
-    let plot_facets = sources.plot_facets.as_ref().and_then(|path| {
-        PlotFacets::read(path).map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty")).ok()
-    });
-    let cards = sources.metadata.as_ref().and_then(|path| {
-        read_cards(path)
-            .map_err(|e| {
-                eprintln!("metadata unusable ({e}) — plot rows are empty, search has no display titles")
-            })
-            .ok()
-    });
-    // The facts hand their titles' other names to the display index, which is then the only one holding them.
-    let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
-    let display = cards.as_ref().map(|cards| {
-        let votes =
-            |kind, id| facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes));
-        // Each title under its display name, and every other name the facts give it: its original title and
-        // aliases ("기생충", "Gisaengchung").
-        TitleIndex::build(
-            cards
-                .iter()
-                .flat_map(|(&(kind, id), card)| {
-                    let also = other_names.get(&(kind, id)).map_or(&[][..], Vec::as_slice);
-                    let names = std::iter::once(card.title.as_str())
-                        .chain(also.iter().map(|name| &**name).filter(|name| *name != card.title));
-                    names.map(move |title| TitleRecord {
-                        tmdb_id: id,
-                        media_type: match kind {
-                            den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
-                            den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
-                        },
-                        title: title.to_owned(),
-                        popularity: votes(kind, id),
-                    })
+/// `work`, and how long it took.
+fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
+    let started = std::time::Instant::now();
+    let value = work();
+    (value, started.elapsed())
+}
+
+/// A load thread's answer; a panic in one is re-raised here, as it would have been had the part loaded inline.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// The indexes, and how long each part took. Every part is its own file and parse, so they load side by side —
+/// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
+/// the facts and the facets.
+fn load(sources: &Sources) -> Result<(Indexes, String), String> {
+    let (plot, premise, facets, facts, plot_facets, cards) = std::thread::scope(|scope| {
+        let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
+        // A broken premise index costs premise-led More Like This, not the whole feature.
+        let premise = scope.spawn(|| {
+            timed(|| {
+                sources.premise.as_ref().and_then(|pair| {
+                    read_index(pair)
+                        .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
+                        .ok()
                 })
-                .collect(),
-        )
+            })
+        });
+        // Like the premise index, an unusable facet blob costs only its own feature.
+        let facets = scope.spawn(|| {
+            timed(|| {
+                sources.facets.as_ref().and_then(|path| match std::fs::read(path) {
+                    Ok(blob) => FacetIndex::from_blob(&blob).or_else(|| {
+                        eprintln!("facet index {} is not a DFI2 blob — facet search is off", path.display());
+                        None
+                    }),
+                    Err(e) => {
+                        eprintln!("read {}: {e} — facet search is off", path.display());
+                        None
+                    }
+                })
+            })
+        });
+        // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
+        let facts = scope.spawn(|| {
+            timed(|| {
+                sources.facts.as_ref().and_then(|path| {
+                    Facts::read(path)
+                        .map_err(|e| {
+                            eprintln!("facts unusable ({e}) — /recommend reads labels and facets only")
+                        })
+                        .ok()
+                })
+            })
+        });
+        // Plot facet rows need both the facets and the cards to draw them with.
+        let plot_facets = scope.spawn(|| {
+            timed(|| {
+                sources.plot_facets.as_ref().and_then(|path| {
+                    PlotFacets::read(path)
+                        .map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty"))
+                        .ok()
+                })
+            })
+        });
+        let cards = scope.spawn(|| {
+            timed(|| {
+                sources.metadata.as_ref().and_then(|path| {
+                    read_cards(path)
+                        .map_err(|e| {
+                            eprintln!(
+                                "metadata unusable ({e}) — plot rows are empty, search has no display titles"
+                            )
+                        })
+                        .ok()
+                })
+            })
+        });
+        (joined(plot), joined(premise), joined(facets), joined(facts), joined(plot_facets), joined(cards))
     });
-    drop(other_names);
-    Ok(Indexes { plot, premise, facets, facts, plot_facets, cards, display })
+    let ((plot, plot_took), (premise, premise_took), (facets, facets_took)) = (plot, premise, facets);
+    let plot = plot?;
+    let ((mut facts, facts_took), (plot_facets, plot_facets_took), (cards, cards_took)) =
+        (facts, plot_facets, cards);
+    // The facts hand their titles' other names to the display index, which is then the only one holding them.
+    let (display, display_took) = timed(|| {
+        let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
+        cards.as_ref().map(|cards| {
+            let votes = |kind, id| {
+                facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes))
+            };
+            // Each title under its display name, and every other name the facts give it: its original title and
+            // aliases ("기생충", "Gisaengchung").
+            TitleIndex::build(
+                cards
+                    .iter()
+                    .flat_map(|(&(kind, id), card)| {
+                        let also = other_names.get(&(kind, id)).map_or(&[][..], Vec::as_slice);
+                        let names = std::iter::once(card.title.as_str())
+                            .chain(also.iter().map(|name| &**name).filter(|name| *name != card.title));
+                        names.map(move |title| TitleRecord {
+                            tmdb_id: id,
+                            media_type: match kind {
+                                den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
+                                den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
+                            },
+                            title: title.to_owned(),
+                            popularity: votes(kind, id),
+                        })
+                    })
+                    .collect(),
+            )
+        })
+    });
+    let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
+    let phases = format!(
+        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, display {}",
+        seconds(plot_took),
+        seconds(premise_took),
+        seconds(facts_took),
+        seconds(cards_took),
+        seconds(facets_took),
+        seconds(plot_facets_took),
+        seconds(display_took)
+    );
+    let indexes = Indexes {
+        plot,
+        premise,
+        facets,
+        facts,
+        plot_facets,
+        cards,
+        display,
+        similar: Mutex::new(HashMap::new()),
+        rows: Mutex::new(HashMap::new()),
+    };
+    Ok((indexes, phases))
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {

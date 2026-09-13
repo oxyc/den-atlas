@@ -137,24 +137,38 @@ const PLOT_PHRASES: &[(&str, &str, &str)] = &[
 ];
 
 /// What a query names, and the words it leaves over.
-pub struct Parsed<'a> {
+pub struct Parsed {
     /// The whole query, folded: what titles are matched against.
     text: String,
+    /// The whole query as titles are compared with it.
+    title_query: TitleQuery,
     facet: FacetQuery,
     genres: Vec<u16>,
     /// Label names as the index spells them, and whether each is a mood.
-    labels: Vec<(&'a str, bool)>,
+    labels: Vec<(String, bool)>,
     plot: Vec<(&'static str, &'static str)>,
     /// The people the query names, by Q-id, most credited first.
     people: Vec<u32>,
     /// Those of them who mostly make titles (direct or create) rather than appear in them.
     makers: Vec<u32>,
+    /// Each of them's titles, and whether they made each (`Facts::credits`): read off the facts once per query.
+    credits: HashMap<u32, Vec<(Key, bool)>>,
     leftover: String,
     /// The share of the query's words left over: how thematic it is.
     lambda: f64,
 }
 
-impl Parsed<'_> {
+/// A query as `Parsed` reads it, before anything is read out of it: folded words joined by single spaces.
+pub fn normalized(text: &str) -> String {
+    words(text).join(" ")
+}
+
+impl Parsed {
+    /// The whole query, as `normalized` gives it.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// What the plot vectors are asked about: the leftover words, or the whole query when nothing is left over.
     /// `None` for a query too short to mean anything.
     pub fn embed_text(&self) -> Option<&str> {
@@ -176,11 +190,11 @@ fn words(text: &str) -> Vec<String> {
 
 /// Read a query: the facets first (`FacetQuery`), then the longest phrases among the rest that name a plot facet,
 /// a genre or a label; whatever is left is the leftover.
-pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
+pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
     let facet = FacetQuery::parse(text);
     let total = words(text).len().max(1);
     let tokens = words(&facet.leftover);
-    let label_names: Vec<(String, &'a str, bool)> = indexes
+    let label_names: Vec<(String, &str, bool)> = indexes
         .plot
         .subgenre_labels()
         .into_iter()
@@ -208,8 +222,8 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
                 }
             }
             for (folded, name, mood) in &label_names {
-                if *folded == phrase && !labels.contains(&(*name, *mood)) {
-                    labels.push((*name, *mood));
+                if *folded == phrase && !labels.iter().any(|(n, m)| n == name && m == mood) {
+                    labels.push(((*name).to_owned(), *mood));
                     matched = true;
                 }
             }
@@ -232,19 +246,23 @@ pub fn parse<'a>(text: &str, indexes: &'a Indexes) -> Parsed<'a> {
         rest.push(tokens[at].clone());
         at += 1;
     }
-    let makers = indexes
+    let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
         .facts
         .as_ref()
-        .map(|facts| {
-            let made_most = |qid: u32| {
-                let credits = facts.credits(qid);
-                2 * credits.iter().filter(|(_, made)| *made).count() >= credits.len()
-            };
-            people.iter().copied().filter(|&qid| made_most(qid)).collect()
-        })
+        .map(|facts| people.iter().map(|&qid| (qid, facts.credits(qid))).collect())
         .unwrap_or_default();
+    let makers = people
+        .iter()
+        .copied()
+        .filter(|qid| {
+            credits.get(qid).is_some_and(|c| 2 * c.iter().filter(|(_, made)| *made).count() >= c.len())
+        })
+        .collect();
+    let whole = normalized(text);
     Parsed {
-        text: words(text).join(" "),
+        title_query: TitleQuery::new(&whole),
+        text: whole,
+        credits,
         lambda: rest.len() as f64 / total as f64,
         leftover: rest.join(" "),
         facet,
@@ -285,7 +303,7 @@ struct Scored {
 pub fn answer(
     indexes: &Indexes,
     export: Option<&TitleIndex>,
-    parsed: &Parsed<'_>,
+    parsed: &Parsed,
     media_type: Option<MediaType>,
     vector: Option<&[i8]>,
     skip: usize,
@@ -316,30 +334,22 @@ pub fn answer(
                 .push(hit.title.to_owned());
         }
     }
-    // A country or decade: its titles, most voted first.
-    let facet_set: Option<HashSet<Key>> = (parsed.facet.has_strong_facet())
-        .then(|| {
-            indexes.facets.as_ref().map(|f| {
-                f.filter(parsed.facet.media_type, parsed.facet.country, parsed.facet.decade)
-                    .into_iter()
-                    .map(|(id, kind)| (kind, id))
-                    .collect()
-            })
-        })
-        .flatten();
-    if let (Some(facets), Some(set)) = (&indexes.facets, &facet_set) {
-        for (id, kind) in facets
-            .filter(parsed.facet.media_type, parsed.facet.country, parsed.facet.decade)
-            .into_iter()
-            .take(FACET_LANE)
-        {
-            debug_assert!(set.contains(&(kind, id)));
-            found.entry((kind, id)).or_default();
-        }
+    // A country or decade: its titles, most voted first. All of them bound the plot vectors; the first
+    // `FACET_LANE` join the candidates.
+    let facet_titles: Option<Vec<Key>> =
+        indexes.facets.as_ref().filter(|_| parsed.facet.has_strong_facet()).map(|f| {
+            f.filter(parsed.facet.media_type, parsed.facet.country, parsed.facet.decade)
+                .into_iter()
+                .map(|(id, kind)| (kind, id))
+                .collect()
+        });
+    for &key in facet_titles.iter().flatten().take(FACET_LANE) {
+        found.entry(key).or_default();
     }
+    let facet_set: Option<HashSet<Key>> = facet_titles.map(|titles| titles.into_iter().collect());
     // Labels and plot facets the query names.
-    for &(name, mood) in &parsed.labels {
-        let titles = if mood {
+    for (name, mood) in &parsed.labels {
+        let titles = if *mood {
             indexes.plot.titles_with_mood(name, None, LABEL_FLOOR, 0, LANE)
         } else {
             indexes.plot.titles_with_subgenre(name, None, LABEL_FLOOR, 0, LANE)
@@ -362,11 +372,9 @@ pub fn answer(
         }
     }
     // The titles of the people the query names.
-    if let Some(facts) = &indexes.facts {
-        for &qid in &parsed.people {
-            for (key, _) in facts.credits(qid) {
-                found.entry(key).or_default();
-            }
+    for credits in parsed.credits.values() {
+        for &(key, _) in credits {
+            found.entry(key).or_default();
         }
     }
     // The plot vectors' nearest to the leftover, within the facet when there is one.
@@ -409,13 +417,13 @@ pub fn answer(
     // An exact title leads the titles most like it.
     if let Some(top) = scored.first().filter(|s| s.exact) {
         let (kind, id) = top.key;
-        let similar: Vec<Key> =
-            den_index::more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, kind)
-                .into_iter()
-                .take(SIMILAR)
-                .map(|n| (kind, n))
-                .filter(|key| wanted(key.0))
-                .collect();
+        let similar: Vec<Key> = indexes
+            .more_like_this(id, kind)
+            .iter()
+            .take(SIMILAR)
+            .map(|&n| (kind, n))
+            .filter(|key| wanted(key.0))
+            .collect();
         let mut spliced: Vec<Scored> = Vec::with_capacity(scored.len() + similar.len());
         let mut rest: Vec<Scored> = Vec::new();
         let mut placed: HashSet<Key> = HashSet::new();
@@ -463,7 +471,7 @@ pub fn answer(
                         "qid": format!("Q{qid}"),
                         "id": person.tmdb_id,
                         "name": person.name,
-                        "credits": facts.credits(qid).len(),
+                        "credits": parsed.credits.get(&qid).map_or(0, Vec::len),
                     }))
                 })
                 .take(PEOPLE)
@@ -550,7 +558,7 @@ fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
 /// A candidate's features, or `None` when a facet it has a record of contradicts the query.
 fn features(
     indexes: &Indexes,
-    parsed: &Parsed<'_>,
+    parsed: &Parsed,
     key: Key,
     found: &Found,
     plot_confidence: &HashMap<Key, f64>,
@@ -594,7 +602,7 @@ fn features(
     let mut exact = false;
     let also_named = found.names.iter().map(String::as_str);
     for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
-        let (score, is_exact) = title_match(&parsed.text, title);
+        let (score, is_exact) = parsed.title_query.score(title);
         exact |= is_exact;
         t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
     }
@@ -609,9 +617,9 @@ fn features(
     }
     if !parsed.labels.is_empty() {
         if let Some(labels) = indexes.plot.labels(id, kind) {
-            for &(name, mood) in &parsed.labels {
-                let pairs = if mood { &labels.moods } else { &labels.subgenres };
-                if let Some(&(_, confidence)) = pairs.iter().find(|(n, _)| *n == name) {
+            for (name, mood) in &parsed.labels {
+                let pairs = if *mood { &labels.moods } else { &labels.subgenres };
+                if let Some(&(_, confidence)) = pairs.iter().find(|(n, _)| *n == name.as_str()) {
                     if confidence >= LABEL_FLOOR {
                         lab = lab.max(confidence);
                     }
@@ -633,36 +641,52 @@ fn features(
     Some(Scored { key, score: 0.0, exact, t, sem, lab, pf, person, pop, phi })
 }
 
-/// How well a title matches the query: exactly (folded, a leading English article dropped from both), or by the
-/// share of the query's trigrams it holds, blended with their Dice overlap so a long title that merely contains
-/// the query ("LEGO DC … Batman Be-Leaguered" for "batman") scores below the title itself.
-fn title_match(query: &str, title: &str) -> (f64, bool) {
-    let strip = |s: &str| -> String {
-        let folded = words(s).join(" ");
-        ["the ", "an ", "a "]
-            .iter()
-            .find_map(|article| folded.strip_prefix(article))
-            .map_or(folded.clone(), str::to_owned)
-    };
-    let (q, a) = (strip(query), strip(title));
-    if q.is_empty() {
-        return (0.0, false);
+/// The query as titles are matched against it — folded, a leading English article dropped, and its trigrams —
+/// worked out once, since every candidate's titles are compared with it.
+struct TitleQuery {
+    stripped: String,
+    trigrams: HashSet<u64>,
+}
+
+impl TitleQuery {
+    fn new(query: &str) -> TitleQuery {
+        let stripped = without_article(query);
+        let trigrams = trigram_keys(&stripped).into_iter().collect();
+        TitleQuery { stripped, trigrams }
     }
-    if q == a {
-        return (1.0, true);
+
+    /// How well a title matches the query: exactly (folded, a leading English article dropped from both), or by
+    /// the share of the query's trigrams it holds, blended with their Dice overlap so a long title that merely
+    /// contains the query ("LEGO DC … Batman Be-Leaguered" for "batman") scores below the title itself.
+    fn score(&self, title: &str) -> (f64, bool) {
+        if self.stripped.is_empty() {
+            return (0.0, false);
+        }
+        let title = without_article(title);
+        if title == self.stripped {
+            return (1.0, true);
+        }
+        let theirs: HashSet<u64> = trigram_keys(&title).into_iter().collect();
+        if self.trigrams.is_empty() || theirs.is_empty() {
+            return (0.0, false);
+        }
+        let shared = self.trigrams.intersection(&theirs).count() as f64;
+        let coverage = shared / self.trigrams.len() as f64;
+        if coverage < MIN_COVERAGE {
+            return (0.0, false);
+        }
+        let dice = 2.0 * shared / (self.trigrams.len() + theirs.len()) as f64;
+        (FUZZY_CAP * (0.5 * coverage + 0.5 * dice), false)
     }
-    let set = |s: &str| trigram_keys(s).into_iter().collect::<HashSet<u64>>();
-    let (qs, ts) = (set(&q), set(&a));
-    if qs.is_empty() || ts.is_empty() {
-        return (0.0, false);
-    }
-    let shared = qs.intersection(&ts).count() as f64;
-    let coverage = shared / qs.len() as f64;
-    if coverage < MIN_COVERAGE {
-        return (0.0, false);
-    }
-    let dice = 2.0 * shared / (qs.len() + ts.len()) as f64;
-    (FUZZY_CAP * (0.5 * coverage + 0.5 * dice), false)
+}
+
+/// Folded words, a leading English article dropped.
+fn without_article(text: &str) -> String {
+    let folded = normalized(text);
+    ["the ", "an ", "a "]
+        .iter()
+        .find_map(|article| folded.strip_prefix(article))
+        .map_or(folded.clone(), str::to_owned)
 }
 
 #[cfg(test)]
@@ -671,6 +695,7 @@ mod tests {
 
     #[test]
     fn a_title_matches_exactly_without_its_article_and_a_longer_one_scores_less() {
+        let title_match = |query: &str, title: &str| TitleQuery::new(query).score(title);
         assert_eq!(title_match("the matrix", "The Matrix"), (1.0, true));
         assert_eq!(title_match("matrix", "The Matrix"), (1.0, true));
         let (reloaded, exact) = title_match("matrix", "The Matrix Reloaded");
