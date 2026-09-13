@@ -176,7 +176,8 @@ impl Facts {
             let production = codes(raw.production_countries, u8::to_ascii_uppercase);
             let record = Record {
                 imdb_id: raw.imdb_id.and_then(OneOrMany::first).filter(|id| id.starts_with("tt")),
-                released: raw.released.and_then(|r| Released::parse(&r.date, &r.precision)),
+                // A film is released; a series starts.
+                released: raw.released.or(raw.started).and_then(|r| Released::parse(&r.date, &r.precision)),
                 genres,
                 countries: if production.is_empty() {
                     codes(raw.countries, u8::to_ascii_uppercase)
@@ -236,6 +237,7 @@ struct RawRecord {
     tmdb_id: u32,
     imdb_id: Option<OneOrMany>,
     released: Option<RawReleased>,
+    started: Option<RawReleased>,
     genres: Option<Vec<String>>,
     countries: Option<Vec<String>>,
     production_countries: Option<Vec<String>>,
@@ -285,7 +287,7 @@ pub(crate) mod tests {
          "released": {"date": "2026-09-01", "precision": "day"},
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
          "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"]},
-        {"mediaType": "tv", "tmdbId": 1, "released": {"date": "2010-00-00", "precision": "year"},
+        {"mediaType": "tv", "tmdbId": 1, "started": {"date": "2010-00-00", "precision": "year"},
          "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "hasVector": false},
         {"mediaType": "movie", "tmdbId": 2}
       ]
