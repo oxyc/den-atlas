@@ -439,9 +439,14 @@ pub fn answer(
 /// How popular a title is, 0 to 1: by its votes (facets.bin), else by TMDB's popularity in the daily export, for
 /// a title facets.bin has no record of.
 pub(crate) fn popularity(votes: u32, export: Option<f64>) -> f64 {
+    attention(votes, export).min(1.0)
+}
+
+/// `popularity` without its ceiling, for ordering: past "fully popular", a title with more votes still comes first.
+pub(crate) fn attention(votes: u32, export: Option<f64>) -> f64 {
     match export {
-        _ if votes > 0 => (f64::from(votes).ln_1p() / POPULAR_VOTES.ln_1p()).min(1.0),
-        Some(popularity) => (popularity.max(0.0).ln_1p() / POPULAR_POPULARITY.ln_1p()).min(1.0),
+        _ if votes > 0 => f64::from(votes).ln_1p() / POPULAR_VOTES.ln_1p(),
+        Some(popularity) => popularity.max(0.0).ln_1p() / POPULAR_POPULARITY.ln_1p(),
         None => 0.0,
     }
 }
@@ -599,6 +604,7 @@ mod tests {
         assert_eq!(popularity(0, Some(50.0)), 1.0);
         assert!(popularity(0, Some(1.0)) < 0.2);
         assert_eq!(popularity(0, None), 0.0);
+        assert!(attention(30_000, None) > attention(5000, None), "ordering keeps apart what popularity caps");
     }
 
     #[test]

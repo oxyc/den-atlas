@@ -153,7 +153,7 @@ pub fn row(
             MediaType::Movie => den_titlesearch::MediaType::Movie,
             MediaType::Tv => den_titlesearch::MediaType::Tv,
         };
-        crate::search::popularity(votes, export.and_then(|e| e.popularity_of(kind, id)))
+        crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
     };
     let mut matched: Vec<(Key, u8, f64)> = candidates
         .into_iter()
