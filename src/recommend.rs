@@ -322,6 +322,8 @@ pub struct Title<'a> {
     pub released: Option<Released>,
     pub rating: Option<f64>,
     pub votes: Option<f64>,
+    /// Whether `votes` is a stand-in for a count nobody gave (JustWatch's IMDb score comes without one).
+    pub estimated_votes: bool,
     pub popularity: Option<f64>,
     /// TMDB genre ids, series' own folded into films' (`fold_genre`).
     pub genres: Vec<u16>,
@@ -460,6 +462,7 @@ impl<'a> Knowledge<'a> {
             (None, Some(rating)) => {
                 title.rating = Some(rating);
                 title.votes = Some(RATING_PRIOR_VOTES);
+                title.estimated_votes = true;
             }
             (None, None) => {}
         }
@@ -781,7 +784,9 @@ fn best(a: Option<Placing>, b: Option<Placing>) -> Option<Placing> {
 }
 
 /// The same title from two sources is one candidate holding everything both knew about it; the first says
-/// what it knows first.
+/// what it knows first, except where the second knows it better. Atlas's own lists come first in the pool
+/// and name a title by its year and a vote-less score, so a client list's exact date and counted rating
+/// must not lose to them.
 fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
     fn either<T>(x: Vec<T>, y: Vec<T>) -> Vec<T> {
         if x.is_empty() {
@@ -791,12 +796,23 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         }
     }
     let (x, y) = (a.title, b.title);
+    let released = match (x.released, y.released) {
+        (Some(first), Some(second)) if second.span_days < first.span_days => Some(second),
+        (first, second) => first.or(second),
+    };
+    let second_rating = x.rating.is_none() || (x.estimated_votes && y.rating.is_some() && !y.estimated_votes);
+    let (rating, votes, estimated_votes) = if second_rating {
+        (y.rating, y.votes, y.estimated_votes)
+    } else {
+        (x.rating, x.votes, x.estimated_votes)
+    };
     Candidate {
         key: a.key,
         title: Title {
-            released: x.released.or(y.released),
-            rating: x.rating.or(y.rating),
-            votes: if x.rating.is_some() { x.votes } else { y.votes },
+            released,
+            rating,
+            votes,
+            estimated_votes,
             popularity: x.popularity.or(y.popularity),
             genres: either(x.genres, y.genres),
             original_language: x.original_language.or(y.original_language),
@@ -970,10 +986,13 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     }
 
     // Only titles something is known about, when there are enough of them: an unjudged title can't be matched
-    // against this library's taste or dropped for missing it, so it competes on attention alone.
-    let unjudged: HashSet<Key> = pool.iter().filter(|c| c.title.genres.is_empty()).map(|c| c.key).collect();
-    if pool.len() - pool.iter().filter(|c| c.title.genres.is_empty()).count() >= JUDGED_ENOUGH {
-        pool.retain(|c| !c.title.genres.is_empty());
+    // against this library's taste or dropped for missing it, so it competes on attention alone. Judged per title,
+    // not per list entry: a title one list named only by id is judged when another list described it, and keeps the
+    // place the first list gave it.
+    let judged: HashSet<Key> = pool.iter().filter(|c| !c.title.genres.is_empty()).map(|c| c.key).collect();
+    let unjudged: HashSet<Key> = pool.iter().map(|c| c.key).filter(|key| !judged.contains(key)).collect();
+    if pool.iter().filter(|c| judged.contains(&c.key)).count() >= JUDGED_ENOUGH {
+        pool.retain(|c| judged.contains(&c.key));
     }
 
     let owned: HashSet<Key> =
@@ -1441,6 +1460,28 @@ mod tests {
         let picked =
             pick(vec![arriving(5, 60.0), arriving(5, 0.0), arriving(6, 30.0)], now(), 40, all, Some(&taste));
         assert_eq!(ids(&picked), vec![5, 6]);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_exact_date_and_the_counted_rating_whichever_came_first() {
+        let listed = cand(
+            5,
+            Title {
+                released: Some(Released::year(2026)),
+                rating: Some(9.0),
+                votes: Some(RATING_PRIOR_VOTES),
+                estimated_votes: true,
+                ..Title::default()
+            },
+        );
+        let described = cand(
+            5,
+            Title { released: on("2026-09-10"), rating: Some(6.1), votes: Some(40.0), ..Title::default() },
+        );
+        let (merged, _) = pick(vec![listed, described], now(), 40, all, None).remove(0);
+        assert_eq!(merged.title.released, on("2026-09-10"));
+        assert_eq!((merged.title.rating, merged.title.votes), (Some(6.1), Some(40.0)));
+        assert!(!merged.title.estimated_votes);
     }
 
     #[test]
