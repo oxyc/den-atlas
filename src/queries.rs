@@ -11,6 +11,7 @@ use den_index::{FacetIndex, Index};
 use den_titlesearch::{TitleIndex, TitleRecord};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -101,6 +102,8 @@ pub struct IndexQueries {
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
+    /// Whether the dataset declares a facts file the last load couldn't read (`/health`).
+    facts_unusable: AtomicBool,
 }
 
 impl IndexQueries {
@@ -119,7 +122,14 @@ impl IndexQueries {
             metadata: ds.metadata.as_ref().map(|m| m.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
+            facts_unusable: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
+    /// then run without facts, which only a log line said before.
+    pub fn facts_unusable(&self) -> bool {
+        self.facts_unusable.load(Ordering::Relaxed)
     }
 
     /// The indexes — loaded first if they aren't in memory — and how long that load took (`None` when they
@@ -155,6 +165,7 @@ impl IndexQueries {
             indexes.plot.len(),
             took.as_secs_f64()
         );
+        self.facts_unusable.store(self.facts.is_some() && indexes.facts.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))

@@ -202,7 +202,12 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
         // app's Plugins screen (and any monitor) can see a problem.
         return json_response(
-            health_body(ds.is_some(), state.catalog.fresh(), state.catalog.schema_suspect()),
+            health_body(
+                ds.is_some(),
+                state.catalog.fresh(),
+                state.catalog.schema_suspect(),
+                state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+            ),
             StatusCode::OK,
         );
     }
@@ -336,12 +341,14 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
 
 /// What `/health` reports: `None` when healthy, else the reason slug and a one-sentence detail.
 /// Dataset-unavailable outranks a stale catalog (no dataset is the more severe condition): no dataset ⇒
-/// `dataset_unavailable`; else a failed last JustWatch refresh ⇒ `stale_catalog`. One function feeds
-/// both the body and the state-change log line, so the two cannot disagree.
+/// `dataset_unavailable`; else a failed last JustWatch refresh ⇒ `stale_catalog`; then a suspected schema break;
+/// then a declared facts file the last index load couldn't read ⇒ `facts_unusable`. One function feeds both the
+/// body and the state-change log line, so the two cannot disagree.
 pub(crate) fn health_state(
     dataset_loaded: bool,
     catalog_fresh: bool,
     schema_suspect: bool,
+    facts_unusable: bool,
 ) -> Option<(&'static str, &'static str)> {
     if !dataset_loaded {
         Some(("dataset_unavailable", "dataset failed to load; refresh with scripts/fetch-dataset.sh"))
@@ -356,6 +363,13 @@ pub(crate) fn health_state(
             "catalog_schema_suspect",
             "a JustWatch chart returned far fewer usable titles than it carried; rows may be short",
         ))
+    } else if facts_unusable {
+        // Everything still answers, from labels and facets alone — which is why it is invisible without this:
+        // recommendations lose their dates, people and countries, and search its people and other titles.
+        Some((
+            "facts_unusable",
+            "the dataset's facts file did not read; /recommend and search run without facts",
+        ))
     } else {
         None
     }
@@ -363,8 +377,13 @@ pub(crate) fn health_state(
 
 /// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
 /// body carries the real state. Pure, so the decision is unit-testable without an HTTP round-trip.
-fn health_body(dataset_loaded: bool, catalog_fresh: bool, schema_suspect: bool) -> String {
-    match health_state(dataset_loaded, catalog_fresh, schema_suspect) {
+fn health_body(
+    dataset_loaded: bool,
+    catalog_fresh: bool,
+    schema_suspect: bool,
+    facts_unusable: bool,
+) -> String {
+    match health_state(dataset_loaded, catalog_fresh, schema_suspect, facts_unusable) {
         None => r#"{"status":"ok"}"#.to_owned(),
         Some((reason, detail)) => {
             format!(r#"{{"status":"degraded","reason":"{reason}","detail":"{detail}"}}"#)
@@ -378,7 +397,12 @@ fn health_body(dataset_loaded: bool, catalog_fresh: bool, schema_suspect: bool) 
 /// where it is read, so a schema-break window that has quietly expired is reported the next time
 /// anyone looks, with no timer running.
 fn note_health(state: &AppState) {
-    let now = health_state(state.dataset.is_some(), state.catalog.fresh(), state.catalog.schema_suspect());
+    let now = health_state(
+        state.dataset.is_some(),
+        state.catalog.fresh(),
+        state.catalog.schema_suspect(),
+        state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+    );
     let slug = now.map_or("ok", |(reason, _)| reason);
     let mut last = crate::util::lock(&state.health);
     if *last == slug {
@@ -1352,14 +1376,25 @@ mod tests {
 
     #[test]
     fn health_ok_when_dataset_loaded_and_fresh() {
-        assert_eq!(health_body(true, true, false), r#"{"status":"ok"}"#);
+        assert_eq!(health_body(true, true, false, false), r#"{"status":"ok"}"#);
     }
 
     #[test]
     fn health_stale_catalog_when_last_refresh_failed() {
-        let body = health_body(true, false, false);
+        let body = health_body(true, false, false, false);
         assert!(body.contains(r#""status":"degraded""#));
         assert!(body.contains(r#""reason":"stale_catalog""#));
+    }
+
+    /// Facts that don't read leave every route answering, from labels and facets alone, so nothing but this says
+    /// recommendations and search have lost them.
+    #[test]
+    fn health_reports_facts_that_did_not_read() {
+        let body = health_body(true, true, false, true);
+        assert!(body.contains(r#""reason":"facts_unusable""#), "{body}");
+        // It ranks below every catalog and dataset state.
+        assert!(health_body(true, true, true, true).contains(r#""reason":"catalog_schema_suspect""#));
+        assert!(health_body(false, true, false, true).contains(r#""reason":"dataset_unavailable""#));
     }
 
     /// A partial schema break is a SUCCESSFUL refresh by every other measure — the row is short but
@@ -1367,21 +1402,21 @@ mod tests {
     /// trace was a line on stderr that nothing reads.
     #[test]
     fn health_reports_a_suspected_schema_break() {
-        let body = health_body(true, true, true);
+        let body = health_body(true, true, true, false);
         assert!(body.contains(r#""status":"degraded""#), "{body}");
         assert!(body.contains(r#""reason":"catalog_schema_suspect""#), "{body}");
         // It ranks BELOW the two that mean rows are missing entirely.
-        assert!(health_body(true, false, true).contains(r#""reason":"stale_catalog""#));
-        assert!(health_body(false, true, true).contains(r#""reason":"dataset_unavailable""#));
+        assert!(health_body(true, false, true, false).contains(r#""reason":"stale_catalog""#));
+        assert!(health_body(false, true, true, false).contains(r#""reason":"dataset_unavailable""#));
     }
 
     #[test]
     fn health_dataset_unavailable_when_dataset_missing() {
         // Dataset-unavailable outranks stale: even with a fresh catalog, no dataset is the reported reason.
-        let body = health_body(false, true, false);
+        let body = health_body(false, true, false, false);
         assert!(body.contains(r#""reason":"dataset_unavailable""#));
         // …and it still takes precedence when the catalog is also stale (the more severe condition wins).
-        assert!(health_body(false, false, true).contains(r#""reason":"dataset_unavailable""#));
+        assert!(health_body(false, false, true, false).contains(r#""reason":"dataset_unavailable""#));
     }
 
     /// The descriptor's Vary depends on ONE bool at its call site, and flipping it left the whole

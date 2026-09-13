@@ -93,7 +93,7 @@ origin.
 | Route | Returns |
 |---|---|
 | `GET /`, `GET /configure` | landing/configure page: pick region + services, get the install URL |
-| `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `stale_catalog` (last JustWatch refresh failed) or `catalog_schema_suspect` (a served chart came back mostly empty) |
+| `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `stale_catalog` (last JustWatch refresh failed), `catalog_schema_suspect` (a served chart came back mostly empty) or `facts_unusable` (the dataset declares a facts file the last index load couldn't read; `/recommend` and search run without facts) |
 | `GET /manifest.json` | the `dataset` + `catalog` manifest (also under a `/<region>_<codes>/` install prefix) |
 | `GET /dataset.json` | the descriptor (absolute blob URLs from the request origin); `503` when the dataset did not load |
 | `GET /labels-<tax>.json` | the derived labels blob |
