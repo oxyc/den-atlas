@@ -57,6 +57,9 @@ const FACET_PEOPLE: f64 = 0.22;
 const FACET_COUNTRIES: f64 = 0.1;
 const FACET_LANGUAGES: f64 = 0.06;
 const FACET_DECADES: f64 = 0.06;
+/// Where a series aired, on top of the facets above: a network's house style is something viewers follow, but
+/// less surely than a maker, so it weighs less than people do. Read only between series.
+const FACET_BROADCASTERS: f64 = 0.08;
 /// How much atlas's labels add on top of the facets, where both the title and the library carry them.
 ///
 /// In the web app labels only chose which sixty candidates TMDB was asked about, which is how they came to
@@ -342,6 +345,8 @@ pub struct Title<'a> {
     /// Who made it and who is in it, each with how much it counts (see `CAST_BILLED`).
     pub people: Vec<(u32, f64)>,
     pub franchise: Option<u32>,
+    /// Where a series aired.
+    pub broadcasters: Vec<u32>,
     pub labels: Option<LabelSet<'a>>,
     /// Every genre a client's hint named, folded like `genres`. Taste may read only the first of them; the hide
     /// rules read them all, so a hidden genre named second still hides the title.
@@ -474,6 +479,7 @@ impl<'a> Knowledge<'a> {
             let each = if r.cast.is_empty() { 0.0 } else { (CAST_BILLED / r.cast.len() as f64).min(1.0) };
             title.people.extend(r.cast.iter().filter(|id| !r.makers.contains(*id)).map(|&id| (id, each)));
             title.franchise = r.franchise;
+            title.broadcasters = r.broadcasters.clone();
         }
         title.released = hint
             .and_then(|h| h.release_date.as_deref())
@@ -538,6 +544,7 @@ pub struct Taste<'a> {
     people: HashMap<u32, f64>,
     decades: HashMap<i64, f64>,
     franchises: HashMap<u32, f64>,
+    broadcasters: HashMap<u32, f64>,
     subgenres: HashMap<&'a str, f64>,
     moods: HashMap<&'a str, f64>,
     /// What one of this library's own titles scores on each facet, averaged over the library: a facet is read
@@ -551,6 +558,7 @@ struct Typical {
     languages: f64,
     countries: f64,
     decades: f64,
+    broadcasters: f64,
     subgenres: f64,
     moods: f64,
 }
@@ -606,6 +614,7 @@ pub fn taste_of<'a>(entries: &[(Title<'a>, f64)]) -> Taste<'a> {
         add(&mut taste.people, title.people.iter().map(|&(p, share)| (p, w * share)));
         add(&mut taste.decades, decades_of(title).into_iter().map(|d| (d, w)));
         add(&mut taste.franchises, franchises_of(title).into_iter().map(|f| (f, w)));
+        add(&mut taste.broadcasters, title.broadcasters.iter().map(|&b| (b, w)));
         if let Some(labels) = &title.labels {
             add(&mut taste.subgenres, labels.subgenres.iter().map(|&(n, c)| (n, w * c)));
             add(&mut taste.moods, labels.moods.iter().map(|&(n, c)| (n, w * c)));
@@ -632,6 +641,11 @@ pub fn taste_of<'a>(entries: &[(Title<'a>, f64)]) -> Taste<'a> {
         languages: mean(&|t| Some(share_of(&taste.languages, &t.languages))),
         countries: mean(&|t| Some(share_of(&taste.countries, &t.countries))),
         decades: mean(&|t| Some(share_of(&taste.decades, &decades_of(t)))),
+        // Over the series that name one: a film has none, and counting films as matching no network would make
+        // every network look like a rare match.
+        broadcasters: mean(&|t| {
+            (!t.broadcasters.is_empty()).then(|| share_of(&taste.broadcasters, &t.broadcasters))
+        }),
         // Over the titles that carry labels at all, as the web's label profile was.
         subgenres: mean(&|t| t.labels.as_ref().map(|l| share_of(&taste.subgenres, &names(&l.subgenres)))),
         moods: mean(&|t| t.labels.as_ref().map(|l| share_of(&taste.moods, &names(&l.moods)))),
@@ -698,7 +712,8 @@ pub fn affinity(title: &Title<'_>, taste: Option<&Taste<'_>>) -> f64 {
         + FACET_LANGUAGES * facet(&taste.languages, &title.languages, t.languages)
         + FACET_COUNTRIES * facet(&taste.countries, &title.countries, t.countries)
         + FACET_DECADES * facet(&taste.decades, &decades_of(title), t.decades)
-        + FACET_PEOPLE * following(&taste.people, &title.people);
+        + FACET_PEOPLE * following(&taste.people, &title.people)
+        + FACET_BROADCASTERS * facet(&taste.broadcasters, &title.broadcasters, t.broadcasters);
     if let Some(labels) = &title.labels {
         evidence += LABEL_WEIGHT
             * (LABEL_SUBGENRES * facet(&taste.subgenres, &names(&labels.subgenres), t.subgenres)
@@ -848,6 +863,7 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
             countries: either(x.countries, y.countries),
             people: either(x.people, y.people),
             franchise: x.franchise.or(y.franchise),
+            broadcasters: either(x.broadcasters, y.broadcasters),
             labels: x.labels.or(y.labels),
             hint_genres: either(x.hint_genres, y.hint_genres),
             adult: x.adult || y.adult,
@@ -1370,6 +1386,17 @@ mod tests {
         let dated = |date| Title { released: on(date), ..film(&[DRAMA], "") };
         let taste = taste_of(&[(dated("2024-01-01"), 1.0), (dated("2022-06-01"), 1.0)]);
         assert!(affinity(&dated("2026-03-01"), Some(&taste)) > affinity(&dated("1981-03-01"), Some(&taste)));
+    }
+
+    #[test]
+    fn prefers_a_series_from_the_networks_this_library_watches() {
+        let aired = |network| Title { broadcasters: vec![network], ..film(&[DRAMA], "") };
+        let taste =
+            taste_of(&[(aired(10), 1.0), (aired(10), 1.0), (aired(20), 1.0), (film(&[DRAMA], ""), 1.0)]);
+        let home = affinity(&aired(10), Some(&taste));
+        let elsewhere = affinity(&aired(30), Some(&taste));
+        let film_alone = affinity(&film(&[DRAMA], ""), Some(&taste));
+        assert!(home > film_alone && film_alone > elsewhere, "{home} {film_alone} {elsewhere}");
     }
 
     #[test]

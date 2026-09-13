@@ -105,6 +105,8 @@ pub struct Record {
     pub cast: Vec<u32>,
     /// The series of works it belongs to (P179).
     pub franchise: Option<u32>,
+    /// Where a series first aired (P449): its network or service.
+    pub broadcasters: Vec<u32>,
 }
 
 pub struct Facts {
@@ -188,6 +190,7 @@ impl Facts {
                 makers,
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
+                broadcasters: entities(raw.broadcaster),
             };
             // The first record wins a duplicate, as in the labels index.
             records.entry((media_type, raw.tmdb_id)).or_insert(record);
@@ -246,6 +249,7 @@ struct RawRecord {
     creators: Option<Vec<String>>,
     cast: Option<Vec<String>>,
     franchise: Option<OneOrMany>,
+    broadcaster: Option<Vec<String>>,
 }
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
@@ -288,7 +292,7 @@ pub(crate) mod tests {
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
          "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"]},
         {"mediaType": "tv", "tmdbId": 1, "started": {"date": "2010-00-00", "precision": "year"},
-         "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "hasVector": false},
+         "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "broadcaster": ["Q80"], "hasVector": false},
         {"mediaType": "movie", "tmdbId": 2}
       ]
     }"#;
@@ -312,6 +316,7 @@ pub(crate) mod tests {
         let series = facts.get(1, MediaType::Tv).unwrap();
         assert_eq!(series.genres, vec![878, 14], "a series-only genre is named as films'");
         assert_eq!(series.makers, vec![7]);
+        assert_eq!(series.broadcasters, vec![80]);
         assert_eq!(series.countries, vec![*b"KR"]);
         assert_eq!(series.released.unwrap().span_days, 365);
 
