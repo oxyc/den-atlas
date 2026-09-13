@@ -15,6 +15,7 @@ mod metrics;
 mod plotrows;
 mod queries;
 mod recommend;
+mod search;
 mod titles;
 mod util;
 

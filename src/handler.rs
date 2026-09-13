@@ -471,6 +471,8 @@ enum IndexQuestion {
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
     Facets,
+    /// Search in one request (`search.rs`). Answered in `handle_index`, because it waits on den-embed.
+    Query,
     /// A row of the plot facets named in the query (`?ending=bittersweet&tone=bleak`).
     Plot {
         media_type: den_index::MediaType,
@@ -498,6 +500,7 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
+            ["query"] => Some(Self::Query),
             ["plot", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
         }
@@ -555,7 +558,7 @@ impl IndexQuestion {
                     number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
                 )
             }
-            Self::Search | Self::Facets => unreachable!("answered in handle_index"),
+            Self::Search | Self::Facets | Self::Query => unreachable!("answered in handle_index"),
         };
         body.to_string()
     }
@@ -649,6 +652,33 @@ async fn search_answer(
         .map(|n| serde_json::json!({ "type": stremio_type(n.media_type), "id": n.tmdb_id, "score": n.score }))
         .collect();
     Ok(serde_json::json!({ "titles": titles, "mean": stats.mean, "sd": stats.sd }).to_string())
+}
+
+/// `GET /index/query.json?q=&type=&skip=&limit=` — search in one request (`search.rs`). The query is embedded
+/// only when den-embed answers; without it the plot vectors simply don't score.
+async fn query_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> String {
+    let text = query_text(query, "q");
+    let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
+    let parsed = crate::search::parse(&text, indexes);
+    let vector = match (&state.embed, parsed.embed_text()) {
+        (Some(_), Some(words)) => {
+            embed_query(state, words).await.map_err(|e| eprintln!("search query left unembedded: {e}")).ok()
+        }
+        _ => None,
+    };
+    let number =
+        |key: &str, default: usize| query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let titles = state.titles.as_ref().and_then(|t| t.index());
+    crate::search::answer(
+        indexes,
+        titles.as_deref(),
+        &parsed,
+        media_type,
+        vector.as_deref(),
+        number("skip", 0),
+        number("limit", crate::search::PAGE).min(crate::search::MAX_PAGE),
+    )
+    .to_string()
 }
 
 /// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
@@ -967,11 +997,12 @@ async fn handle_index(
     };
     // Search and facets can rank through den-embed, so they stay short. Every other answer is the dataset
     // alone, which changes at most once a day: fresh for an hour, and served stale while it revalidates.
-    let cache_control = if matches!(question, IndexQuestion::Search | IndexQuestion::Facets) {
-        "public, max-age=300"
-    } else {
-        "public, max-age=3600, stale-while-revalidate=86400"
-    };
+    let cache_control =
+        if matches!(question, IndexQuestion::Search | IndexQuestion::Facets | IndexQuestion::Query) {
+            "public, max-age=300"
+        } else {
+            "public, max-age=3600, stale-while-revalidate=86400"
+        };
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
             Ok(body) => body,
@@ -981,6 +1012,7 @@ async fn handle_index(
             }
         },
         IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
+        IndexQuestion::Query => query_answer(state, &indexes, query).await,
         question => question.answer(&indexes, query),
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
@@ -1545,6 +1577,51 @@ mod tests {
         );
         let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
         assert_eq!(none["facet"], serde_json::Value::Null);
+    }
+
+    /// Search in one request: an exact title leads its similar titles, a typo still finds its title, a country
+    /// filters, a label and a plot facet each propose and lift their titles — and the reading comes back too.
+    #[tokio::test]
+    async fn query_searches_titles_facets_labels_and_plot_facets_in_one_ranking() {
+        let state = index_state("den-atlas-query");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ask = |q: &str| format!("/index/query.json?q={}", q.replace(' ', "+"));
+        let keys = |answer: &serde_json::Value| -> Vec<String> {
+            answer["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| format!("{}:{}", h["type"].as_str().unwrap(), h["id"]))
+                .collect()
+        };
+
+        // "One" is exact; More Like This for movie 1 is 3 then 2 (premise-led), drawn right after it.
+        let one = json(body_of(get(&state, &ask("one")).await).await);
+        assert_eq!(keys(&one)[..3], ["movie:1", "movie:3", "movie:2"], "{one}");
+        assert_eq!(one["hits"][0]["title"], "One");
+        assert_eq!(one["hits"][0]["posterPath"], "/1.jpg");
+        assert!(one["hits"][0]["f"]["t"].as_f64().unwrap() >= 0.6);
+
+        let typo = json(body_of(get(&state, &ask("thre")).await).await);
+        assert_eq!(keys(&typo)[0], "movie:3", "{typo}");
+
+        // Korean films only, most voted first; the Korean series is another type.
+        let korean = json(body_of(get(&state, &ask("korean movies")).await).await);
+        assert_eq!(keys(&korean), ["movie:2", "movie:1"], "{korean}");
+        assert_eq!(korean["parse"]["country"], "KR");
+
+        // The Heist label proposes all four; the series carries it most confidently.
+        let heist = json(body_of(get(&state, &ask("heist")).await).await);
+        assert_eq!(keys(&heist)[0], "series:4", "{heist}");
+        assert_eq!(heist["parse"]["labels"], serde_json::json!(["Heist"]));
+
+        // Bleak: movie 1 is sure of it, movie 2 only a little; nothing else is proposed.
+        let bleak = json(body_of(get(&state, &ask("bleak")).await).await);
+        assert_eq!(keys(&bleak), ["movie:1", "movie:2"], "{bleak}");
+        assert_eq!(bleak["parse"]["plotFacets"], serde_json::json!(["tone=bleak"]));
+
+        let empty = json(body_of(get(&state, &ask("zzzz")).await).await);
+        assert_eq!(empty["hits"], serde_json::json!([]));
     }
 
     /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards

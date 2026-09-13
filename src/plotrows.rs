@@ -168,7 +168,7 @@ pub fn row(
 
 /// Every genre anything names for a title, as TMDB genre ids: the labels' primary genre and animation, and the
 /// facts' genres. What a client's hide rules read.
-fn genres(indexes: &Indexes, (media_type, id): Key) -> Vec<u16> {
+pub(crate) fn genres(indexes: &Indexes, (media_type, id): Key) -> Vec<u16> {
     let mut genres: Vec<u16> = Vec::new();
     if let Some(labels) = indexes.plot.labels(id, media_type) {
         genres.extend(crate::recommend::genre_named(labels.primary_genre));

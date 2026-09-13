@@ -12,7 +12,7 @@ pub fn fold(s: &str) -> String {
 /// Character trigrams of already-folded text, whitespace removed so multi-word titles still overlap
 /// ("the matrix" → "the", "hem", "ema", …). Each is packed into one integer — three code points of 21
 /// bits — which keeps the index a sorted `Vec<u64>` instead of a map of strings.
-pub(crate) fn trigram_keys(folded: &str) -> Vec<u64> {
+pub fn trigram_keys(folded: &str) -> Vec<u64> {
     let chars: Vec<char> = folded.chars().filter(|c| !c.is_whitespace()).collect();
     chars.windows(3).map(|w| ((w[0] as u64) << 42) | ((w[1] as u64) << 21) | w[2] as u64).collect()
 }

@@ -8,6 +8,7 @@ use crate::facts::Facts;
 use crate::plotrows::{read_cards, Card, PlotFacets};
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
+use den_titlesearch::{TitleIndex, TitleRecord};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,9 @@ pub struct Indexes {
     /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
     pub plot_facets: Option<PlotFacets>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
+    /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
+    /// title, so "parasite" finds only what is displayed as "Parasite" here.
+    pub display: Option<TitleIndex>,
 }
 
 /// A labels blob and its vectors blob.
@@ -173,10 +177,32 @@ fn load(sources: &Sources) -> Result<Indexes, String> {
     let plot_facets = sources.plot_facets.as_ref().and_then(|path| {
         PlotFacets::read(path).map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty")).ok()
     });
-    let cards = plot_facets.as_ref().and(sources.metadata.as_ref()).and_then(|path| {
-        read_cards(path).map_err(|e| eprintln!("metadata unusable ({e}) — plot rows are empty")).ok()
+    let cards = sources.metadata.as_ref().and_then(|path| {
+        read_cards(path)
+            .map_err(|e| {
+                eprintln!("metadata unusable ({e}) — plot rows are empty, search has no display titles")
+            })
+            .ok()
     });
-    Ok(Indexes { plot, premise, facets, facts, plot_facets, cards })
+    let display = cards.as_ref().map(|cards| {
+        let votes =
+            |kind, id| facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes));
+        TitleIndex::build(
+            cards
+                .iter()
+                .map(|(&(kind, id), card)| TitleRecord {
+                    tmdb_id: id,
+                    media_type: match kind {
+                        den_index::MediaType::Movie => den_titlesearch::MediaType::Movie,
+                        den_index::MediaType::Tv => den_titlesearch::MediaType::Tv,
+                    },
+                    title: card.title.clone(),
+                    popularity: votes(kind, id),
+                })
+                .collect(),
+        )
+    });
+    Ok(Indexes { plot, premise, facets, facts, plot_facets, cards, display })
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {

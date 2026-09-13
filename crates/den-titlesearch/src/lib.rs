@@ -10,7 +10,7 @@ mod fold;
 mod index;
 
 pub use export::ExportScanner;
-pub use fold::fold;
+pub use fold::{fold, trigram_keys};
 pub use index::{Hit, TitleIndex, DEFAULT_MIN_COVERAGE};
 
 /// The two kinds of title TMDB exports.
