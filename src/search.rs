@@ -43,6 +43,10 @@ const SEMANTIC_FLOOR_Z: f64 = 2.5;
 const SEMANTIC_SPAN_Z: f64 = 3.5;
 /// What a candidate keeps when the query names a country or decade it has no record of: unknown isn't a mismatch.
 const UNKNOWN_FACET: f64 = 0.6;
+/// What a candidate keeps when it CONTRADICTS a facet that was guessed from the query's words rather than
+/// given as a parameter. Heavy enough that the facet still orders the answer, light enough that an exact
+/// title survives it: `russian doll` must not be able to erase Russian Doll.
+const WRONG_TEXT_FACET: f64 = 0.15;
 /// A title typed exactly scores this plus popularity's share; a near match at most `FUZZY_CAP`.
 const EXACT_TITLE: f64 = 0.6;
 const FUZZY_CAP: f64 = 0.5;
@@ -183,6 +187,13 @@ pub struct Parsed {
     /// The whole query as titles are compared with it.
     title_query: TitleQuery,
     facet: FacetQuery,
+    /// Whether the year window was GIVEN by the caller rather than read out of the words.
+    ///
+    /// Only an explicit parameter may drop a title. A facet guessed from prose may discount, never erase:
+    /// `russian doll` read RU and lost Russian Doll, `brazil` lost Gilliam's Brazil, `1917` lost the 2019
+    /// film. The caller who sends `year_min=2015` meant it; the person who typed a word that happens to be
+    /// a country did not.
+    year_from_param: bool,
     genres: Vec<u16>,
     /// Label names as the index spells them, and whether each is a mood.
     labels: Vec<(String, bool)>,
@@ -236,10 +247,16 @@ impl Parsed {
     /// Set the release-year window from a caller that computed it, overriding whatever the text implied.
     pub fn set_year_min(&mut self, year: u16) {
         self.facet.year_min = Some(year);
+        self.year_from_param = true;
+        // An explicit window REPLACES a decade the words implied, rather than intersecting with it: asking
+        // for `80s horror` with year_min=2020 should not quietly answer nothing.
+        self.facet.decade = None;
     }
 
     pub fn set_year_max(&mut self, year: u16) {
         self.facet.year_max = Some(year);
+        self.year_from_param = true;
+        self.facet.decade = None;
     }
 
     /// True when the query named anything the facts or labels can answer directly.
@@ -350,6 +367,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         labels,
         plot,
         source_kinds,
+        year_from_param: false,
         people,
         makers,
     }
@@ -390,8 +408,12 @@ pub fn answer(
     skip: usize,
     limit: usize,
 ) -> serde_json::Value {
-    let wanted = |kind: MediaType| {
-        media_type.is_none_or(|want| want == kind) && parsed.facet.media_type.is_none_or(|want| want == kind)
+    // A `type=` PARAMETER wins outright; the word "show" or "movie" in the query is only a default for when
+    // none was given. ANDing the two let them annihilate — `?q=the show&type=movie` answered with nothing at
+    // all, because the words said series and the caller said film.
+    let wanted = |kind: MediaType| match media_type.or(parsed.facet.media_type) {
+        Some(want) => want == kind,
+        None => true,
     };
     let mut found: HashMap<Key, Found> = HashMap::new();
 
@@ -711,7 +733,11 @@ fn features(
         if known.is_empty() {
             phi = UNKNOWN_FACET;
         } else if !known.contains(&code) {
-            return None;
+            // Read out of the words, so it may only discount. A demonym is as often part of a TITLE as it is
+            // a claim about origin — `russian doll` lost Russian Doll this way, `brazil` lost Gilliam's —
+            // and the corpus shows the guess is wrong about half the time anyway: "spanish" as a country
+            // misses 1,138 Spanish-LANGUAGE titles. Discounting lets a real title still win on its name.
+            phi *= WRONG_TEXT_FACET;
         }
     }
     // The release-year window. Same rule as country and decade: a title ON RECORD outside it is not what was
@@ -724,10 +750,14 @@ fn features(
             .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
         match year {
             Some(year) => {
-                if parsed.facet.year_min.is_some_and(|min| year < i64::from(min))
-                    || parsed.facet.year_max.is_some_and(|max| year > i64::from(max))
-                {
-                    return None;
+                let outside = parsed.facet.year_min.is_some_and(|min| year < i64::from(min))
+                    || parsed.facet.year_max.is_some_and(|max| year > i64::from(max));
+                if outside {
+                    // A window the CALLER gave is a real constraint; one read out of the words is a guess.
+                    if parsed.year_from_param {
+                        return None;
+                    }
+                    phi *= WRONG_TEXT_FACET;
                 }
             }
             None => phi *= UNKNOWN_FACET,
@@ -739,7 +769,7 @@ fn features(
             .map(i64::from)
             .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
         match year {
-            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => return None,
+            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => phi *= WRONG_TEXT_FACET,
             Some(_) => {}
             None => phi = UNKNOWN_FACET,
         }

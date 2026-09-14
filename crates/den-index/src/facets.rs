@@ -198,7 +198,8 @@ impl FacetQuery {
         let mut query = FacetQuery::default();
         let mut leftover: Vec<&str> = Vec::new();
         let lowered = text.to_lowercase();
-        for token in lowered.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        for (at, token) in lowered.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).enumerate()
+        {
             if query.country.is_none() {
                 if let Some(country) = lookup(COUNTRIES, token) {
                     query.country = Some(country);
@@ -217,9 +218,14 @@ impl FacetQuery {
                     continue;
                 }
             }
-            // A bare four-digit year, within the range a release can plausibly carry. Bounded on both sides
-            // so a runtime, a resolution or an id ("1080", "4000") is not read as a date.
-            if query.year_min.is_none() && query.year_max.is_none() && token.len() == 4 {
+            // A bare four-digit year — but NEVER as the whole query, and never as its first word.
+            //
+            // 67 titles in the corpus are exactly a four-digit year and 63 of them came out in a different
+            // one, so reading the year unconditionally makes each of them erase itself: `q=1917` returned
+            // three films from 1917 and not the 2019 one. A year that TRAILS other words ("korean thriller
+            // 2019") is the case this is for, and it is the only case where the reading is safe.
+            let trailing = at > 0;
+            if trailing && query.year_min.is_none() && query.year_max.is_none() && token.len() == 4 {
                 if let Ok(year) = token.parse::<u16>() {
                     if (1890..=2100).contains(&year) {
                         query.year_min = Some(year);
@@ -231,11 +237,13 @@ impl FacetQuery {
             // "recent" / "new" name a window with no end; "classic" / "old" one with no beginning. The
             // boundaries are deliberately generous: someone asking for something recent will accept a film
             // from a couple of years ago, and would rather see one than nothing.
-            if query.year_min.is_none() && matches!(token, "recent" | "new" | "latest" | "newest") {
+            // "new", "latest", "old", "older" and "classic" are all titles in their own right — `q=old`
+            // dropped Shyamalan's Old, `q=new girl` dropped New Girl. Only words no film is called survive.
+            if query.year_min.is_none() && matches!(token, "recent" | "newest") {
                 query.year_min = Some(RECENT_SINCE);
                 continue;
             }
-            if query.year_max.is_none() && matches!(token, "classic" | "classics" | "old" | "older") {
+            if query.year_max.is_none() && matches!(token, "classics") {
                 query.year_max = Some(CLASSIC_UNTIL);
                 continue;
             }
@@ -394,11 +402,24 @@ mod tests {
             let q = FacetQuery::parse(text);
             (q.year_min, q.year_max, q.leftover)
         };
-        assert_eq!(year("2019"), (Some(2019), Some(2019), String::new()));
-        assert_eq!(year("korean thriller 2019").0, Some(2019), "no longer prose");
+        assert_eq!(year("korean thriller 2019").0, Some(2019), "a TRAILING year is a date");
         assert_eq!(year("recent horror"), (Some(RECENT_SINCE), None, "horror".to_owned()));
-        assert_eq!(year("new movies").0, Some(RECENT_SINCE));
-        assert_eq!(year("classic westerns"), (None, Some(CLASSIC_UNTIL), "westerns".to_owned()));
+        assert_eq!(year("classics"), (None, Some(CLASSIC_UNTIL), String::new()));
+
+        // 67 titles ARE a four-digit year, 63 of them released in a different one. Reading the year when it
+        // is the whole query made each of them erase itself: `1917` answered with three films from 1917 and
+        // not the 2019 one.
+        assert_eq!(year("1917"), (None, None, "1917".to_owned()), "a year alone is a title");
+        // ("movie" is claimed by MEDIA_TYPES, so only "2012" is left over — the point is that it stayed a
+        // word rather than becoming a date.)
+        assert_eq!(year("2012 movie"), (None, None, "2012".to_owned()), "…and so is a leading one");
+
+        // Same rule for words a film can be called. `old` dropped Shyamalan's Old; `new girl` dropped New
+        // Girl. Only words nothing is titled survive.
+        assert_eq!(year("old"), (None, None, "old".to_owned()));
+        assert_eq!(year("new girl"), (None, None, "new girl".to_owned()));
+        assert_eq!(year("classic"), (None, None, "classic".to_owned()));
+        assert_eq!(year("latest"), (None, None, "latest".to_owned()));
 
         // Bounded on both sides, so a runtime or a resolution is not a date.
         assert_eq!(year("1080p"), (None, None, "1080p".to_owned()));
