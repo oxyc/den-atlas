@@ -48,6 +48,32 @@ struct Catalog {
     den_provider_ids: Vec<i64>,
 }
 
+/// One statement a data source's terms ask for wherever its data reaches people (den-spec attribution-v1): the whole
+/// statement, the part of it that links, and where.
+#[derive(Serialize)]
+struct Attribution {
+    text: &'static str,
+    link: &'static str,
+    url: &'static str,
+}
+
+const WIKIPEDIA: Attribution = Attribution {
+    text: "Discovery data (subgenres, moods, and “more like this”) is derived from Wikipedia article text, used under CC BY-SA 4.0 and modified.",
+    link: "CC BY-SA 4.0",
+    url: "https://creativecommons.org/licenses/by-sa/4.0",
+};
+const MOVIE_OF_THE_NIGHT: Attribution = Attribution {
+    text:
+        "Streaming availability information is provided by Streaming Availability API by Movie of the Night.",
+    link: "Streaming Availability API by Movie of the Night",
+    url: "https://www.movieofthenight.com/about/api",
+};
+const JUSTWATCH: Attribution = Attribution {
+    text: "Streaming availability by JustWatch.",
+    link: "JustWatch",
+    url: "https://www.justwatch.com",
+};
+
 #[derive(Serialize)]
 struct Manifest {
     id: &'static str,
@@ -61,6 +87,9 @@ struct Manifest {
     catalogs: Vec<Catalog>,
     #[serde(rename = "behaviorHints")]
     behavior_hints: BehaviorHints,
+    /// The sources this install's data comes from, credited by the client that shows it (den-spec attribution-v1).
+    #[serde(rename = "denAttribution")]
+    den_attribution: Vec<Attribution>,
 }
 
 /// `title_search` adds the fuzzy title-search catalogs (one per type, `search` required, so a client that
@@ -91,6 +120,15 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
             });
         }
     }
+    // The dataset is always derived from Wikipedia; the streaming rows credit only the sources this operator has on —
+    // Movie of the Night's lists with its key, JustWatch's catalogs with any provider configured.
+    let mut den_attribution = vec![WIKIPEDIA];
+    if soon {
+        den_attribution.push(MOVIE_OF_THE_NIGHT);
+    }
+    if !config.providers.is_empty() {
+        den_attribution.push(JUSTWATCH);
+    }
     let m = Manifest {
         id: "com.den.atlas",
         version: VERSION,
@@ -104,6 +142,7 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
         // Configurable: /configure builds a `<region>_<providers>` install URL. Not *required* — a bare
         // …/manifest.json still serves the operator-default config, so existing installs keep working.
         behavior_hints: BehaviorHints { configurable: true, configuration_required: false },
+        den_attribution,
     };
     serde_json::to_string(&m).unwrap()
 }
@@ -125,6 +164,36 @@ mod tests {
         assert_eq!(by("jw-nfx-new")["denProviderId"], 8);
         // The cross-provider aggregate has no single provider, so the field is absent (not null).
         assert!(by(catalog::TRENDING_ID).get("denProviderId").is_none());
+    }
+
+    /// Wikipedia always; Movie of the Night only with its lists on, and JustWatch only with a provider configured —
+    /// an operator is never credited for a source they haven't turned on.
+    #[test]
+    fn credits_the_sources_this_install_uses() {
+        let texts = |json: String| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v["denAttribution"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let with_motn = texts(manifest_json(&Config::default_config(), false, true));
+        assert_eq!(with_motn.len(), 3);
+        assert!(with_motn[0].contains("Wikipedia"));
+        assert!(with_motn[1].contains("Movie of the Night"));
+        assert!(with_motn[2].contains("JustWatch"));
+        let without = texts(manifest_json(&Config::default_config(), false, false));
+        assert!(!without.iter().any(|t| t.contains("Movie of the Night")), "{without:?}");
+        let none = Config { providers: Vec::new(), ..Config::default_config() };
+        assert_eq!(texts(manifest_json(&none, false, false)).len(), 1, "Wikipedia alone");
+        // Each link is a part of its statement, so a client can find it there.
+        let v: serde_json::Value =
+            serde_json::from_str(&manifest_json(&Config::default_config(), false, true)).unwrap();
+        for a in v["denAttribution"].as_array().unwrap() {
+            assert!(a["text"].as_str().unwrap().contains(a["link"].as_str().unwrap()), "{a}");
+        }
     }
 
     /// Title search is declared only when on, as a required `search` extra per type — required, so a
