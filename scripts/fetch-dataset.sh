@@ -137,6 +137,25 @@ done <<EOF
 $FILES
 EOF
 
+# READ IT THE WAY SERVING WILL, BEFORE SWAPPING IT IN.
+#
+# Hashes matching only proves the bytes arrived intact; it says nothing about whether atlas can USE them. A
+# release once arrived complete and verified, and one entity in it carried `"aliases": "…"` where atlas types
+# Vec<String>. Atlas does not partially load a facts file, so it dropped 27 MB of it and served
+# `facts_unusable` — no people search, no imdbId, no countries, no /recommend — for nineteen minutes, with
+# only a log line to say so. A dataset that costs a feature class is not an upgrade.
+#
+# `den-atlas check` loads the staged directory with atlas's own deserialiser, so this cannot drift from what
+# serving requires. Skipped when the binary is not to hand (a bare checkout); the server still fails soft.
+if [ -n "${DEN_ATLAS_BIN:-}" ] || command -v den-atlas >/dev/null 2>&1; then
+  atlas_bin="${DEN_ATLAS_BIN:-den-atlas}"
+  cp -p data/dataset.meta.json "$STAGE/dataset.meta.json.live" 2>/dev/null || true
+  if ! "$atlas_bin" check "$STAGE" >&2; then
+    echo "the staged dataset does not load — refusing, ./data untouched" >&2
+    exit 1
+  fi
+fi
+
 # Everything verified. Remove the live descriptor while replacing blobs, so starting a server
 # mid-refresh cannot load a mixture under the previous generation. Existing responses retain their
 # open files; new requests refuse changed files until the server reloads the completed descriptor.

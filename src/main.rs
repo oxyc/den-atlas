@@ -144,12 +144,54 @@ pub struct EmbedProxy {
 pub const MAX_EMBED_INFLIGHT: usize = 4;
 pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// `den-atlas check <dir>` — load a dataset directory exactly as serving would, and say whether it is fit to
+/// swap in. Exit 0 if it is, 1 if it is not.
+///
+/// This exists because a dataset can pass every check outside atlas and still be unusable by it. One entity
+/// carrying `"aliases": "…"` where `RawEntity.aliases` is `Vec<String>` made a 27 MB facts file unparseable
+/// at its first entity; atlas does not partially load one, so it dropped the whole file and served
+/// `facts_unusable` — no people search, no imdbId, no countries, no /recommend — for nineteen minutes, and
+/// only a log line said so.
+///
+/// The fetch script already refuses a half-published release. A release that is complete but that atlas
+/// cannot read is the same kind of failure one layer down, and the same answer applies: do not swap it in.
+/// Checking here rather than in the publisher is deliberate — this uses atlas's OWN deserialiser, so it
+/// cannot drift from what serving actually requires the way a mirrored schema can.
+fn check_dataset(dir: &std::path::Path) -> i32 {
+    let dataset = match dataset::Dataset::load(dir) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("check: dataset at {} will not load: {e}", dir.display());
+            return 1;
+        }
+    };
+    // A declared facts file that does not read is the case that bit us: serving continues, degraded, with a
+    // whole feature class silently off. Treat it as fatal HERE so it never reaches serving.
+    let declared = !dataset.facts.is_empty();
+    let reads = dataset.facts.iter().any(|path| match facts::Facts::read(path) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("check: {} does not read: {e}", path.display());
+            false
+        }
+    });
+    if declared && !reads {
+        eprintln!("check: the dataset declares facts that atlas cannot read — refusing");
+        return 1;
+    }
+    println!("check: ok ({} facts candidate(s), {} usable)", dataset.facts.len(), u8::from(reads));
+    0
+}
+
 #[tokio::main]
 async fn main() {
     let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_owned());
     if let [_, command, path] = std::env::args().collect::<Vec<_>>().as_slice() {
         if command == "replay" {
             std::process::exit(replay(&dir, path).await);
+        }
+        if command == "check" {
+            std::process::exit(check_dataset(std::path::Path::new(path)));
         }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
