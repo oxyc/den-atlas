@@ -2040,9 +2040,12 @@ mod tests {
         assert!(!loses_a_feature("ok"));
 
         // Every reason health_state can produce is classified: a new one must be considered, not defaulted.
-        for (loaded, fresh, suspect, facts) in
-            [(false, true, false, false), (true, false, false, false), (true, true, true, false), (true, true, false, true)]
-        {
+        for (loaded, fresh, suspect, facts) in [
+            (false, true, false, false),
+            (true, false, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+        ] {
             let (reason, _) = health_state(loaded, fresh, suspect, facts).expect("degraded");
             assert!(
                 loses_a_feature(reason) || matches!(reason, "stale_catalog" | "catalog_schema_suspect"),

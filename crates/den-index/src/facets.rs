@@ -147,8 +147,7 @@ impl FacetIndex {
         let others: Vec<HashSet<u32>> = others.into_iter().map(|s| s.iter().copied().collect()).collect();
         let in_window = |p: &u32| {
             let year = self.rows[*p as usize].year;
-            year == 0
-                || (year_min.is_none_or(|min| year >= min) && year_max.is_none_or(|max| year <= max))
+            year == 0 || (year_min.is_none_or(|min| year >= min) && year_max.is_none_or(|max| year <= max))
         };
         let mut matched: Vec<u32> = smallest
             .iter()

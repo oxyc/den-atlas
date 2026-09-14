@@ -426,9 +426,9 @@ pub fn answer(
                 parsed.facet.year_min,
                 parsed.facet.year_max,
             )
-                .into_iter()
-                .map(|(id, kind)| (kind, id))
-                .collect()
+            .into_iter()
+            .map(|(id, kind)| (kind, id))
+            .collect()
         });
     for &key in facet_titles.iter().flatten().take(FACET_LANE) {
         found.entry(key).or_default();
