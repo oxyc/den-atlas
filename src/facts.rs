@@ -107,6 +107,55 @@ pub struct Record {
     pub franchise: Option<u32>,
     /// Where a series first aired (P449): its network or service.
     pub broadcasters: Vec<u32>,
+    /// The works it is adapted FROM (P144), as Q-ids — so two adaptations of one novel can be linked to each
+    /// other. What KIND of work each is lives in `source_kinds`, because the id alone cannot answer it.
+    pub based_on: Vec<u32>,
+    /// What it was adapted from, as kinds rather than ids — the fact "based on a book" needs.
+    pub source_kinds: SourceKinds,
+}
+
+/// What a title was adapted from, folded to a closed vocabulary by the dataset (`basedOnKind`).
+///
+/// A bitmask, because a title is often several at once and honestly so: Coriolanus is adapted from a book and
+/// a play, The Day the Earth Stood Still from a book and an earlier film.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceKinds(u16);
+
+impl SourceKinds {
+    pub const BOOK: u16 = 1 << 0;
+    pub const COMIC: u16 = 1 << 1;
+    pub const PLAY: u16 = 1 << 2;
+    pub const GAME: u16 = 1 << 3;
+    pub const SCREEN: u16 = 1 << 4;
+    pub const MUSIC: u16 = 1 << 5;
+    pub const FRANCHISE: u16 = 1 << 6;
+    pub const CHARACTER: u16 = 1 << 7;
+    pub const OTHER: u16 = 1 << 8;
+
+    /// The dataset's vocabulary. An unknown name is IGNORED rather than folded into `OTHER`: a new name here
+    /// means the producer grew a kind, and quietly absorbing it would hide that from whoever reads the counts.
+    pub fn parse(name: &str) -> Option<u16> {
+        Some(match name {
+            "book" => Self::BOOK,
+            "comic" => Self::COMIC,
+            "play" => Self::PLAY,
+            "game" => Self::GAME,
+            "screen" => Self::SCREEN,
+            "music" => Self::MUSIC,
+            "franchise" => Self::FRANCHISE,
+            "character" => Self::CHARACTER,
+            "other" => Self::OTHER,
+            _ => return None,
+        })
+    }
+
+    pub fn contains(self, kind: u16) -> bool {
+        self.0 & kind != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Someone the facts credit as a director, creator or cast member.
@@ -274,6 +323,14 @@ impl Facts {
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
                 broadcasters: entities(raw.broadcaster),
+                based_on: entities(raw.based_on),
+                source_kinds: SourceKinds(
+                    raw.based_on_kind
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|name| SourceKinds::parse(name))
+                        .fold(0, |mask, kind| mask | kind),
+                ),
             };
             // The first record wins a duplicate, as in the labels index.
             records.entry((media_type, raw.tmdb_id)).or_insert(record);
@@ -415,6 +472,8 @@ struct RawRecord {
     franchise: Option<OneOrMany>,
     broadcaster: Option<Vec<String>>,
     titles: Option<RawTitles>,
+    based_on: Option<Vec<String>>,
+    based_on_kind: Option<Vec<String>>,
 }
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
@@ -457,12 +516,38 @@ pub(crate) mod tests {
          "titles": {"en": "One", "orig": "하나", "aliases": ["Uno", "One"]},
          "released": {"date": "2026-09-01", "precision": "day"},
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
-         "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"]},
+         "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"],
+         "basedOn": ["Q60", "Q61"], "basedOnKind": ["book", "play"]},
         {"mediaType": "tv", "tmdbId": 1, "started": {"date": "2010-00-00", "precision": "year"},
          "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "broadcaster": ["Q80"], "hasVector": false},
         {"mediaType": "movie", "tmdbId": 2}
       ]
     }"#;
+
+    /// `basedOn` was parsed away entirely, so "films based on a book" could not be answered from a file that
+    /// carried the answer. The kinds come pre-folded by the producer; the Q-ids link adaptations of one source.
+    #[test]
+    fn reads_what_a_title_was_adapted_from() {
+        let facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
+        let film = facts.get(1, MediaType::Movie).unwrap();
+        assert_eq!(film.based_on, vec![60, 61]);
+        assert!(film.source_kinds.contains(SourceKinds::BOOK));
+        assert!(film.source_kinds.contains(SourceKinds::PLAY), "a title can be adapted from several kinds");
+        assert!(!film.source_kinds.contains(SourceKinds::SCREEN));
+
+        // Absent means UNKNOWN, not "an original work" — nothing may rank a missing statement as a negative.
+        let series = facts.get(1, MediaType::Tv).unwrap();
+        assert!(series.based_on.is_empty());
+        assert!(series.source_kinds.is_empty());
+    }
+
+    /// A kind the producer grows later must not be silently folded into `other`.
+    #[test]
+    fn an_unknown_source_kind_is_ignored_not_guessed() {
+        assert_eq!(SourceKinds::parse("book"), Some(SourceKinds::BOOK));
+        assert_eq!(SourceKinds::parse("podcast"), None);
+        assert_eq!(SourceKinds::parse(""), None);
+    }
 
     #[test]
     fn reads_records_by_type_and_id_with_their_genres_mapped() {
