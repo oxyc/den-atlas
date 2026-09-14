@@ -156,6 +156,30 @@ impl SourceKinds {
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    /// The mask itself, for callers testing several kinds at once.
+    pub fn raw(self) -> u16 {
+        self.0
+    }
+
+    /// The kinds a mask holds, named — so a parsed query can say what it understood rather than a number.
+    pub fn names(mask: u16) -> Vec<&'static str> {
+        [
+            (Self::BOOK, "book"),
+            (Self::COMIC, "comic"),
+            (Self::PLAY, "play"),
+            (Self::GAME, "game"),
+            (Self::SCREEN, "screen"),
+            (Self::MUSIC, "music"),
+            (Self::FRANCHISE, "franchise"),
+            (Self::CHARACTER, "character"),
+            (Self::OTHER, "other"),
+        ]
+        .into_iter()
+        .filter(|&(bit, _)| mask & bit != 0)
+        .map(|(_, name)| name)
+        .collect()
+    }
 }
 
 /// Someone the facts credit as a director, creator or cast member.

@@ -16,6 +16,7 @@
 //! A candidate relevant to nothing is dropped. The weights are starting values, to be tuned against a judged
 //! query set.
 
+use crate::facts::SourceKinds;
 use crate::queries::Indexes;
 use den_index::{FacetQuery, MediaType};
 use den_titlesearch::{fold, trigram_keys, TitleIndex};
@@ -100,6 +101,45 @@ const GENRES: &[(&str, u16)] = &[
     ("westerns", 37),
 ];
 
+/// The longest phrase the parser will consider. "based on a video game" is five words; matching only four
+/// meant the most natural way to ask for one silently did nothing.
+const MAX_PHRASE_WORDS: usize = 5;
+
+/// Ways people ask for an adaptation, and the kind each names.
+///
+/// "based on a book" used to fall through to the semantic lane and be matched as prose, which returned
+/// *Books of Blood* — a film with the word in its title — instead of adaptations. It is a FACET, like a
+/// country or a decade: the facts state it outright, and no amount of reading the plot text can.
+///
+/// Phrases are matched against up to `MAX_PHRASE_WORDS` folded words, so articles are spelled out rather
+/// than stripped; both forms are listed because both get typed. A phrase longer than that limit can never
+/// match — `every_source_phrase_is_reachable` holds the two together.
+const SOURCE_PHRASES: &[(&str, u16)] = &[
+    ("based on a book", SourceKinds::BOOK),
+    ("based on book", SourceKinds::BOOK),
+    ("based on a novel", SourceKinds::BOOK),
+    ("based on novel", SourceKinds::BOOK),
+    ("book adaptation", SourceKinds::BOOK),
+    ("novel adaptation", SourceKinds::BOOK),
+    ("literary adaptation", SourceKinds::BOOK),
+    ("from a book", SourceKinds::BOOK),
+    ("from a novel", SourceKinds::BOOK),
+    ("based on a comic", SourceKinds::COMIC),
+    ("based on comic", SourceKinds::COMIC),
+    ("based on a manga", SourceKinds::COMIC),
+    ("based on manga", SourceKinds::COMIC),
+    ("comic adaptation", SourceKinds::COMIC),
+    ("manga adaptation", SourceKinds::COMIC),
+    ("graphic novel", SourceKinds::COMIC),
+    ("based on a play", SourceKinds::PLAY),
+    ("based on play", SourceKinds::PLAY),
+    ("stage adaptation", SourceKinds::PLAY),
+    ("based on a video game", SourceKinds::GAME),
+    ("based on a game", SourceKinds::GAME),
+    ("video game adaptation", SourceKinds::GAME),
+    ("game adaptation", SourceKinds::GAME),
+];
+
 /// Phrases that name a plot facet value (`plotrows.rs`). They only ever lift a title: the facets cover part of the
 /// corpus, so a title without one is unknown, never a mismatch.
 const PLOT_PHRASES: &[(&str, &str, &str)] = &[
@@ -147,6 +187,8 @@ pub struct Parsed {
     /// Label names as the index spells them, and whether each is a mood.
     labels: Vec<(String, bool)>,
     plot: Vec<(&'static str, &'static str)>,
+    /// The source kinds the query names ("based on a book"), as a `SourceKinds` mask.
+    source_kinds: u16,
     /// The people the query names, by Q-id, most credited first.
     people: Vec<u32>,
     /// Those of them who mostly make titles (direct or create) rather than appear in them.
@@ -203,12 +245,19 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         .map(|(name, mood)| (words(name).join(" "), name, mood))
         .collect();
     let (mut genres, mut labels, mut plot, mut rest) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut source_kinds: u16 = 0;
     let mut people: Vec<u32> = Vec::new();
     let mut at = 0;
     'words: while at < tokens.len() {
-        for span in (1..=4.min(tokens.len() - at)).rev() {
+        for span in (1..=MAX_PHRASE_WORDS.min(tokens.len() - at)).rev() {
             let phrase = tokens[at..at + span].join(" ");
             let mut matched = false;
+            for &(words, kind) in SOURCE_PHRASES {
+                if words == phrase {
+                    source_kinds |= kind;
+                    matched = true;
+                }
+            }
             for &(words, axis, value) in PLOT_PHRASES {
                 if words == phrase && !plot.contains(&(axis, value)) {
                     plot.push((axis, value));
@@ -269,6 +318,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         genres,
         labels,
         plot,
+        source_kinds,
         people,
         makers,
     }
@@ -522,6 +572,7 @@ pub fn answer(
             "genres": parsed.genres,
             "labels": parsed.labels.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             "plotFacets": parsed.plot.iter().map(|(axis, value)| format!("{axis}={value}")).collect::<Vec<_>>(),
+            "basedOnKind": SourceKinds::names(parsed.source_kinds),
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
         },
@@ -597,6 +648,21 @@ fn features(
             Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => return None,
             Some(_) => {}
             None => phi = UNKNOWN_FACET,
+        }
+    }
+
+    // A source kind the query names. The facts state it outright, so a title ON RECORD as adapted from
+    // something else is genuinely not what was asked for and drops out — the same rule as country.
+    //
+    // A title with NO basedOn statement is unknown, not an original work: Wikidata is open-world, and only
+    // 19% of records carry the property at all. Discounting rather than dropping keeps the other 81%
+    // reachable, which is the difference between a working row and an empty one.
+    if parsed.source_kinds != 0 {
+        match record.map(|r| r.source_kinds) {
+            Some(kinds) if kinds.is_empty() => phi *= UNKNOWN_FACET,
+            Some(kinds) if kinds.raw() & parsed.source_kinds != 0 => {}
+            Some(_) => return None,
+            None => phi *= UNKNOWN_FACET,
         }
     }
 
@@ -698,6 +764,59 @@ fn without_article(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "based on a book" fell through to the semantic lane and matched prose, returning Books of Blood —
+    /// a film with the word in its title. It names a FACET; the facts answer it outright.
+    #[test]
+    fn asking_for_an_adaptation_names_a_source_kind() {
+        let kinds = |query: &str| {
+            let tokens = words(query);
+            let mut mask = 0u16;
+            let mut at = 0;
+            while at < tokens.len() {
+                let mut hit = false;
+                for span in (1..=MAX_PHRASE_WORDS.min(tokens.len() - at)).rev() {
+                    let phrase = tokens[at..at + span].join(" ");
+                    for &(words, kind) in SOURCE_PHRASES {
+                        if words == phrase {
+                            mask |= kind;
+                            hit = true;
+                        }
+                    }
+                    if hit {
+                        at += span;
+                        break;
+                    }
+                }
+                if !hit {
+                    at += 1;
+                }
+            }
+            SourceKinds::names(mask)
+        };
+        assert_eq!(kinds("based on a book"), vec!["book"]);
+        assert_eq!(kinds("recent movies based on a novel"), vec!["book"]);
+        assert_eq!(kinds("manga adaptation"), vec!["comic"]);
+        assert_eq!(kinds("based on a video game"), vec!["game"]);
+        // "based on a video game" must win over the shorter "based on a game" inside it.
+        assert_eq!(kinds("based on a video game"), vec!["game"]);
+        assert_eq!(kinds("the shawshank redemption"), Vec::<&str>::new());
+    }
+
+    /// A phrase longer than the matcher's span can never fire. "based on a video game" is five words and was
+    /// dead on arrival against a four-word limit — invisible, because an unmatched phrase just falls through
+    /// to the semantic lane and returns something plausible.
+    #[test]
+    fn every_source_phrase_is_reachable() {
+        for &(phrase, _) in SOURCE_PHRASES {
+            let n = phrase.split_whitespace().count();
+            assert!(n <= MAX_PHRASE_WORDS, "{phrase:?} is {n} words, past the {MAX_PHRASE_WORDS}-word span");
+        }
+        for &(phrase, _, _) in PLOT_PHRASES {
+            let n = phrase.split_whitespace().count();
+            assert!(n <= MAX_PHRASE_WORDS, "{phrase:?} is {n} words, past the {MAX_PHRASE_WORDS}-word span");
+        }
+    }
 
     #[test]
     fn a_title_matches_exactly_without_its_article_and_a_longer_one_scores_less() {
