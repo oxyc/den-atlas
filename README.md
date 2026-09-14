@@ -192,7 +192,19 @@ Every variable is optional; the binary reads the process environment only (no `.
 scripts/fetch-dataset.sh   # prep ./data from the den-dataset `data-latest` release (labels + vectors + gzip + meta)
 cargo run                  # http://localhost:8080  (add /manifest.json in Den → Plugins)
 cargo test                 # the caching layer (ETag / Range / gzip / 304), routes, catalog, shutdown
+cargo fmt --all --check    # CI gates on this — see below if the command is missing
 ```
+**If `cargo fmt` reports "no such command"**, the toolchain has no rustfmt component and there is no rustup
+to add one. Run the formatter through nix instead — it reads this repo's `rustfmt.toml` and matches CI
+exactly:
+```sh
+nix run nixpkgs#rustfmt -- --edition 2021 --check $(git ls-files '*.rs')
+```
+Worth doing before every push. Two releases in a row built nothing because a wrapped expression was left in
+a shape rustfmt disagreed with: `docker-publish` never produced an image, and `den-update` then correctly
+reported the box was already at the previous digest — a failure that reads as "nothing to deploy" rather
+than as a broken build. Checking line widths by hand does not substitute: rustfmt also JOINS short wrapped
+lines and SPLITS long array literals, neither of which a width check can predict.
 `fetch-dataset.sh` is anonymous (needs curl, python3 and shasum). It downloads every blob
 `dataset.meta.json` declares — the labels (and their `.gz`), the vectors, the poster sidecar, the premise
 index and `facets.bin` — verifies each against the meta's sha256, and only then moves them into `./data`.
