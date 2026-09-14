@@ -37,6 +37,8 @@ pub struct AppState {
     pub default_country: String,
     /// Upstream den-embed for the `/embed` search proxy (env `EMBED_URL`). `None` disables search embeds.
     pub embed: Option<EmbedProxy>,
+    /// Search query vectors den-embed already gave, by query text and embedding space.
+    pub embed_memo: cache::EmbedMemo,
     /// Fuzzy title search over TMDB's daily exports (env `TITLE_SEARCH`). `None` — off — declares no
     /// search catalog.
     pub titles: Option<Arc<titles::TitleSearch>>,
@@ -107,6 +109,7 @@ impl AppState {
             ),
             default_country: "US".to_owned(),
             embed: None,
+            embed_memo: cache::EmbedMemo::new(cache::EMBED_MEMO_TTL, cache::EMBED_MEMO_ENTRIES),
             titles: None,
             index: None,
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
@@ -259,6 +262,7 @@ async fn main() {
         catalog,
         default_country,
         embed,
+        embed_memo: cache::EmbedMemo::new(cache::EMBED_MEMO_TTL, cache::EMBED_MEMO_ENTRIES),
         titles: title_search,
         index,
         motn,

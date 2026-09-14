@@ -240,7 +240,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             &method,
             &headers,
             manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
-            "public, max-age=3600, stale-while-revalidate=600",
+            "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
             None,
             false,
         )
@@ -251,12 +251,17 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             Some(ds) => {
                 // The descriptor embeds absolute blob URLs built from the request's own
                 // host/scheme, so those headers are part of what the body says.
+                //
+                // No Last-Modified. The dataset's date is not this body's date: the origin and the
+                // embed/index flags change the body under the same date, so a client revalidating with
+                // If-Modified-Since alone would be told a changed descriptor had not changed. The ETag
+                // covers every byte.
                 serve_json(
                     &method,
                     &headers,
                     build_descriptor(&origin, ds, state.embed.is_some(), state.index.is_some()),
-                    "public, max-age=300",
-                    ds.last_modified.clone(),
+                    "public, max-age=300, stale-while-revalidate=3600, stale-if-error=86400",
+                    None,
                     true,
                 )
                 .await
@@ -684,8 +689,27 @@ fn query_text(query: &str, key: &str) -> String {
 }
 
 /// Embed text through den-embed the way `/embed` does — the corpus's own model and quantiser — under the same
-/// permits and deadline.
+/// permits and deadline, answered from `embed_memo` when this text was embedded for this dataset's space
+/// already. Only a vector as wide as the dataset's is kept, so a den-embed answering in another width is asked
+/// again rather than remembered.
 async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
+    let key = state.dataset.as_ref().map(|ds| {
+        (crate::cache::EmbedMemo::key(&ds.meta.embedding_model, ds.meta.dims, text), ds.meta.dims as usize)
+    });
+    if let Some(vector) = key.as_ref().and_then(|(key, _)| state.embed_memo.get(key)) {
+        return Ok(vector);
+    }
+    let vector = embed_upstream(state, text).await?;
+    if let Some((key, dims)) = key {
+        if vector.len() == dims {
+            state.embed_memo.put(key, vector.clone());
+        }
+    }
+    Ok(vector)
+}
+
+/// One den-embed call, never from the memo.
+async fn embed_upstream(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
     #[derive(serde::Deserialize)]
     struct Embedded {
         vector: Vec<i8>,
@@ -715,8 +739,9 @@ fn warm_embed(state: &Arc<AppState>) {
         return;
     }
     let state = Arc::clone(state);
+    // Past the memo: a remembered "warm" would wake nothing.
     tokio::spawn(async move {
-        if let Err(e) = embed_query(&state, "warm").await {
+        if let Err(e) = embed_upstream(&state, "warm").await {
             eprintln!("den-embed warm-up failed: {e}");
         }
     });
@@ -750,13 +775,14 @@ async fn search_answer(
 /// as Server-Timing entries. The query is embedded only when den-embed answers; without it the plot vectors simply
 /// don't score. `early` is the whole query's embedding, started as the request arrived (`handle_index`): it is what
 /// the vectors are asked about unless the query names something, and a cold den-embed then loads its model while
-/// the indexes load rather than after. The ranking itself runs off the request threads.
+/// the indexes load rather than after. The ranking itself runs off the request threads. The flag says den-embed was
+/// asked and did not answer, so the ranking went without the vectors.
 async fn query_answer(
     state: &AppState,
     indexes: Arc<crate::queries::Indexes>,
     query: &str,
     early: Option<tokio::task::JoinHandle<Result<Vec<i8>, String>>>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, bool), String> {
     let text = query_text(query, "q");
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
     let number =
@@ -803,6 +829,7 @@ async fn query_answer(
         (Some(words), _) if state.embed.is_some() => embed_query(state, words).await.map_err(unembedded).ok(),
         _ => None,
     };
+    let unembedded = vector.is_none() && state.embed.is_some() && parsed.embed_text().is_some();
     let embedded_in = embedding.elapsed();
     let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());
@@ -826,17 +853,18 @@ async fn query_answer(
         ms(embedded_in),
         ms(answering.elapsed())
     );
-    Ok((body, timing))
+    Ok((body, timing, unembedded))
 }
 
 /// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
 /// most-voted first, with any leftover words ranked semantically to the front. `facet` is null when the query
-/// names none. Without den-embed the matches still come back, unranked.
-async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> String {
+/// names none. Without den-embed the matches still come back, unranked, and the flag says the ranking was skipped.
+async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> (String, bool) {
     let facet = den_index::FacetQuery::parse(&query_text(query, "q"));
     let (Some(facets), true) = (indexes.facets.as_ref(), facet.has_facet()) else {
-        return serde_json::json!({ "facet": null, "titles": [] }).to_string();
+        return (serde_json::json!({ "facet": null, "titles": [] }).to_string(), false);
     };
+    let mut unranked = false;
     let mut titles = facets.filter(facet.media_type, facet.country, facet.decade);
     if !facet.leftover.is_empty() && !titles.is_empty() {
         match embed_query(state, &facet.leftover).await {
@@ -854,11 +882,14 @@ async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, quer
                 let lifted: std::collections::HashSet<_> = head.iter().copied().collect();
                 titles = head.into_iter().chain(titles.into_iter().filter(|t| !lifted.contains(t))).collect();
             }
-            Err(e) => eprintln!("facet leftover left unranked: {e}"),
+            Err(e) => {
+                eprintln!("facet leftover left unranked: {e}");
+                unranked = true;
+            }
         }
     }
     titles.truncate(FACET_LIMIT);
-    serde_json::json!({
+    let body = serde_json::json!({
         "facet": {
             "mediaType": facet.media_type.map(stremio_type),
             "country": facet.country,
@@ -867,7 +898,8 @@ async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, quer
         },
         "titles": titles_json(&titles),
     })
-    .to_string()
+    .to_string();
+    (body, unranked)
 }
 
 /// A title named in a POST body: `{"type":"movie"|"series","id":…}`.
@@ -1173,14 +1205,18 @@ async fn handle_index(
             return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
-    // Search and facets can rank through den-embed, so they stay short. Every other answer is the dataset
-    // alone, which changes at most once a day: fresh for an hour, and served stale while it revalidates.
-    let cache_control =
-        if matches!(question, IndexQuestion::Search | IndexQuestion::Facets | IndexQuestion::Query) {
-            "public, max-age=300"
-        } else {
-            "public, max-age=3600, stale-while-revalidate=86400"
-        };
+    // An answer is the dataset's — and, for search, den-embed's vector for the text, which is fixed for the
+    // dataset's model — so it changes when the dataset does, at most once a day, and its ETag with it: fresh
+    // for an hour, and served stale while it revalidates. A search that should have been ranked through
+    // den-embed and wasn't is the exception: it stays short, so the ranked answer replaces it once den-embed
+    // is back.
+    let long = "public, max-age=3600, stale-while-revalidate=86400";
+    let mut cache_control = long;
+    let mut unembedded = |missed: bool| {
+        if missed {
+            cache_control = "public, max-age=300";
+        }
+    };
     let mut phases = String::new();
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
@@ -1190,9 +1226,14 @@ async fn handle_index(
                 return unavailable_response(r#"{"error":"embed_unavailable"}"#, RELOAD_WAIT);
             }
         },
-        IndexQuestion::Facets => facets_answer(state, &indexes, query).await,
+        IndexQuestion::Facets => {
+            let (body, unranked) = facets_answer(state, &indexes, query).await;
+            unembedded(unranked);
+            body
+        }
         IndexQuestion::Query => match query_answer(state, Arc::clone(&indexes), query, early).await {
-            Ok((body, timing)) => {
+            Ok((body, timing, missed)) => {
+                unembedded(missed);
                 phases = format!("{timing}, ");
                 body
             }
@@ -1250,7 +1291,7 @@ async fn handle_title_search(
     let body = titles::metas_json(&index, &query, media_type);
     let searched = started.elapsed();
     let resp =
-        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=600", None, false)
+        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=3600", None, false)
             .await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
@@ -1630,7 +1671,7 @@ mod tests {
     async fn title_search_answers_from_the_index() {
         let state = title_state();
         let hit = get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await;
-        assert_eq!(hit.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=600");
+        assert_eq!(hit.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=3600");
         let hit = body_of(hit).await;
         assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
         let other_type =
@@ -1708,15 +1749,28 @@ mod tests {
         }
     }
 
-    /// A stand-in den-embed answering every request with `vector`.
-    async fn fake_embed(vector: &'static str) -> crate::EmbedProxy {
+    /// A stand-in den-embed answering every request with `vector`, and how many texts other than the warm-up
+    /// it was asked to embed.
+    async fn fake_embed(vector: &'static str) -> (crate::EmbedProxy, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                // Until the JSON body's closing brace: the head and the body can arrive in separate reads.
+                let mut seen = Vec::new();
                 let mut buf = vec![0u8; 16 * 1024];
-                let _ = sock.read(&mut buf).await;
+                while !seen.contains(&b'}') {
+                    match sock.read(&mut buf).await {
+                        Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                        _ => break,
+                    }
+                }
+                if !String::from_utf8_lossy(&seen).contains(r#""text":"warm""#) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 let body = format!(r#"{{"vector":{vector},"dims":3,"model":"m"}}"#);
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
@@ -1728,11 +1782,12 @@ mod tests {
                 let _ = sock.shutdown().await;
             }
         });
-        crate::EmbedProxy {
+        let proxy = crate::EmbedProxy {
             client: reqwest::Client::new(),
             base: format!("http://{addr}"),
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
-        }
+        };
+        (proxy, asked)
     }
 
     async fn post(state: &Arc<AppState>, uri: &str, body: &str) -> axum::response::Response {
@@ -1756,7 +1811,7 @@ mod tests {
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         let state = Arc::new(AppState {
             index: Some(index),
-            embed: Some(fake_embed("[0,100,0]").await),
+            embed: Some(fake_embed("[0,100,0]").await.0),
             ..AppState::for_test(Some(ds))
         });
         let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
@@ -1765,7 +1820,11 @@ mod tests {
         assert_eq!(neighbours["ids"], serde_json::json!([2, 3]));
         // The embedded query sits on movie 3.
         let search = get(&state, "/index/search.json?q=campy+fun").await;
-        assert_eq!(search.headers()["cache-control"], "public, max-age=300", "an embedded query stays short");
+        assert_eq!(
+            search.headers()["cache-control"],
+            "public, max-age=3600, stale-while-revalidate=86400",
+            "an embedded answer changes only with the dataset"
+        );
         let search = json(body_of(search).await);
         assert_eq!(
             (&search["titles"][0]["type"], &search["titles"][0]["id"]),
@@ -1789,6 +1848,54 @@ mod tests {
         );
         let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
         assert_eq!(none["facet"], serde_json::Value::Null);
+    }
+
+    /// A text searched again is answered from the memo, not by another den-embed call — on every route that
+    /// embeds it.
+    #[tokio::test]
+    async fn a_repeated_search_embeds_once() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-memo-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let (proxy, asked) = fake_embed("[0,100,0]").await;
+        let state =
+            Arc::new(AppState { index: Some(index), embed: Some(proxy), ..AppState::for_test(Some(ds)) });
+        let asked = || asked.load(std::sync::atomic::Ordering::SeqCst);
+        let first = get(&state, "/index/search.json?q=campy+fun").await;
+        assert_eq!(first.status(), 200);
+        assert_eq!(asked(), 1);
+        let again = body_of(get(&state, "/index/search.json?q=campy+fun").await).await;
+        assert_eq!(body_of(first).await, again, "the remembered vector ranked differently");
+        assert_eq!(asked(), 1, "the same text was embedded twice");
+        get(&state, "/index/search.json?q=something+else").await;
+        assert_eq!(asked(), 2, "a new text was answered from the memo");
+        assert_eq!(state.embed_memo.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A search den-embed should have ranked but could not is cached briefly, so the ranked answer replaces it
+    /// once den-embed is back; one it had nothing to rank is cached like any dataset answer.
+    #[tokio::test]
+    async fn an_unembedded_search_is_cached_briefly() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-unembedded-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        // Nothing listens on the discard port, so every embed fails at once.
+        let down = crate::EmbedProxy {
+            client: reqwest::Client::new(),
+            base: "http://127.0.0.1:9".to_owned(),
+            inflight: Arc::new(tokio::sync::Semaphore::new(4)),
+        };
+        let state =
+            Arc::new(AppState { index: Some(index), embed: Some(down), ..AppState::for_test(Some(ds)) });
+        for path in ["/index/query.json?q=zzzz", "/index/facets.json?q=korean+heist"] {
+            let resp = get(&state, path).await;
+            assert_eq!(resp.status(), 200, "{path}");
+            assert_eq!(resp.headers()["cache-control"], "public, max-age=300", "{path}");
+        }
+        let unthemed = get(&state, "/index/facets.json?q=korean+movies").await;
+        assert_eq!(unthemed.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Search in one request: an exact title leads its similar titles, a typo still finds its title, a country
@@ -2293,6 +2400,53 @@ mod tests {
     async fn a_missing_dataset_is_unavailable_not_empty() {
         let state = Arc::new(AppState::for_test(None));
         assert_eq!(get(&state, "/dataset.json").await.status(), 503);
+    }
+
+    /// The manifest and the descriptor ride out an outage from a cache, and the descriptor revalidates by its
+    /// ETag alone: its body moves with the origin and the embed/index flags under an unchanged dataset date, so
+    /// an If-Modified-Since against that date would 304 a changed body.
+    #[tokio::test]
+    async fn the_manifest_and_descriptor_cache_and_revalidate_correctly() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-desc-cc-{}", std::process::id()));
+        let mut ds = fixture(&dir);
+        ds.last_modified = Some("Wed, 01 Jul 2026 00:00:00 GMT".to_owned());
+        let state = Arc::new(AppState::for_test(Some(ds)));
+
+        let manifest = get(&state, "/manifest.json").await;
+        assert_eq!(
+            manifest.headers()["cache-control"],
+            "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400"
+        );
+
+        let desc = get(&state, "/dataset.json").await;
+        assert_eq!(
+            desc.headers()["cache-control"],
+            "public, max-age=300, stale-while-revalidate=3600, stale-if-error=86400"
+        );
+        assert!(desc.headers().get("last-modified").is_none(), "the descriptor carried the dataset's date");
+        let etag = desc.headers()["etag"].to_str().unwrap().to_owned();
+        let tag = etag.trim_matches('"');
+        let (hash, len) = tag.split_once('-').unwrap_or_else(|| panic!("{etag}"));
+        assert_eq!(hash.len(), 16, "{etag}");
+        assert_eq!(usize::from_str_radix(len, 16).unwrap(), body_of(desc).await.len(), "{etag}");
+
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let since = HttpRequest::builder()
+            .uri("/dataset.json")
+            .header("if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(handle(State(Arc::clone(&state)), since).await.status(), 200);
+        let matching = HttpRequest::builder()
+            .uri("/dataset.json")
+            .header("if-none-match", etag.as_str())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(handle(State(Arc::clone(&state)), matching).await.status(), 304);
+        // A blob is the dataset's own bytes, so it keeps the date.
+        assert!(get(&state, "/labels.json").await.headers().get("last-modified").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The manifest is the contract the app reads first; dropping a resource or the country extra

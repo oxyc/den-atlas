@@ -2,9 +2,11 @@
 //! in memory from TMDB's daily ID exports and rebuilt once a day; nothing is written to disk, so it needs no
 //! writable mount. Its size is logged at every build.
 
+use crate::util::lock;
 use den_titlesearch::{ExportScanner, MediaType, TitleIndex};
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CATALOG_ID: &str = "den-titles";
@@ -22,13 +24,21 @@ pub struct TitleSearch {
     index: RwLock<Option<Arc<TitleIndex>>>,
     client: reqwest::Client,
     base: String,
+    /// Exports that downloaded, by URL, while a build waits on the other one. A retry an hour later asks only
+    /// for the file that failed rather than both again; cleared once a build lands.
+    downloaded: Mutex<HashMap<String, bytes::Bytes>>,
 }
 
 impl TitleSearch {
     /// The two exports come to ~33 MB, hence the generous timeout.
     pub fn new(base: &str) -> Result<Self, reqwest::Error> {
         let client = reqwest::Client::builder().timeout(Duration::from_secs(180)).build()?;
-        Ok(TitleSearch { index: RwLock::new(None), client, base: base.to_owned() })
+        Ok(TitleSearch {
+            index: RwLock::new(None),
+            client,
+            base: base.to_owned(),
+            downloaded: Mutex::default(),
+        })
     }
 
     #[cfg(test)]
@@ -37,6 +47,7 @@ impl TitleSearch {
             index: RwLock::new(Some(Arc::new(index))),
             client: reqwest::Client::new(),
             base: String::new(),
+            downloaded: Mutex::default(),
         }
     }
 
@@ -50,9 +61,12 @@ impl TitleSearch {
     pub async fn refresh(&self) -> Result<String, String> {
         let started = Instant::now();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let stamps: Vec<String> =
+            (0..2).map(|days_back| utc_stamp(now.saturating_sub(days_back * 86_400))).collect();
+        // A download from a day no longer tried is of no use to this build.
+        lock(&self.downloaded).retain(|url, _| stamps.iter().any(|stamp| url.contains(stamp.as_str())));
         let mut failure = String::new();
-        for days_back in 0..2 {
-            let stamp = utc_stamp(now.saturating_sub(days_back * 86_400));
+        for stamp in stamps {
             let (movies, series) = match self.fetch_pair(&stamp).await {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -70,15 +84,26 @@ impl TitleSearch {
                 started.elapsed().as_secs_f64()
             );
             *self.index.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(index));
+            lock(&self.downloaded).clear();
             return Ok(line);
         }
         Err(failure)
     }
 
+    /// Both files are asked for even when the first fails, so the one that downloads is kept for the retry.
     async fn fetch_pair(&self, stamp: &str) -> Result<(bytes::Bytes, bytes::Bytes), String> {
-        let movies = self.fetch(&format!("{}movie_ids_{stamp}.json.gz", self.base)).await?;
-        let series = self.fetch(&format!("{}tv_series_ids_{stamp}.json.gz", self.base)).await?;
-        Ok((movies, series))
+        let movies = self.fetch_kept(&format!("{}movie_ids_{stamp}.json.gz", self.base)).await;
+        let series = self.fetch_kept(&format!("{}tv_series_ids_{stamp}.json.gz", self.base)).await;
+        Ok((movies?, series?))
+    }
+
+    async fn fetch_kept(&self, url: &str) -> Result<bytes::Bytes, String> {
+        if let Some(kept) = lock(&self.downloaded).get(url) {
+            return Ok(kept.clone());
+        }
+        let body = self.fetch(url).await?;
+        lock(&self.downloaded).insert(url.to_owned(), body.clone());
+        Ok(body)
     }
 
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes, String> {
@@ -197,6 +222,56 @@ mod tests {
         assert_eq!(v["metas"][0]["moviedb_id"], 603);
         assert_eq!(v["metas"][0]["name"], "The Matrix");
         assert_eq!(metas_json(&index, "matrix", MediaType::Tv), r#"{"metas":[]}"#);
+    }
+
+    /// The series export fails for every day tried, then answers. The retry downloads only the series file:
+    /// the movie export that already arrived is not fetched again.
+    #[tokio::test]
+    async fn a_retry_downloads_only_the_export_that_failed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let movies = gz("{\"adult\":false,\"id\":603,\"original_title\":\"The Matrix\",\"popularity\":80}\n");
+        let series = gz("{\"id\":1399,\"original_name\":\"Game of Thrones\",\"popularity\":300}\n");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let movie_asks = Arc::new(AtomicUsize::new(0));
+        let series_asks = Arc::new(AtomicUsize::new(0));
+        let (m, s) = (Arc::clone(&movie_asks), Arc::clone(&series_asks));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8 * 1024];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = if head.contains("movie_ids_") {
+                    m.fetch_add(1, Ordering::SeqCst);
+                    ("200 OK", movies.clone())
+                } else if s.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ("500 Internal Server Error", Vec::new())
+                } else {
+                    ("200 OK", series.clone())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let search = TitleSearch::new(&format!("http://{addr}/")).unwrap();
+
+        assert!(search.refresh().await.is_err(), "both days' series exports failed");
+        assert_eq!(movie_asks.load(Ordering::SeqCst), 2, "one movie export per day tried");
+        search.refresh().await.expect("the retry builds");
+        assert_eq!(
+            movie_asks.load(Ordering::SeqCst),
+            2,
+            "the retry downloaded a movie export it already had"
+        );
+        assert_eq!(series_asks.load(Ordering::SeqCst), 3);
+        assert_eq!(search.index().unwrap().len(), 2);
+        assert!(lock(&search.downloaded).is_empty(), "the downloads outlived the build");
     }
 
     #[test]

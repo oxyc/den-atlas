@@ -170,6 +170,69 @@ fn write_atomically(file: &Path, body: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&partial, file)
 }
 
+/// How many query vectors the embed memo keeps, and for how long.
+pub const EMBED_MEMO_ENTRIES: usize = 1_000;
+pub const EMBED_MEMO_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Query text → the vector den-embed gave it, so a search typed again (another page, the same word from the
+/// next viewer, a client revalidating) does not queue a model call behind the embed permits. Least recently
+/// used goes first when full, and nothing is kept past its TTL. In memory only: a restart costs one embed per
+/// query, which is what every search cost before.
+///
+/// The key names the embedding space along with the text (`key`), so a vector is never handed to a corpus
+/// embedded by another model or at another width.
+pub struct EmbedMemo {
+    ttl: Duration,
+    max_entries: usize,
+    map: Mutex<HashMap<String, Remembered>>,
+}
+
+struct Remembered {
+    vector: Vec<i8>,
+    stored: std::time::Instant,
+    used: std::time::Instant,
+}
+
+impl EmbedMemo {
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self { ttl, max_entries, map: Mutex::default() }
+    }
+
+    /// The memo key for `text` in the space of `model` at `dims`.
+    pub fn key(model: &str, dims: u32, text: &str) -> String {
+        format!("{model}\u{0}{dims}\u{0}{text}")
+    }
+
+    /// A kept vector still inside its TTL; an expired one is dropped here.
+    pub fn get(&self, key: &str) -> Option<Vec<i8>> {
+        let mut map = lock(&self.map);
+        let entry = map.get_mut(key)?;
+        if entry.stored.elapsed() >= self.ttl {
+            map.remove(key);
+            return None;
+        }
+        entry.used = std::time::Instant::now();
+        Some(entry.vector.clone())
+    }
+
+    pub fn put(&self, key: String, vector: Vec<i8>) {
+        let mut map = lock(&self.map);
+        if map.len() >= self.max_entries && !map.contains_key(&key) {
+            // A thousand entries: a scan per insert when full is cheaper than keeping an order list.
+            if let Some(coldest) = map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone()) {
+                map.remove(&coldest);
+            }
+        }
+        let now = std::time::Instant::now();
+        map.insert(key, Remembered { vector, stored: now, used: now });
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        lock(&self.map).len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +293,42 @@ mod tests {
         std::fs::write(&file, b"not json").unwrap();
         assert!(matches!(TtlCache::persisted(Duration::from_secs(3600), &dir).get("k"), Lookup::Miss));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_embed_memo_drops_the_least_recently_used_at_its_cap() {
+        let memo = EmbedMemo::new(Duration::from_secs(3600), 2);
+        memo.put("a".into(), vec![1]);
+        memo.put("b".into(), vec![2]);
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(memo.get("a"), Some(vec![1]), "a read makes `a` the most recently used");
+        memo.put("c".into(), vec![3]);
+        assert_eq!(memo.len(), 2);
+        assert_eq!(memo.get("b"), None, "the least recently used survived");
+        assert_eq!(memo.get("a"), Some(vec![1]));
+        assert_eq!(memo.get("c"), Some(vec![3]));
+    }
+
+    #[test]
+    fn the_embed_memo_forgets_past_its_ttl() {
+        let memo = EmbedMemo::new(Duration::ZERO, 10);
+        memo.put("a".into(), vec![1]);
+        assert_eq!(memo.get("a"), None);
+        assert_eq!(memo.len(), 0, "an expired vector was kept");
+    }
+
+    /// One text in two embedding spaces is two keys, so a vector never reaches a corpus of another model.
+    #[test]
+    fn the_embed_memo_key_names_the_model_and_width() {
+        let text = "korean heist";
+        let keys = [
+            EmbedMemo::key("bge-m3", 1024, text),
+            EmbedMemo::key("bge-m3", 512, text),
+            EmbedMemo::key("other", 1024, text),
+        ];
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_eq!(keys[0], EmbedMemo::key("bge-m3", 1024, text));
     }
 
     #[test]

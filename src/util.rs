@@ -1,4 +1,4 @@
-//! Small shared helpers — ports of `src/util.ts` (fnv1a, public_origin, plain json responses).
+//! Small shared helpers — the JSON ETag hash, public_origin, plain json responses.
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -161,15 +161,18 @@ pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// FNV-1a 32-bit → 8-char hex, byte-identical to the TS `fnv1a` (which hashes `charCodeAt`, i.e. UTF-16
-/// code units). Used for the small JSON responses' ETags; the big blobs use their real sha256.
+/// FNV-1a 64-bit over the UTF-8 bytes → `<16 hex>-<byte length in hex>`, the ETag den-reel gives its JSON
+/// too. Used for the small JSON and HTML responses' ETags; the big blobs use their real sha256. 32 bits made a
+/// collision between two bodies of one route plausible over a long enough life — a 304 for a changed body —
+/// and folding in the length costs nothing. A fixed hash, not std's `DefaultHasher`, so a validator survives
+/// a restart and a toolchain upgrade.
 pub fn fnv1a(input: &str) -> String {
-    let mut h: u32 = 0x811c_9dc5;
-    for unit in input.encode_utf16() {
-        h ^= unit as u32;
-        h = h.wrapping_mul(0x0100_0193);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in input.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{:08x}", h)
+    format!("{h:016x}-{:x}", input.len())
 }
 
 /// A plain JSON response, explicitly uncacheable (used for /health, 404, 405, and the 503
@@ -259,6 +262,18 @@ mod tests {
         for hostile in ["https://evil.example/pwn?x=", "javascript:", "://", "https evil"] {
             assert_eq!(origin(hostile), "http://atlas.local", "{hostile:?} reached the advertised blob URLs");
         }
+    }
+
+    #[test]
+    fn a_json_etag_is_64_bit_fnv_and_the_length() {
+        // The FNV-1a 64 reference values.
+        assert_eq!(fnv1a(""), "cbf29ce484222325-0");
+        assert_eq!(fnv1a("a"), "af63dc4c8601ec8c-1");
+        let tag = fnv1a(r#"{"metas":[]}"#);
+        let (hash, len) = tag.split_once('-').unwrap();
+        assert_eq!(hash.len(), 16, "{tag}");
+        assert_eq!(len, "c", "{tag}");
+        assert_ne!(fnv1a(r#"{"ids":[1]}"#), fnv1a(r#"{"ids":[2]}"#));
     }
 
     #[test]

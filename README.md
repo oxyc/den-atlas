@@ -77,12 +77,25 @@ at the `legacy-ts` git tag.)
 
 ## Caching
 Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the blob's sha256, distinct `-gzip`
-variant) + `Last-Modified`, honoring `If-None-Match` and `If-Modified-Since` (→ `304`), plus `HEAD`. Blob
+variant; a JSON body's 64-bit FNV-1a plus its length) honoring `If-None-Match` (→ `304`), plus `HEAD`. Blobs
+also carry the dataset's `Last-Modified` and honor `If-Modified-Since`; `dataset.json` does not, because its
+body also depends on the request origin and the embed/index flags, so only its ETag can say it changed. Blob
 URLs in the descriptor are version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable`
 for a year while a bare path revalidates. Every blob is **range-resumable** (`Accept-Ranges` / `206`); the
 labels JSON (and the metadata sidecar, when the release publishes a `.gz`) is **gzipped** transparently — the
 ETag/checksum is over the raw bytes, so the Den app (which validates the decompressed payload) is
 unaffected. Sit a CDN in front and it caches everything by URL with correct revalidation.
+
+| Response | `Cache-Control` |
+|---|---|
+| `manifest.json` | `max-age=3600, stale-while-revalidate=600, stale-if-error=86400` |
+| `dataset.json` | `max-age=300, stale-while-revalidate=3600, stale-if-error=86400` |
+| `/index/…` GET | `max-age=3600, stale-while-revalidate=86400` (answers move only with the dataset); `max-age=300` when a search should have been ranked through den-embed and wasn't |
+| title search | `max-age=3600, stale-while-revalidate=3600` |
+| a JustWatch row | `max-age=3600, stale-while-revalidate=86400, stale-if-error=86400`; `max-age=60` for a stale or empty fallback |
+
+A search query's vector is remembered in memory (1,000 texts, least recently used first, 24 h), keyed by the
+dataset's embedding model and width, so a repeated search does not call den-embed again.
 
 `dataset.json` builds its absolute blob URLs from `X-Forwarded-Proto` + `X-Forwarded-Host`/`Host` (and
 names them in `Vary`), so a proxy in front that forwards those gets URLs on its own origin. To serve the
