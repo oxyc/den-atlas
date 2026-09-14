@@ -233,6 +233,15 @@ impl Parsed {
         Some(if self.leftover.is_empty() { &self.text } else { &self.leftover })
     }
 
+    /// Set the release-year window from a caller that computed it, overriding whatever the text implied.
+    pub fn set_year_min(&mut self, year: u16) {
+        self.facet.year_min = Some(year);
+    }
+
+    pub fn set_year_max(&mut self, year: u16) {
+        self.facet.year_max = Some(year);
+    }
+
     /// True when the query named anything the facts or labels can answer directly.
     fn names_something(&self) -> bool {
         !self.people.is_empty()
@@ -242,6 +251,8 @@ impl Parsed {
             || self.source_kinds != 0
             || self.facet.country.is_some()
             || self.facet.decade.is_some()
+            || self.facet.year_min.is_some()
+            || self.facet.year_max.is_some()
     }
 }
 
@@ -408,7 +419,13 @@ pub fn answer(
     // `FACET_LANE` join the candidates.
     let facet_titles: Option<Vec<Key>> =
         indexes.facets.as_ref().filter(|_| parsed.facet.has_strong_facet()).map(|f| {
-            f.filter(parsed.facet.media_type, parsed.facet.country, parsed.facet.decade)
+            f.filter_years(
+                parsed.facet.media_type,
+                parsed.facet.country,
+                parsed.facet.decade,
+                parsed.facet.year_min,
+                parsed.facet.year_max,
+            )
                 .into_iter()
                 .map(|(id, kind)| (kind, id))
                 .collect()
@@ -627,6 +644,8 @@ pub fn answer(
             "labels": parsed.labels.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             "plotFacets": parsed.plot.iter().map(|(axis, value)| format!("{axis}={value}")).collect::<Vec<_>>(),
             "basedOnKind": SourceKinds::names(parsed.source_kinds),
+            "yearMin": parsed.facet.year_min,
+            "yearMax": parsed.facet.year_max,
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
         },
@@ -693,6 +712,25 @@ fn features(
             phi = UNKNOWN_FACET;
         } else if !known.contains(&code) {
             return None;
+        }
+    }
+    // The release-year window. Same rule as country and decade: a title ON RECORD outside it is not what was
+    // asked for; one with no year at all is unknown, and unknown is not a mismatch.
+    if parsed.facet.year_min.is_some() || parsed.facet.year_max.is_some() {
+        let year = facets
+            .and_then(|f| f.year)
+            .filter(|&y| y > 0)
+            .map(i64::from)
+            .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
+        match year {
+            Some(year) => {
+                if parsed.facet.year_min.is_some_and(|min| year < i64::from(min))
+                    || parsed.facet.year_max.is_some_and(|max| year > i64::from(max))
+                {
+                    return None;
+                }
+            }
+            None => phi *= UNKNOWN_FACET,
         }
     }
     if let Some(decade) = parsed.facet.decade {

@@ -108,6 +108,24 @@ impl FacetIndex {
         country: Option<&str>,
         decade: Option<u16>,
     ) -> Vec<(u32, MediaType)> {
+        self.filter_years(media_type, country, decade, None, None)
+    }
+
+    /// As `filter`, bounded by an inclusive release-year window.
+    ///
+    /// A range cannot be a bucket lookup the way a decade is, so it filters the matched set instead — and
+    /// when the window is the ONLY thing given, the whole row table is the starting set. That is the price
+    /// of letting "recent" propose candidates at all: without it a year window could only refine titles some
+    /// other lane had already found, and `q=recent` would answer with whatever the plot vectors made of the
+    /// word. A year of 0 means unknown in the blob, and unknown is never a mismatch, so it is kept.
+    pub fn filter_years(
+        &self,
+        media_type: Option<MediaType>,
+        country: Option<&str>,
+        decade: Option<u16>,
+        year_min: Option<u16>,
+        year_max: Option<u16>,
+    ) -> Vec<(u32, MediaType)> {
         let empty: &[u32] = &[];
         let mut sets: Vec<&[u32]> = Vec::new();
         if let Some(country) = country {
@@ -120,10 +138,24 @@ impl FacetIndex {
         if let Some(media_type) = media_type {
             sets.push(self.by_type.get(&media_type).map_or(empty, Vec::as_slice));
         }
+        let all: Vec<u32>;
+        if sets.is_empty() && (year_min.is_some() || year_max.is_some()) {
+            all = (0..self.rows.len() as u32).collect();
+            sets.push(&all);
+        }
         let Some((smallest, others)) = smallest_first(sets) else { return Vec::new() };
         let others: Vec<HashSet<u32>> = others.into_iter().map(|s| s.iter().copied().collect()).collect();
-        let mut matched: Vec<u32> =
-            smallest.iter().copied().filter(|p| others.iter().all(|s| s.contains(p))).collect();
+        let in_window = |p: &u32| {
+            let year = self.rows[*p as usize].year;
+            year == 0
+                || (year_min.is_none_or(|min| year >= min) && year_max.is_none_or(|max| year <= max))
+        };
+        let mut matched: Vec<u32> = smallest
+            .iter()
+            .copied()
+            .filter(|p| others.iter().all(|s| s.contains(p)))
+            .filter(|p| in_window(p))
+            .collect();
         matched.sort_by_key(|&p| std::cmp::Reverse(self.rows[p as usize].votes));
         matched.iter().map(|&p| (self.rows[p as usize].tmdb_id, self.rows[p as usize].media_type)).collect()
     }
@@ -148,6 +180,14 @@ pub struct FacetQuery {
     pub country: Option<&'static str>,
     /// The decade's first year, e.g. 1980.
     pub decade: Option<u16>,
+    /// An inclusive release-year window. A bare year ("2019") sets both ends; "recent" and "new" set only
+    /// the lower one, and "classic" only the upper.
+    ///
+    /// Decade equality was the only thing a query could say about time, so "recent" meant nothing and a
+    /// bare year was matched as PROSE — `korean thriller 2019` pulled a 2020 film above Parasite, because
+    /// "2019" went to the plot vectors rather than to a filter.
+    pub year_min: Option<u16>,
+    pub year_max: Option<u16>,
     pub leftover: String,
 }
 
@@ -178,6 +218,28 @@ impl FacetQuery {
                     continue;
                 }
             }
+            // A bare four-digit year, within the range a release can plausibly carry. Bounded on both sides
+            // so a runtime, a resolution or an id ("1080", "4000") is not read as a date.
+            if query.year_min.is_none() && query.year_max.is_none() && token.len() == 4 {
+                if let Ok(year) = token.parse::<u16>() {
+                    if (1890..=2100).contains(&year) {
+                        query.year_min = Some(year);
+                        query.year_max = Some(year);
+                        continue;
+                    }
+                }
+            }
+            // "recent" / "new" name a window with no end; "classic" / "old" one with no beginning. The
+            // boundaries are deliberately generous: someone asking for something recent will accept a film
+            // from a couple of years ago, and would rather see one than nothing.
+            if query.year_min.is_none() && matches!(token, "recent" | "new" | "latest" | "newest") {
+                query.year_min = Some(RECENT_SINCE);
+                continue;
+            }
+            if query.year_max.is_none() && matches!(token, "classic" | "classics" | "old" | "older") {
+                query.year_max = Some(CLASSIC_UNTIL);
+                continue;
+            }
             leftover.push(token);
         }
         query.leftover = leftover.join(" ");
@@ -185,13 +247,17 @@ impl FacetQuery {
     }
 
     pub fn has_facet(&self) -> bool {
-        self.media_type.is_some() || self.country.is_some() || self.decade.is_some()
+        self.media_type.is_some()
+            || self.country.is_some()
+            || self.decade.is_some()
+            || self.year_min.is_some()
+            || self.year_max.is_some()
     }
 
     /// A facet ordinary search can't express — a country or a decade. A bare type ("batman movies") is not
     /// one: title and theme search already cover it.
     pub fn has_strong_facet(&self) -> bool {
-        self.country.is_some() || self.decade.is_some()
+        self.country.is_some() || self.decade.is_some() || self.year_min.is_some() || self.year_max.is_some()
     }
 }
 
@@ -210,6 +276,13 @@ const MEDIA_TYPES: &[(&str, MediaType)] = &[
     ("film", MediaType::Movie),
     ("films", MediaType::Movie),
 ];
+
+/// What "recent" means. A fixed year rather than "now minus N" on purpose: the corpus is a published
+/// snapshot, so a moving boundary would quietly empty this facet as the dataset aged, and a wrong constant
+/// is easier to notice than a window that shrinks on its own.
+const RECENT_SINCE: u16 = 2021;
+/// And "classic". Before home video, roughly.
+const CLASSIC_UNTIL: u16 = 1979;
 
 const DECADES: &[(&str, u16)] = &[
     ("50s", 1950),
@@ -312,6 +385,33 @@ mod tests {
             (4, MediaType::Tv, "KR", 2010, 300),
         ]))
         .unwrap()
+    }
+
+    /// Time could only be said as a decade, so "recent" meant nothing and a bare year was matched as prose —
+    /// `korean thriller 2019` pulled a 2020 film above Parasite.
+    #[test]
+    fn a_query_can_bound_its_release_years() {
+        let year = |text: &str| {
+            let q = FacetQuery::parse(text);
+            (q.year_min, q.year_max, q.leftover)
+        };
+        assert_eq!(year("2019"), (Some(2019), Some(2019), String::new()));
+        assert_eq!(year("korean thriller 2019").0, Some(2019), "no longer prose");
+        assert_eq!(year("recent horror"), (Some(RECENT_SINCE), None, "horror".to_owned()));
+        assert_eq!(year("new movies").0, Some(RECENT_SINCE));
+        assert_eq!(year("classic westerns"), (None, Some(CLASSIC_UNTIL), "westerns".to_owned()));
+
+        // Bounded on both sides, so a runtime or a resolution is not a date.
+        assert_eq!(year("1080p"), (None, None, "1080p".to_owned()));
+        assert_eq!(year("4000"), (None, None, "4000".to_owned()));
+        assert_eq!(year("90"), (None, None, "90".to_owned()), "two digits is not a year");
+
+        // A decade still wins where both could read: "1990s" is a decade, not the year 1990.
+        let decade = FacetQuery::parse("1990s");
+        assert_eq!((decade.decade, decade.year_min), (Some(1990), None));
+
+        // A year window alone is worth a lane of its own: without this "recent" proposes nothing.
+        assert!(FacetQuery::parse("recent").has_strong_facet());
     }
 
     #[test]

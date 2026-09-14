@@ -48,6 +48,30 @@ pub fn render(state: &AppState) -> String {
         &format!("{{version=\"{}\"}}", env!("CARGO_PKG_VERSION")),
         1,
     );
+    // What /health says, as a number a monitor can alert on. `serious` separates "a feature class is off"
+    // from "the rows are a day old": the first deserves waking someone, the second does not, and before this
+    // they were indistinguishable to anything but a human reading JSON.
+    let health = crate::handler::health_state(
+        state.dataset.is_some(),
+        state.catalog.fresh(),
+        state.catalog.schema_suspect(),
+        state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+    );
+    let reason = health.map_or("ok", |(reason, _)| reason);
+    gauge(
+        &mut b,
+        "atlas_health",
+        "1 for the reason currently reported by /health (reason=\"ok\" when healthy).",
+        &format!("{{reason=\"{}\"}}", label(reason)),
+        1,
+    );
+    gauge(
+        &mut b,
+        "atlas_degraded_feature_loss",
+        "1 when a degraded reason means a whole capability is off, not merely that answers are stale.",
+        "",
+        u64::from(health.is_some_and(|(reason, _)| crate::handler::loses_a_feature(reason))),
+    );
     let ds = state.dataset.as_ref();
     gauge(
         &mut b,

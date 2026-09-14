@@ -212,6 +212,29 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             StatusCode::OK,
         );
     }
+    // `/ready` — the alertable one. `/health` answers 200 whatever is wrong, by the addon convention
+    // (ADDON-02), which is right for a liveness probe and useless for waking someone. This returns 503 when a
+    // feature class is off, so a plain `curl -f`, a systemd timer or an uptime check is enough to notice —
+    // no scraper, no rules file. Cosmetic degradation still answers 200: a monitor that cries wolf over a
+    // stale catalog is a monitor that gets muted before the outage it was meant to catch.
+    if route == "/ready" {
+        note_health(&state);
+        let now = health_state(
+            ds.is_some(),
+            state.catalog.fresh(),
+            state.catalog.schema_suspect(),
+            state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+        );
+        let serious = now.is_some_and(|(reason, _)| loses_a_feature(reason));
+        let body = health_body(
+            ds.is_some(),
+            state.catalog.fresh(),
+            state.catalog.schema_suspect(),
+            state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+        );
+        let status = if serious { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+        return json_response(body, status);
+    }
     if route == "/manifest.json" {
         return serve_json(
             &method,
@@ -345,6 +368,17 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
         }
     };
     with_timing(resp, &format!("embed;dur={}, total;dur={}", ms(upstream.elapsed()), ms(started.elapsed())))
+}
+
+/// Whether a degraded reason means a FEATURE CLASS IS OFF, rather than that the answers are merely older.
+///
+/// `stale_catalog` serves yesterday's rows: worth knowing, not worth waking anyone. `facts_unusable` and
+/// `dataset_unavailable` silently remove whole capabilities — people search, imdbId, countries, /recommend's
+/// reading of a title — while every request still answers 200. That is the state that sat unnoticed for
+/// nineteen minutes and surfaced as bad search results rather than as a signal, so the two must not look
+/// alike to a monitor.
+pub(crate) fn loses_a_feature(reason: &str) -> bool {
+    matches!(reason, "dataset_unavailable" | "facts_unusable")
 }
 
 /// What `/health` reports: `None` when healthy, else the reason slug and a one-sentence detail.
@@ -730,7 +764,19 @@ async fn query_answer(
     let (skip, limit) =
         (number("skip", 0), number("limit", crate::search::PAGE).min(crate::search::MAX_PAGE));
     let parsing = Instant::now();
-    let parsed = crate::search::parse(&text, &indexes);
+    let mut parsed = crate::search::parse(&text, &indexes);
+    // `year_min` / `year_max` — the STRUCTURED way to bound a release year, for a caller that has already
+    // worked out what the user meant. Atlas reads a handful of words itself ("recent", "classic", a bare
+    // year) because the TV's search box has nothing else; it deliberately does not grow a natural-language
+    // date parser, because an LLM client turns "something from before I was born" or "the last five years"
+    // into these two numbers far better than a word list ever will. Given explicitly, they win over anything
+    // the text said.
+    if let Some(min) = query_param(query, "year_min").and_then(|v| v.parse().ok()) {
+        parsed.set_year_min(min);
+    }
+    if let Some(max) = query_param(query, "year_max").and_then(|v| v.parse().ok()) {
+        parsed.set_year_max(max);
+    }
     let parsed_in = parsing.elapsed();
     let embedding = Instant::now();
     let unembedded = |e: String| eprintln!("search query left unembedded: {e}");
@@ -1980,6 +2026,30 @@ mod tests {
         assert_eq!(loggable_path(&uri), "/<config>/catalog/movie/x/search=<query>&skip=5.json");
         let uri: axum::http::Uri = "/catalog/movie/jw-nfx.json".parse().unwrap();
         assert_eq!(loggable_path(&uri), "/catalog/movie/jw-nfx.json");
+    }
+
+    /// `/health` answers 200 whatever is wrong, by the addon convention. `/ready` is the one a monitor
+    /// watches, and it must separate "a capability is gone" from "the rows are a day old" — the distinction
+    /// that let facts_unusable sit unnoticed behind a healthy-looking 200.
+    #[test]
+    fn only_losing_a_capability_is_worth_waking_someone() {
+        assert!(loses_a_feature("dataset_unavailable"));
+        assert!(loses_a_feature("facts_unusable"));
+        assert!(!loses_a_feature("stale_catalog"), "older rows are not an outage");
+        assert!(!loses_a_feature("catalog_schema_suspect"), "short rows are not an outage");
+        assert!(!loses_a_feature("ok"));
+
+        // Every reason health_state can produce is classified: a new one must be considered, not defaulted.
+        for (loaded, fresh, suspect, facts) in
+            [(false, true, false, false), (true, false, false, false), (true, true, true, false), (true, true, false, true)]
+        {
+            let (reason, _) = health_state(loaded, fresh, suspect, facts).expect("degraded");
+            assert!(
+                loses_a_feature(reason) || matches!(reason, "stale_catalog" | "catalog_schema_suspect"),
+                "unclassified reason {reason}"
+            );
+        }
+        assert!(health_state(true, true, false, false).is_none());
     }
 
     #[test]
