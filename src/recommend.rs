@@ -73,6 +73,13 @@ const MAX_SLIDES: usize = 100;
 /// Service lists read for one request, "new on" before "popular on": every household service in each type, and
 /// then some.
 const SERVICE_LISTS: usize = 48;
+/// The household's own pool (`personal`): titles from the whole catalogue out within this many days, or due within
+/// this many, since freshness has all but gone by then (`FRESH_DAYS`, `ANTICIPATION_DAYS`) …
+const PERSONAL_BEHIND: i64 = 2 * FRESH_DAYS as i64;
+const PERSONAL_AHEAD: i64 = 2 * ANTICIPATION_DAYS as i64;
+/// … narrowed to this many on a sketch of their fit, and to this many of the best fits after the whole of it.
+const PERSONAL_SKETCHED: usize = 400;
+const PERSONAL: usize = 60;
 /// The most any one request may name.
 pub const MAX_LIBRARY: usize = 5000;
 pub const MAX_OWNED: usize = 10_000;
@@ -806,6 +813,15 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         };
         push(key, known.title(key, Some(&offered.hint), None), rank, None);
     }
+    let owned: HashSet<Key> =
+        request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
+    let keep = |c: &Candidate<'_>| {
+        only.is_none_or(|t| t == c.key.0) && !owned.contains(&c.key) && !hidden(c, &request.hide)
+    };
+    // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.
+    let personal = taste.as_ref().map_or_else(Vec::new, |taste| personal(indexes, &known, taste, now, keep));
+    let personal_count = personal.len();
+    pool.extend(personal);
 
     // Only titles something is known about, when there are enough of them: an unjudged title can't be matched
     // against this library's taste or dropped for missing it, so it competes on attention alone. Judged per title,
@@ -821,11 +837,6 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         .map(|c| c.key)
         .collect::<HashSet<_>>()
         .len();
-    let owned: HashSet<Key> =
-        request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
-    let keep = |c: &Candidate<'_>| {
-        only.is_none_or(|t| t == c.key.0) && !owned.contains(&c.key) && !hidden(c, &request.hide)
-    };
     // The unjudged titles most worth describing, by what they are worth before taste: a client that can say what
     // they are asks again with that as their hints.
     let unjudged: Vec<Key> = pick(
@@ -874,8 +885,40 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
             .collect::<Vec<_>>(),
         "unjudgedCount": unjudged_count,
         "libraryUnjudged": library_unjudged,
-        "pool": { "titles": pooled, "catalogue": catalogue, "libraryIndexed": library_indexed },
+        "pool": { "titles": pooled, "catalogue": catalogue, "personal": personal_count, "libraryIndexed": library_indexed },
     })
+}
+
+/// The catalogue's titles out lately or coming soon (`PERSONAL_BEHIND`, `PERSONAL_AHEAD`) that fit this household
+/// best, `PERSONAL` of them at most and none below `LEAD_FIT`. The lists only know what services and charts push; a
+/// film from a director the household follows, or a series like the ones it finishes, can be on none of them. Each
+/// is sketched first (`Fit::sketch`) and only the best `PERSONAL_SKETCHED` get the whole fit.
+fn personal<'a>(
+    indexes: &'a Indexes,
+    known: &Knowledge<'a>,
+    taste: &Fit<'_>,
+    now: f64,
+    keep: impl Fn(&Candidate<'a>) -> bool,
+) -> Vec<Candidate<'a>> {
+    let today = now as i64;
+    let mut sketched: Vec<(f64, Candidate<'a>, Features)> = indexes
+        .corpus()
+        .released_between(today - PERSONAL_BEHIND, today + PERSONAL_AHEAD)
+        .filter_map(|key| {
+            let candidate = Candidate { key, title: known.title(key, None, None), rank: None, arrival: None };
+            if candidate.title.genres.is_empty() || !keep(&candidate) {
+                return None;
+            }
+            let features = Features::of(indexes, key, &candidate.title);
+            Some((taste.sketch(&features), candidate, features))
+        })
+        .collect();
+    sketched.sort_by(|a, b| b.0.total_cmp(&a.0));
+    sketched.truncate(PERSONAL_SKETCHED);
+    let mut fitted: Vec<(f64, Candidate<'a>)> =
+        sketched.into_iter().map(|(_, candidate, features)| (taste.of(&features).fit, candidate)).collect();
+    fitted.sort_by(|a, b| b.0.total_cmp(&a.0));
+    fitted.into_iter().take(PERSONAL).take_while(|(fit, _)| *fit >= LEAD_FIT).map(|(_, c)| c).collect()
 }
 
 /// Slides an answer's log line names.
@@ -985,7 +1028,7 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         .collect();
     format!(
         "recommend {}: library {} ({} unjudged, {} indexed), owned {}, candidates {}, pool {} ({} catalogue, {} \
-         unjudged), {} slides; {}",
+         unjudged, {} personal), {} slides; {}",
         request.surface.as_deref().unwrap_or("home"),
         request.library.len(),
         answer["libraryUnjudged"],
@@ -995,6 +1038,7 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         answer["pool"]["titles"],
         answer["pool"]["catalogue"],
         answer["unjudgedCount"],
+        answer["pool"]["personal"],
         slides.len(),
         top.join("; ")
     )

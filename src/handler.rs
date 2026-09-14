@@ -1885,7 +1885,7 @@ mod tests {
             ),
             "{line}"
         );
-        assert!(line.contains(" 1 unjudged), 1 slides; 1. Two "), "{line}");
+        assert!(line.contains(" 1 unjudged, 0 personal), 1 slides; 1. Two "), "{line}");
         assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
 

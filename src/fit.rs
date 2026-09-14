@@ -129,6 +129,8 @@ pub struct Corpus {
     centre: Vec<f64>,
     /// An even sample of the index with vectors, the yardstick every fit is read against.
     sample: Vec<Features>,
+    /// Every dated title by the first day it could have come out, with how many days that date spans.
+    dated: Vec<(i64, i64, Key)>,
 }
 
 impl Corpus {
@@ -143,9 +145,13 @@ impl Corpus {
         }
         let step = (indexes.plot.len() / SAMPLE).max(1);
         let (mut counts, mut carrying, mut credits) = (HashMap::new(), [0.0; 8], HashMap::new());
-        let mut sample = Vec::with_capacity(SAMPLE);
+        let (mut sample, mut dated) = (Vec::with_capacity(SAMPLE), Vec::new());
         for (at, &key) in keys.iter().enumerate() {
-            let features = Features::of(indexes, key, &known.title(key, None, None));
+            let title = known.title(key, None, None);
+            if let Some(released) = title.released {
+                dated.push((released.first_day, released.span_days.max(1), key));
+            }
+            let features = Features::of(indexes, key, &title);
             for (family, carried) in carrying.iter_mut().enumerate() {
                 if features.has(family) {
                     *carried += 1.0;
@@ -163,7 +169,21 @@ impl Corpus {
         }
         let shares =
             counts.into_iter().map(|(value, n): (Value, f64)| (value, n / carrying[value.0])).collect();
-        Corpus { shares, credits, titles: keys.len() as f64, centre: indexes.plot.mean_vector(), sample }
+        dated.sort_unstable();
+        Corpus {
+            shares,
+            credits,
+            titles: keys.len() as f64,
+            centre: indexes.plot.mean_vector(),
+            sample,
+            dated,
+        }
+    }
+
+    /// The titles that could have come out between two days, inclusive: a date known only to its year counts when
+    /// any day of that year does.
+    pub fn released_between(&self, from: i64, to: i64) -> impl Iterator<Item = Key> + '_ {
+        released_between(&self.dated, from, to)
     }
 
     fn share(&self, value: Value) -> f64 {
@@ -293,6 +313,12 @@ impl<'a> Fit<'a> {
         Fitted { fit, similar, profile, people, confidence }
     }
 
+    /// What fit makes of a title before its plot is read: its profile and its people, weighed as `of` weighs them. The
+    /// plot's nearest-liked search is most of what a fit costs, so a large set is narrowed on this first.
+    pub fn sketch(&self, features: &Features) -> f64 {
+        W_PROFILE * z(self.lifted(features), self.profile) + W_PEOPLE * self.following(features)
+    }
+
     /// The weighted mean closeness of a row to its nearest liked titles, less its closeness to the index as a whole.
     fn nearest(&self, row: u32) -> Option<f64> {
         if self.liked.is_empty() {
@@ -345,6 +371,17 @@ impl<'a> Fit<'a> {
     }
 }
 
+/// The keys of `dated` (sorted by first day) whose span of days touches `from..=to`.
+fn released_between(dated: &[(i64, i64, Key)], from: i64, to: i64) -> impl Iterator<Item = Key> + '_ {
+    // No date spans more than a year, so nothing starting earlier than a year before `from` can reach it.
+    let start = dated.partition_point(|&(first, _, _)| first < from - 366);
+    let end = dated.partition_point(|&(first, _, _)| first <= to);
+    dated[start..end.max(start)]
+        .iter()
+        .filter(move |&&(first, span, _)| first + span > from)
+        .map(|&(_, _, key)| key)
+}
+
 fn z(value: f64, (mean, sd): (f64, f64)) -> f64 {
     (value - mean) / sd
 }
@@ -384,6 +421,19 @@ mod tests {
 
     fn features(indexes: &Indexes, key: Key) -> Features {
         Features::of(indexes, key, &Knowledge { indexes }.title(key, None, None))
+    }
+
+    #[test]
+    fn a_title_is_released_between_two_days_when_any_day_it_could_be_falls_between() {
+        // Sorted by first day: a dated day, a year known only as a year, and a day well after.
+        let dated = [(100, 1, ONE), (200, 365, TWO), (900, 1, THREE)];
+        let between = |from, to| released_between(&dated, from, to).collect::<Vec<_>>();
+        assert_eq!(between(100, 100), vec![ONE], "both ends are inclusive");
+        assert_eq!(between(101, 500), vec![TWO], "a year counts while any of its days does");
+        assert_eq!(between(564, 564), vec![TWO], "its last day still counts");
+        assert_eq!(between(565, 899), Vec::<Key>::new(), "the day after it does not");
+        assert_eq!(between(0, 1000), vec![ONE, TWO, THREE]);
+        assert_eq!(between(1000, 0), Vec::<Key>::new(), "an empty span holds nothing");
     }
 
     #[tokio::test]
