@@ -1102,6 +1102,56 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     })
 }
 
+/// Slides an answer's log line names.
+const SUMMARY_SLIDES: usize = 5;
+
+/// An answer as one log line: what the request carried, and the slides it leads with, each with why — so a billboard
+/// that leads with something odd can be read off the log rather than reproduced. A slide is named from the metadata
+/// cards, else by its IMDb id. The library's titles are never named, only counted.
+pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value) -> String {
+    let name = |slide: &serde_json::Value| {
+        let key = slide["type"]
+            .as_str()
+            .and_then(media_type)
+            .zip(slide["id"].as_u64().and_then(|id| id.try_into().ok()));
+        key.and_then(|key| indexes.cards.as_ref()?.get(&key))
+            .map(|card| card.title.clone())
+            .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| slide["id"].to_string())
+    };
+    let term = |slide: &serde_json::Value, name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
+    let slides = answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let top: Vec<String> = slides
+        .iter()
+        .take(SUMMARY_SLIDES)
+        .enumerate()
+        .map(|(at, s)| {
+            format!(
+                "{}. {} {:.3} (fresh {:.2}, attention {:.2}, quality {:.2}, taste {:.2}, novelty {:.2})",
+                at + 1,
+                name(s),
+                term(s, "score"),
+                term(s, "fresh"),
+                term(s, "attention"),
+                term(s, "quality"),
+                term(s, "taste"),
+                term(s, "novelty")
+            )
+        })
+        .collect();
+    format!(
+        "recommend {}: library {} ({} unjudged), owned {}, candidates {}, {} unjudged in the pool, {} slides; {}",
+        request.surface.as_deref().unwrap_or("home"),
+        request.library.len(),
+        answer["libraryUnjudged"],
+        request.owned.len(),
+        request.candidates.len(),
+        answer["unjudgedCount"],
+        slides.len(),
+        top.join("; ")
+    )
+}
+
 /// Atlas's own lists for a request, as the web app fetched them: at most eight "new on" lists — the
 /// household's picked services in their own countries, else every service this install carries — and
 /// Trending Everywhere. A list that can't be had is empty; the catalog already degrades and caches.

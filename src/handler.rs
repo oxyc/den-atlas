@@ -952,6 +952,7 @@ const RECOMMEND_BODY: usize = 512 * 1024;
 /// config decides which services' lists are read when the household has picked none.
 async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -> Response {
     let started = Instant::now();
+    let rid = request_id(req.headers()).map(|rid| format!(" rid={rid}")).unwrap_or_default();
     let Some(queries) = state.index.as_ref() else {
         return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
     };
@@ -988,6 +989,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
         let now = request.now.as_deref().and_then(crate::recommend::parse_now);
         let mut answer =
             crate::recommend::answer(&indexes, &request, &lists, now.unwrap_or_else(crate::recommend::today));
+        eprintln!("{}{rid}", crate::recommend::summary(&indexes, &request, &answer));
         answer["datasetVersion"] = serde_json::json!(version);
         answer.to_string()
     })
@@ -1863,6 +1865,17 @@ mod tests {
         // Movie 99 is known to nothing but its hint, which names no genre — and it is hidden, so never asked about.
         assert_eq!(answer["unjudged"], serde_json::json!([]));
         assert_eq!(answer["unjudgedCount"], 1);
+
+        // The log line names the slides from the cards and counts the library without naming it.
+        let request: crate::recommend::Request = serde_json::from_str(body).unwrap();
+        let indexes = state.index.as_ref().unwrap().get(|| ()).await.unwrap().0;
+        let line = crate::recommend::summary(&indexes, &request, &answer);
+        assert!(
+            line.starts_with("recommend movies: library 1 (0 unjudged), owned 1, candidates 4, 1 unjudged in the pool, 1 slides; 1. Two "),
+            "{line}"
+        );
+        assert!(line.contains("fresh ") && line.contains("taste "), "{line}");
+        assert!(!line.contains("One"), "a library title is never named: {line}");
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.
