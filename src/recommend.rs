@@ -10,24 +10,24 @@
 //!
 //! What a billboard shows is not the leading row. A "Because you watched X" row is the nearest neighbours of
 //! a title already watched, and after enough history that neighbourhood IS the history. A billboard is the
-//! top of a page opened to find something to watch, so this ranks what is new — new in the world and new to
-//! this library — weighted towards the library's taste and away from what it has already worn out.
+//! top of a page opened to find something to watch, so this ranks what fits this household (`fit.rs`) and, among
+//! what fits, what is good and new — new in the world, or newly on a service the household has.
 //!
 //! Pure and deterministic given `now`, so a recorded request replays to the same answer.
 
 use crate::catalog::{new_catalog_id, Provider, TRENDING_ID};
 use crate::config::Config;
 use crate::facts::{Facts, Released};
+use crate::fit::{Features, Fit, Fitted};
 use crate::queries::Indexes;
 use crate::AppState;
 use den_index::MediaType;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::sync::Arc;
 
 /// Names the scoring rules, so a kept answer can say which rules chose it.
-pub const SCORER: &str = "billboard-port-2";
+pub const SCORER: &str = "fit-1";
 
 type Key = (MediaType, u32);
 
@@ -47,57 +47,21 @@ const COUNTED_ENOUGH: f64 = 100.0;
 const CATALOGUE_DAYS: f64 = 730.0;
 /// What an arrival is worth when it is catalogue: Interstellar on "New on Prime" is a title the household has had
 /// every chance to meet.
-const CATALOGUE_ARRIVAL: f64 = 0.5;
-/// How the terms trade off. Freshness leads but not alone; attention is weighted to match it, so among new
-/// things the ones people are actually watching win.
-const WEIGHT_FRESH: f64 = 0.22;
-const WEIGHT_ATTENTION: f64 = 0.4;
-const WEIGHT_QUALITY: f64 = 0.15;
-/// What a title keeps when it matches nothing this library watches. Taste multiplies the rest rather than
-/// adding to it, so it decides between contenders instead of being outvoted by them.
-const TASTE_FLOOR: f64 = 0.35;
-/// How much a second kind of attention adds once the first is counted.
-const CORROBORATION: f64 = 0.3;
-/// How the facets of a taste trade off; they sum to one. Language is the smallest: in a library three-quarters
-/// in English it would otherwise hand the decision to every Hollywood release.
-const FACET_GENRES: f64 = 0.56;
-const FACET_PEOPLE: f64 = 0.22;
-const FACET_COUNTRIES: f64 = 0.1;
-const FACET_LANGUAGES: f64 = 0.06;
-const FACET_DECADES: f64 = 0.06;
-/// Where a series aired, on top of the facets above: a network's house style is something viewers follow, but
-/// less surely than a maker, so it weighs less than people do. Read only between series.
-const FACET_BROADCASTERS: f64 = 0.08;
-/// How much atlas's labels add on top of the facets, where both the title and the library carry them.
-///
-/// In the web app labels only chose which sixty candidates TMDB was asked about, which is how they came to
-/// decide the field. With every candidate judged here there is no such cut, so without a term of their own
-/// the labels would stop counting at all — and a primary genre alone cannot tell Nordic noir from a slasher.
-const LABEL_WEIGHT: f64 = 0.3;
-/// How the two kinds of label trade off: a subgenre says what a thing is, a mood only how it feels.
-const LABEL_SUBGENRES: f64 = 0.7;
-const LABEL_MOODS: f64 = 0.3;
-/// Weight of matching people at which the household counts as following them: one lead is a coincidence.
-const PEOPLE_ENOUGH: f64 = 2.0;
+const CATALOGUE_ARRIVAL: f64 = 0.25;
+/// What merit, timeliness and buzz can each do to a score. A title with none of one keeps this much of it, so fit —
+/// squared — decides, and the rest choose between titles that fit alike.
+const MERIT_FLOOR: f64 = 0.5;
+const TIMELY_FLOOR: f64 = 0.2;
+const BUZZ_BONUS: f64 = 0.1;
+/// The slides that must fit at least `LEAD_FIT`: a billboard opens on what this household might want, never on a
+/// title only everyone else is watching.
+const LEAD_SLIDES: usize = 10;
+const LEAD_FIT: f64 = 0.25;
+/// A title's fit while the library likes nothing yet.
+const NO_TASTE: f64 = 0.5;
 /// Cast members that count as much as a maker. Wikidata's cast is unordered and about ten deep where the web
 /// read the top three billed, so each cast member counts `3 / cast size`, at most one.
 const CAST_BILLED: f64 = 3.0;
-/// How far towards a full match a title carries for being the next of something already followed.
-const FRANCHISE_LIFT: f64 = 0.5;
-/// Weight of dislike that halves a title's affinity.
-const DISLIKE_PATIENCE: f64 = 2.0;
-/// Keeps a facet's ratio finite when a share is zero.
-const FACET_FLOOR: f64 = 0.02;
-/// How sharply the summed facets separate.
-const FACET_SHARPNESS: f64 = 3.0;
-/// What a title keeps at the dead centre of what this household already watches.
-const NOVELTY_FLOOR: f64 = 0.5;
-/// How much of a match is too little to belong on a personal billboard.
-const STRANGER: f64 = 0.15;
-/// The titles asked "more like this" about, to tell what the library has worn out.
-const SEEDS: usize = 8;
-/// Redundancy divides by at least this many seeds, so one answering seed can't call its neighbours wholly redundant.
-const MIN_SEEDS: usize = 3;
 /// Judged candidates enough to drop the unjudged ones.
 const JUDGED_ENOUGH: usize = 20;
 /// Unjudged titles an answer names for the client to describe, best first. Until the facts cover what is new
@@ -106,8 +70,9 @@ const UNJUDGED_NAMED: usize = 20;
 /// Slides by default, and at most.
 const SLIDES: usize = 40;
 const MAX_SLIDES: usize = 100;
-/// "New on" lists read, as the web app does.
-const ARRIVAL_LISTS: usize = 8;
+/// Service lists read for one request, "new on" before "popular on": every household service in each type, and
+/// then some.
+const SERVICE_LISTS: usize = 48;
 /// The most any one request may name.
 pub const MAX_LIBRARY: usize = 5000;
 pub const MAX_OWNED: usize = 10_000;
@@ -188,9 +153,6 @@ pub struct LibraryEntry {
     pub id: u32,
     /// Watched or in progress 1, watchlisted 0.6, like +0.5, love +1; a dislike is −1.5 outright.
     pub weight: f64,
-    /// When it was last touched; orders the seeds.
-    #[serde(default)]
-    pub at: f64,
     /// What the client knows about the title, for a library title atlas holds nothing on.
     #[serde(default)]
     pub hint: Hint,
@@ -373,12 +335,13 @@ pub struct Listed {
     pub year: Option<i64>,
 }
 
-/// Atlas's lists for one request: each "new on <service>" list, and Trending Everywhere with both types
-/// interleaved.
+/// Atlas's lists for one request: each "new on <service>" list, Trending Everywhere with both types interleaved,
+/// and each "popular on <service>" list.
 #[derive(Default)]
 pub struct Lists {
     pub arrivals: Vec<Vec<Listed>>,
     pub everywhere: Vec<Listed>,
+    pub popular: Vec<Vec<Listed>>,
 }
 
 /// A rendered catalog body (`catalog::render_metas`) back as titles. A row without a TMDB id can't be named
@@ -546,204 +509,6 @@ pub struct Candidate<'a> {
     pub rank: Option<Placing>,
     /// Its place in a "new on <service>" list.
     pub arrival: Option<Placing>,
-    /// The share of the library's seeds whose "more like this" includes it, 0…1.
-    pub redundancy: Option<f64>,
-}
-
-/// What the library says its viewer likes, facet by facet. Weights are signed: a dislike subtracts.
-#[derive(Default)]
-pub struct Taste<'a> {
-    genres: HashMap<u16, f64>,
-    languages: HashMap<[u8; 2], f64>,
-    countries: HashMap<[u8; 2], f64>,
-    people: HashMap<u32, f64>,
-    decades: HashMap<i64, f64>,
-    franchises: HashMap<u32, f64>,
-    broadcasters: HashMap<u32, f64>,
-    subgenres: HashMap<&'a str, f64>,
-    moods: HashMap<&'a str, f64>,
-    /// What one of this library's own titles scores on each facet, averaged over the library: a facet is read
-    /// as how far a title departs from that, not as a level.
-    typical: Typical,
-}
-
-#[derive(Default)]
-struct Typical {
-    genres: f64,
-    languages: f64,
-    countries: f64,
-    decades: f64,
-    broadcasters: f64,
-    subgenres: f64,
-    moods: f64,
-}
-
-fn decades_of(title: &Title<'_>) -> Vec<i64> {
-    title.released.map(|r| r.year_of().div_euclid(10) * 10).into_iter().collect()
-}
-
-fn franchises_of(title: &Title<'_>) -> Vec<u32> {
-    title.franchise.into_iter().collect()
-}
-
-fn names<'a>(pairs: &[(&'a str, f64)]) -> Vec<&'a str> {
-    pairs.iter().map(|&(name, _)| name).collect()
-}
-
-/// How much of a facet's liked weight these keys account for. Only the liked part.
-fn share_of<K: Copy + Eq + Hash>(map: &HashMap<K, f64>, keys: &[K]) -> f64 {
-    let liked: f64 = map.values().filter(|&&w| w > 0.0).sum();
-    if liked <= 0.0 {
-        return 0.0;
-    }
-    let mine: f64 = keys
-        .iter()
-        .enumerate()
-        .filter(|&(at, key)| !keys[..at].contains(key))
-        .map(|(_, key)| map.get(key).copied().unwrap_or(0.0).max(0.0))
-        .sum();
-    (mine / liked).min(1.0)
-}
-
-fn add<K: Copy + Eq + Hash>(map: &mut HashMap<K, f64>, keys: impl IntoIterator<Item = (K, f64)>) {
-    let mut seen: Vec<K> = Vec::new();
-    for (key, weight) in keys {
-        if !seen.contains(&key) {
-            seen.push(key);
-            *map.entry(key).or_insert(0.0) += weight;
-        }
-    }
-}
-
-/// The shape of a library, from its titles and their signed weights.
-pub fn taste_of<'a>(entries: &[(Title<'a>, f64)]) -> Taste<'a> {
-    let mut taste = Taste::default();
-    for (title, weight) in entries {
-        let w = *weight;
-        if w == 0.0 {
-            continue;
-        }
-        add(&mut taste.genres, title.genres.iter().map(|&g| (g, w)));
-        add(&mut taste.languages, title.languages.iter().map(|&l| (l, w)));
-        add(&mut taste.countries, title.countries.iter().map(|&c| (c, w)));
-        add(&mut taste.people, title.people.iter().map(|&(p, share)| (p, w * share)));
-        add(&mut taste.decades, decades_of(title).into_iter().map(|d| (d, w)));
-        add(&mut taste.franchises, franchises_of(title).into_iter().map(|f| (f, w)));
-        add(&mut taste.broadcasters, title.broadcasters.iter().map(|&b| (b, w)));
-        if let Some(labels) = &title.labels {
-            add(&mut taste.subgenres, labels.subgenres.iter().map(|&(n, c)| (n, w * c)));
-            add(&mut taste.moods, labels.moods.iter().map(|&(n, c)| (n, w * c)));
-        }
-    }
-    let liked: Vec<(&Title<'a>, f64)> =
-        entries.iter().filter(|(_, w)| *w > 0.0).map(|(t, w)| (t, *w)).collect();
-    let mean = |score: &dyn Fn(&Title<'a>) -> Option<f64>| {
-        let (mut sum, mut total) = (0.0, 0.0);
-        for &(title, weight) in &liked {
-            if let Some(share) = score(title) {
-                sum += weight * share;
-                total += weight;
-            }
-        }
-        if total > 0.0 {
-            sum / total
-        } else {
-            0.0
-        }
-    };
-    taste.typical = Typical {
-        genres: mean(&|t| Some(share_of(&taste.genres, &t.genres))),
-        languages: mean(&|t| Some(share_of(&taste.languages, &t.languages))),
-        countries: mean(&|t| Some(share_of(&taste.countries, &t.countries))),
-        decades: mean(&|t| Some(share_of(&taste.decades, &decades_of(t)))),
-        // Over the series that name one: a film has none, and counting films as matching no network would make
-        // every network look like a rare match.
-        broadcasters: mean(&|t| {
-            (!t.broadcasters.is_empty()).then(|| share_of(&taste.broadcasters, &t.broadcasters))
-        }),
-        // Over the titles that carry labels at all, as the web's label profile was.
-        subgenres: mean(&|t| t.labels.as_ref().map(|l| share_of(&taste.subgenres, &names(&l.subgenres)))),
-        moods: mean(&|t| t.labels.as_ref().map(|l| share_of(&taste.moods, &names(&l.moods)))),
-    };
-    taste
-}
-
-/// Whether the household follows the people behind this title, saturating: one shared lead is a coincidence.
-fn following(map: &HashMap<u32, f64>, people: &[(u32, f64)]) -> f64 {
-    if people.is_empty() || map.is_empty() {
-        return 0.0;
-    }
-    let met: f64 = people
-        .iter()
-        .enumerate()
-        .filter(|&(at, (id, _))| !people[..at].iter().any(|(other, _)| other == id))
-        .map(|(_, &(id, share))| map.get(&id).copied().unwrap_or(0.0).max(0.0) * share)
-        .sum();
-    1.0 - (-met / PEOPLE_ENOUGH).exp()
-}
-
-/// How much this library has turned down what the title is made of.
-fn distaste(title: &Title<'_>, taste: &Taste<'_>) -> f64 {
-    let owed = |weight: Option<&f64>| -weight.copied().unwrap_or(0.0).min(0.0);
-    let mut against = 0.0;
-    let mut genres: Vec<u16> = Vec::new();
-    for &genre in &title.genres {
-        if !genres.contains(&genre) {
-            genres.push(genre);
-            against += owed(taste.genres.get(&genre));
-        }
-    }
-    let mut people: Vec<u32> = Vec::new();
-    for &(id, share) in &title.people {
-        if !people.contains(&id) {
-            people.push(id);
-            against += owed(taste.people.get(&id)) * share;
-        }
-    }
-    for franchise in franchises_of(title) {
-        against += owed(taste.franchises.get(&franchise));
-    }
-    if against <= 0.0 {
-        0.0
-    } else {
-        against / (against + DISLIKE_PATIENCE)
-    }
-}
-
-/// A facet read against the library's typical title: nothing where there is nothing to compare.
-fn facet<K: Copy + Eq + Hash>(map: &HashMap<K, f64>, keys: &[K], typical: f64) -> f64 {
-    if keys.is_empty() || typical <= 0.0 {
-        0.0
-    } else {
-        ((share_of(map, keys) + FACET_FLOOR) / (typical + FACET_FLOOR)).ln().tanh()
-    }
-}
-
-/// How much a title looks like the library, read as how far it departs from the library's own average.
-pub fn affinity(title: &Title<'_>, taste: Option<&Taste<'_>>) -> f64 {
-    let Some(taste) = taste.filter(|t| t.typical.genres > 0.0) else { return 0.0 };
-    let t = &taste.typical;
-    let mut evidence = FACET_GENRES * facet(&taste.genres, &title.genres, t.genres)
-        + FACET_LANGUAGES * facet(&taste.languages, &title.languages, t.languages)
-        + FACET_COUNTRIES * facet(&taste.countries, &title.countries, t.countries)
-        + FACET_DECADES * facet(&taste.decades, &decades_of(title), t.decades)
-        + FACET_PEOPLE * following(&taste.people, &title.people)
-        + FACET_BROADCASTERS * facet(&taste.broadcasters, &title.broadcasters, t.broadcasters);
-    if let Some(labels) = &title.labels {
-        evidence += LABEL_WEIGHT
-            * (LABEL_SUBGENRES * facet(&taste.subgenres, &names(&labels.subgenres), t.subgenres)
-                + LABEL_MOODS * facet(&taste.moods, &names(&labels.moods), t.moods));
-    }
-    let matched = 1.0 / (1.0 + (-FACET_SHARPNESS * evidence).exp());
-    // The next of something already followed is wanted whatever else it is.
-    let followed = title.franchise.is_some_and(|f| taste.franchises.get(&f).copied().unwrap_or(0.0) > 0.0);
-    let lifted = if followed { matched + (1.0 - matched) * FRANCHISE_LIFT } else { matched };
-    lifted * (1.0 - distaste(title, taste))
-}
-
-/// How much of this title is not already covered by what the household watches.
-pub fn novelty(candidate: &Candidate<'_>) -> f64 {
-    1.0 - (1.0 - NOVELTY_FLOOR) * candidate.redundancy.unwrap_or(0.0).clamp(0.0, 1.0)
 }
 
 /// Peaks on release day and falls away either side of it; unknown dates score as old. A date known only to
@@ -781,12 +546,6 @@ pub fn arrival(candidate: &Candidate<'_>, now: f64) -> f64 {
     standing(candidate.arrival) * if catalogue { CATALOGUE_ARRIVAL } else { 1.0 }
 }
 
-/// The two kinds of attention, counted once rather than twice.
-pub fn attention(candidate: &Candidate<'_>, busiest: f64, now: f64) -> f64 {
-    let (a, b) = (buzz(candidate, busiest), arrival(candidate, now));
-    a.max(b) + CORROBORATION * a.min(b)
-}
-
 /// Well liked, on enough votes to mean it.
 pub fn quality(title: &Title<'_>) -> f64 {
     let votes = if title.rating.is_none() { 0.0 } else { title.votes.unwrap_or(0.0) };
@@ -798,33 +557,27 @@ pub fn quality(title: &Title<'_>) -> f64 {
 /// Why a title scored what it did.
 #[derive(Clone, Copy, Debug)]
 pub struct Why {
+    pub fit: Fitted,
     pub fresh: f64,
-    pub attention: f64,
+    pub arrived: f64,
     pub quality: f64,
-    pub taste: f64,
-    pub novelty: f64,
+    pub buzz: f64,
     pub score: f64,
 }
 
-pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, taste: Option<&Taste<'_>>) -> Why {
+/// A title's score: its fit squared, so fit decides, then merit, timeliness — new, or newly on a household service —
+/// and buzz. Across a real household's pool fit² spans about 35×, merit 2×, timeliness 5× and buzz 1.1×.
+pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> Why {
     let fresh = freshness(&candidate.title, now);
-    let attention = attention(candidate, busiest, now);
+    let arrived = arrival(candidate, now);
     let quality = quality(&candidate.title);
-    let taste = affinity(&candidate.title, taste);
-    let novelty = novelty(candidate);
-    let worth = WEIGHT_FRESH * fresh + WEIGHT_ATTENTION * attention + WEIGHT_QUALITY * quality;
-    let score = worth * (TASTE_FLOOR + (1.0 - TASTE_FLOOR) * taste) * novelty;
-    Why { fresh, attention, quality, taste, novelty, score }
-}
-
-/// Whether a title resembles too little of what this library holds. Only asked when there is an answer.
-fn stranger_here(title: &Title<'_>, taste: Option<&Taste<'_>>) -> bool {
-    match taste {
-        Some(taste) if !taste.genres.is_empty() && !title.genres.is_empty() => {
-            affinity(title, Some(taste)) < STRANGER
-        }
-        _ => false,
-    }
+    let buzz = buzz(candidate, busiest);
+    let score = fit.fit
+        * fit.fit
+        * (MERIT_FLOOR + (1.0 - MERIT_FLOOR) * quality)
+        * (TIMELY_FLOOR + (1.0 - TIMELY_FLOOR) * fresh.max(arrived))
+        * (1.0 + BUZZ_BONUS * buzz);
+    Why { fit, fresh, arrived, quality, buzz, score }
 }
 
 /// Whether a vote count is enough for its rating to replace JustWatch's IMDb score.
@@ -904,17 +657,17 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         },
         rank: best(a.rank, b.rank),
         arrival: best(a.arrival, b.arrival),
-        redundancy: a.redundancy.or(b.redundancy),
     }
 }
 
-/// The slides, best first: deduped, filtered, and only then cut to `slides`.
+/// The slides, best first: deduped, filtered, scored, and only then cut to `slides`. The first `LEAD_SLIDES` go to
+/// titles that fit at least `LEAD_FIT`; the rest follow in score order.
 pub fn pick<'a>(
     candidates: Vec<Candidate<'a>>,
     now: f64,
     slides: usize,
     keep: impl Fn(&Candidate<'a>) -> bool,
-    taste: Option<&Taste<'a>>,
+    fit: impl Fn(&Candidate<'a>) -> Fitted,
 ) -> Vec<(Candidate<'a>, Why)> {
     let mut order: Vec<Key> = Vec::new();
     let mut by_key: HashMap<Key, Candidate<'a>> = HashMap::new();
@@ -930,23 +683,29 @@ pub fn pick<'a>(
     }
     // Judged once everything known about a title is together: filtering each copy first let a copy that knew
     // nothing — atlas's own lists name a title by id — through a rule its described copy was dropped by.
-    let running: Vec<Candidate<'a>> = order
-        .into_iter()
-        .filter_map(|key| by_key.remove(&key))
-        .filter(|c| keep(c) && !stranger_here(&c.title, taste))
-        .collect();
+    let running: Vec<Candidate<'a>> =
+        order.into_iter().filter_map(|key| by_key.remove(&key)).filter(|c| keep(c)).collect();
     let busiest = running.iter().filter_map(|c| c.title.popularity).fold(0.0, f64::max);
     let mut scored: Vec<(Candidate<'a>, Why)> = running
         .into_iter()
         .map(|candidate| {
-            let why = score(&candidate, now, busiest, taste);
+            let why = score(&candidate, now, busiest, fit(&candidate));
             (candidate, why)
         })
         .collect();
     // Stable, so equal scores keep the order their sources put them in.
     scored.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(slides);
-    scored
+    let (mut lead, mut rest) = (Vec::new(), Vec::new());
+    for slide in scored {
+        if lead.len() < LEAD_SLIDES && slide.1.fit.fit >= LEAD_FIT {
+            lead.push(slide);
+        } else {
+            rest.push(slide);
+        }
+    }
+    lead.extend(rest);
+    lead.truncate(slides);
+    lead
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -984,49 +743,6 @@ fn hidden(candidate: &Candidate<'_>, hide: &Hide) -> bool {
     hide.anime && genres.contains(&ANIMATION) && language == Some(*b"ja")
 }
 
-/// How many of the library's own seeds each title is a near neighbour of, and how many seeds answered.
-fn neighbourhood(indexes: &Indexes, library: &[(Key, f64, f64)]) -> (usize, HashMap<Key, usize>) {
-    let held = |(media_type, id): Key| indexes.plot.labels(id, media_type).is_some();
-    let mut seeds: Vec<&(Key, f64, f64)> = library.iter().filter(|(_, weight, _)| *weight >= 1.0).collect();
-    // What atlas actually holds first: it answers for nothing it never indexed, and there are only eight to spend.
-    seeds.sort_by(|a, b| {
-        held(b.0)
-            .cmp(&held(a.0))
-            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    let mut keys: Vec<Key> = Vec::new();
-    for seed in seeds {
-        if !keys.contains(&seed.0) {
-            keys.push(seed.0);
-        }
-    }
-    keys.truncate(SEEDS);
-    // Every seed at once: each is a scan or two when atlas hasn't worked it out yet (`Indexes::more_like_this`).
-    let similar: Vec<Arc<[u32]>> = std::thread::scope(|scope| {
-        let seeds: Vec<_> = keys
-            .iter()
-            .map(|&(media_type, id)| scope.spawn(move || indexes.more_like_this(id, media_type)))
-            .collect();
-        seeds
-            .into_iter()
-            .map(|seed| seed.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
-            .collect()
-    });
-    let mut hits: HashMap<Key, usize> = HashMap::new();
-    let mut answered = 0;
-    for (&(media_type, _), ids) in keys.iter().zip(&similar) {
-        let near: Vec<Key> = ids.iter().map(|&n| (media_type, n)).filter(|key| !keys.contains(key)).collect();
-        if !near.is_empty() {
-            answered += 1;
-        }
-        for key in near {
-            *hits.entry(key).or_insert(0) += 1;
-        }
-    }
-    (answered, hits)
-}
-
 /// The answer to a request, given atlas's lists for it.
 pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> serde_json::Value {
     let known = Knowledge { indexes };
@@ -1039,18 +755,24 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         .filter(|e| e.weight.is_finite() && e.weight != 0.0)
         .filter_map(|e| Some(((media_type(&e.type_)?, e.id), e)))
         .collect();
-    let library: Vec<(Key, f64, f64)> = weighed.iter().map(|&(key, e)| (key, e.weight, e.at)).collect();
-    let entries: Vec<(Title<'_>, f64)> =
-        weighed.iter().map(|&(key, e)| (known.title(key, Some(&e.hint), None), e.weight)).collect();
-    let library_unjudged = entries.iter().filter(|(title, _)| title.genres.is_empty()).count();
-    let taste = taste_of(&entries);
-    let (answered, hits) = neighbourhood(indexes, &library);
+    let library: Vec<(Features, f64)> = weighed
+        .iter()
+        .map(|&(key, e)| (Features::of(indexes, key, &known.title(key, Some(&e.hint), None)), e.weight))
+        .collect();
+    let library_unjudged =
+        weighed.iter().filter(|&&(key, e)| known.title(key, Some(&e.hint), None).genres.is_empty()).count();
+    let library_indexed = library.iter().filter(|(features, _)| features.indexed()).count();
+    let taste = Fit::new(indexes, indexes.corpus(), &library);
+    let fitted = |c: &Candidate<'_>| match &taste {
+        Some(taste) => taste.of(&Features::of(indexes, c.key, &c.title)),
+        None => Fitted { fit: NO_TASTE, ..Fitted::default() },
+    };
 
-    // In the web app's order: what just landed, what is trending everywhere, then the client's own lists.
+    // In the web app's order: what just landed, what is trending everywhere, what is on the household's services,
+    // then the client's own lists.
     let mut pool: Vec<Candidate<'_>> = Vec::new();
     let mut push = |key: Key, title, rank: Option<Placing>, arrival: Option<Placing>| {
-        let redundancy = hits.get(&key).copied().unwrap_or(0) as f64 / answered.max(MIN_SEEDS) as f64;
-        pool.push(Candidate { key, title, rank, arrival, redundancy: Some(redundancy) });
+        pool.push(Candidate { key, title, rank, arrival });
     };
     for list in &lists.arrivals {
         let of = list.len() as f64;
@@ -1063,6 +785,9 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     for (at, item) in lists.everywhere.iter().enumerate() {
         let placing = Placing { rank: at as f64, of };
         push(item.key, known.title(item.key, None, Some(item)), Some(placing), None);
+    }
+    for item in lists.popular.iter().flatten() {
+        push(item.key, known.title(item.key, None, Some(item)), None, None);
     }
     for offered in &request.candidates {
         let Some(media_type) = media_type(&offered.type_) else { continue };
@@ -1081,6 +806,13 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     let judged: HashSet<Key> = pool.iter().filter(|c| !c.title.genres.is_empty()).map(|c| c.key).collect();
     let unjudged_count =
         pool.iter().map(|c| c.key).filter(|key| !judged.contains(key)).collect::<HashSet<_>>().len();
+    let pooled = pool.iter().map(|c| c.key).collect::<HashSet<_>>().len();
+    let catalogue = pool
+        .iter()
+        .filter(|c| c.title.released.is_some_and(|r| now - r.first_day as f64 > CATALOGUE_DAYS))
+        .map(|c| c.key)
+        .collect::<HashSet<_>>()
+        .len();
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
     let keep = |c: &Candidate<'_>| {
@@ -1093,7 +825,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         now,
         UNJUDGED_NAMED,
         keep,
-        None,
+        |_: &Candidate<'_>| Fitted { fit: NO_TASTE, ..Fitted::default() },
     )
     .into_iter()
     .map(|(c, _)| c.key)
@@ -1101,7 +833,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     if pool.iter().filter(|c| judged.contains(&c.key)).count() >= JUDGED_ENOUGH {
         pool.retain(|c| judged.contains(&c.key));
     }
-    let picked = pick(pool, now, slides, keep, Some(&taste));
+    let picked = pick(pool, now, slides, keep, fitted);
 
     let round = |x: f64| (x * 1000.0).round() / 1000.0;
     let slides: Vec<serde_json::Value> = picked
@@ -1111,8 +843,10 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
                 "type": type_name(c.key.0),
                 "id": c.key.1,
                 "why": {
-                    "score": round(why.score), "fresh": round(why.fresh), "attention": round(why.attention),
-                    "quality": round(why.quality), "taste": round(why.taste), "novelty": round(why.novelty),
+                    "score": round(why.score), "fit": round(why.fit.fit), "similar": why.fit.similar.map(round),
+                    "profile": round(why.fit.profile), "people": round(why.fit.people),
+                    "confidence": round(why.fit.confidence), "fresh": round(why.fresh),
+                    "arrived": round(why.arrived), "quality": round(why.quality), "buzz": round(why.buzz),
                 },
             });
             if let Some(imdb) = &c.title.imdb_id {
@@ -1132,6 +866,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
             .collect::<Vec<_>>(),
         "unjudgedCount": unjudged_count,
         "libraryUnjudged": library_unjudged,
+        "pool": { "titles": pooled, "catalogue": catalogue, "libraryIndexed": library_indexed },
     })
 }
 
@@ -1150,14 +885,18 @@ pub fn describe(indexes: &Indexes, slide: &serde_json::Value) -> String {
         .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
         .unwrap_or_else(|| slide["id"].to_string());
     let term = |name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
+    let similar = slide["why"]["similar"].as_f64().map_or("-".to_owned(), |z| format!("{z:.1}"));
     format!(
-        "{name} {:.3} (fresh {:.2}, attention {:.2}, quality {:.2}, taste {:.2}, novelty {:.2})",
+        "{name} {:.3} (fit {:.2}: similar {similar}, profile {:.1}, people {:.2}; fresh {:.2}, arrived {:.2}, \
+         quality {:.2}, buzz {:.2})",
         term("score"),
+        term("fit"),
+        term("profile"),
+        term("people"),
         term("fresh"),
-        term("attention"),
+        term("arrived"),
         term("quality"),
-        term("taste"),
-        term("novelty")
+        term("buzz")
     )
 }
 
@@ -1180,6 +919,7 @@ pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::
         "lists": {
             "arrivals": lists.arrivals.iter().map(|list| listed(list)).collect::<Vec<_>>(),
             "everywhere": listed(&lists.everywhere),
+            "popular": lists.popular.iter().map(|list| listed(list)).collect::<Vec<_>>(),
         },
     })
 }
@@ -1205,6 +945,7 @@ pub fn replayed(fixture: &serde_json::Value) -> Result<(Request, Lists, f64), St
     let lists = Lists {
         arrivals: items(&fixture["lists"]["arrivals"]).iter().map(listed).collect(),
         everywhere: listed(&fixture["lists"]["everywhere"]),
+        popular: items(&fixture["lists"]["popular"]).iter().map(listed).collect(),
     };
     Ok((request, lists, now))
 }
@@ -1233,51 +974,64 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         .map(|(at, slide)| format!("{}. {}", at + 1, describe(indexes, slide)))
         .collect();
     format!(
-        "recommend {}: library {} ({} unjudged), owned {}, candidates {}, {} unjudged in the pool, {} slides; {}",
+        "recommend {}: library {} ({} unjudged, {} indexed), owned {}, candidates {}, pool {} ({} catalogue, {} \
+         unjudged), {} slides; {}",
         request.surface.as_deref().unwrap_or("home"),
         request.library.len(),
         answer["libraryUnjudged"],
+        answer["pool"]["libraryIndexed"],
         request.owned.len(),
         request.candidates.len(),
+        answer["pool"]["titles"],
+        answer["pool"]["catalogue"],
         answer["unjudgedCount"],
         slides.len(),
         top.join("; ")
     )
 }
 
-/// Atlas's own lists for a request, as the web app fetched them: at most eight "new on" lists — the
-/// household's picked services in their own countries, else every service this install carries — and
-/// Trending Everywhere. A list that can't be had is empty; the catalog already degrades and caches.
+/// Atlas's own lists for a request: "new on" and "popular on" each of the household's services in its own country
+/// (every service this install carries when none are picked), of the surface's types, and Trending Everywhere. A
+/// list that can't be had is empty; the catalog already degrades and caches.
 pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) -> Lists {
     /// A catalog to read: its id, Stremio type, country and the providers it is for.
     type Wanted = (String, &'static str, String, Vec<&'static Provider>);
     let country = config.country(None, &state.default_country);
-    let mut arrivals: Vec<Wanted> = Vec::new();
-    for stremio_type in ["movie", "series"] {
-        for &provider in &config.providers {
-            if request.services.is_empty() {
-                arrivals.push((new_catalog_id(provider), stremio_type, country.clone(), vec![provider]));
-                continue;
-            }
-            for pick in request.services.iter().filter(|s| provider.package_ids.contains(&s.id)) {
-                let there = config.country(Some(&pick.country), &state.default_country);
-                arrivals.push((new_catalog_id(provider), stremio_type, there, vec![provider]));
-            }
-        }
-    }
-    arrivals.truncate(ARRIVAL_LISTS);
-    let everywhere: Vec<&'static str> = ["movie", "series"]
+    let types: Vec<&'static str> = ["movie", "series"]
         .into_iter()
         .filter(|t| request.only().is_none_or(|only| media_type(t) == Some(only)))
         .collect();
+    // The household's services, each in its own country; none picked, every service this install carries.
+    let mut services: Vec<(&'static Provider, String)> = Vec::new();
+    for &provider in &config.providers {
+        if request.services.is_empty() {
+            services.push((provider, country.clone()));
+        }
+        for pick in request.services.iter().filter(|s| provider.package_ids.contains(&s.id)) {
+            services.push((provider, config.country(Some(&pick.country), &state.default_country)));
+        }
+    }
+    let per = |id: fn(&Provider) -> String| -> Vec<Wanted> {
+        types
+            .iter()
+            .flat_map(|&t| {
+                services
+                    .iter()
+                    .map(move |(provider, there)| (id(provider), t, there.clone(), vec![*provider]))
+            })
+            .collect()
+    };
+    let mut arrivals = per(new_catalog_id);
+    arrivals.truncate(SERVICE_LISTS);
+    let mut popular = per(|provider| provider.id.to_owned());
+    popular.truncate(SERVICE_LISTS - arrivals.len());
 
     let mut set = tokio::task::JoinSet::new();
-    let asked = arrivals.len();
-    let wanted = arrivals.into_iter().chain(
-        everywhere
-            .into_iter()
-            .map(|t| (TRENDING_ID.to_owned(), t, country.clone(), config.providers.clone())),
-    );
+    let (new_lists, popular_lists) = (arrivals.len(), popular.len());
+    let wanted = arrivals
+        .into_iter()
+        .chain(popular)
+        .chain(types.iter().map(|&t| (TRENDING_ID.to_owned(), t, country.clone(), config.providers.clone())));
     for (at, (id, stremio_type, country, providers)) in wanted.enumerate() {
         let state = Arc::clone(state);
         set.spawn(async move {
@@ -1297,8 +1051,10 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
     let mut out = Lists::default();
     let (mut movies, mut series) = (Vec::new(), Vec::new());
     for (at, stremio_type, items) in answers {
-        if at < asked {
+        if at < new_lists {
             out.arrivals.push(items);
+        } else if at < new_lists + popular_lists {
+            out.popular.push(items);
         } else if stremio_type == "movie" {
             movies = items;
         } else {
@@ -1328,10 +1084,7 @@ mod tests {
     use super::*;
 
     const CRIME: u16 = 80;
-    const HORROR: u16 = 27;
     const DRAMA: u16 = 18;
-    const MYSTERY: u16 = 9648;
-    const ACTION: u16 = 28;
 
     fn now() -> f64 {
         day(2026, 9, 12)
@@ -1355,7 +1108,7 @@ mod tests {
     }
 
     fn cand(id: u32, title: Title<'static>) -> Candidate<'static> {
-        Candidate { key: (MediaType::Movie, id), title, rank: None, arrival: None, redundancy: None }
+        Candidate { key: (MediaType::Movie, id), title, rank: None, arrival: None }
     }
 
     fn ids(picked: &[(Candidate<'_>, Why)]) -> Vec<u32> {
@@ -1364,6 +1117,11 @@ mod tests {
 
     fn all(_: &Candidate<'_>) -> bool {
         true
+    }
+
+    /// Every title fitting alike, so the rest of the score decides.
+    fn neutral(_: &Candidate<'_>) -> Fitted {
+        Fitted { fit: NO_TASTE, ..Fitted::default() }
     }
 
     #[test]
@@ -1410,7 +1168,7 @@ mod tests {
             popularity: Some(popularity),
             ..Title::default()
         };
-        let picked = pick(vec![cand(1, new(2.0)), cand(2, new(900.0))], now(), 40, all, None);
+        let picked = pick(vec![cand(1, new(2.0)), cand(2, new(900.0))], now(), 40, all, neutral);
         assert_eq!(ids(&picked), vec![2, 1]);
     }
 
@@ -1423,210 +1181,42 @@ mod tests {
         assert!((quality(&Title::default()) - 0.3).abs() < 1e-6);
     }
 
-    fn nordic_crime_with_one_horror() -> Taste<'static> {
-        taste_of(&[
-            (film(&[CRIME], "sv"), 1.0),
-            (film(&[CRIME], "da"), 1.0),
-            (film(&[CRIME], "sv"), 1.0),
-            (film(&[HORROR], "en"), 0.6),
-        ])
-    }
-
     #[test]
-    fn taste_marks_up_the_genres_watched_and_down_the_rest() {
-        let taste = nordic_crime_with_one_horror();
-        let nordic = affinity(&film(&[CRIME, MYSTERY], "sv"), Some(&taste));
-        let horror = affinity(&film(&[HORROR], "en"), Some(&taste));
-        assert!(nordic > horror);
-        assert!(nordic > 0.5);
-        assert!(horror < 0.3);
-    }
-
-    #[test]
-    fn language_nudges_rather_than_decides() {
-        let taste = taste_of(&[(film(&[CRIME], "en"), 9.0), (film(&[CRIME], "sv"), 1.0)]);
-        let english = affinity(&film(&[CRIME], "en"), Some(&taste));
-        let swedish = affinity(&film(&[CRIME], "sv"), Some(&taste));
-        let wrong = affinity(&film(&[HORROR], "en"), Some(&taste));
-        assert!(english - swedish <= 0.1);
-        assert!(english - wrong > 3.0 * (english - swedish));
-    }
-
-    #[test]
-    fn no_profile_is_no_taste() {
-        assert_eq!(affinity(&film(&[CRIME], ""), None), 0.0);
-        assert_eq!(affinity(&film(&[CRIME], ""), Some(&taste_of(&[]))), 0.0);
-    }
-
-    #[test]
-    fn taste_beats_a_title_that_tops_every_list_since_it_multiplies() {
-        let everywhere = Candidate {
+    fn fit_decides_between_a_title_for_this_household_and_one_for_everyone() {
+        let everyone = Candidate {
             rank: Some(Placing { rank: 0.0, of: 100.0 }),
             arrival: Some(Placing { rank: 0.0, of: 100.0 }),
-            ..cand(30, Title { released: on("2026-09-01"), popularity: Some(900.0), ..film(&[ACTION], "en") })
+            ..cand(1, Title { released: on("2026-09-10"), popularity: Some(900.0), ..Title::default() })
         };
-        let on_taste = Candidate {
-            rank: Some(Placing { rank: 20.0, of: 100.0 }),
-            ..cand(31, Title { released: on("2026-09-01"), ..film(&[CRIME], "sv") })
+        let theirs = cand(2, Title { released: on("2026-05-01"), ..Title::default() });
+        let fit =
+            |c: &Candidate<'_>| Fitted { fit: if c.key.1 == 2 { 0.7 } else { 0.3 }, ..Fitted::default() };
+        assert_eq!(ids(&pick(vec![everyone, theirs], now(), 40, all, fit)), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_title_that_barely_fits_waits_below_the_lead_however_new() {
+        let buzzing = Candidate {
+            rank: Some(Placing { rank: 0.0, of: 10.0 }),
+            ..cand(99, Title { released: on("2026-09-10"), ..Title::default() })
         };
-        let taste = taste_of(&[(film(&[CRIME], "sv"), 1.0), (film(&[ACTION], "en"), 0.2)]);
-        assert_eq!(ids(&pick(vec![everywhere, on_taste], now(), 40, all, Some(&taste))), vec![31, 30]);
+        let mut pool: Vec<Candidate<'static>> =
+            (0..12).map(|i| cand(i, Title { released: on("2024-01-01"), ..Title::default() })).collect();
+        pool.push(buzzing);
+        let fit =
+            |c: &Candidate<'_>| Fitted { fit: if c.key.1 == 99 { 0.2 } else { 0.3 }, ..Fitted::default() };
+        let picked = ids(&pick(pool, now(), 40, all, fit));
+        assert_eq!(picked[LEAD_SLIDES], 99, "{picked:?}");
     }
 
     #[test]
-    fn the_on_taste_title_beats_an_equally_new_louder_one() {
-        let on_taste =
-            cand(20, Title { released: on("2026-09-05"), popularity: Some(40.0), ..film(&[CRIME], "sv") });
-        let loud =
-            cand(21, Title { released: on("2026-09-05"), popularity: Some(400.0), ..film(&[HORROR], "en") });
-        let taste = nordic_crime_with_one_horror();
-        assert_eq!(ids(&pick(vec![loud, on_taste], now(), 40, all, Some(&taste))), vec![20, 21]);
-    }
-
-    #[test]
-    fn a_real_match_beats_a_title_that_merely_carries_the_commonest_genre() {
-        let taste = taste_of(&[
-            (film(&[DRAMA, MYSTERY], ""), 1.0),
-            (film(&[DRAMA, CRIME], ""), 1.0),
-            (film(&[DRAMA, MYSTERY, CRIME], ""), 1.0),
-            (film(&[DRAMA], ""), 1.0),
-        ]);
-        let close = affinity(&film(&[DRAMA, MYSTERY, CRIME], ""), Some(&taste));
-        let drama = affinity(&film(&[DRAMA], ""), Some(&taste));
-        assert!(close > drama);
-        assert!(drama < 0.8);
-    }
-
-    #[test]
-    fn follows_the_people_behind_what_was_watched_across_genres() {
-        let by = |genres: &[u16], people: &[u32]| Title {
-            people: people.iter().map(|&p| (p, 1.0)).collect(),
-            ..film(genres, "")
-        };
-        let taste = taste_of(&[(by(&[DRAMA], &[5000, 1, 2]), 1.0), (by(&[DRAMA], &[5000, 3, 4]), 1.0)]);
-        let theirs = affinity(&by(&[ACTION], &[5000, 9]), Some(&taste));
-        let stranger = affinity(&by(&[ACTION], &[8, 9]), Some(&taste));
-        assert!(theirs > stranger);
-        assert!(theirs > 0.15);
-    }
-
-    #[test]
-    fn a_cast_member_counts_for_less_the_longer_the_cast() {
-        let taste = taste_of(&[(Title { people: vec![(7, 1.0)], ..film(&[DRAMA], "") }, 1.0)]);
-        let lead = affinity(&Title { people: vec![(7, 1.0)], ..film(&[DRAMA], "") }, Some(&taste));
-        let one_of_ten = affinity(&Title { people: vec![(7, 0.3)], ..film(&[DRAMA], "") }, Some(&taste));
-        assert!(lead > one_of_ten);
-    }
-
-    #[test]
-    fn reads_where_a_title_was_made() {
-        let made = |countries: &[&[u8; 2]], language| Title {
-            countries: countries.iter().map(|c| **c).collect(),
-            ..film(&[CRIME], language)
-        };
-        let taste = taste_of(&[(made(&[b"SE"], "sv"), 1.0), (made(&[b"DK"], "da"), 1.0)]);
-        let coproduction = affinity(&made(&[b"SE", b"GB"], "en"), Some(&taste));
-        let american = affinity(&made(&[b"US"], "en"), Some(&taste));
-        assert!(coproduction > american);
-    }
-
-    #[test]
-    fn prefers_the_decade_this_library_watches() {
-        let dated = |date| Title { released: on(date), ..film(&[DRAMA], "") };
-        let taste = taste_of(&[(dated("2024-01-01"), 1.0), (dated("2022-06-01"), 1.0)]);
-        assert!(affinity(&dated("2026-03-01"), Some(&taste)) > affinity(&dated("1981-03-01"), Some(&taste)));
-    }
-
-    #[test]
-    fn prefers_a_series_from_the_networks_this_library_watches() {
-        let aired = |network| Title { broadcasters: vec![network], ..film(&[DRAMA], "") };
-        let taste =
-            taste_of(&[(aired(10), 1.0), (aired(10), 1.0), (aired(20), 1.0), (film(&[DRAMA], ""), 1.0)]);
-        let home = affinity(&aired(10), Some(&taste));
-        let elsewhere = affinity(&aired(30), Some(&taste));
-        let film_alone = affinity(&film(&[DRAMA], ""), Some(&taste));
-        assert!(home > film_alone && film_alone > elsewhere, "{home} {film_alone} {elsewhere}");
-    }
-
-    #[test]
-    fn carries_the_next_of_a_franchise_already_started() {
-        let taste = taste_of(&[(Title { franchise: Some(77), ..film(&[ACTION], "") }, 1.0)]);
-        let sequel = affinity(&Title { franchise: Some(77), ..film(&[DRAMA], "") }, Some(&taste));
-        let unrelated = affinity(&film(&[DRAMA], ""), Some(&taste));
-        assert!((sequel - (unrelated + (1.0 - unrelated) * 0.5)).abs() < 1e-6);
-        assert!(sequel > 0.5);
-    }
-
-    #[test]
-    fn marks_down_what_was_disliked_while_a_watched_genre_survives_one_bad_film() {
-        let taste = taste_of(&[
-            (film(&[DRAMA, HORROR], ""), 1.0),
-            (film(&[DRAMA], ""), 1.0),
-            (film(&[DRAMA], ""), 1.0),
-            (film(&[DRAMA, ACTION], ""), -1.5),
-        ]);
-        let drama = affinity(&film(&[DRAMA], ""), Some(&taste));
-        let also_action = affinity(&film(&[DRAMA, ACTION], ""), Some(&taste));
-        let only_action = affinity(&film(&[ACTION], ""), Some(&taste));
-        assert!(drama > 0.4);
-        assert!(also_action < drama);
-        assert!(only_action < also_action);
-        assert!(only_action < 0.1);
-    }
-
-    #[test]
-    fn labels_separate_two_titles_of_the_same_genre() {
-        let labelled = |subgenres: Vec<(&'static str, f64)>, moods: Vec<(&'static str, f64)>| Title {
-            labels: Some(LabelSet { subgenres, moods }),
-            ..film(&[CRIME], "")
-        };
-        let taste = taste_of(&[
-            (labelled(vec![("Police Procedural", 0.9), ("Neo-Noir", 0.8)], vec![("Slow-burn", 0.9)]), 1.0),
-            (labelled(vec![("Police Procedural", 0.8)], vec![("Slow-burn", 0.8)]), 1.0),
-            (labelled(vec![("Neo-Noir", 0.7)], vec![("Dark & Gritty", 0.6)]), 1.0),
-        ]);
-        let noir = affinity(
-            &labelled(vec![("Neo-Noir", 0.9), ("Police Procedural", 0.7)], vec![("Slow-burn", 0.8)]),
-            Some(&taste),
-        );
-        let slasher = affinity(&labelled(vec![("Slasher", 0.9)], vec![("Tense", 0.8)]), Some(&taste));
-        assert!(noir > slasher);
-        // A title atlas never labelled is judged on its facets alone, not marked down for the gap.
-        let unlabelled = affinity(&film(&[CRIME], ""), Some(&taste));
-        assert!(unlabelled > slasher && unlabelled < noir);
-    }
-
-    #[test]
-    fn novelty_leaves_a_title_alone_until_the_library_reaches_it() {
-        let worn = |r| Candidate { redundancy: r, ..cand(1, Title::default()) };
-        assert_eq!(novelty(&worn(None)), 1.0);
-        assert!((novelty(&worn(Some(0.5))) - 0.75).abs() < 1e-6);
-        assert!((novelty(&worn(Some(1.0))) - 0.5).abs() < 1e-6);
-        let same = || Title { released: on("2026-09-01"), popularity: Some(100.0), ..Title::default() };
-        let picked = pick(
-            vec![Candidate { redundancy: Some(1.0), ..cand(1, same()) }, cand(2, same())],
-            now(),
-            40,
-            all,
-            None,
-        );
-        assert_eq!(ids(&picked), vec![2, 1]);
-    }
-
-    #[test]
-    fn an_arrival_lifts_an_old_title_and_a_pushed_release_counts_once() {
+    fn an_arrival_lifts_an_old_title_over_the_same_title_not_arriving() {
         let landed = Candidate {
             arrival: Some(Placing { rank: 0.0, of: 10.0 }),
             ..cand(1, Title { released: on("1997-06-01"), ..Title::default() })
         };
-        let merely_new = cand(2, Title { released: on("2026-08-20"), ..Title::default() });
-        assert_eq!(ids(&pick(vec![merely_new, landed], now(), 40, all, None)), vec![1, 2]);
-        let pushed = Candidate {
-            rank: Some(Placing { rank: 0.0, of: 100.0 }),
-            arrival: Some(Placing { rank: 0.0, of: 100.0 }),
-            ..cand(1, Title::default())
-        };
-        assert!((attention(&pushed, 0.0, now()) - 1.3).abs() < 1e-6);
+        let still = cand(2, Title { released: on("1997-06-01"), ..Title::default() });
+        assert_eq!(ids(&pick(vec![still, landed], now(), 40, all, neutral)), vec![1, 2]);
         assert_eq!(
             arrival(
                 &Candidate { arrival: Some(Placing { rank: 0.0, of: 0.0 }), ..cand(4, Title::default()) },
@@ -1637,12 +1227,12 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_joining_a_service_counts_half_of_something_new_arriving() {
+    fn catalogue_joining_a_service_counts_a_quarter_of_something_new_arriving() {
         let arriving = |date| Candidate {
             arrival: Some(Placing { rank: 0.0, of: 10.0 }),
             ..cand(1, Title { released: on(date), ..Title::default() })
         };
-        assert_eq!(arrival(&arriving("2014-11-05"), now()), 0.5);
+        assert_eq!(arrival(&arriving("2014-11-05"), now()), 0.25);
         assert_eq!(arrival(&arriving("2026-03-01"), now()), 1.0);
         assert_eq!(
             arrival(
@@ -1665,11 +1255,20 @@ mod tests {
                 year: Some(2024),
             }]],
             everywhere: vec![Listed { key: (MediaType::Tv, 8), imdb_id: None, rating: None, year: None }],
+            popular: vec![vec![Listed {
+                key: (MediaType::Movie, 9),
+                imdb_id: None,
+                rating: Some(8.1),
+                year: None,
+            }]],
         };
         let (request, back, now) = replayed(&fixture(&raw, &lists, 20_709.5)).unwrap();
         assert_eq!(now, 20_709.5);
         assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
-        assert_eq!((back.arrivals, back.everywhere), (lists.arrivals, lists.everywhere));
+        assert_eq!(
+            (back.arrivals, back.everywhere, back.popular),
+            (lists.arrivals, lists.everywhere, lists.popular)
+        );
         assert!(replayed(&serde_json::json!({})).is_err());
     }
 
@@ -1688,12 +1287,11 @@ mod tests {
             2,
             Title { released: on("2026-09-01"), rating: Some(6.4), votes: Some(200.0), ..Title::default() },
         );
-        assert_eq!(ids(&pick(vec![classic, new], now(), 40, all, None)), vec![2, 1]);
+        assert_eq!(ids(&pick(vec![classic, new], now(), 40, all, neutral)), vec![2, 1]);
     }
 
     #[test]
     fn merges_what_two_sources_offered_and_takes_the_better_placing() {
-        let taste = taste_of(&[(film(&[CRIME], "sv"), 1.0)]);
         let ranked = Candidate { rank: Some(Placing { rank: 0.0, of: 10.0 }), ..cand(5, Title::default()) };
         let described = cand(
             5,
@@ -1713,15 +1311,14 @@ mod tests {
                 ..film(&[CRIME], "sv")
             },
         );
-        assert_eq!(ids(&pick(vec![ranked, described, alone], now(), 40, all, Some(&taste))), vec![5, 6]);
+        assert_eq!(ids(&pick(vec![ranked, described, alone], now(), 40, all, neutral)), vec![5, 6]);
 
-        let taste = taste_of(&[(film(&[CRIME], ""), 1.0)]);
         let arriving = |id, rank| Candidate {
             arrival: Some(Placing { rank, of: 100.0 }),
             ..cand(id, film(&[CRIME], ""))
         };
         let picked =
-            pick(vec![arriving(5, 60.0), arriving(5, 0.0), arriving(6, 30.0)], now(), 40, all, Some(&taste));
+            pick(vec![arriving(5, 60.0), arriving(5, 0.0), arriving(6, 30.0)], now(), 40, all, neutral);
         assert_eq!(ids(&picked), vec![5, 6]);
     }
 
@@ -1750,14 +1347,14 @@ mod tests {
                 },
             )
         };
-        let (merged, _) = pick(vec![listed(), described(400.0)], now(), 40, all, None).remove(0);
+        let (merged, _) = pick(vec![listed(), described(400.0)], now(), 40, all, neutral).remove(0);
         assert_eq!(merged.title.released, on("2026-09-10"));
         assert_eq!((merged.title.rating, merged.title.votes), (Some(7.2), Some(400.0)));
         assert!(!merged.title.estimated_votes);
 
         // Eighteen votes don't outweigh IMDb's score, in either order.
         for pool in [vec![listed(), described(18.0)], vec![described(18.0), listed()]] {
-            let (merged, _) = pick(pool, now(), 40, all, None).remove(0);
+            let (merged, _) = pick(pool, now(), 40, all, neutral).remove(0);
             assert_eq!(merged.title.released, on("2026-09-10"));
             assert_eq!(merged.title.rating, Some(5.4));
             assert!(merged.title.estimated_votes);
@@ -1765,21 +1362,10 @@ mod tests {
     }
 
     #[test]
-    fn drops_a_stranger_only_when_its_genres_are_known() {
-        let taste = taste_of(&[(film(&[CRIME], "sv"), 3.0), (film(&[ACTION], "en"), 0.3)]);
-        let new = |genres: &[u16], language| Title { released: on("2026-09-01"), ..film(genres, language) };
-        let alien = cand(2, new(&[16], "ja"));
-        let barely = cand(4, new(&[ACTION], "en"));
-        let unknown = cand(3, new(&[], ""));
-        assert_eq!(ids(&pick(vec![alien.clone(), barely, unknown], now(), 40, all, Some(&taste))), vec![3]);
-        assert_eq!(ids(&pick(vec![alien], now(), 40, all, None)), vec![2]);
-    }
-
-    #[test]
     fn filters_before_cutting_to_the_slide_count() {
         let pool: Vec<Candidate<'static>> =
             (0..60).map(|i| cand(i, Title { released: on("2026-08-01"), ..Title::default() })).collect();
-        let picked = pick(pool, now(), 20, |c| c.key.1 % 2 == 0, None);
+        let picked = pick(pool, now(), 20, |c| c.key.1 % 2 == 0, neutral);
         assert_eq!(picked.len(), 20);
         assert!(picked.iter().all(|(c, _)| c.key.1 % 2 == 0));
     }
@@ -1810,7 +1396,7 @@ mod tests {
             Candidate { arrival: Some(Placing { rank: 0.0, of: 10.0 }), ..cand(7, Title::default()) };
         let described = cand(7, Title { original_language: Some(*b"ta"), ..film(&[DRAMA], "") });
         let other = cand(8, Title { released: on("2026-09-01"), ..Title::default() });
-        let picked = pick(vec![listed, described, other], now(), 40, |c| !hidden(c, &rules), None);
+        let picked = pick(vec![listed, described, other], now(), 40, |c| !hidden(c, &rules), neutral);
         assert_eq!(ids(&picked), vec![8]);
     }
 

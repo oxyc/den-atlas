@@ -12,6 +12,8 @@ use std::fmt;
 /// guesses in front of the viewer.
 pub const DISPLAY_CONFIDENCE_FLOOR: f64 = 0.55;
 const HEADER_BYTES: usize = 8;
+/// The quantiser's scale: a unit vector's components were stored as `round(x × 127)`.
+const QUANTUM: f64 = 127.0;
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -299,6 +301,45 @@ impl Index {
     /// 0 so the tilt only ever promotes; 0 for a title the index doesn't hold.
     pub fn taste_boost(&self, tmdb_id: u32, media_type: MediaType, centroid: &[f64]) -> f64 {
         self.cosine(tmdb_id, media_type, centroid).unwrap_or(0.0).max(0.0)
+    }
+
+    /// Every indexed title, in row order; a duplicate row is left out, as lookups leave it out.
+    pub fn titles(&self) -> impl Iterator<Item = (MediaType, u32)> + '_ {
+        self.records.iter().enumerate().filter_map(|(row, record)| {
+            let key = (record.media_type?, record.tmdb_id);
+            (self.rows.get(&key) == Some(&(row as u32))).then_some(key)
+        })
+    }
+
+    /// A title's row, for `similarity` and `projection`; `None` when it isn't indexed.
+    pub fn row_of(&self, tmdb_id: u32, media_type: MediaType) -> Option<u32> {
+        self.rows.get(&(media_type, tmdb_id)).copied()
+    }
+
+    /// Two rows' cosine similarity. The vectors were L2-normalised and quantised to ±127, so their int8 dot product
+    /// over 127² is the cosine, give or take the rounding.
+    pub fn similarity(&self, a: u32, b: u32) -> f64 {
+        f64::from(dot(self.row_vector(a as usize), self.row_vector(b as usize))) / (QUANTUM * QUANTUM)
+    }
+
+    /// The mean of every row's vector, in `similarity`'s units: a row's `projection` on it is how close that title
+    /// sits to the index as a whole.
+    pub fn mean_vector(&self) -> Vec<f64> {
+        let mut mean = vec![0.0; self.dim];
+        for row in 0..self.records.len() {
+            for (m, &v) in mean.iter_mut().zip(self.row_vector(row)) {
+                *m += f64::from(v as i8);
+            }
+        }
+        let scale = QUANTUM * self.records.len().max(1) as f64;
+        mean.iter_mut().for_each(|m| *m /= scale);
+        mean
+    }
+
+    /// A row's dot product with a vector in `similarity`'s units (`mean_vector`).
+    pub fn projection(&self, row: u32, vector: &[f64]) -> f64 {
+        self.row_vector(row as usize).iter().zip(vector).map(|(&v, &x)| f64::from(v as i8) * x).sum::<f64>()
+            / QUANTUM
     }
 
     fn name(&self, id: u32) -> &str {

@@ -7,6 +7,7 @@ mod config;
 mod dataset;
 mod descriptor;
 mod facts;
+mod fit;
 mod handler;
 mod http;
 mod justwatch;

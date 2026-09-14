@@ -5,6 +5,7 @@
 
 use crate::dataset::Dataset;
 use crate::facts::Facts;
+use crate::fit::Corpus;
 use crate::plotrows::{read_cards, Card, PlotFacets};
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
@@ -12,7 +13,7 @@ use den_titlesearch::{TitleIndex, TitleRecord};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -39,6 +40,8 @@ pub struct Indexes {
     similar: Mutex<HashMap<Key, Arc<[u32]>>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
+    /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
+    corpus: OnceLock<Corpus>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -56,6 +59,12 @@ impl Indexes {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
             den_index::more_like_this(Some(&self.plot), self.premise.as_ref(), tmdb_id, media_type).into()
         })
+    }
+
+    /// What a billboard's fit reads off the index as a whole (`fit::Corpus`), worked out once: the first time it is
+    /// asked for, which the load does, so no billboard waits on it.
+    pub fn corpus(&self) -> &Corpus {
+        self.corpus.get_or_init(|| Corpus::of(self))
     }
 
     /// A browse row's order (`plotrows::row`), worked out once per type and constraints: every page of a row, and
@@ -347,8 +356,12 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         display,
         similar: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
+        corpus: OnceLock::new(),
     };
-    Ok((indexes, phases))
+    let (_, fit_took) = timed(|| {
+        indexes.corpus();
+    });
+    Ok((indexes, format!("{phases}, fit {}", seconds(fit_took))))
 }
 
 fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {

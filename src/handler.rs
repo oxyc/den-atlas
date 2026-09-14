@@ -1880,10 +1880,13 @@ mod tests {
         let indexes = state.index.as_ref().unwrap().get(|| ()).await.unwrap().0;
         let line = crate::recommend::summary(&indexes, &request, &answer);
         assert!(
-            line.starts_with("recommend movies: library 1 (0 unjudged), owned 1, candidates 4, 1 unjudged in the pool, 1 slides; 1. Two "),
+            line.starts_with(
+                "recommend movies: library 1 (0 unjudged, 1 indexed), owned 1, candidates 4, pool 4 ("
+            ),
             "{line}"
         );
-        assert!(line.contains("fresh ") && line.contains("taste "), "{line}");
+        assert!(line.contains(" 1 unjudged), 1 slides; 1. Two "), "{line}");
+        assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
 
         // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one, and a client rating on too few

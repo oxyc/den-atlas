@@ -185,6 +185,11 @@ impl Facts {
         self.records.len()
     }
 
+    /// Every title the facts describe, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = (MediaType, u32)> + '_ {
+        self.records.keys().copied()
+    }
+
     /// Read a facts file, plain or gzipped. Parsed from memory rather than streamed: a stream parsed about three
     /// times slower, and the index load waits on it, while the file's ~24 MB are held only until it is parsed.
     pub fn read(path: &Path) -> Result<Facts, String> {
