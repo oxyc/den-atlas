@@ -591,47 +591,32 @@ pub fn answer(
         b.score.total_cmp(&a.score).then(votes(b.key).cmp(&votes(a.key))).then(a.key.cmp(&b.key))
     });
 
-    // An exact title leads the titles most like it.
+    // An exact title leads the titles most like it — but never ahead of another title the query NAMED.
+    // `hobbit` is exactly the 1977 film, and putting its neighbours straight behind it left twelve animated
+    // films that had matched nothing, scoring 0, above the Jackson trilogy, which had matched by name.
     if let Some(top) = scored.first().filter(|s| s.exact) {
         let (kind, id) = top.key;
-        let similar: Vec<Key> = indexes
-            .more_like_this(id, kind)
-            .iter()
-            .take(SIMILAR)
-            .map(|&n| (kind, n))
-            .filter(|key| wanted(key.0))
-            .collect();
-        let mut spliced: Vec<Scored> = Vec::with_capacity(scored.len() + similar.len());
-        let mut rest: Vec<Scored> = Vec::new();
-        let mut placed: HashSet<Key> = HashSet::new();
         let mut iter = scored.into_iter();
         let first = iter.next().expect("a top hit");
-        placed.insert(first.key);
-        spliced.push(first);
-        let mut pending: HashMap<Key, Scored> = HashMap::new();
-        for s in iter {
-            if similar.contains(&s.key) {
-                pending.insert(s.key, s);
-            } else {
-                rest.push(s);
-            }
-        }
-        for key in similar {
-            if !placed.insert(key) {
+        // Everything already scored keeps the place its score earned, neighbour or not.
+        let ranked: Vec<Scored> = iter.collect();
+        let known: HashSet<Key> = ranked.iter().map(|s| s.key).chain([first.key]).collect();
+        // Only the neighbours nothing else found are new here, and they carry no score of their own.
+        let mut neighbours: Vec<Scored> = Vec::new();
+        let mut seen: HashSet<Key> = HashSet::new();
+        for n in indexes.more_like_this(id, kind).iter().take(SIMILAR) {
+            let key = (kind, *n);
+            if !wanted(key.0) || known.contains(&key) || !seen.insert(key) {
                 continue;
             }
-            let s = pending.remove(&key).or_else(|| {
-                features(indexes, parsed, key, &Found::default(), &plot_confidence).map(|mut s| {
-                    s.score = 0.0;
-                    s
-                })
-            });
-            spliced.extend(s.filter(|s| drawable(&s.key)));
+            if let Some(mut s) = features(indexes, parsed, key, &Found::default(), &plot_confidence) {
+                s.score = 0.0;
+                if drawable(&s.key) {
+                    neighbours.push(s);
+                }
+            }
         }
-        // Best first among them; those found only as similar (score 0) keep More Like This's order.
-        spliced[1..].sort_by(|a, b| b.score.total_cmp(&a.score));
-        spliced.extend(rest.into_iter().filter(|s| placed.insert(s.key)));
-        scored = spliced;
+        scored = order_around_exact(first, ranked, neighbours);
     }
 
     let total = scored.len();
@@ -925,6 +910,21 @@ fn features(
     Some(Scored { key, score: 0.0, exact, t, sem, lab, pf, person, pop, phi })
 }
 
+/// The order around an exact title: the title itself, then everything else the query matched by name in the
+/// order its score earned, then More Like This's own titles in its order, then the theme-only tail.
+///
+/// `ranked` arrives sorted; `neighbours` are the ones only More Like This found, which carry no score. They
+/// belong ahead of a title that merely sounds alike and behind one the query actually named.
+fn order_around_exact(first: Scored, ranked: Vec<Scored>, neighbours: Vec<Scored>) -> Vec<Scored> {
+    let (named, tail): (Vec<Scored>, Vec<Scored>) = ranked.into_iter().partition(|s| s.t > 0.0);
+    let mut ordered = Vec::with_capacity(1 + named.len() + neighbours.len() + tail.len());
+    ordered.push(first);
+    ordered.extend(named);
+    ordered.extend(neighbours);
+    ordered.extend(tail);
+    ordered
+}
+
 /// The query as titles are matched against it — folded, a leading English article dropped, and its trigrams —
 /// worked out once, since every candidate's titles are compared with it.
 struct TitleQuery {
@@ -1095,6 +1095,35 @@ mod tests {
         assert!(popularity(0, Some(1.0)) < 0.2);
         assert_eq!(popularity(0, None), 0.0);
         assert!(attention(30_000, None) > attention(5000, None), "ordering keeps apart what popularity caps");
+    }
+
+    /// `hobbit` is exactly the 1977 animated film, so More Like This ran on it and its twelve animated
+    /// neighbours — scoring 0, matching nothing — were placed directly behind it, above the Jackson trilogy
+    /// (0.72–1.06) which had matched the query by name. A neighbour may lead the tail, never a title named.
+    #[test]
+    fn more_like_this_never_outranks_a_title_the_query_named() {
+        let hit = |id, score, t| Scored {
+            key: (MediaType::Movie, id),
+            score,
+            exact: false,
+            t,
+            sem: 0.0,
+            lab: 0.0,
+            pf: 0.0,
+            person: 0.0,
+            pop: 1.0,
+            phi: 1.0,
+        };
+        let anchor = Scored { exact: true, ..hit(1362, 2.0055, 0.8775) };
+        // As the ranking hands them over: sorted by score, named and theme-only alike.
+        let ranked = vec![
+            hit(122917, 1.0625, 0.4722), // The Hobbit: The Battle of the Five Armies
+            hit(49051, 0.8127, 0.3241),  // The Hobbit: An Unexpected Journey
+            hit(672, 0.2682, 0.0),       // Harry Potter and the Chamber of Secrets — theme only
+        ];
+        let neighbours = vec![hit(808, 0.0, 0.0), hit(330457, 0.0, 0.0)]; // Shrek, Frozen II
+        let ids: Vec<u32> = order_around_exact(anchor, ranked, neighbours).iter().map(|s| s.key.1).collect();
+        assert_eq!(ids, vec![1362, 122917, 49051, 808, 330457, 672]);
     }
 
     #[test]
