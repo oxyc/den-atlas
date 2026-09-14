@@ -133,8 +133,8 @@ impl IndexQueries {
     }
 
     /// The indexes — loaded first if they aren't in memory — and how long that load took (`None` when they
-    /// already were).
-    pub async fn get(&self) -> Result<(Arc<Indexes>, Option<Duration>), String> {
+    /// already were). `on_load` runs once, as a load starts, and not when they were in memory.
+    pub async fn get(&self, on_load: impl FnOnce()) -> Result<(Arc<Indexes>, Option<Duration>), String> {
         if let Some(indexes) = self.touch() {
             return Ok((indexes, None));
         }
@@ -142,6 +142,7 @@ impl IndexQueries {
         if let Some(indexes) = self.touch() {
             return Ok((indexes, None));
         }
+        on_load();
         let started = Instant::now();
         let sources = Sources {
             plot: self.plot.clone(),
@@ -452,12 +453,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-{}", std::process::id()));
         let queries = IndexQueries::new(&write_fixture(&dir));
 
-        let (indexes, first) = queries.get().await.unwrap();
+        let loads = std::cell::Cell::new(0);
+        let counted = || loads.set(loads.get() + 1);
+        let (indexes, first) = queries.get(counted).await.unwrap();
         assert!(first.is_some(), "the first query loads");
         assert!(indexes.premise.is_some());
         assert_eq!(indexes.facts.as_ref().map(|f| f.len()), Some(3), "the facts load with the indexes");
-        let (_, again) = queries.get().await.unwrap();
+        let (_, again) = queries.get(counted).await.unwrap();
         assert!(again.is_none(), "a warm query doesn't");
+        assert_eq!(loads.get(), 1, "on_load runs for the load alone");
 
         tokio::time::advance(IDLE_RELEASE - Duration::from_secs(1)).await;
         assert!(!queries.release_if_idle(), "released before it was idle");
@@ -466,8 +470,9 @@ mod tests {
 
         // A query that held the index across the release still has it; the next query reloads.
         assert_eq!(indexes.plot.len(), 4);
-        let (_, reload) = queries.get().await.unwrap();
+        let (_, reload) = queries.get(counted).await.unwrap();
         assert!(reload.is_some(), "the query after a release loads again");
+        assert_eq!(loads.get(), 2);
     }
 
     #[tokio::test]
@@ -475,6 +480,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-bad-{}", std::process::id()));
         let ds = write_fixture(&dir);
         std::fs::write(&ds.labels.path, b"not json").unwrap();
-        assert!(IndexQueries::new(&ds).get().await.is_err());
+        assert!(IndexQueries::new(&ds).get(|| ()).await.is_err());
     }
 }

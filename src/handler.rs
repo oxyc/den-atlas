@@ -662,6 +662,20 @@ async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
     resp.json::<Embedded>().await.map(|e| e.vector).map_err(|e| format!("den-embed body: {e}"))
 }
 
+/// Wake den-embed as the indexes load. Both drop their memory after ten idle minutes, so a load follows the spell
+/// in which den-embed unloaded its model too, and the search that comes next would wait on that model otherwise.
+fn warm_embed(state: &Arc<AppState>) {
+    if state.embed.is_none() {
+        return;
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        if let Err(e) = embed_query(&state, "warm").await {
+            eprintln!("den-embed warm-up failed: {e}");
+        }
+    });
+}
+
 /// Semantic search in one request: embed the query, then the plot index's nearest titles to it — the tvOS
 /// app's `semanticSearch` — each with its score, and the mean and standard deviation of the whole scan, so a
 /// client can drop what barely stands out from this query's own spread. The error is why den-embed couldn't
@@ -957,7 +971,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
     if let Err(detail) = request.check() {
         return bad(detail);
     }
-    let (indexes, loaded_in) = match queries.get().await {
+    let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
@@ -1009,7 +1023,7 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
     let Ok(body) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
         return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST);
     };
-    let (indexes, loaded_in) = match queries.get().await {
+    let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
@@ -1059,7 +1073,15 @@ async fn handle_index(
         }
         _ => None,
     };
-    let (indexes, loaded_in) = match queries.get().await {
+    // A search's early embed already wakes den-embed.
+    let (indexes, loaded_in) = match queries
+        .get(|| {
+            if early.is_none() {
+                warm_embed(state)
+            }
+        })
+        .await
+    {
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
