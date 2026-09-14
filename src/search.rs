@@ -503,8 +503,7 @@ pub fn answer(
         // A title the query NAMED — by country, decade, source kind or genre — is relevant for that reason
         // alone. Without this, a book adaptation with no other signal scores 0 and is dropped by the retain
         // below, which is how `based on a book` returned 200 prose neighbours and none of its 4,750 titles.
-        let named = facet_set.as_ref().is_some_and(|set| set.contains(&s.key))
-            || named_set.contains(&s.key);
+        let named = facet_set.as_ref().is_some_and(|set| set.contains(&s.key)) || named_set.contains(&s.key);
         s.score = score(s, w_sem, named);
     }
     // A title nothing names — no card, no export title: a facts-only record — has nothing to draw it by.
