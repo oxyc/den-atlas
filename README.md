@@ -206,6 +206,7 @@ scripts/fetch-dataset.sh   # prep ./data from the den-dataset `data-latest` rele
 cargo run                  # http://localhost:8080  (add /manifest.json in Den → Plugins)
 cargo test                 # the caching layer (ETag / Range / gzip / 304), routes, catalog, shutdown
 cargo fmt --all --check    # CI gates on this — see below if the command is missing
+scripts/release.sh 0.37.0  # checks, bumps, tags, and WAITS for the image
 ```
 **If `cargo fmt` reports "no such command"**, the toolchain has no rustfmt component and there is no rustup
 to add one. Run the formatter through nix instead — it reads this repo's `rustfmt.toml` and matches CI
