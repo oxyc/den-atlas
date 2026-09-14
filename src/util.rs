@@ -58,6 +58,39 @@ pub fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
     Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
 }
 
+/// How long until an upstream's allowance comes back, when its answer says none is left: the IETF draft
+/// `RateLimit: "policy";r=0;t=30`, its older `RateLimit-Remaining` / `RateLimit-Reset`, or the common
+/// `X-RateLimit-Remaining` / `X-RateLimit-Reset`. `None` while requests remain, or when it doesn't say. A reset
+/// larger than a billion is read as a Unix time rather than seconds to wait.
+pub fn exhausted_for(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    let number = |value: &str| value.parse::<u64>().ok();
+    let wait = |reset: u64| {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        std::time::Duration::from_secs(if reset > 1_000_000_000 { reset.saturating_sub(now) } else { reset })
+    };
+    if let Some(field) = text("ratelimit") {
+        let param = |key: &str| {
+            field
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix(key)?.strip_prefix('='))
+                .and_then(number)
+        };
+        if param("r") == Some(0) {
+            return Some(wait(param("t").unwrap_or(0)));
+        }
+    }
+    for (remaining, reset) in
+        [("ratelimit-remaining", "ratelimit-reset"), ("x-ratelimit-remaining", "x-ratelimit-reset")]
+    {
+        if text(remaining).and_then(number) == Some(0) {
+            return Some(wait(text(reset).and_then(number).unwrap_or(0)));
+        }
+    }
+    None
+}
+
 /// A pause on one upstream, shared by everything that asks it. A refusal (429, 5xx, no connection) starts it: for as
 /// long as `Retry-After` says when the upstream sends one, else for a base that doubles with each refusal in a row.
 /// While it runs every caller is turned away without asking, so a rate-limited upstream is waited out once instead
@@ -151,6 +184,19 @@ pub fn json_response(body: impl Into<Body>, status: StatusCode) -> Response {
         .unwrap()
 }
 
+/// How long a client is asked to wait out a condition that clears on its own: an index or dataset loading, den-embed
+/// waking its model, a blob mid-replacement.
+pub const RELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A 503 JSON response carrying `Retry-After`, so a client waits as long as the condition lasts instead of polling
+/// into it. Short waits only: the TV app closes a whole host for as long as a Retry-After says.
+pub fn unavailable_response(body: impl Into<Body>, wait: std::time::Duration) -> Response {
+    let mut resp = json_response(body, StatusCode::SERVICE_UNAVAILABLE);
+    let secs = wait.as_secs().max(1);
+    resp.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
+    resp
+}
+
 /// The public origin for descriptor blob URLs — `PUBLIC_BASE_URL` override, else `X-Forwarded-Proto` +
 /// `X-Forwarded-Host`/`Host` (a reverse proxy sets these; on the LAN it is the request's own `Host`), else
 /// `http`/`localhost`. Port of `publicOrigin`.
@@ -231,6 +277,31 @@ mod tests {
         assert_eq!(with(&past), Some(Duration::ZERO), "a date gone by is no wait, not an error");
         assert_eq!(with("soon"), None);
         assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn an_allowance_that_says_none_is_left_names_its_reset() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let with = |pairs: &[(&'static str, String)]| {
+            let mut h = HeaderMap::new();
+            for (name, value) in pairs {
+                h.insert(*name, value.parse().unwrap());
+            }
+            exhausted_for(&h)
+        };
+        assert_eq!(with(&[("ratelimit", r#""daily";r=0;t=90"#.into())]), Some(Duration::from_secs(90)));
+        assert_eq!(with(&[("ratelimit", r#""daily";r=3;t=90"#.into())]), None, "requests remain");
+        assert_eq!(
+            with(&[("x-ratelimit-remaining", "0".into()), ("x-ratelimit-reset", "45".into())]),
+            Some(Duration::from_secs(45))
+        );
+        let in_a_minute = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 60;
+        let secs = with(&[("ratelimit-remaining", "0".into()), ("ratelimit-reset", in_a_minute.to_string())])
+            .unwrap()
+            .as_secs();
+        assert!((58..=60).contains(&secs), "a Unix-time reset read as {secs}s");
+        assert_eq!(with(&[("x-ratelimit-remaining", "12".into())]), None);
+        assert_eq!(with(&[]), None);
     }
 
     #[test]

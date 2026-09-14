@@ -285,7 +285,12 @@ async fn open_file(path: &std::path::Path, expected: Option<&FileIdentity>, what
 fn unavailable() -> Response {
     build(
         StatusCode::SERVICE_UNAVAILABLE,
-        &[("content-type", "application/json".to_owned()), ("cache-control", "no-store".to_owned())],
+        &[
+            ("content-type", "application/json".to_owned()),
+            ("cache-control", "no-store".to_owned()),
+            // A reload usually clears it; see util::RELOAD_WAIT.
+            ("retry-after", crate::util::RELOAD_WAIT.as_secs().to_string()),
+        ],
         Body::from(
             r#"{"error":"blob_unavailable","detail":"the dataset blob is missing, unreadable, or changed since load; see the server log and reload the dataset"}"#,
         ),

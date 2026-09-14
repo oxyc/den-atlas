@@ -233,6 +233,18 @@ async fn main() {
     if state.motn.enabled() {
         tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
     }
+    // JustWatch rows anyone asked for in the last day are refreshed before they expire, so no request waits on
+    // JustWatch for one: rows and billboards read what is kept.
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            loop {
+                state.catalog.refresh_due().await;
+                handler::note_catalog_health(&state);
+                tokio::time::sleep(catalog::REFRESH_EVERY).await;
+            }
+        }
+    });
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
 

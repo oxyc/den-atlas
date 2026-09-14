@@ -215,6 +215,50 @@ pub struct CatalogResponse {
     pub stale: bool,
 }
 
+/// How often the refresher looks for rows due, how far into its TTL a row is refreshed, how long a row nobody asks
+/// for again is kept fresh, how many rows it keeps track of, and how many it refreshes in one pass.
+pub const REFRESH_EVERY: Duration = Duration::from_secs(60);
+const REFRESH_AT: f64 = 0.8;
+const ASKED_FOR: Duration = Duration::from_secs(24 * 3600);
+const ASKED_ROWS: usize = 1_000;
+const REFRESHES_PER_PASS: usize = 8;
+
+/// A row someone asked for, as the refresher asks for it again.
+#[derive(Clone)]
+struct Asked {
+    catalog_id: String,
+    stremio_type: &'static str,
+    country: String,
+    providers: Vec<&'static Provider>,
+    at: Instant,
+}
+
+/// A JustWatch row's cache key; `None` for an id that is neither Trending Everywhere nor one of `providers`' rows.
+fn row_key(
+    catalog_id: &str,
+    stremio_type: &str,
+    country: &str,
+    providers: &[&'static Provider],
+) -> Option<String> {
+    let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
+    if !is_trending && resolve_catalog(catalog_id, providers).is_none() {
+        return None;
+    }
+    // The aggregate row is a union over THIS install's selected providers, so the selection is
+    // part of what the value is. Without it in the key, whichever install warmed the entry won
+    // for the whole TTL: a Netflix-only install's chart was served verbatim to someone who had
+    // picked four services, and vice versa — titles they cannot stream. Non-aggregate rows are
+    // already one provider, named by catalog_id, so they need nothing extra.
+    Some(if is_trending {
+        let mut codes: Vec<&str> = providers.iter().map(|p| p.code).collect();
+        codes.sort_unstable(); // selection is a set; order must not split the cache
+        format!("jw:{}:{}:{}:{}", country, catalog_id, stremio_type, codes.join(","))
+    } else {
+        // Not `jw:`: a service's row is led by Movie of the Night's list now, so a row kept before isn't this one.
+        format!("service:{}:{}:{}", country, catalog_id, stremio_type)
+    })
+}
+
 /// A union plus whether every provider that was asked actually answered.
 struct Aggregate {
     items: Vec<TrendingItem>,
@@ -253,6 +297,10 @@ pub struct CatalogState {
     upstream: Arc<tokio::sync::Semaphore>,
     /// Movie of the Night's kept lists, which lead a service's rows where they exist (`motn.rs`).
     motn: Option<Arc<Motn>>,
+    /// The rows asked for lately, which `refresh_due` keeps fresh, by cache key.
+    asked: Mutex<HashMap<String, Asked>>,
+    /// Whether `refresh_due` is running, so an expired row can be served at once and left to it.
+    refreshes_ahead: AtomicBool,
 }
 
 /// Removes a single-flight gate once nobody is using it.
@@ -333,6 +381,8 @@ impl CatalogState {
             last_refresh_ok: AtomicBool::new(true),
             upstream: Arc::new(tokio::sync::Semaphore::new(MAX_UPSTREAM_INFLIGHT)),
             motn: None,
+            asked: Mutex::new(HashMap::new()),
+            refreshes_ahead: AtomicBool::new(false),
         }
     }
 
@@ -367,12 +417,94 @@ impl CatalogState {
     /// this install's `providers`. `None` (→ 404) for an unknown/unselected id or unknown type.
     /// Otherwise always valid JSON; on a source failure it serves last-good rows, else empty — both
     /// marked `fresh: false` so the handler can cache them briefly.
+    ///
+    /// Once `refresh_due` runs, a JustWatch row someone asks for is kept fresh ahead of its expiry, so a request
+    /// never waits on JustWatch for it: an expired copy is served at once, and the refresher replaces it.
     pub async fn metas_json(
         &self,
         catalog_id: &str,
         stremio_type: &str,
         country: &str,
         providers: &[&'static Provider],
+    ) -> Option<CatalogResponse> {
+        let ahead = self.refreshes_ahead.load(Ordering::Relaxed);
+        if let (true, Some(obj_type), None) =
+            (ahead, ObjectType::from_stremio(stremio_type), resolve_soon(catalog_id, providers))
+        {
+            if let Some(key) = row_key(catalog_id, stremio_type, country, providers) {
+                self.note_asked(&key, catalog_id, obj_type, country, providers);
+                if let Lookup::Stale(body) = self.cache.get(&key) {
+                    return Some(CatalogResponse { body, fresh: false, upstream: None, stale: true });
+                }
+            }
+        }
+        self.fetch_row(catalog_id, stremio_type, country, providers, false).await
+    }
+
+    /// Remember that a row was asked for, so the refresher keeps it fresh for `ASKED_FOR`.
+    fn note_asked(
+        &self,
+        key: &str,
+        catalog_id: &str,
+        obj_type: ObjectType,
+        country: &str,
+        providers: &[&'static Provider],
+    ) {
+        let mut asked = lock(&self.asked);
+        if asked.len() >= ASKED_ROWS && !asked.contains_key(key) {
+            if let Some(oldest) = asked.iter().min_by_key(|(_, a)| a.at).map(|(k, _)| k.clone()) {
+                asked.remove(&oldest);
+            }
+        }
+        let stremio_type = match obj_type {
+            ObjectType::Movie => "movie",
+            ObjectType::Show => "series",
+        };
+        asked.insert(
+            key.to_owned(),
+            Asked {
+                catalog_id: catalog_id.to_owned(),
+                stremio_type,
+                country: country.to_owned(),
+                providers: providers.to_vec(),
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// Refresh the asked-for rows that are near expiry (`REFRESH_AT` of the TTL) or have none, at most
+    /// `REFRESHES_PER_PASS` of them, one at a time. Rows nobody asked for in `ASKED_FOR` are let go. Returns how many
+    /// it refreshed. While JustWatch is being left alone after a refusal a refresh asks nothing (`Backoff`).
+    pub async fn refresh_due(&self) -> usize {
+        self.refreshes_ahead.store(true, Ordering::Relaxed);
+        let due: Vec<Asked> = {
+            let mut asked = lock(&self.asked);
+            asked.retain(|_, a| a.at.elapsed() < ASKED_FOR);
+            let mut due: Vec<(Duration, Asked)> = asked
+                .iter()
+                .filter_map(|(key, a)| {
+                    let age = self.cache.age(key).unwrap_or(Duration::MAX);
+                    (age >= self.ttl.mul_f64(REFRESH_AT)).then(|| (age, a.clone()))
+                })
+                .collect();
+            // The oldest first: a row already past its TTL is being served stale.
+            due.sort_by_key(|(age, _)| std::cmp::Reverse(*age));
+            due.into_iter().take(REFRESHES_PER_PASS).map(|(_, a)| a).collect()
+        };
+        for row in &due {
+            self.fetch_row(&row.catalog_id, row.stremio_type, &row.country, &row.providers, true).await;
+        }
+        due.len()
+    }
+
+    /// `metas_json` without keeping rows ahead: read the cache, else fetch. `force` fetches even over a fresh row.
+    async fn fetch_row(
+        &self,
+        catalog_id: &str,
+        stremio_type: &str,
+        country: &str,
+        providers: &[&'static Provider],
+        force: bool,
     ) -> Option<CatalogResponse> {
         let obj = ObjectType::from_stremio(stremio_type)?;
         // Leaving and coming rows are Movie of the Night's alone: read straight from what it keeps, soonest first.
@@ -389,27 +521,12 @@ impl CatalogState {
         }
         let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
         let resolved = resolve_catalog(catalog_id, providers);
-        if !is_trending && resolved.is_none() {
-            return None; // unknown id, or not one of this install's selected providers
-        }
+        // None: an unknown id, or not one of this install's selected providers.
+        let key = row_key(catalog_id, stremio_type, country, providers)?;
         if let (Some((provider, _)), Some(motn)) = (resolved, &self.motn) {
             motn.want(provider, country);
         }
-
-        // The aggregate row is a union over THIS install's selected providers, so the selection is
-        // part of what the value is. Without it in the key, whichever install warmed the entry won
-        // for the whole TTL: a Netflix-only install's chart was served verbatim to someone who had
-        // picked four services, and vice versa — titles they cannot stream. Non-aggregate rows are
-        // already one provider, named by catalog_id, so they need nothing extra.
-        let key = if is_trending {
-            let mut codes: Vec<&str> = providers.iter().map(|p| p.code).collect();
-            codes.sort_unstable(); // selection is a set; order must not split the cache
-            format!("jw:{}:{}:{}:{}", country, catalog_id, stremio_type, codes.join(","))
-        } else {
-            // Not `jw:`: a service's row is led by Movie of the Night's list now, so a row kept before isn't this one.
-            format!("service:{}:{}:{}", country, catalog_id, stremio_type)
-        };
-        if let Lookup::Fresh(v) = self.cache.get(&key) {
+        if let (false, Lookup::Fresh(v)) = (force, self.cache.get(&key)) {
             return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
         }
 
@@ -423,7 +540,7 @@ impl CatalogState {
         // the entry must not be removed while this task still holds the gate.
         let _sweep = InflightSweep { map: &self.inflight, key: &key };
         let _hold = gate.lock().await;
-        if let Lookup::Fresh(v) = self.cache.get(&key) {
+        if let (false, Lookup::Fresh(v)) = (force, self.cache.get(&key)) {
             // Filled while we waited.
             return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
         }
@@ -925,6 +1042,23 @@ mod tests {
         let second = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
         assert_eq!(second.body, first.body, "stale value served when refresh fails");
         assert!(!second.fresh, "stale-served body must be marked not-fresh");
+    }
+
+    /// With the refresher running, an expired row is served at once without asking JustWatch, and the refresher is
+    /// what replaces it; a row nobody asked for is never refreshed.
+    #[tokio::test]
+    async fn an_expired_row_is_served_at_once_and_refreshed_behind_it() {
+        let source = Arc::new(fake(vec![item("tt1", "A", 0)], usize::MAX, false));
+        let s = CatalogState::new(source.clone(), Duration::ZERO);
+        assert_eq!(s.refresh_due().await, 0, "nothing asked for, nothing to refresh");
+        let first = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
+        assert!(first.fresh);
+        let asked = source.calls.load(Ordering::SeqCst);
+        let again = s.metas_json("jw-nfx", "movie", "US", selected_providers()).await.unwrap();
+        assert!(again.stale && again.body == first.body, "the kept row is served while it is refreshed");
+        assert_eq!(source.calls.load(Ordering::SeqCst), asked, "an expired row waited on JustWatch");
+        assert_eq!(s.refresh_due().await, 1);
+        assert_eq!(source.calls.load(Ordering::SeqCst), asked + 1, "the refresher asked JustWatch again");
     }
 
     #[test]

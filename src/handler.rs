@@ -7,7 +7,7 @@ use crate::descriptor::build_descriptor;
 use crate::http::{serve, Payload, Servable};
 use crate::manifest::manifest_json;
 use crate::titles;
-use crate::util::{fnv1a, json_response, public_origin};
+use crate::util::{fnv1a, json_response, public_origin, unavailable_response, RELOAD_WAIT};
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -58,7 +58,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
     resp.headers_mut().insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        header::HeaderValue::from_static("Server-Timing, X-Den-Degraded"),
+        // Retry-After and ETag too, or a browser can neither wait as asked nor revalidate.
+        header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After, ETag"),
     );
     resp.headers_mut().insert("timing-allow-origin", header::HeaderValue::from_static("*"));
     if let Some((started, method, path, rid)) = log {
@@ -237,9 +238,9 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 )
                 .await
             }
-            None => json_response(
+            None => unavailable_response(
                 r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
-                StatusCode::SERVICE_UNAVAILABLE,
+                RELOAD_WAIT,
             ),
         };
     }
@@ -308,9 +309,10 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
     let Ok(Ok(_permit)) =
         tokio::time::timeout(crate::EMBED_WAIT, proxy.inflight.clone().acquire_owned()).await
     else {
-        return json_response(
+        // As long again as it just waited for a slot.
+        return unavailable_response(
             r#"{"error":"embed_busy","detail":"too many concurrent embeds; retry shortly"}"#,
-            StatusCode::SERVICE_UNAVAILABLE,
+            crate::EMBED_WAIT,
         );
     };
     let upstream = Instant::now();
@@ -322,14 +324,20 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
     let resp = match upstream_req.body(body).send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            // den-embed's own wait hint, when it gives one, reaches the client.
+            let retry_after = resp.headers().get(header::RETRY_AFTER).cloned();
             let bytes = resp.bytes().await.unwrap_or_default();
-            Response::builder()
+            let mut out = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 // A POST proxy of per-query vectors — never let a heuristic/intermediary cache these.
                 .header(header::CACHE_CONTROL, "no-store")
                 .body(Body::from(bytes))
-                .unwrap()
+                .unwrap();
+            if let Some(value) = retry_after {
+                out.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            out
         }
         Err(e) => {
             crate::util::log_throttled!("embed upstream error: {e}");
@@ -396,6 +404,10 @@ fn health_body(
 /// repeat it thousands of times. Checked where the answer can move — after a catalog refresh — and
 /// where it is read, so a schema-break window that has quietly expired is reported the next time
 /// anyone looks, with no timer running.
+pub(crate) fn note_catalog_health(state: &AppState) {
+    note_health(state);
+}
+
 fn note_health(state: &AppState) {
     let now = health_state(
         state.dataset.is_some(),
@@ -976,7 +988,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
-            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+            return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
     // Kept for `den-atlas replay` when `RECOMMEND_FIXTURES` names a directory: the body as sent, library and all.
@@ -1038,7 +1050,7 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
-            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+            return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
     let answer = match question {
@@ -1096,7 +1108,7 @@ async fn handle_index(
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
-            return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+            return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
     // Search and facets can rank through den-embed, so they stay short. Every other answer is the dataset
@@ -1113,7 +1125,7 @@ async fn handle_index(
             Ok(body) => body,
             Err(e) => {
                 eprintln!("semantic search unavailable: {e}");
-                return json_response(r#"{"error":"embed_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
+                return unavailable_response(r#"{"error":"embed_unavailable"}"#, RELOAD_WAIT);
             }
         },
         IndexQuestion::Facets => facets_answer(state, &indexes, query).await,

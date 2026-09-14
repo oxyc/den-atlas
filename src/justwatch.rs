@@ -504,7 +504,17 @@ impl JustWatchClient {
             log_throttled!("justwatch http {status} ({label}){pause}");
             return Err(());
         }
-        self.backoff.answered();
+        // An answer that also says the allowance is spent is waited out from here, rather than found out by a 429.
+        match crate::util::exhausted_for(resp.headers()) {
+            Some(wait) => {
+                self.backoff.refused(Some(wait));
+                log_throttled!(
+                    "justwatch says its allowance is spent ({label}) — asking nothing for {}s",
+                    wait.as_secs()
+                );
+            }
+            None => self.backoff.answered(),
+        }
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
             if buf.len() + chunk.len() > MAX_BODY {

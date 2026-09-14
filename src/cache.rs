@@ -117,6 +117,11 @@ impl TtlCache {
         }
     }
 
+    /// How long ago the row was stored; `None` when there is none.
+    pub fn age(&self, key: &str) -> Option<Duration> {
+        lock(&self.map).get(key).map(|e| e.stored.elapsed().unwrap_or_default())
+    }
+
     pub fn put(&self, key: &str, value: String) {
         {
             let mut map = lock(&self.map);

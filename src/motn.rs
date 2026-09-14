@@ -359,6 +359,7 @@ impl Motn {
         };
         let status = response.status();
         let asked = retry_after(response.headers());
+        let exhausted = crate::util::exhausted_for(response.headers());
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             // A refusal of this one request (an unsupported country, say) leaves the others to be asked.
@@ -370,7 +371,14 @@ impl Motn {
             eprintln!("motn: {path}: HTTP {status}{pause}: {}", body.chars().take(200).collect::<String>());
             return None;
         }
-        self.backoff.answered();
+        // An answer that also says the allowance is spent is waited out from here, rather than found out by a 429.
+        match exhausted {
+            Some(wait) => {
+                self.backoff.refused(Some(wait));
+                eprintln!("motn: the API's allowance is spent — asking nothing for {}s", wait.as_secs());
+            }
+            None => self.backoff.answered(),
+        }
         serde_json::from_str(&body).map_err(|e| eprintln!("motn: {path}: unreadable answer ({e})")).ok()
     }
 
