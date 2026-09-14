@@ -1981,6 +1981,133 @@ mod tests {
         assert_eq!(post(&state, "/recommend", &many).await.status(), 400);
     }
 
+    /// A service channel ranks what its service's lists named and what the client offered, still only of the
+    /// surface's types, and a service atlas doesn't carry ranks the client's candidates alone.
+    #[tokio::test]
+    async fn recommend_on_a_service_shows_only_what_is_on_it() {
+        use crate::recommend::{answer, parse_now, Listed, Lists, Request};
+        use den_index::MediaType;
+        let state = index_state("den-atlas-recommend-service");
+        let indexes = state.index.as_ref().unwrap().get(|| ()).await.unwrap().0;
+        let slides = |answer: &serde_json::Value| -> Vec<(String, u64)> {
+            let slides = answer["slides"].as_array().unwrap().iter();
+            slides.map(|s| (s["type"].as_str().unwrap().to_owned(), s["id"].as_u64().unwrap())).collect()
+        };
+        let now = parse_now("1995-07-01T00:00:00Z").unwrap();
+        let lists = Lists {
+            popular: vec![vec![Listed {
+                key: (MediaType::Movie, 3),
+                imdb_id: None,
+                rating: None,
+                year: None,
+            }]],
+            ..Lists::default()
+        };
+        let body = |extra: &str| -> Request {
+            serde_json::from_str(&format!(
+                r#"{{"library":[{{"type":"movie","id":1,"weight":1}}],"owned":[{{"type":"movie","id":1}}],
+                    "candidates":[{{"type":"series","id":4}}]{extra}}}"#
+            ))
+            .unwrap()
+        };
+        let channel = answer(&indexes, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now);
+        assert_eq!(slides(&channel), vec![("series".to_owned(), 4), ("movie".to_owned(), 3)], "{channel}");
+        assert_eq!(channel["pool"]["personal"], 0);
+
+        let movies = answer(&indexes, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now);
+        assert_eq!(slides(&movies), vec![("movie".to_owned(), 3)], "{movies}");
+
+        // A service atlas doesn't carry has no lists (`lists` reads none): the client's candidates alone.
+        let unknown = answer(&indexes, &body(r#","service":{"id":283}"#), &Lists::default(), now);
+        assert_eq!(slides(&unknown), vec![("series".to_owned(), 4)], "{unknown}");
+    }
+
+    /// A channel asks JustWatch for its own service in its own country only — Trending Everywhere included, so
+    /// another service's trending title never reaches it — and a service this install doesn't carry asks nothing.
+    #[tokio::test]
+    async fn recommend_lists_for_a_channel_read_its_service_alone() {
+        use crate::justwatch::{ObjectType, TrendingItem};
+        /// Carries Netflix and Disney+, every row of a service naming one title of its own (TMDB id = its package id),
+        /// and notes each row asked for as (service, country, sort).
+        #[derive(Default)]
+        struct Services {
+            asked: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+        impl Services {
+            fn row(&self, provider: &str, country: &str, sort: &str) -> Vec<TrendingItem> {
+                crate::util::lock(&self.asked).push((
+                    provider.to_owned(),
+                    country.to_owned(),
+                    sort.to_owned(),
+                ));
+                let id = if provider == "nfx" { 8 } else { 337 };
+                vec![TrendingItem {
+                    imdb: format!("tt{id}"),
+                    moviedb: Some(id),
+                    title: provider.to_owned(),
+                    rank: 0,
+                    rating: None,
+                    year: None,
+                }]
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::justwatch::TrendingSource for Services {
+            async fn popular(
+                &self,
+                provider: &str,
+                _: ObjectType,
+                country: &str,
+                sort: &str,
+            ) -> Result<Vec<TrendingItem>, ()> {
+                Ok(self.row(provider, country, sort))
+            }
+            async fn new_titles(
+                &self,
+                provider: &str,
+                _: ObjectType,
+                country: &str,
+            ) -> Result<Vec<TrendingItem>, ()> {
+                Ok(self.row(provider, country, "NEW"))
+            }
+            async fn packages(&self, _: &str) -> Result<Vec<(i64, String)>, ()> {
+                Ok(vec![(8, "nfx".to_owned()), (337, "dnp".to_owned())])
+            }
+        }
+        let read = |body: &str| serde_json::from_str::<crate::recommend::Request>(body).unwrap();
+        let config = Config::default_config();
+        let keys = |lists: &crate::recommend::Lists| -> Vec<u32> {
+            let all = lists.arrivals.iter().chain(&lists.popular).chain(&lists.charts).flatten();
+            let mut ids: Vec<u32> = all.chain(&lists.everywhere).map(|l| l.key.1).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let source = Arc::new(Services::default());
+        let state = Arc::new(AppState::for_test_with_source(source.clone()));
+        let home = crate::recommend::lists(&state, &config, &read(r#"{"surface":"movies"}"#)).await;
+        assert_eq!(keys(&home), vec![8, 337]);
+        assert!(crate::util::lock(&source.asked).contains(&("dnp".into(), "US".into(), "TRENDING".into())));
+
+        let source = Arc::new(Services::default());
+        let state = Arc::new(AppState::for_test_with_source(source.clone()));
+        let channel = r#"{"surface":"movies","service":{"id":8,"country":"FI"}}"#;
+        let channel = crate::recommend::lists(&state, &config, &read(channel)).await;
+        assert_eq!(keys(&channel), vec![8]);
+        assert_eq!(channel.everywhere.len(), 1, "Trending Everywhere is Netflix's own trending chart");
+        let mut asked = crate::util::lock(&source.asked).clone();
+        asked.sort();
+        let fi = |sort: &str| ("nfx".to_owned(), "FI".to_owned(), sort.to_owned());
+        assert_eq!(asked, vec![fi("NEW"), fi("POPULAR"), fi("TRENDING")]);
+
+        let source = Arc::new(Services::default());
+        let state = Arc::new(AppState::for_test_with_source(source.clone()));
+        let unknown = crate::recommend::lists(&state, &config, &read(r#"{"service":{"id":283}}"#)).await;
+        assert!(keys(&unknown).is_empty() && unknown.arrivals.is_empty() && unknown.popular.is_empty());
+        assert!(crate::util::lock(&source.asked).is_empty(), "an unknown service asks JustWatch nothing");
+    }
+
     /// Batch labels, taste scores and suggestions, and how a bad POST is refused.
     #[tokio::test]
     async fn labels_scores_and_suggestions_answer_by_post() {

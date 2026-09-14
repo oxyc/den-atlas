@@ -112,7 +112,7 @@ origin.
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
-| `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged:[{type,id}],unjudgedCount,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
+| `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,service?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged:[{type,id}],unjudgedCount,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -161,6 +161,19 @@ with their hints, since an undescribed title is dropped once enough are judged. 
 (`minYear`, `genres`, `languages`, `anime`). Each slide's `why` gives its terms. `Server-Timing` carries
 `lists;dur=` and `rank;dur=`. Bodies over 512 KiB are refused.
 
+`surface` is `home` (both types, the default), `movies` or `series`. `services` is the household's
+`[{id,country?}]`: `id` a provider id from the catalogs' `denProviderIds`, `country` ISO 3166-1 alpha-2, else
+the install's country; none picked, every service the install carries. A service channel (one service's page)
+adds `service: {id,country?}` in the same shape, and its slides are then only titles atlas can show are on
+that service in that country. Atlas holds no per-title availability, so that means titles one of its lists
+for that service named — "new on" and "popular on" (JustWatch, filtered by that country's package), the
+service's Movie of the Night Top 10 and additions, and Trending Everywhere read over that one service, i.e.
+its own trending chart — plus the client's `candidates`, which a channel sends from its own rows and which
+are trusted as the service's catalogue. The personal pool's whole-catalogue titles, other services' lists
+and Netflix's US Top 10 don't reach a channel. `surface` still filters the types, and taste, `owned`, `hide`
+and scoring are unchanged. A `service` whose id the install doesn't carry reads no lists and ranks the
+client's `candidates` alone. The response is the same shape.
+
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
 `atlas_dataset_titles`, and the two catalog signals behind `/health` — `atlas_catalog_fresh` and
@@ -182,7 +195,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
-| `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json`: the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
+| `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json` (a service channel's as `<surface>-service-<id>[-<country>].json`): the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |

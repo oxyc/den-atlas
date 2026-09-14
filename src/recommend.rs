@@ -94,6 +94,10 @@ pub struct Request {
     /// `home` (both types), `movies` or `series`.
     #[serde(default)]
     pub surface: Option<String>,
+    /// A service channel: the surface of one service in one country, whose slides are only titles on it
+    /// (`on_service`). `surface` still says which types it shows.
+    #[serde(default)]
+    pub service: Option<ServicePick>,
     /// RFC 3339 in UTC (`…Z`); the server's clock when absent.
     #[serde(default)]
     pub now: Option<String>,
@@ -143,6 +147,8 @@ impl Request {
 pub struct ServicePick {
     /// The provider id atlas's catalogs carry (`denProviderIds`).
     pub id: i64,
+    /// ISO 3166-1 alpha-2; absent or unreadable, the install's country (`Config::country`).
+    #[serde(default)]
     pub country: String,
 }
 
@@ -815,8 +821,12 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     }
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
+    let on = on_service(request, lists);
     let keep = |c: &Candidate<'_>| {
-        only.is_none_or(|t| t == c.key.0) && !owned.contains(&c.key) && !hidden(c, &request.hide)
+        only.is_none_or(|t| t == c.key.0)
+            && on.as_ref().is_none_or(|on| on.contains(&c.key))
+            && !owned.contains(&c.key)
+            && !hidden(c, &request.hide)
     };
     // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.
     let personal = taste.as_ref().map_or_else(Vec::new, |taste| personal(indexes, &known, taste, now, keep));
@@ -887,6 +897,24 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         "libraryUnjudged": library_unjudged,
         "pool": { "titles": pooled, "catalogue": catalogue, "personal": personal_count, "libraryIndexed": library_indexed },
     })
+}
+
+/// The titles a service channel may show; `None` for any other surface, which shows whatever fits.
+///
+/// Atlas holds no per-title availability: no JustWatch offers, and the facts' broadcasters are Wikidata entities
+/// with no mapping to a service, which say where a series first aired rather than where it streams now. What it
+/// can prove is on a service is what a list of that service named: its "new on" and "popular on" rows (JustWatch
+/// filtered by the country's own package code), its Movie of the Night Top 10 and additions for that market, and
+/// Trending Everywhere, which `lists` reads over that one service alone, so it is the service's trending chart.
+/// Every list `lists` reads for a channel is one of these, so every listed title counts. So does every client
+/// candidate: a channel page sends its own rows, which are that service's catalogue. Nothing else is proven, so
+/// the personal pool's whole-catalogue titles, and any list or candidate outside this set, are dropped.
+fn on_service(request: &Request, lists: &Lists) -> Option<HashSet<Key>> {
+    request.service.as_ref()?;
+    let listed =
+        lists.arrivals.iter().chain(&lists.popular).chain(&lists.charts).flatten().chain(&lists.everywhere);
+    let offered = request.candidates.iter().filter_map(|o| Some((media_type(&o.type_)?, o.id)));
+    Some(listed.map(|l| l.key).chain(offered).collect())
 }
 
 /// The catalogue's titles out lately or coming soon (`PERSONAL_BEHIND`, `PERSONAL_AHEAD`) that fit this household
@@ -1003,11 +1031,25 @@ pub fn replayed(fixture: &serde_json::Value) -> Result<(Request, Lists, f64), St
     Ok((request, lists, now))
 }
 
-/// Keep a request's `fixture` in `dir` as `<surface>.json`, replacing the last one for that surface.
-pub fn keep_fixture(dir: &std::path::Path, raw: &serde_json::Value, lists: &Lists, now: f64) {
+/// The file a request's fixture is kept in: `<surface>.json`, and a service channel's
+/// `<surface>-service-<id>[-<country>].json`, so a channel never replaces home's or another channel's.
+fn fixture_name(raw: &serde_json::Value) -> String {
     let surface: String =
         raw["surface"].as_str().unwrap_or("home").chars().filter(char::is_ascii_lowercase).collect();
-    let path = dir.join(format!("{}.json", if surface.is_empty() { "home" } else { &surface }));
+    let mut name = if surface.is_empty() { "home".to_owned() } else { surface };
+    if let Some(id) = raw["service"]["id"].as_i64() {
+        name.push_str(&format!("-service-{id}"));
+        let country = raw["service"]["country"].as_str().unwrap_or_default().to_ascii_lowercase();
+        if country.len() == 2 && country.bytes().all(|b| b.is_ascii_lowercase()) {
+            name.push_str(&format!("-{country}"));
+        }
+    }
+    name + ".json"
+}
+
+/// Keep a request's `fixture` in `dir` (`fixture_name`), replacing the last one for that surface.
+pub fn keep_fixture(dir: &std::path::Path, raw: &serde_json::Value, lists: &Lists, now: f64) {
+    let path = dir.join(fixture_name(raw));
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(&path, fixture(raw, lists, now).to_string()));
     if let Err(e) = written {
@@ -1026,9 +1068,14 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         .enumerate()
         .map(|(at, slide)| format!("{}. {}", at + 1, describe(indexes, slide)))
         .collect();
+    let on = match &request.service {
+        Some(pick) if pick.country.is_empty() => format!(" on service {}", pick.id),
+        Some(pick) => format!(" on service {} in {}", pick.id, pick.country),
+        None => String::new(),
+    };
     format!(
-        "recommend {}: library {} ({} unjudged, {} indexed), owned {}, candidates {}, pool {} ({} catalogue, {} \
-         unjudged, {} personal), {} slides; {}",
+        "recommend {}{on}: library {} ({} unjudged, {} indexed), owned {}, candidates {}, pool {} ({} catalogue, \
+         {} unjudged, {} personal), {} slides; {}",
         request.surface.as_deref().unwrap_or("home"),
         request.library.len(),
         answer["libraryUnjudged"],
@@ -1058,9 +1105,37 @@ fn motn_listed(shows: &[crate::motn::Show], series: bool) -> Vec<Listed> {
         .collect()
 }
 
+/// The services whose lists a request reads, each in its country (`country` resolves a picked one, `""` for none):
+/// a channel's one service, else the household's, else every service this install carries.
+///
+/// A channel for a service this install doesn't carry reads none. Atlas then knows nothing that is on it, so the
+/// channel ranks the client's candidates alone (`on_service`) rather than refusing: the page still gets a hero from
+/// its own rows, and a service a client knows before atlas does isn't an error.
+fn services_read(
+    providers: &[&'static Provider],
+    request: &Request,
+    country: impl Fn(&str) -> String,
+) -> Vec<(&'static Provider, String)> {
+    if let Some(pick) = &request.service {
+        let provider = providers.iter().find(|p| p.package_ids.contains(&pick.id));
+        return provider.map(|&p| (p, country(&pick.country))).into_iter().collect();
+    }
+    let mut services = Vec::new();
+    for &provider in providers {
+        if request.services.is_empty() {
+            services.push((provider, country("")));
+        }
+        for pick in request.services.iter().filter(|s| provider.package_ids.contains(&s.id)) {
+            services.push((provider, country(&pick.country)));
+        }
+    }
+    services
+}
+
 /// Atlas's own lists for a request: "new on" and "popular on" each of the household's services in its own country
 /// (every service this install carries when none are picked), of the surface's types, and Trending Everywhere. A
-/// list that can't be had is empty; the catalog already degrades and caches.
+/// list that can't be had is empty; the catalog already degrades and caches. A service channel reads only lists of
+/// its service (`on_service`).
 pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) -> Lists {
     /// A catalog to read: its id, Stremio type, country and the providers it is for.
     type Wanted = (String, &'static str, String, Vec<&'static Provider>);
@@ -1069,19 +1144,22 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
         .into_iter()
         .filter(|t| request.only().is_none_or(|only| media_type(t) == Some(only)))
         .collect();
-    // The household's services, each in its own country; none picked, every service this install carries.
-    let mut services: Vec<(&'static Provider, String)> = Vec::new();
-    for &provider in &config.providers {
-        if request.services.is_empty() {
-            services.push((provider, country.clone()));
-        }
-        for pick in request.services.iter().filter(|s| provider.package_ids.contains(&s.id)) {
-            services.push((provider, config.country(Some(&pick.country), &state.default_country)));
-        }
+    let services = services_read(&config.providers, request, |there| {
+        config.country(Some(there), &state.default_country)
+    });
+    if request.service.is_some() && services.is_empty() {
+        return Lists::default();
     }
+    // Trending Everywhere is a union over the providers it is read for, so a channel reads it over its one service in
+    // that service's country: the service's own trending chart, every title of it on the service.
+    let trending = match (&request.service, services.first()) {
+        (Some(_), Some((provider, there))) => (there.clone(), vec![*provider]),
+        _ => (country.clone(), config.providers.clone()),
+    };
     // Movie of the Night's lists stand in for JustWatch's where they are kept (`motn.rs`): a service's own Top 10 is a
     // chart, and what was added to it an arrival. Netflix's US Top 10 goes to every household too: the one chart that
-    // says what most people are watching now.
+    // says what most people are watching now — but not to a channel, since it says nothing of what is on a service
+    // elsewhere, or on any other service.
     let mut out = Lists::default();
     let (mut arrivals, mut popular): (Vec<Wanted>, Vec<Wanted>) = (Vec::new(), Vec::new());
     let netflix = provider_by_code("nfx");
@@ -1098,7 +1176,7 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
                 None => popular.push((provider.id.to_owned(), t, there.clone(), vec![*provider])),
             }
         }
-        if let Some(netflix) = netflix {
+        if let (None, Some(netflix)) = (&request.service, netflix) {
             state.motn.want(netflix, "US");
             out.charts.extend(state.motn.top(netflix, "US").map(|shows| motn_listed(&shows, series)));
         }
@@ -1111,7 +1189,7 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
     let wanted = arrivals
         .into_iter()
         .chain(popular)
-        .chain(types.iter().map(|&t| (TRENDING_ID.to_owned(), t, country.clone(), config.providers.clone())));
+        .chain(types.iter().map(|&t| (TRENDING_ID.to_owned(), t, trending.0.clone(), trending.1.clone())));
     for (at, (id, stremio_type, country, providers)) in wanted.enumerate() {
         let state = Arc::clone(state);
         set.spawn(async move {
@@ -1500,5 +1578,84 @@ mod tests {
         assert_eq!(fold_genre(10759), &[28, 12]);
         assert_eq!(fold_genre(80), &[80]);
         assert!(fold_genre(1).is_empty());
+    }
+
+    fn request(body: serde_json::Value) -> Request {
+        Request::deserialize(&body).unwrap()
+    }
+
+    #[test]
+    fn a_request_reads_with_and_without_a_service() {
+        let home = request(serde_json::json!({"surface": "home", "services": [{"id": 8, "country": "FI"}]}));
+        assert!(home.service.is_none());
+        assert_eq!((home.services[0].id, home.services[0].country.as_str()), (8, "FI"));
+        let channel =
+            request(serde_json::json!({"surface": "movies", "service": {"id": 337, "country": "SE"}}));
+        let pick = channel.service.as_ref().unwrap();
+        assert_eq!((pick.id, pick.country.as_str(), channel.only()), (337, "SE", Some(MediaType::Movie)));
+        assert_eq!(request(serde_json::json!({"service": {"id": 8}})).service.unwrap().country, "");
+        assert!(Request::deserialize(&serde_json::json!({"service": {"country": "FI"}})).is_err());
+    }
+
+    #[test]
+    fn a_channel_reads_its_one_service_and_an_unknown_one_reads_none() {
+        let providers: Vec<&'static Provider> =
+            ["nfx", "dnp", "prv"].iter().map(|code| provider_by_code(code).unwrap()).collect();
+        let country = |there: &str| if there.is_empty() { "US".to_owned() } else { there.to_owned() };
+        let read = |body| -> Vec<(&str, String)> {
+            services_read(&providers, &request(body), country).into_iter().map(|(p, c)| (p.code, c)).collect()
+        };
+        let every = vec![("nfx", "US".to_owned()), ("dnp", "US".to_owned()), ("prv", "US".to_owned())];
+        assert_eq!(read(serde_json::json!({})), every);
+        assert_eq!(
+            read(serde_json::json!({"services": [{"id": 9, "country": "FI"}, {"id": 8, "country": "SE"}]})),
+            vec![("nfx", "SE".to_owned()), ("prv", "FI".to_owned())]
+        );
+        // The channel's service alone, whatever the household has, by any id it is known by.
+        let channel = serde_json::json!({"service": {"id": 9, "country": "FI"}, "services": [{"id": 8, "country": "SE"}]});
+        assert_eq!(read(channel), vec![("prv", "FI".to_owned())]);
+        assert_eq!(read(serde_json::json!({"service": {"id": 337}})), vec![("dnp", "US".to_owned())]);
+        // Not every service, as a household that picked none would get: none.
+        assert!(read(serde_json::json!({"service": {"id": 283, "country": "FI"}})).is_empty());
+    }
+
+    #[test]
+    fn a_channel_may_show_what_its_lists_named_and_the_client_offered() {
+        let item = |media_type, id| Listed { key: (media_type, id), imdb_id: None, rating: None, year: None };
+        let lists = Lists {
+            arrivals: vec![vec![item(MediaType::Movie, 1)]],
+            everywhere: vec![item(MediaType::Tv, 2)],
+            popular: vec![vec![item(MediaType::Movie, 3)]],
+            charts: vec![vec![item(MediaType::Tv, 4)]],
+        };
+        let offered = serde_json::json!([{"type": "movie", "id": 5}, {"type": "anime", "id": 6}]);
+        assert!(on_service(&request(serde_json::json!({"candidates": offered})), &lists).is_none());
+        let on =
+            on_service(&request(serde_json::json!({"service": {"id": 8}, "candidates": offered})), &lists)
+                .unwrap();
+        let mut keys: Vec<Key> = on.into_iter().collect();
+        keys.sort_unstable();
+        let (movie, tv) = (MediaType::Movie, MediaType::Tv);
+        assert_eq!(keys, vec![(movie, 1), (movie, 3), (movie, 5), (tv, 2), (tv, 4)]);
+    }
+
+    #[test]
+    fn a_channels_fixture_is_kept_apart_from_homes() {
+        let name = |body| fixture_name(&body);
+        assert_eq!(name(serde_json::json!({})), "home.json");
+        assert_eq!(name(serde_json::json!({"surface": "movies"})), "movies.json");
+        assert_eq!(
+            name(serde_json::json!({"service": {"id": 8, "country": "FI"}})),
+            "home-service-8-fi.json"
+        );
+        assert_eq!(
+            name(serde_json::json!({"surface": "series", "service": {"id": 337}})),
+            "series-service-337.json"
+        );
+        assert_eq!(
+            name(serde_json::json!({"service": {"id": 8, "country": "../x"}})),
+            "home-service-8.json",
+            "only a country code reaches the name"
+        );
     }
 }
