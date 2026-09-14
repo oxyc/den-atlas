@@ -182,6 +182,34 @@ impl SourceKinds {
     }
 }
 
+impl Facts {
+    /// Every title adapted from any of the kinds in `mask`, and every title carrying `genre`.
+    ///
+    /// These exist because a facet that cannot PROPOSE candidates cannot rank them. Country and decade have
+    /// had a lane since the beginning; source kind and genre had none, so a query naming only one of them
+    /// was answered entirely by the plot vectors' 200 nearest — `total` pinned to exactly LANE — and the
+    /// 4,750 titles that actually are book adaptations were never in the running at all.
+    ///
+    /// A linear scan of ~38k records, unsorted: the caller orders by votes, which live in facets.bin rather
+    /// than here. Measured at well under a millisecond, and it keeps this type free of a second index to
+    /// hold consistent.
+    pub fn titles_with_source_kind(&self, mask: u16) -> Vec<(MediaType, u32)> {
+        self.records
+            .iter()
+            .filter(|(_, record)| record.source_kinds.raw() & mask != 0)
+            .map(|(&key, _)| key)
+            .collect()
+    }
+
+    pub fn titles_with_genre(&self, genre: u16) -> Vec<(MediaType, u32)> {
+        self.records
+            .iter()
+            .filter(|(_, record)| record.genres.contains(&genre))
+            .map(|(&key, _)| key)
+            .collect()
+    }
+}
+
 /// Someone the facts credit as a director, creator or cast member.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Person {

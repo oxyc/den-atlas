@@ -186,7 +186,7 @@ mod tests {
             metadata: None,
             premise_labels: None,
             premise_vectors: None,
-            facts: None,
+            facts: Vec::new(),
             plot_facets: None,
             facets: None,
             last_modified: None,

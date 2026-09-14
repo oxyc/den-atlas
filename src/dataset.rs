@@ -132,7 +132,9 @@ pub struct Dataset {
     pub premise_labels: Option<Blob>,
     pub premise_vectors: Option<Blob>,
     /// The Wikidata facts file `/recommend` reads (optional; never served).
-    pub facts: Option<PathBuf>,
+    /// Every facts file the release ships, best first. The loader tries them in turn: a file that is
+    /// present but unparseable must not end the search while good alternatives sit beside it.
+    pub facts: Vec<PathBuf>,
     /// The plot facets file `/index/plot` rows read (optional; never served).
     pub plot_facets: Option<PathBuf>,
     /// DT-I compact facet blob (optional).
@@ -234,11 +236,17 @@ impl Dataset {
             None,
         );
         // The Wikidata facts: the slim file when the release has one, and the plain file before its gzip.
-        let facts = [&meta.facts_slim_file, &meta.facts_slim_gz_file, &meta.facts_file, &meta.facts_gz_file]
-            .into_iter()
-            .flatten()
-            .filter_map(|name| safe_blob_path(dir, name).ok())
-            .find(|path| path.is_file());
+        // EVERY candidate, not the first that exists. This list used to `find` the first file present, so a
+        // file that was present and unparseable ended the search — one entity with a string where a list
+        // belonged discarded a 27 MB file and left /recommend, people search, imdbId and countries off, with
+        // three perfectly good alternatives sitting beside it. The loader tries them in turn.
+        let facts: Vec<PathBuf> =
+            [&meta.facts_slim_file, &meta.facts_slim_gz_file, &meta.facts_file, &meta.facts_gz_file]
+                .into_iter()
+                .flatten()
+                .filter_map(|name| safe_blob_path(dir, name).ok())
+                .filter(|path| path.is_file())
+                .collect();
         let plot_facets = [&meta.plot_facets_file, &meta.plot_facets_gz_file]
             .into_iter()
             .flatten()

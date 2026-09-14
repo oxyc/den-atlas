@@ -105,7 +105,7 @@ pub struct IndexQueries {
     plot: BlobPair,
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
-    facts: Option<PathBuf>,
+    facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
     metadata: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
@@ -175,7 +175,7 @@ impl IndexQueries {
             indexes.plot.len(),
             took.as_secs_f64()
         );
-        self.facts_unusable.store(self.facts.is_some() && indexes.facts.is_none(), Ordering::Relaxed);
+        self.facts_unusable.store(!self.facts.is_empty() && indexes.facts.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
@@ -216,7 +216,7 @@ struct Sources {
     plot: BlobPair,
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
-    facts: Option<PathBuf>,
+    facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
     metadata: Option<PathBuf>,
 }
@@ -267,12 +267,14 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
         let facts = scope.spawn(|| {
             timed(|| {
-                sources.facts.as_ref().and_then(|path| {
-                    Facts::read(path)
-                        .map_err(|e| {
-                            eprintln!("facts unusable ({e}) — /recommend reads labels and facets only")
-                        })
-                        .ok()
+                sources.facts.iter().find_map(|path| match Facts::read(path) {
+                    Ok(facts) => Some(facts),
+                    Err(e) => {
+                        // Name the file: with several candidates, "facts unusable" alone does not say which
+                        // one, and the next line may be a success from a different file.
+                        eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
+                        None
+                    }
                 })
             })
         });

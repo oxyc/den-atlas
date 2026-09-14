@@ -217,11 +217,31 @@ impl Parsed {
         if self.text.chars().count() < 2 {
             return None;
         }
-        if self.leftover.is_empty() && !self.people.is_empty() {
-            // A name and nothing more: the plot vectors hold no people, so they could only add what sounds alike.
+        // NOTHING LEFT OVER MEANS NOTHING TO ASK THE VECTORS.
+        //
+        // When every word was claimed, handing the whole query back embeds the FACET PHRASE as prose — and
+        // the plot vectors hold no people, no decades, no countries and no source kinds, so they can only
+        // add what sounds alike. "1980s" scored Ho Fatto Splash at 0.93 and pushed Back to the Future to
+        // fourth; "based on a book" returned films with the word in their titles, which is the very failure
+        // SOURCE_PHRASES was added to fix — the parse was corrected and this line let the words back in
+        // through the other door.
+        //
+        // The rule was already here for people alone. It is the same rule; it was just written once.
+        if self.leftover.is_empty() && self.names_something() {
             return None;
         }
         Some(if self.leftover.is_empty() { &self.text } else { &self.leftover })
+    }
+
+    /// True when the query named anything the facts or labels can answer directly.
+    fn names_something(&self) -> bool {
+        !self.people.is_empty()
+            || !self.genres.is_empty()
+            || !self.labels.is_empty()
+            || !self.plot.is_empty()
+            || self.source_kinds != 0
+            || self.facet.country.is_some()
+            || self.facet.decade.is_some()
     }
 }
 
@@ -396,6 +416,36 @@ pub fn answer(
     for &key in facet_titles.iter().flatten().take(FACET_LANE) {
         found.entry(key).or_default();
     }
+    // SOURCE KIND AND GENRE PROPOSE TOO. Without a lane of their own they could only filter or boost titles
+    // some other lane had already found, so a query naming nothing else was answered by the plot vectors and
+    // Fight Club could not rank as a book adaptation because it was never a candidate.
+    //
+    // Ordered by votes, like the country/decade lane: a facet names a SET, not an order within it, so the
+    // order has to come from a prior, and popularity is the one Den uses everywhere else.
+    let mut named_titles: Vec<Key> = Vec::new();
+    if let Some(facts) = indexes.facts.as_ref() {
+        if parsed.source_kinds != 0 {
+            named_titles.extend(facts.titles_with_source_kind(parsed.source_kinds));
+        }
+        for &genre in &parsed.genres {
+            named_titles.extend(facts.titles_with_genre(genre));
+        }
+    }
+    if !named_titles.is_empty() {
+        named_titles.sort_unstable();
+        named_titles.dedup();
+        if let Some(media_type) = parsed.facet.media_type {
+            named_titles.retain(|(kind, _)| *kind == media_type);
+        }
+        let votes =
+            |key: &Key| indexes.facets.as_ref().and_then(|f| f.title(key.1, key.0)).map_or(0, |t| t.votes);
+        named_titles.sort_by_key(|key| std::cmp::Reverse(votes(key)));
+        named_titles.truncate(FACET_LANE);
+        for &key in &named_titles {
+            found.entry(key).or_default();
+        }
+    }
+    let named_set: HashSet<Key> = named_titles.into_iter().collect();
     let facet_set: Option<HashSet<Key>> = facet_titles.map(|titles| titles.into_iter().collect());
     // Labels and plot facets the query names.
     for (name, mood) in &parsed.labels {
@@ -450,7 +500,12 @@ pub fn answer(
     let exact_answered = scored.iter().any(|s| s.exact && s.pop >= EXACT_POPULAR);
     let w_sem = W_SEMANTIC * (0.3 + 0.7 * parsed.lambda) * if exact_answered { 0.3 } else { 1.0 };
     for s in &mut scored {
-        s.score = score(s, w_sem, facet_set.as_ref().is_some_and(|set| set.contains(&s.key)));
+        // A title the query NAMED — by country, decade, source kind or genre — is relevant for that reason
+        // alone. Without this, a book adaptation with no other signal scores 0 and is dropped by the retain
+        // below, which is how `based on a book` returned 200 prose neighbours and none of its 4,750 titles.
+        let named = facet_set.as_ref().is_some_and(|set| set.contains(&s.key))
+            || named_set.contains(&s.key);
+        s.score = score(s, w_sem, named);
     }
     // A title nothing names — no card, no export title: a facts-only record — has nothing to draw it by.
     let drawable = |key: &Key| {
@@ -597,7 +652,9 @@ pub(crate) fn attention(votes: u32, export: Option<f64>) -> f64 {
     }
 }
 
-/// `S`, with `in_facet` for a title inside the country or decade the query names.
+/// `S`, with `in_facet` for a title the query NAMED — inside its country or decade, carrying its genre, or
+/// adapted from the kind it asked for. Such a title is relevant on that basis alone, so popularity applies
+/// to it: a facet names a set, and within that set popularity is the only order available.
 fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
     let relevance = [s.t / EXACT_TITLE, s.sem, s.lab, s.pf, s.person, if in_facet { 1.0 } else { 0.0 }]
         .into_iter()
