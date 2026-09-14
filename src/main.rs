@@ -13,6 +13,7 @@ mod http;
 mod justwatch;
 mod manifest;
 mod metrics;
+mod motn;
 mod plotrows;
 mod queries;
 mod recommend;
@@ -42,6 +43,9 @@ pub struct AppState {
     /// Index queries over the dataset (env `INDEX_QUERIES`, and a loaded dataset). `None` — off — 404s the
     /// `/index/…` routes.
     pub index: Option<Arc<queries::IndexQueries>>,
+    /// Movie of the Night's lists (env `MOTN_KEY`): each service's Top 10 and additions, per country. Without a key
+    /// it keeps nothing, and rows and billboards read JustWatch alone.
+    pub motn: Arc<motn::Motn>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
     /// One stderr line per request (env `LOG_REQUESTS`: off when unset, empty or `0`, on for anything
@@ -105,6 +109,7 @@ impl AppState {
             embed: None,
             titles: None,
             index: None,
+            motn: std::sync::Arc::new(motn::Motn::new(None, None)),
             metrics_token: None,
             log_requests: false,
             health: std::sync::Mutex::new("ok"),
@@ -167,6 +172,8 @@ async fn main() {
     if let Some(dir) = &cache_dir {
         catalog = catalog.kept_in(std::path::Path::new(dir));
     }
+    let motn = Arc::new(motn::Motn::new(env_opt("MOTN_KEY"), cache_dir.as_deref().map(std::path::Path::new)));
+    catalog = catalog.with_motn(Arc::clone(&motn));
 
     // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
@@ -212,6 +219,7 @@ async fn main() {
         embed,
         titles: title_search,
         index,
+        motn,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
@@ -221,6 +229,9 @@ async fn main() {
     }
     if let Some(index) = &state.index {
         tokio::spawn(queries::release_when_idle(Arc::clone(index)));
+    }
+    if state.motn.enabled() {
+        tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
     }
 
     let app = axum::Router::new().fallback(handler::handle).with_state(Arc::clone(&state));
@@ -249,7 +260,7 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} public_base={} embed={} title_search={} index_queries={}",
+         catalog_ttl={}s catalog_cache={} public_base={} embed={} title_search={} index_queries={} motn={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -261,6 +272,7 @@ async fn main() {
         on(state.embed.is_some()),
         on(state.titles.is_some()),
         on(state.index.is_some()),
+        on(state.motn.enabled()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());

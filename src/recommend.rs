@@ -15,7 +15,7 @@
 //!
 //! Pure and deterministic given `now`, so a recorded request replays to the same answer.
 
-use crate::catalog::{new_catalog_id, Provider, TRENDING_ID};
+use crate::catalog::{new_catalog_id, provider_by_code, Provider, TRENDING_ID};
 use crate::config::Config;
 use crate::facts::{Facts, Released};
 use crate::fit::{Features, Fit, Fitted};
@@ -336,12 +336,13 @@ pub struct Listed {
 }
 
 /// Atlas's lists for one request: each "new on <service>" list, Trending Everywhere with both types interleaved,
-/// and each "popular on <service>" list.
+/// each "popular on <service>" list, and each service's own Top 10 (`charts`, a ranking).
 #[derive(Default)]
 pub struct Lists {
     pub arrivals: Vec<Vec<Listed>>,
     pub everywhere: Vec<Listed>,
     pub popular: Vec<Vec<Listed>>,
+    pub charts: Vec<Vec<Listed>>,
 }
 
 /// A rendered catalog body (`catalog::render_metas`) back as titles. A row without a TMDB id can't be named
@@ -786,6 +787,13 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         let placing = Placing { rank: at as f64, of };
         push(item.key, known.title(item.key, None, Some(item)), Some(placing), None);
     }
+    for list in &lists.charts {
+        let of = list.len() as f64;
+        for (at, item) in list.iter().enumerate() {
+            let placing = Placing { rank: at as f64, of };
+            push(item.key, known.title(item.key, None, Some(item)), Some(placing), None);
+        }
+    }
     for item in lists.popular.iter().flatten() {
         push(item.key, known.title(item.key, None, Some(item)), None, None);
     }
@@ -920,6 +928,7 @@ pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::
             "arrivals": lists.arrivals.iter().map(|list| listed(list)).collect::<Vec<_>>(),
             "everywhere": listed(&lists.everywhere),
             "popular": lists.popular.iter().map(|list| listed(list)).collect::<Vec<_>>(),
+            "charts": lists.charts.iter().map(|list| listed(list)).collect::<Vec<_>>(),
         },
     })
 }
@@ -946,6 +955,7 @@ pub fn replayed(fixture: &serde_json::Value) -> Result<(Request, Lists, f64), St
         arrivals: items(&fixture["lists"]["arrivals"]).iter().map(listed).collect(),
         everywhere: listed(&fixture["lists"]["everywhere"]),
         popular: items(&fixture["lists"]["popular"]).iter().map(listed).collect(),
+        charts: items(&fixture["lists"]["charts"]).iter().map(listed).collect(),
     };
     Ok((request, lists, now))
 }
@@ -990,6 +1000,20 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
     )
 }
 
+/// A kept Movie of the Night list's titles of one type, as a list the billboard reads.
+fn motn_listed(shows: &[crate::motn::Show], series: bool) -> Vec<Listed> {
+    shows
+        .iter()
+        .filter(|s| s.series == series)
+        .map(|s| Listed {
+            key: (if series { MediaType::Tv } else { MediaType::Movie }, s.tmdb),
+            imdb_id: s.imdb.clone(),
+            rating: s.rating,
+            year: s.year,
+        })
+        .collect()
+}
+
 /// Atlas's own lists for a request: "new on" and "popular on" each of the household's services in its own country
 /// (every service this install carries when none are picked), of the surface's types, and Trending Everywhere. A
 /// list that can't be had is empty; the catalog already degrades and caches.
@@ -1011,19 +1035,31 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
             services.push((provider, config.country(Some(&pick.country), &state.default_country)));
         }
     }
-    let per = |id: fn(&Provider) -> String| -> Vec<Wanted> {
-        types
-            .iter()
-            .flat_map(|&t| {
-                services
-                    .iter()
-                    .map(move |(provider, there)| (id(provider), t, there.clone(), vec![*provider]))
-            })
-            .collect()
-    };
-    let mut arrivals = per(new_catalog_id);
+    // Movie of the Night's lists stand in for JustWatch's where they are kept (`motn.rs`): a service's own Top 10 is a
+    // chart, and what was added to it an arrival. Netflix's US Top 10 goes to every household too: the one chart that
+    // says what most people are watching now.
+    let mut out = Lists::default();
+    let (mut arrivals, mut popular): (Vec<Wanted>, Vec<Wanted>) = (Vec::new(), Vec::new());
+    let netflix = provider_by_code("nfx");
+    for &t in &types {
+        let series = t == "series";
+        for (provider, there) in &services {
+            state.motn.want(provider, there);
+            match state.motn.added(provider, there) {
+                Some(shows) => out.arrivals.push(motn_listed(&shows, series)),
+                None => arrivals.push((new_catalog_id(provider), t, there.clone(), vec![*provider])),
+            }
+            match state.motn.top(provider, there) {
+                Some(shows) => out.charts.push(motn_listed(&shows, series)),
+                None => popular.push((provider.id.to_owned(), t, there.clone(), vec![*provider])),
+            }
+        }
+        if let Some(netflix) = netflix {
+            state.motn.want(netflix, "US");
+            out.charts.extend(state.motn.top(netflix, "US").map(|shows| motn_listed(&shows, series)));
+        }
+    }
     arrivals.truncate(SERVICE_LISTS);
-    let mut popular = per(|provider| provider.id.to_owned());
     popular.truncate(SERVICE_LISTS - arrivals.len());
 
     let mut set = tokio::task::JoinSet::new();
@@ -1048,7 +1084,6 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
         }
     }
     answers.sort_by_key(|&(at, _, _)| at);
-    let mut out = Lists::default();
     let (mut movies, mut series) = (Vec::new(), Vec::new());
     for (at, stremio_type, items) in answers {
         if at < new_lists {
@@ -1261,13 +1296,14 @@ mod tests {
                 rating: Some(8.1),
                 year: None,
             }]],
+            charts: vec![vec![Listed { key: (MediaType::Tv, 10), imdb_id: None, rating: None, year: None }]],
         };
         let (request, back, now) = replayed(&fixture(&raw, &lists, 20_709.5)).unwrap();
         assert_eq!(now, 20_709.5);
         assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
         assert_eq!(
-            (back.arrivals, back.everywhere, back.popular),
-            (lists.arrivals, lists.everywhere, lists.popular)
+            (back.arrivals, back.everywhere, back.popular, back.charts),
+            (lists.arrivals, lists.everywhere, lists.popular, lists.charts)
         );
         assert!(replayed(&serde_json::json!({})).is_err());
     }

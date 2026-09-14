@@ -4,6 +4,7 @@
 
 use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
+use crate::motn::{self, Motn};
 use crate::util::lock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,8 @@ pub struct Provider {
     /// Every JustWatch package id this service is known by, most common first. Identical to the TMDB
     /// watch-provider ids (verified against both lists). Per-country: Prime is 119 in UY/FI, 9 in the US.
     pub package_ids: &'static [i64],
+    /// The service's id at Movie of the Night (`motn.rs`); empty for one it doesn't list.
+    pub motn: &'static str,
 }
 
 // Short codes can drift per country; if a row comes back empty, verify against JustWatch's provider
@@ -33,15 +36,40 @@ pub struct Provider {
 // `denProviderId` publishes for back-compat — and all of them are published as `denProviderIds` so a client
 // keying on its own region's id (Den keys on TMDB's, which is the same number) matches whichever applies.
 const PROVIDERS: &[Provider] = &[
-    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix", package_ids: &[8] },
-    Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_ids: &[1899] },
-    Provider { code: "prv", id: "jw-prv", name: "Popular on Prime Video", package_ids: &[119, 9] },
-    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_ids: &[337] },
+    Provider { code: "nfx", id: "jw-nfx", name: "Popular on Netflix", package_ids: &[8], motn: "netflix" },
+    Provider { code: "mxx", id: "jw-mxx", name: "Popular on HBO Max", package_ids: &[1899], motn: "hbo" },
+    Provider {
+        code: "prv",
+        id: "jw-prv",
+        name: "Popular on Prime Video",
+        package_ids: &[119, 9],
+        motn: "prime",
+    },
+    Provider { code: "dnp", id: "jw-dnp", name: "Popular on Disney+", package_ids: &[337], motn: "disney" },
     // 531 is Paramount+ in LatAm/EU and is also TMDB's id everywhere; the US splits it into tiers with their
     // own ids and no plain 531, so a client keying on TMDB's 531 still matches while we resolve the local tier.
-    Provider { code: "pmp", id: "jw-pmp", name: "Popular on Paramount+", package_ids: &[531, 2303, 2616] },
-    Provider { code: "atp", id: "jw-atp", name: "Popular on Apple TV+", package_ids: &[350, 2552] },
-    Provider { code: "sst", id: "jw-sst", name: "Popular on SkyShowtime", package_ids: &[1773] },
+    Provider {
+        code: "pmp",
+        id: "jw-pmp",
+        name: "Popular on Paramount+",
+        package_ids: &[531, 2303, 2616],
+        motn: "paramount",
+    },
+    Provider {
+        code: "atp",
+        id: "jw-atp",
+        name: "Popular on Apple TV+",
+        package_ids: &[350, 2552],
+        motn: "apple",
+    },
+    Provider {
+        code: "sst",
+        id: "jw-sst",
+        name: "Popular on SkyShowtime",
+        package_ids: &[1773],
+        motn: "skyshowtime",
+    },
+    Provider { code: "hlu", id: "jw-hlu", name: "Popular on Hulu", package_ids: &[15], motn: "hulu" },
 ];
 
 pub const NEW_SUFFIX: &str = "-new";
@@ -182,6 +210,8 @@ pub struct CatalogState {
     /// simultaneous calls and earned this host a 403 from JustWatch. What upstream cares about is
     /// the total, so that is what has to be capped — the queue is bounded by the request timeout.
     upstream: Arc<tokio::sync::Semaphore>,
+    /// Movie of the Night's kept lists, which lead a service's rows where they exist (`motn.rs`).
+    motn: Option<Arc<Motn>>,
 }
 
 /// Removes a single-flight gate once nobody is using it.
@@ -261,12 +291,18 @@ impl CatalogState {
             packages_failed: Mutex::new(HashMap::new()),
             last_refresh_ok: AtomicBool::new(true),
             upstream: Arc::new(tokio::sync::Semaphore::new(MAX_UPSTREAM_INFLIGHT)),
+            motn: None,
         }
     }
 
     /// The same, with its rows kept in `dir` across restarts (`CACHE_DIR`).
     pub fn kept_in(self, dir: &std::path::Path) -> Self {
         Self { cache: TtlCache::persisted(self.ttl, dir), ..self }
+    }
+
+    /// The same, with a service's rows led by Movie of the Night's lists where they are kept.
+    pub fn with_motn(self, motn: Arc<Motn>) -> Self {
+        Self { motn: Some(motn), ..self }
     }
 
     /// Whether the last JustWatch refresh succeeded — the `/health` freshness signal (ADDON-02).
@@ -303,6 +339,9 @@ impl CatalogState {
         if !is_trending && resolved.is_none() {
             return None; // unknown id, or not one of this install's selected providers
         }
+        if let (Some((provider, _)), Some(motn)) = (resolved, &self.motn) {
+            motn.want(provider, country);
+        }
 
         // The aggregate row is a union over THIS install's selected providers, so the selection is
         // part of what the value is. Without it in the key, whichever install warmed the entry won
@@ -314,7 +353,8 @@ impl CatalogState {
             codes.sort_unstable(); // selection is a set; order must not split the cache
             format!("jw:{}:{}:{}:{}", country, catalog_id, stremio_type, codes.join(","))
         } else {
-            format!("jw:{}:{}:{}", country, catalog_id, stremio_type)
+            // Not `jw:`: a service's row is led by Movie of the Night's list now, so a row kept before isn't this one.
+            format!("service:{}:{}:{}", country, catalog_id, stremio_type)
         };
         if let Lookup::Fresh(v) = self.cache.get(&key) {
             return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
@@ -380,6 +420,27 @@ impl CatalogState {
                     None => return None,
                 },
             }
+        };
+
+        // Movie of the Night's list leads a service's row where one is kept (`motn.rs`): the service's own Top 10, or
+        // what was added to it, newest first. JustWatch's row follows, less what the lead already holds.
+        let fetched = match (resolved, &self.motn) {
+            (Some((provider, is_new)), Some(motn)) => {
+                let kept = if is_new { motn.added(provider, country) } else { motn.top(provider, country) };
+                let lead = kept
+                    .map(|shows| motn::trending(&shows, matches!(obj, ObjectType::Show)))
+                    .unwrap_or_default();
+                if lead.is_empty() {
+                    fetched
+                } else {
+                    let complete = fetched.as_ref().is_none_or(|a| a.complete);
+                    Some(Aggregate {
+                        items: led_by(lead, fetched.map(|a| a.items).unwrap_or_default()),
+                        complete,
+                    })
+                }
+            }
+            _ => fetched,
         };
 
         let upstream = Some(started.elapsed());
@@ -598,6 +659,20 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
         .collect()
 }
 
+/// `lead`, then what `rest` holds that `lead` doesn't, ranked afresh.
+fn led_by(lead: Vec<TrendingItem>, rest: Vec<TrendingItem>) -> Vec<TrendingItem> {
+    let mut items = lead;
+    for item in rest {
+        if !items.iter().any(|held| held.imdb == item.imdb) {
+            items.push(item);
+        }
+    }
+    for (rank, item) in items.iter_mut().enumerate() {
+        item.rank = rank;
+    }
+    items
+}
+
 /// Render items as Stremio catalog metas. `id` is the IMDb id (a plain Stremio client + Cinemeta resolve
 /// the detail page from it); `imdb_id` + `moviedb_id` are the extra keys the Den app maps rows through
 /// (it bridges everything via TMDB — an item without `moviedb_id` won't render there). Poster is
@@ -637,6 +712,16 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn a_kept_list_leads_a_row_and_justwatch_follows_without_repeats() {
+        let led =
+            led_by(vec![item("tt2", "Top", 0)], vec![item("tt1", "Other", 0), item("tt2", "Top again", 1)]);
+        assert_eq!(
+            led.iter().map(|i| (i.imdb.as_str(), i.rank)).collect::<Vec<_>>(),
+            vec![("tt2", 0), ("tt1", 1)]
+        );
+    }
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
         TrendingItem {
