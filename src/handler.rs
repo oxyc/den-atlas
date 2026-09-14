@@ -979,6 +979,9 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             return json_response(r#"{"error":"index_unavailable"}"#, StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+    // Kept for `den-atlas replay` when `RECOMMEND_FIXTURES` names a directory: the body as sent, library and all.
+    let fixtures = std::env::var("RECOMMEND_FIXTURES").ok().filter(|dir| !dir.is_empty());
+    let raw: Option<serde_json::Value> = fixtures.as_ref().and_then(|_| serde_json::from_slice(&body).ok());
     let listing = Instant::now();
     let lists = crate::recommend::lists(state, &config, &request).await;
     let listed = listing.elapsed();
@@ -986,10 +989,16 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
     let version = state.dataset.as_ref().map(|ds| ds.meta.dataset_version.clone());
     // More Like This for each seed scans the vectors, so the ranking runs off the request threads.
     let ranked = tokio::task::spawn_blocking(move || {
-        let now = request.now.as_deref().and_then(crate::recommend::parse_now);
-        let mut answer =
-            crate::recommend::answer(&indexes, &request, &lists, now.unwrap_or_else(crate::recommend::today));
+        let now = request
+            .now
+            .as_deref()
+            .and_then(crate::recommend::parse_now)
+            .unwrap_or_else(crate::recommend::today);
+        let mut answer = crate::recommend::answer(&indexes, &request, &lists, now);
         eprintln!("{}{rid}", crate::recommend::summary(&indexes, &request, &answer));
+        if let (Some(dir), Some(raw)) = (&fixtures, &raw) {
+            crate::recommend::keep_fixture(std::path::Path::new(dir), raw, &lists, now);
+        }
         answer["datasetVersion"] = serde_json::json!(version);
         answer.to_string()
     })
@@ -1876,6 +1885,26 @@ mod tests {
         );
         assert!(line.contains("fresh ") && line.contains("taste "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
+
+        // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one, and a client rating on too few
+        // votes doesn't replace it.
+        let known = crate::recommend::Knowledge { indexes: &indexes };
+        let listed = crate::recommend::Listed {
+            key: (den_index::MediaType::Movie, 2),
+            imdb_id: None,
+            rating: Some(8.0),
+            year: None,
+        };
+        let title = known.title(listed.key, None, Some(&listed));
+        assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(500.0), false));
+        let few: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":18}"#).unwrap();
+        let title = known.title((den_index::MediaType::Movie, 99), Some(&few), Some(&listed));
+        assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(200.0), true));
+        let enough: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
+        assert_eq!(
+            known.title((den_index::MediaType::Movie, 99), Some(&enough), Some(&listed)).rating,
+            Some(7.2)
+        );
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.

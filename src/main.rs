@@ -141,6 +141,11 @@ pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 #[tokio::main]
 async fn main() {
     let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_owned());
+    if let [_, command, path] = std::env::args().collect::<Vec<_>>().as_slice() {
+        if command == "replay" {
+            std::process::exit(replay(&dir, path).await);
+        }
+    }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
     // dataset.meta.json must not crash-loop the addon. Keep serving; the dataset routes report 503 and
     // the app surfaces a real reason instead of a connection refusal.
@@ -262,6 +267,36 @@ async fn main() {
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// `den-atlas replay <fixture>` — a request kept under `RECOMMEND_FIXTURES`, ranked again against the dataset in
+/// `DATA_DIR` with the scoring this binary carries, and every slide printed on its own line. The exit code.
+async fn replay(dir: &str, path: &str) -> i32 {
+    let fail = |e: String| {
+        eprintln!("replay: {e}");
+        1
+    };
+    let dataset = match dataset::Dataset::load(std::path::Path::new(dir)) {
+        Ok(dataset) => dataset,
+        Err(e) => return fail(format!("dataset: {e}")),
+    };
+    let fixture = std::fs::read(path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string()));
+    let (request, lists, now) = match fixture.and_then(|f| recommend::replayed(&f)) {
+        Ok(replayed) => replayed,
+        Err(e) => return fail(format!("{path}: {e}")),
+    };
+    let indexes = match queries::IndexQueries::new(&dataset).get(|| ()).await {
+        Ok((indexes, _)) => indexes,
+        Err(e) => return fail(format!("indexes: {e}")),
+    };
+    let answer = recommend::answer(&indexes, &request, &lists, now);
+    println!("{}", recommend::summary(&indexes, &request, &answer));
+    for (at, slide) in answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+        println!("{:>3}. {}", at + 1, recommend::describe(&indexes, slide));
+    }
+    0
 }
 
 /// An env var's value, with unset and empty both meaning "not configured" — the rule every den addon

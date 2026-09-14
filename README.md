@@ -181,6 +181,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
+| `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json`: the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |

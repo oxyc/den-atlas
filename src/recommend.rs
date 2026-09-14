@@ -27,7 +27,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 /// Names the scoring rules, so a kept answer can say which rules chose it.
-pub const SCORER: &str = "billboard-port-1";
+pub const SCORER: &str = "billboard-port-2";
 
 type Key = (MediaType, u32);
 
@@ -40,6 +40,14 @@ const ANTICIPATION_DAYS: f64 = 45.0;
 const RATING_PRIOR_VOTES: f64 = 200.0;
 /// What a title is worth before anyone has said: a little above TMDB's middle, where most rated titles land.
 const RATING_PRIOR: f64 = 6.6;
+/// Votes a counted rating needs before it replaces JustWatch's IMDb score. TMDB's 7.2 on 18 votes read over IMDb's
+/// 5.4 put a poorly received release at the top of a billboard.
+const COUNTED_ENOUGH: f64 = 100.0;
+/// Days after its release beyond which a title arriving on a service is catalogue joining it, not something new.
+const CATALOGUE_DAYS: f64 = 730.0;
+/// What an arrival is worth when it is catalogue: Interstellar on "New on Prime" is a title the household has had
+/// every chance to meet.
+const CATALOGUE_ARRIVAL: f64 = 0.5;
 /// How the terms trade off. Freshness leads but not alone; attention is weighted to match it, so among new
 /// things the ones people are actually watching win.
 const WEIGHT_FRESH: f64 = 0.22;
@@ -487,18 +495,25 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
-        match (hint.and_then(|h| h.rating), listed.and_then(|l| l.rating)) {
-            (Some(rating), _) => {
+        match (hint.and_then(|h| h.rating.map(|rating| (rating, h.votes))), listed.and_then(|l| l.rating)) {
+            // A client's rating over JustWatch's only when enough votes stand behind it (`COUNTED_ENOUGH`).
+            (Some((rating, votes)), listed_rating) if listed_rating.is_none() || counted(votes) => {
                 title.rating = Some(rating);
-                title.votes = hint.and_then(|h| h.votes);
+                title.votes = votes;
             }
-            // JustWatch gives IMDb's score without its vote count: trusted as far as the prior's own weight.
-            (None, Some(rating)) => {
+            // JustWatch gives IMDb's score without its vote count. TMDB's count for the title, where the facets hold
+            // one, says how far it stands; without one it is trusted as far as the prior's own weight.
+            (_, Some(rating)) => {
                 title.rating = Some(rating);
-                title.votes = Some(RATING_PRIOR_VOTES);
-                title.estimated_votes = true;
+                match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
+                    Some(votes) => title.votes = Some(f64::from(votes)),
+                    None => {
+                        title.votes = Some(RATING_PRIOR_VOTES);
+                        title.estimated_votes = true;
+                    }
+                }
             }
-            (None, None) => {}
+            _ => {}
         }
         title.popularity = hint.and_then(|h| h.popularity);
         title.adult = hint.and_then(|h| h.adult).unwrap_or(false);
@@ -759,14 +774,16 @@ pub fn buzz(candidate: &Candidate<'_>, busiest: f64) -> f64 {
     ranked.max(popular.min(1.0))
 }
 
-/// Newly watchable on a service this household has.
-pub fn arrival(candidate: &Candidate<'_>) -> f64 {
-    standing(candidate.arrival)
+/// Newly watchable on a service this household has — half as much when it is catalogue (`CATALOGUE_DAYS`). A title
+/// of unknown date counts in full: nothing says it is old.
+pub fn arrival(candidate: &Candidate<'_>, now: f64) -> f64 {
+    let catalogue = candidate.title.released.is_some_and(|r| now - r.first_day as f64 > CATALOGUE_DAYS);
+    standing(candidate.arrival) * if catalogue { CATALOGUE_ARRIVAL } else { 1.0 }
 }
 
 /// The two kinds of attention, counted once rather than twice.
-pub fn attention(candidate: &Candidate<'_>, busiest: f64) -> f64 {
-    let (a, b) = (buzz(candidate, busiest), arrival(candidate));
+pub fn attention(candidate: &Candidate<'_>, busiest: f64, now: f64) -> f64 {
+    let (a, b) = (buzz(candidate, busiest), arrival(candidate, now));
     a.max(b) + CORROBORATION * a.min(b)
 }
 
@@ -791,7 +808,7 @@ pub struct Why {
 
 pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, taste: Option<&Taste<'_>>) -> Why {
     let fresh = freshness(&candidate.title, now);
-    let attention = attention(candidate, busiest);
+    let attention = attention(candidate, busiest, now);
     let quality = quality(&candidate.title);
     let taste = affinity(&candidate.title, taste);
     let novelty = novelty(candidate);
@@ -807,6 +824,22 @@ fn stranger_here(title: &Title<'_>, taste: Option<&Taste<'_>>) -> bool {
             affinity(title, Some(taste)) < STRANGER
         }
         _ => false,
+    }
+}
+
+/// Whether a vote count is enough for its rating to replace JustWatch's IMDb score.
+fn counted(votes: Option<f64>) -> bool {
+    votes.is_some_and(|votes| votes >= COUNTED_ENOUGH)
+}
+
+/// How far a title's rating can be taken at its word, to choose between two sources' ratings: one counted on
+/// enough votes, then JustWatch's IMDb score, then a count too small to go by, then none.
+fn rating_standing(title: &Title<'_>) -> u8 {
+    match (title.rating, title.estimated_votes) {
+        (None, _) => 0,
+        (Some(_), true) => 2,
+        (Some(_), false) if counted(title.votes) => 3,
+        (Some(_), false) => 1,
     }
 }
 
@@ -843,7 +876,7 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         (Some(first), Some(second)) if second.span_days < first.span_days => Some(second),
         (first, second) => first.or(second),
     };
-    let second_rating = x.rating.is_none() || (x.estimated_votes && y.rating.is_some() && !y.estimated_votes);
+    let second_rating = rating_standing(&y) > rating_standing(&x);
     let (rating, votes, estimated_votes) = if second_rating {
         (y.rating, y.votes, y.estimated_votes)
     } else {
@@ -1105,39 +1138,99 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
 /// Slides an answer's log line names.
 const SUMMARY_SLIDES: usize = 5;
 
+/// One slide of an answer: its name from the metadata cards, else its IMDb id, and why it scored what it did.
+pub fn describe(indexes: &Indexes, slide: &serde_json::Value) -> String {
+    let key = slide["type"]
+        .as_str()
+        .and_then(media_type)
+        .zip(slide["id"].as_u64().and_then(|id| id.try_into().ok()));
+    let name = key
+        .and_then(|key| indexes.cards.as_ref()?.get(&key))
+        .map(|card| card.title.clone())
+        .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| slide["id"].to_string());
+    let term = |name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
+    format!(
+        "{name} {:.3} (fresh {:.2}, attention {:.2}, quality {:.2}, taste {:.2}, novelty {:.2})",
+        term("score"),
+        term("fresh"),
+        term("attention"),
+        term("quality"),
+        term("taste"),
+        term("novelty")
+    )
+}
+
+/// A request as `den-atlas replay` ranks it again: the body as the client sent it, atlas's lists for it, and the
+/// moment it was ranked at — the lists move between calls, so the same answer needs the same lists.
+pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::Value {
+    let listed = |items: &[Listed]| -> Vec<serde_json::Value> {
+        items
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "type": type_name(l.key.0), "id": l.key.1, "imdbId": l.imdb_id, "rating": l.rating, "year": l.year,
+                })
+            })
+            .collect()
+    };
+    serde_json::json!({
+        "now": now,
+        "request": raw,
+        "lists": {
+            "arrivals": lists.arrivals.iter().map(|list| listed(list)).collect::<Vec<_>>(),
+            "everywhere": listed(&lists.everywhere),
+        },
+    })
+}
+
+/// A kept `fixture` read back.
+pub fn replayed(fixture: &serde_json::Value) -> Result<(Request, Lists, f64), String> {
+    let now = fixture["now"].as_f64().ok_or("the fixture names no moment it was ranked at")?;
+    let request = Request::deserialize(&fixture["request"]).map_err(|e| format!("request: {e}"))?;
+    let items = |value: &serde_json::Value| value.as_array().map(Vec::as_slice).unwrap_or_default().to_vec();
+    let listed = |value: &serde_json::Value| -> Vec<Listed> {
+        items(value)
+            .iter()
+            .filter_map(|item| {
+                Some(Listed {
+                    key: (media_type(item["type"].as_str()?)?, item["id"].as_u64()?.try_into().ok()?),
+                    imdb_id: item["imdbId"].as_str().map(str::to_owned),
+                    rating: item["rating"].as_f64(),
+                    year: item["year"].as_i64(),
+                })
+            })
+            .collect()
+    };
+    let lists = Lists {
+        arrivals: items(&fixture["lists"]["arrivals"]).iter().map(listed).collect(),
+        everywhere: listed(&fixture["lists"]["everywhere"]),
+    };
+    Ok((request, lists, now))
+}
+
+/// Keep a request's `fixture` in `dir` as `<surface>.json`, replacing the last one for that surface.
+pub fn keep_fixture(dir: &std::path::Path, raw: &serde_json::Value, lists: &Lists, now: f64) {
+    let surface: String =
+        raw["surface"].as_str().unwrap_or("home").chars().filter(char::is_ascii_lowercase).collect();
+    let path = dir.join(format!("{}.json", if surface.is_empty() { "home" } else { &surface }));
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(&path, fixture(raw, lists, now).to_string()));
+    if let Err(e) = written {
+        eprintln!("recommend fixture not kept at {}: {e}", path.display());
+    }
+}
+
 /// An answer as one log line: what the request carried, and the slides it leads with, each with why — so a billboard
 /// that leads with something odd can be read off the log rather than reproduced. A slide is named from the metadata
 /// cards, else by its IMDb id. The library's titles are never named, only counted.
 pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value) -> String {
-    let name = |slide: &serde_json::Value| {
-        let key = slide["type"]
-            .as_str()
-            .and_then(media_type)
-            .zip(slide["id"].as_u64().and_then(|id| id.try_into().ok()));
-        key.and_then(|key| indexes.cards.as_ref()?.get(&key))
-            .map(|card| card.title.clone())
-            .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| slide["id"].to_string())
-    };
-    let term = |slide: &serde_json::Value, name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
     let slides = answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default();
     let top: Vec<String> = slides
         .iter()
         .take(SUMMARY_SLIDES)
         .enumerate()
-        .map(|(at, s)| {
-            format!(
-                "{}. {} {:.3} (fresh {:.2}, attention {:.2}, quality {:.2}, taste {:.2}, novelty {:.2})",
-                at + 1,
-                name(s),
-                term(s, "score"),
-                term(s, "fresh"),
-                term(s, "attention"),
-                term(s, "quality"),
-                term(s, "taste"),
-                term(s, "novelty")
-            )
-        })
+        .map(|(at, slide)| format!("{}. {}", at + 1, describe(indexes, slide)))
         .collect();
     format!(
         "recommend {}: library {} ({} unjudged), owned {}, candidates {}, {} unjudged in the pool, {} slides; {}",
@@ -1533,14 +1626,51 @@ mod tests {
             arrival: Some(Placing { rank: 0.0, of: 100.0 }),
             ..cand(1, Title::default())
         };
-        assert!((attention(&pushed, 0.0) - 1.3).abs() < 1e-6);
+        assert!((attention(&pushed, 0.0, now()) - 1.3).abs() < 1e-6);
         assert_eq!(
-            arrival(&Candidate {
-                arrival: Some(Placing { rank: 0.0, of: 0.0 }),
-                ..cand(4, Title::default())
-            }),
+            arrival(
+                &Candidate { arrival: Some(Placing { rank: 0.0, of: 0.0 }), ..cand(4, Title::default()) },
+                now()
+            ),
             0.0
         );
+    }
+
+    #[test]
+    fn catalogue_joining_a_service_counts_half_of_something_new_arriving() {
+        let arriving = |date| Candidate {
+            arrival: Some(Placing { rank: 0.0, of: 10.0 }),
+            ..cand(1, Title { released: on(date), ..Title::default() })
+        };
+        assert_eq!(arrival(&arriving("2014-11-05"), now()), 0.5);
+        assert_eq!(arrival(&arriving("2026-03-01"), now()), 1.0);
+        assert_eq!(
+            arrival(
+                &Candidate { arrival: Some(Placing { rank: 0.0, of: 10.0 }), ..cand(1, Title::default()) },
+                now()
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_fixture_reads_back_as_the_request_lists_and_moment_it_was_ranked_with() {
+        let raw =
+            serde_json::json!({"surface": "movies", "library": [{"type": "movie", "id": 1, "weight": 1.0}]});
+        let lists = Lists {
+            arrivals: vec![vec![Listed {
+                key: (MediaType::Movie, 7),
+                imdb_id: Some("tt7".to_owned()),
+                rating: Some(6.9),
+                year: Some(2024),
+            }]],
+            everywhere: vec![Listed { key: (MediaType::Tv, 8), imdb_id: None, rating: None, year: None }],
+        };
+        let (request, back, now) = replayed(&fixture(&raw, &lists, 20_709.5)).unwrap();
+        assert_eq!(now, 20_709.5);
+        assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
+        assert_eq!((back.arrivals, back.everywhere), (lists.arrivals, lists.everywhere));
+        assert!(replayed(&serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -1596,25 +1726,42 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_keeps_the_exact_date_and_the_counted_rating_whichever_came_first() {
-        let listed = cand(
-            5,
-            Title {
-                released: Some(Released::year(2026)),
-                rating: Some(9.0),
-                votes: Some(RATING_PRIOR_VOTES),
-                estimated_votes: true,
-                ..Title::default()
-            },
-        );
-        let described = cand(
-            5,
-            Title { released: on("2026-09-10"), rating: Some(6.1), votes: Some(40.0), ..Title::default() },
-        );
-        let (merged, _) = pick(vec![listed, described], now(), 40, all, None).remove(0);
+    fn a_merge_keeps_the_exact_date_and_a_rating_counted_on_enough_votes_whichever_came_first() {
+        let listed = || {
+            cand(
+                5,
+                Title {
+                    released: Some(Released::year(2026)),
+                    rating: Some(5.4),
+                    votes: Some(RATING_PRIOR_VOTES),
+                    estimated_votes: true,
+                    ..Title::default()
+                },
+            )
+        };
+        let described = |votes| {
+            cand(
+                5,
+                Title {
+                    released: on("2026-09-10"),
+                    rating: Some(7.2),
+                    votes: Some(votes),
+                    ..Title::default()
+                },
+            )
+        };
+        let (merged, _) = pick(vec![listed(), described(400.0)], now(), 40, all, None).remove(0);
         assert_eq!(merged.title.released, on("2026-09-10"));
-        assert_eq!((merged.title.rating, merged.title.votes), (Some(6.1), Some(40.0)));
+        assert_eq!((merged.title.rating, merged.title.votes), (Some(7.2), Some(400.0)));
         assert!(!merged.title.estimated_votes);
+
+        // Eighteen votes don't outweigh IMDb's score, in either order.
+        for pool in [vec![listed(), described(18.0)], vec![described(18.0), listed()]] {
+            let (merged, _) = pick(pool, now(), 40, all, None).remove(0);
+            assert_eq!(merged.title.released, on("2026-09-10"));
+            assert_eq!(merged.title.rating, Some(5.4));
+            assert!(merged.title.estimated_votes);
+        }
     }
 
     #[test]
