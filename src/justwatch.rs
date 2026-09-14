@@ -150,7 +150,14 @@ pub struct JustWatchClient {
     /// is a lifetime figure, and reporting "rows may be short" in the present tense forever after one
     /// transient makes the signal something to ignore.
     last_schema_break: AtomicU64,
+    /// A pause after JustWatch refused (429, 5xx) or couldn't be reached. Every row and aggregate asks through this
+    /// one client, so while it runs they serve what they kept instead of each asking again.
+    backoff: crate::util::Backoff,
 }
+
+/// How long JustWatch is left alone after a refusal that names no `Retry-After`, doubling per refusal in a row.
+const REFUSED_PAUSE: Duration = Duration::from_secs(30);
+const MAX_REFUSED_PAUSE: Duration = Duration::from_secs(1800);
 
 impl JustWatchClient {
     pub fn new() -> Self {
@@ -165,6 +172,7 @@ impl JustWatchClient {
             endpoint: ENDPOINT.to_string(),
             suspected_schema_breaks: AtomicUsize::new(0),
             last_schema_break: AtomicU64::new(0),
+            backoff: crate::util::Backoff::new(REFUSED_PAUSE, MAX_REFUSED_PAUSE),
         }
     }
 
@@ -466,17 +474,37 @@ impl JustWatchClient {
             Some(h) => h,
             None => return Err(()),
         };
+        if let Some(left) = self.backoff.paused() {
+            log_throttled!(
+                "justwatch is being left alone for {}s more; not asking ({label})",
+                left.as_secs()
+            );
+            return Err(());
+        }
         let mut resp = match http.post(&self.endpoint).json(payload).send().await {
             Ok(r) => r,
             Err(e) => {
-                log_throttled!("justwatch request failed ({label}): {e}");
+                let pause = self.backoff.refused(None);
+                log_throttled!(
+                    "justwatch request failed ({label}): {e} — asking nothing for {}s",
+                    pause.as_secs()
+                );
                 return Err(());
             }
         };
         if !resp.status().is_success() {
-            log_throttled!("justwatch http {} ({label})", resp.status());
+            let status = resp.status();
+            // A refusal of this one request leaves the others to be asked; a rate limit or an outage does not.
+            let pause = if crate::util::backs_off(status) {
+                let asked = crate::util::retry_after(resp.headers());
+                format!(" — asking nothing for {}s", self.backoff.refused(asked).as_secs())
+            } else {
+                String::new()
+            };
+            log_throttled!("justwatch http {status} ({label}){pause}");
             return Err(());
         }
+        self.backoff.answered();
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
             if buf.len() + chunk.len() > MAX_BODY {
@@ -776,6 +804,32 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A 429 leaves JustWatch alone for as long as its `Retry-After` says: the next ask is turned away here, and no
+    /// second request reaches it.
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_rather_than_asked_again() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::Relaxed);
+                let refusal =
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\n\r\n";
+                let _ = sock.write_all(refusal.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let c = JustWatchClient::with_endpoint(base);
+        let payload = serde_json::json!({});
+        assert!(c.post_graphql(&payload, "test").await.is_err());
+        assert!(c.post_graphql(&payload, "test").await.is_err());
+        assert_eq!(accepted.load(Ordering::Relaxed), 1, "asked again inside the Retry-After");
+        assert!(c.backoff.paused().is_some_and(|left| left > Duration::from_secs(100)));
     }
 
     /// Build a chart body of `n` edges, of which `bad` are broken in the way `how` says.

@@ -47,6 +47,77 @@ macro_rules! log_throttled {
 }
 pub(crate) use log_throttled;
 
+/// How long an upstream's `Retry-After` asks to be left alone: a number of seconds or an HTTP date. `None` when it
+/// sends none that reads.
+pub fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
+}
+
+/// A pause on one upstream, shared by everything that asks it. A refusal (429, 5xx, no connection) starts it: for as
+/// long as `Retry-After` says when the upstream sends one, else for a base that doubles with each refusal in a row.
+/// While it runs every caller is turned away without asking, so a rate-limited upstream is waited out once instead
+/// of being asked again by each request, row and loop tick. An answer ends it.
+pub struct Backoff {
+    /// When the pause ends, as `since_start` milliseconds; 0 when there is none.
+    until: std::sync::atomic::AtomicU64,
+    refusals: std::sync::atomic::AtomicU32,
+    base: std::time::Duration,
+    max: std::time::Duration,
+}
+
+impl Backoff {
+    pub const fn new(base: std::time::Duration, max: std::time::Duration) -> Backoff {
+        Backoff {
+            until: std::sync::atomic::AtomicU64::new(0),
+            refusals: std::sync::atomic::AtomicU32::new(0),
+            base,
+            max,
+        }
+    }
+
+    /// How much of the pause is left, if one is running.
+    pub fn paused(&self) -> Option<std::time::Duration> {
+        let until = self.until.load(std::sync::atomic::Ordering::Relaxed);
+        let now = since_start().as_millis() as u64;
+        (until > now).then(|| std::time::Duration::from_millis(until - now))
+    }
+
+    /// Start a pause after a refusal, and say how long it is. `Retry-After` is honoured as sent, up to a day; without
+    /// one the pause doubles per refusal in a row up to `max`, with a quarter of jitter so callers don't return as one.
+    pub fn refused(&self, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+        let refusals = self.refusals.fetch_add(1, Ordering::Relaxed).min(16);
+        let pause = match retry_after {
+            Some(asked) => asked.min(std::time::Duration::from_secs(86_400)),
+            None => {
+                let doubled = self.base.saturating_mul(1 << refusals).min(self.max);
+                let spread = doubled.as_millis() as u64 / 4;
+                let jitter = if spread == 0 { 0 } else { since_start().subsec_nanos() as u64 % spread };
+                doubled + std::time::Duration::from_millis(jitter)
+            }
+        };
+        let until = since_start().as_millis() as u64 + pause.as_millis() as u64;
+        self.until.fetch_max(until.max(1), Ordering::Relaxed);
+        pause
+    }
+
+    /// The upstream answered: no pause, and the next refusal starts from the base again.
+    pub fn answered(&self) {
+        self.refusals.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.until.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a status is the upstream asking to be left alone for a while, rather than refusing this one request.
+pub fn backs_off(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 /// Lock a mutex, poisoned or not.
 ///
 /// Used wherever the critical section is a short, non-unwinding map or counter update, so a poisoned
@@ -142,5 +213,46 @@ mod tests {
         for hostile in ["https://evil.example/pwn?x=", "javascript:", "://", "https evil"] {
             assert_eq!(origin(hostile), "http://atlas.local", "{hostile:?} reached the advertised blob URLs");
         }
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_or_a_date_and_nothing_else() {
+        use std::time::{Duration, SystemTime};
+        let with = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&h)
+        };
+        assert_eq!(with("120"), Some(Duration::from_secs(120)));
+        let secs =
+            with(&httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600))).unwrap().as_secs();
+        assert!((3590..=3600).contains(&secs), "an HTTP date an hour away read as {secs}s");
+        let past = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(60));
+        assert_eq!(with(&past), Some(Duration::ZERO), "a date gone by is no wait, not an error");
+        assert_eq!(with("soon"), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_backoff_waits_what_it_is_told_else_doubles_and_an_answer_ends_it() {
+        use std::time::Duration;
+        let backoff = Backoff::new(Duration::from_secs(10), Duration::from_secs(60));
+        assert!(backoff.paused().is_none());
+        let told = Duration::from_secs(300);
+        assert_eq!(backoff.refused(Some(told)), told, "Retry-After is honoured as sent, even past the max");
+        assert!(backoff.paused().is_some_and(|left| left > Duration::from_secs(290)));
+        backoff.answered();
+        assert!(backoff.paused().is_none(), "an answer ends the pause");
+        let first = backoff.refused(None);
+        let second = backoff.refused(None);
+        assert!(first >= Duration::from_secs(10) && first < Duration::from_millis(12_500), "{first:?}");
+        assert!(second >= Duration::from_secs(20) && second < Duration::from_secs(25), "{second:?}");
+        for _ in 0..10 {
+            backoff.refused(None);
+        }
+        assert!(
+            backoff.refused(None) < Duration::from_secs(75),
+            "doubling stops at the max, plus its jitter"
+        );
     }
 }

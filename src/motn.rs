@@ -11,10 +11,11 @@
 
 use crate::catalog::Provider;
 use crate::justwatch::TrendingItem;
-use crate::util::lock;
+use crate::util::{backs_off, lock, retry_after, Backoff};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,8 +31,8 @@ const SERVE_FOR: i64 = 7 * DAY;
 const FIRST_LOOK_BACK: i64 = 7 * DAY;
 /// How long an addition stays on its "New on" list.
 const KEEP_ADDED: i64 = 30 * DAY;
-/// Pages of additions one pass reads for a service in a country, 25 changes each. Per service rather than per country,
-/// so a service adding a hundred titles doesn't leave the country's others unread.
+/// Pages of additions one pass reads for a country, 25 changes each. A read the pages don't finish is picked up where
+/// it stopped by the next pass (`read_until`), so a busy country takes a few passes rather than losing its tail.
 const ADDED_PAGES: u32 = 4;
 /// A market nobody has asked for in this long is no longer fetched.
 const WANTED_FOR: i64 = 30 * DAY;
@@ -53,6 +54,10 @@ const CHARTED: &[&str] = &["netflix", "prime", "disney", "apple", "hbo", "hulu"]
 /// Countries the API doesn't cover, read as a neighbour whose catalogs are nearly the same: Argentina's Netflix Top 10
 /// matched Uruguay's official one title for title.
 const STAND_INS: &[(&str, &str)] = &[("UY", "AR")];
+/// How long nothing is asked after the API refuses (429, 5xx) or can't be reached and says nothing of when to come
+/// back, doubling with each refusal in a row up to the longest.
+const REFUSED_PAUSE: Duration = Duration::from_secs(600);
+const MAX_REFUSED_PAUSE: Duration = Duration::from_secs(6 * 3600);
 /// The file under `CACHE_DIR`. A new format takes a new name, so an old file is ignored, not misread.
 const FILE: &str = "motn.v1.json";
 
@@ -84,7 +89,7 @@ struct Kept {
     top: BTreeMap<String, (i64, Vec<Show>)>,
     /// Each market's additions, newest first.
     added: BTreeMap<String, Vec<Show>>,
-    /// Each market's additions are read up to this moment.
+    /// Each country's additions are read up to this moment: one read covers every service wanted there.
     added_until: BTreeMap<String, i64>,
     /// The services each country offers, by the API's lowercase country code, and when they were read.
     services: BTreeMap<String, Vec<String>>,
@@ -100,6 +105,10 @@ pub struct Motn {
     http: reqwest::Client,
     kept: Mutex<Kept>,
     file: Option<PathBuf>,
+    /// The day a request was last refused for the budget, so that is said once a day.
+    refused_on: AtomicI64,
+    /// A pause after the API refused or couldn't be reached: nothing is asked, or spent, until it ends.
+    backoff: Backoff,
 }
 
 impl Motn {
@@ -120,7 +129,14 @@ impl Motn {
             })
             .unwrap_or_default();
         let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap_or_default();
-        Motn { key: key.filter(|k| !k.is_empty()), http, kept: Mutex::new(kept), file }
+        Motn {
+            key: key.filter(|k| !k.is_empty()),
+            http,
+            kept: Mutex::new(kept),
+            file,
+            refused_on: AtomicI64::new(-1),
+            backoff: Backoff::new(REFUSED_PAUSE, MAX_REFUSED_PAUSE),
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -147,8 +163,8 @@ impl Motn {
     pub fn added(&self, provider: &Provider, country: &str) -> Option<Vec<Show>> {
         let market = market(provider, country)?;
         let kept = lock(&self.kept);
-        let until = kept.added_until.get(&market)?;
-        (now() - until < SERVE_FOR).then(|| kept.added.get(&market).cloned().unwrap_or_default())
+        let until = kept.added_until.get(market_country(&market))?;
+        (now() - until < SERVE_FOR).then(|| kept.added.get(&market).cloned()).flatten()
     }
 
     /// The service's titles leaving the country within a month, soonest first; `None` when that country's lists
@@ -224,29 +240,57 @@ impl Motn {
             lock(&self.kept).top.insert(market.clone(), (now, shows));
         }
 
-        for market in &wanted {
-            let since =
-                lock(&self.kept).added_until.get(market).copied().unwrap_or(0).max(now - FIRST_LOOK_BACK);
+        let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
+        for &country in &countries {
+            let catalogs = services_in(&wanted, country, None);
+            let until = lock(&self.kept).added_until.get(country).copied();
+            // A service newly wanted in a country that is already being read has missed that country's earlier reads:
+            // its own week is read once, up to where the country's reads stand, rather than the country's again.
+            if let Some(until) = until {
+                for &service in &catalogs {
+                    let market = format!("{service}@{country}");
+                    if lock(&self.kept).added.contains_key(&market) {
+                        continue;
+                    }
+                    let from = (now - FIRST_LOOK_BACK).min(until);
+                    if let Some((read, _)) =
+                        self.changes(country, "new", &[service], from, until, ADDED_PAGES).await
+                    {
+                        keep_added(&mut lock(&self.kept), &[market], read, now);
+                    }
+                }
+            }
+            let since = until.unwrap_or(0).max(now - FIRST_LOOK_BACK);
             if now - since < REFRESH_AFTER {
                 continue;
             }
-            let (service, country) = (market_service(market), market_country(market));
-            if let Some(read) = self.changes(country, "new", &[service], since, now, ADDED_PAGES).await {
-                keep_added(&mut lock(&self.kept), market, read, now);
+            if let Some((read, complete)) =
+                self.changes(country, "new", &catalogs, since, now, ADDED_PAGES).await
+            {
+                let reached = read_until(&read, complete, since, now);
+                let markets: Vec<String> =
+                    catalogs.iter().map(|service| format!("{service}@{country}")).collect();
+                let mut kept = lock(&self.kept);
+                keep_added(&mut kept, &markets, read, now);
+                kept.added_until.insert(country.to_owned(), reached);
             }
         }
-        let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
         for &country in &countries {
             if lock(&self.kept).soon_at.get(country).is_some_and(|at| now - at < SOON_AFTER) {
                 continue;
             }
             let all = services_in(&wanted, country, None);
-            let leaving = self.changes(country, "expiring", &all, now, now + SOON_AHEAD, SOON_PAGES).await;
+            let leaving = self
+                .changes(country, "expiring", &all, now, now + SOON_AHEAD, SOON_PAGES)
+                .await
+                .map(|(read, _)| read);
             let upcoming = services_in(&wanted, country, Some(UPCOMING));
             let coming = if upcoming.is_empty() {
                 Some(Vec::new())
             } else {
-                self.changes(country, "upcoming", &upcoming, now, now + SOON_AHEAD, SOON_PAGES).await
+                self.changes(country, "upcoming", &upcoming, now, now + SOON_AHEAD, SOON_PAGES)
+                    .await
+                    .map(|(read, _)| read)
             };
             let (Some(leaving), Some(coming)) = (leaving, coming) else { continue };
             let mut kept = lock(&self.kept);
@@ -257,8 +301,8 @@ impl Motn {
         self.save();
     }
 
-    /// A country's changes of one kind to `catalogs` between `from` and `to`, by market, over at most `pages` pages;
-    /// `None` when not even the first page could be had.
+    /// A country's changes of one kind to `catalogs` between `from` and `to`, by market and oldest first, over at most
+    /// `pages` pages, and whether that was all of them; `None` when not even the first page could be had.
     async fn changes(
         &self,
         country: &str,
@@ -267,7 +311,7 @@ impl Motn {
         from: i64,
         to: i64,
         pages: u32,
-    ) -> Option<Vec<(String, Show)>> {
+    ) -> Option<(Vec<(String, Show)>, bool)> {
         let mut read = Vec::new();
         let mut cursor: Option<String> = None;
         for page_at in 0..pages {
@@ -277,37 +321,56 @@ impl Motn {
                 catalogs.join(","),
                 cursor.as_deref().map(|c| format!("&cursor={c}")).unwrap_or_default()
             );
-            let Some(page) = self.ask(&path).await else { return (page_at > 0).then_some(read) };
+            let Some(page) = self.ask(&path).await else { return (page_at > 0).then_some((read, false)) };
             read.extend(changed(&page, country));
             if page["hasMore"].as_bool() != Some(true) {
-                break;
+                return Some((read, true));
             }
             cursor = page["nextCursor"].as_str().map(str::to_owned);
         }
-        Some(read)
+        Some((read, false))
     }
 
-    /// One request, if the day's budget allows it; `None` on any failure, which is logged.
+    /// One request, if the day's budget allows it and the API isn't being left alone; `None` on any failure, which is
+    /// logged.
     async fn ask(&self, path: &str) -> Option<serde_json::Value> {
         let key = self.key.as_deref()?;
-        if !spend(&mut lock(&self.kept), now()) {
-            eprintln!("motn: the day's {DAILY_REQUESTS} requests are spent; {path} waits for tomorrow");
+        // Before the budget: a request never sent spends nothing, and the rest of a pass falls through here at once.
+        if self.backoff.paused().is_some() {
+            return None;
+        }
+        let now = now();
+        if !spend(&mut lock(&self.kept), now) {
+            // Once a day: every pass until midnight is refused the same way.
+            let day = now.div_euclid(DAY);
+            if self.refused_on.swap(day, Ordering::Relaxed) != day {
+                eprintln!("motn: the day's {DAILY_REQUESTS} requests are spent; what is still due waits for tomorrow");
+            }
             return None;
         }
         let answer = self.http.get(format!("{BASE}{path}")).header("X-API-Key", key).send().await;
         let response = match answer {
             Ok(response) => response,
             Err(e) => {
-                eprintln!("motn: {path}: {e}");
+                let pause = self.backoff.refused(None);
+                eprintln!("motn: {path}: {e} — asking nothing for {}s", pause.as_secs());
                 return None;
             }
         };
         let status = response.status();
+        let asked = retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            eprintln!("motn: {path}: HTTP {status}: {}", body.chars().take(200).collect::<String>());
+            // A refusal of this one request (an unsupported country, say) leaves the others to be asked.
+            let pause = if backs_off(status) {
+                format!(" — asking nothing for {}s", self.backoff.refused(asked).as_secs())
+            } else {
+                String::new()
+            };
+            eprintln!("motn: {path}: HTTP {status}{pause}: {}", body.chars().take(200).collect::<String>());
             return None;
         }
+        self.backoff.answered();
         serde_json::from_str(&body).map_err(|e| eprintln!("motn: {path}: unreadable answer ({e})")).ok()
     }
 
@@ -445,18 +508,32 @@ fn changed(page: &serde_json::Value, country: &str) -> Vec<(String, Show)> {
         .unwrap_or_default()
 }
 
-/// Fold a market's newly read additions into what is kept: each title once, newest first, and nothing older than
-/// `KEEP_ADDED`.
-fn keep_added(kept: &mut Kept, market: &str, read: Vec<(String, Show)>, now: i64) {
-    let list = kept.added.entry(market.to_owned()).or_default();
-    for (_, show) in read {
+/// Fold newly read additions into what is kept: each title once per market, newest first, and nothing older than
+/// `KEEP_ADDED`. Every market in `markets` was read, so each is kept even when nothing was added to it.
+fn keep_added(kept: &mut Kept, markets: &[String], read: Vec<(String, Show)>, now: i64) {
+    for market in markets {
+        kept.added.entry(market.clone()).or_default();
+    }
+    for (market, show) in read {
+        let list = kept.added.entry(market).or_default();
         if !list.iter().any(|held| held.series == show.series && held.tmdb == show.tmdb) {
             list.push(show);
         }
     }
-    list.retain(|s| s.at.is_none_or(|at| now - at < KEEP_ADDED));
-    list.sort_by_key(|s| std::cmp::Reverse(s.at.unwrap_or(0)));
-    kept.added_until.insert(market.to_owned(), now);
+    for list in kept.added.values_mut() {
+        list.retain(|s| s.at.is_none_or(|at| now - at < KEEP_ADDED));
+        list.sort_by_key(|s| std::cmp::Reverse(s.at.unwrap_or(0)));
+    }
+}
+
+/// How far a read of additions from `since` got: all the way to `now` when it finished, else to the last change it
+/// read — changes come oldest first, so the next read starts there instead of reading the same pages again. A second
+/// past `since` at least, so a page of changes sharing one timestamp can't hold the read in place.
+fn read_until(read: &[(String, Show)], complete: bool, since: i64, now: i64) -> i64 {
+    if complete {
+        return now;
+    }
+    read.iter().filter_map(|(_, show)| show.at).max().map_or(since, |last| last.max(since + 1)).min(now)
 }
 
 /// Replace a country's leaving or coming lists with what was just read: each title once per market, soonest first,
@@ -569,21 +646,57 @@ mod tests {
     fn additions_are_kept_once_newest_first_for_a_month() {
         let mut kept = Kept::default();
         let now = 100 * DAY;
+        let markets = ["hbo@FI".to_owned(), "netflix@FI".to_owned()];
         keep_added(
             &mut kept,
-            "hbo@FI",
+            &markets,
             vec![("hbo@FI".into(), at("Old", 1, now - 40 * DAY))],
             now - 10 * DAY,
         );
         keep_added(
             &mut kept,
-            "hbo@FI",
+            &markets,
             vec![("hbo@FI".into(), at("Newer", 2, now - DAY)), ("hbo@FI".into(), at("Newer again", 2, now))],
             now,
         );
         let titles: Vec<&str> = kept.added["hbo@FI"].iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, vec!["Newer"], "a repeat is dropped and an addition past a month ages out");
-        assert_eq!(kept.added_until["hbo@FI"], now);
+        assert_eq!(
+            kept.added["netflix@FI"],
+            vec![],
+            "a market read with nothing added is kept as nothing added"
+        );
+    }
+
+    #[test]
+    fn a_read_the_pages_did_not_finish_resumes_from_its_last_change() {
+        let now = 100 * DAY;
+        let since = now - DAY;
+        let read = vec![
+            ("netflix@US".to_owned(), at("A", 1, since + 50)),
+            ("hulu@US".to_owned(), at("B", 2, since + 90)),
+        ];
+        assert_eq!(read_until(&read, true, since, now), now, "a finished read is read up to now");
+        assert_eq!(
+            read_until(&read, false, since, now),
+            since + 90,
+            "an unfinished one from its last change"
+        );
+        assert_eq!(read_until(&[], false, since, now), since, "nothing read, nothing gained");
+        let stuck = vec![("netflix@US".to_owned(), at("A", 1, since))];
+        assert_eq!(read_until(&stuck, false, since, now), since + 1, "a page all at `since` still moves on");
+    }
+
+    #[test]
+    fn a_service_is_served_its_additions_only_once_they_have_been_read() {
+        let motn = Motn::new(None, None);
+        {
+            let mut kept = lock(&motn.kept);
+            kept.added_until.insert("FI".into(), now());
+            kept.added.insert("netflix@FI".into(), vec![at("New", 1, now())]);
+        }
+        assert_eq!(motn.added(&provider("netflix"), "fi").map(|a| a.len()), Some(1));
+        assert_eq!(motn.added(&provider("hbo"), "fi"), None, "not read yet, so JustWatch's row stands");
     }
 
     #[test]
