@@ -70,6 +70,10 @@ const PROVIDERS: &[Provider] = &[
         motn: "skyshowtime",
     },
     Provider { code: "hlu", id: "jw-hlu", name: "Popular on Hulu", package_ids: &[15], motn: "hulu" },
+    // Services Movie of the Night doesn't list: their rows are JustWatch's alone.
+    Provider { code: "vip", id: "jw-vip", name: "Popular on Viaplay", package_ids: &[76], motn: "" },
+    Provider { code: "tv4", id: "jw-tv4", name: "Popular on TV4 Play", package_ids: &[1944], motn: "" },
+    Provider { code: "mp9", id: "jw-mp9", name: "Popular on Movistar Plus+", package_ids: &[2241], motn: "" },
 ];
 
 pub const NEW_SUFFIX: &str = "-new";

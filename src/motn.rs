@@ -26,11 +26,12 @@ const DAY: i64 = 86_400;
 const REFRESH_AFTER: i64 = DAY;
 /// How long a kept list is still served while it can't be refreshed.
 const SERVE_FOR: i64 = 7 * DAY;
-/// How far back the first look at a country's additions goes.
+/// How far back the first look at a market's additions goes.
 const FIRST_LOOK_BACK: i64 = 7 * DAY;
 /// How long an addition stays on its "New on" list.
 const KEEP_ADDED: i64 = 30 * DAY;
-/// Pages of additions one pass reads for a country, 25 changes each.
+/// Pages of additions one pass reads for a service in a country, 25 changes each. Per service rather than per country,
+/// so a service adding a hundred titles doesn't leave the country's others unread.
 const ADDED_PAGES: u32 = 4;
 /// A market nobody has asked for in this long is no longer fetched.
 const WANTED_FOR: i64 = 30 * DAY;
@@ -83,7 +84,7 @@ struct Kept {
     top: BTreeMap<String, (i64, Vec<Show>)>,
     /// Each market's additions, newest first.
     added: BTreeMap<String, Vec<Show>>,
-    /// Each country's additions are read up to this moment.
+    /// Each market's additions are read up to this moment.
     added_until: BTreeMap<String, i64>,
     /// The services each country offers, by the API's lowercase country code, and when they were read.
     services: BTreeMap<String, Vec<String>>,
@@ -141,12 +142,12 @@ impl Motn {
         (now() - at < SERVE_FOR).then(|| shows.clone())
     }
 
-    /// What was added to the service in the country, newest first; `None` when the country's additions aren't kept or
-    /// are too old. An empty list is an answer: nothing was added.
+    /// What was added to the service in the country, newest first; `None` when its additions aren't kept or are too
+    /// old. An empty list is an answer: nothing was added.
     pub fn added(&self, provider: &Provider, country: &str) -> Option<Vec<Show>> {
         let market = market(provider, country)?;
         let kept = lock(&self.kept);
-        let until = kept.added_until.get(market_country(&market))?;
+        let until = kept.added_until.get(&market)?;
         (now() - until < SERVE_FOR).then(|| kept.added.get(&market).cloned().unwrap_or_default())
     }
 
@@ -223,18 +224,18 @@ impl Motn {
             lock(&self.kept).top.insert(market.clone(), (now, shows));
         }
 
-        let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
-        for &country in &countries {
+        for market in &wanted {
             let since =
-                lock(&self.kept).added_until.get(country).copied().unwrap_or(0).max(now - FIRST_LOOK_BACK);
+                lock(&self.kept).added_until.get(market).copied().unwrap_or(0).max(now - FIRST_LOOK_BACK);
             if now - since < REFRESH_AFTER {
                 continue;
             }
-            let catalogs = services_in(&wanted, country, None);
-            if let Some(read) = self.changes(country, "new", &catalogs, since, now, ADDED_PAGES).await {
-                keep_added(&mut lock(&self.kept), country, read, now);
+            let (service, country) = (market_service(market), market_country(market));
+            if let Some(read) = self.changes(country, "new", &[service], since, now, ADDED_PAGES).await {
+                keep_added(&mut lock(&self.kept), market, read, now);
             }
         }
+        let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
         for &country in &countries {
             if lock(&self.kept).soon_at.get(country).is_some_and(|at| now - at < SOON_AFTER) {
                 continue;
@@ -444,22 +445,18 @@ fn changed(page: &serde_json::Value, country: &str) -> Vec<(String, Show)> {
         .unwrap_or_default()
 }
 
-/// Fold a country's newly read additions into what is kept: each title once per market, newest first, and nothing
-/// older than `KEEP_ADDED`.
-fn keep_added(kept: &mut Kept, country: &str, read: Vec<(String, Show)>, now: i64) {
-    for (market, show) in read {
-        let list = kept.added.entry(market).or_default();
+/// Fold a market's newly read additions into what is kept: each title once, newest first, and nothing older than
+/// `KEEP_ADDED`.
+fn keep_added(kept: &mut Kept, market: &str, read: Vec<(String, Show)>, now: i64) {
+    let list = kept.added.entry(market.to_owned()).or_default();
+    for (_, show) in read {
         if !list.iter().any(|held| held.series == show.series && held.tmdb == show.tmdb) {
             list.push(show);
         }
     }
-    for (market, list) in kept.added.iter_mut() {
-        if market_country(market) == country {
-            list.retain(|s| s.at.is_none_or(|at| now - at < KEEP_ADDED));
-            list.sort_by_key(|s| std::cmp::Reverse(s.at.unwrap_or(0)));
-        }
-    }
-    kept.added_until.insert(country.to_owned(), now);
+    list.retain(|s| s.at.is_none_or(|at| now - at < KEEP_ADDED));
+    list.sort_by_key(|s| std::cmp::Reverse(s.at.unwrap_or(0)));
+    kept.added_until.insert(market.to_owned(), now);
 }
 
 /// Replace a country's leaving or coming lists with what was just read: each title once per market, soonest first,
@@ -572,16 +569,21 @@ mod tests {
     fn additions_are_kept_once_newest_first_for_a_month() {
         let mut kept = Kept::default();
         let now = 100 * DAY;
-        keep_added(&mut kept, "FI", vec![("hbo@FI".into(), at("Old", 1, now - 40 * DAY))], now - 10 * DAY);
         keep_added(
             &mut kept,
-            "FI",
+            "hbo@FI",
+            vec![("hbo@FI".into(), at("Old", 1, now - 40 * DAY))],
+            now - 10 * DAY,
+        );
+        keep_added(
+            &mut kept,
+            "hbo@FI",
             vec![("hbo@FI".into(), at("Newer", 2, now - DAY)), ("hbo@FI".into(), at("Newer again", 2, now))],
             now,
         );
         let titles: Vec<&str> = kept.added["hbo@FI"].iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, vec!["Newer"], "a repeat is dropped and an addition past a month ages out");
-        assert_eq!(kept.added_until["FI"], now);
+        assert_eq!(kept.added_until["hbo@FI"], now);
     }
 
     #[test]
