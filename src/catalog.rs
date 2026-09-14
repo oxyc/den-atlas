@@ -79,6 +79,27 @@ pub fn new_catalog_id(provider: &Provider) -> String {
     format!("{}{}", provider.id, NEW_SUFFIX)
 }
 
+pub const LEAVING_SUFFIX: &str = "-leaving";
+pub const COMING_SUFFIX: &str = "-coming";
+
+/// A row of what is about to change on a service, which only Movie of the Night knows (`motn.rs`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Soon {
+    Leaving,
+    Coming,
+}
+
+/// Resolve a leaving or coming catalog id to its provider.
+fn resolve_soon<'a>(catalog_id: &str, providers: &[&'a Provider]) -> Option<(&'a Provider, Soon)> {
+    let (base, soon) = match (catalog_id.strip_suffix(LEAVING_SUFFIX), catalog_id.strip_suffix(COMING_SUFFIX))
+    {
+        (Some(base), _) => (base, Soon::Leaving),
+        (_, Some(base)) => (base, Soon::Coming),
+        _ => return None,
+    };
+    providers.iter().find(|p| p.id == base && !p.motn.is_empty()).map(|p| (*p, soon))
+}
+
 /// Resolve a catalog id to a provider + whether it's the arrivals variant.
 pub fn resolve_catalog<'a>(catalog_id: &str, providers: &[&'a Provider]) -> Option<(&'a Provider, bool)> {
     if let Some(base) = catalog_id.strip_suffix(NEW_SUFFIX) {
@@ -128,8 +149,9 @@ pub struct CatalogEntry {
 }
 
 /// The manifest `catalogs[]` for a given provider set — one per provider × type, plus "Trending
-/// Everywhere" × type. Empty when no providers are selected (the feature is off for that install).
-pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
+/// Everywhere" × type. Empty when no providers are selected (the feature is off for that install). With `soon` —
+/// Movie of the Night on — a service it lists also gets "Leaving <service> Soon" and "Coming to <service>".
+pub fn catalog_entries(providers: &[&'static Provider], soon: bool) -> Vec<CatalogEntry> {
     if providers.is_empty() {
         return Vec::new();
     }
@@ -157,6 +179,21 @@ pub fn catalog_entries(providers: &[&'static Provider]) -> Vec<CatalogEntry> {
                 name: format!("New on {}", p.name.trim_start_matches("Popular on ")),
                 package_ids: p.package_ids,
             });
+            if soon && !p.motn.is_empty() {
+                let service = p.name.trim_start_matches("Popular on ");
+                out.push(CatalogEntry {
+                    type_: t,
+                    id: format!("{}{LEAVING_SUFFIX}", p.id),
+                    name: format!("Leaving {service} Soon"),
+                    package_ids: p.package_ids,
+                });
+                out.push(CatalogEntry {
+                    type_: t,
+                    id: format!("{}{COMING_SUFFIX}", p.id),
+                    name: format!("Coming to {service}"),
+                    package_ids: p.package_ids,
+                });
+            }
         }
     }
     out
@@ -334,6 +371,18 @@ impl CatalogState {
         providers: &[&'static Provider],
     ) -> Option<CatalogResponse> {
         let obj = ObjectType::from_stremio(stremio_type)?;
+        // Leaving and coming rows are Movie of the Night's alone: read straight from what it keeps, soonest first.
+        if let Some((provider, soon)) = resolve_soon(catalog_id, providers) {
+            let motn = self.motn.as_ref().filter(|motn| motn.enabled())?;
+            motn.want(provider, country);
+            let shows = match soon {
+                Soon::Leaving => motn.leaving(provider, country),
+                Soon::Coming => motn.coming(provider, country),
+            };
+            let items = motn::trending(&shows.unwrap_or_default(), matches!(obj, ObjectType::Show));
+            let body = render_metas(&items, stremio_type);
+            return Some(CatalogResponse { body, fresh: true, upstream: None, stale: false });
+        }
         let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
         let resolved = resolve_catalog(catalog_id, providers);
         if !is_trending && resolved.is_none() {
@@ -889,7 +938,7 @@ mod tests {
 
     #[test]
     fn catalog_entries_cover_providers_and_trending() {
-        let entries = catalog_entries(selected_providers());
+        let entries = catalog_entries(selected_providers(), false);
         assert!(entries
             .iter()
             .any(|e| e.id == "jw-nfx" && e.type_ == "movie" && e.name == "Popular on Netflix"));
@@ -901,7 +950,7 @@ mod tests {
 
     #[test]
     fn arrivals_catalog_per_provider_is_named_from_the_provider() {
-        let entries = catalog_entries(selected_providers());
+        let entries = catalog_entries(selected_providers(), false);
         // "New on Netflix" is derived from "Popular on Netflix" — adding a service needs only its
         // PROVIDERS row, no second name to keep in sync.
         assert!(entries
@@ -987,7 +1036,23 @@ mod tests {
 
     #[test]
     fn empty_provider_set_yields_no_catalog_entries() {
-        assert!(catalog_entries(&[]).is_empty());
+        assert!(catalog_entries(&[], true).is_empty());
+    }
+
+    #[test]
+    fn leaving_and_coming_rows_exist_only_with_movie_of_the_night_and_resolve_to_their_service() {
+        let entries = catalog_entries(selected_providers(), true);
+        assert!(entries.iter().any(|e| e.id == "jw-nfx-leaving" && e.name == "Leaving Netflix Soon"));
+        assert!(entries.iter().any(|e| e.id == "jw-hlu-coming" && e.name == "Coming to Hulu"));
+        assert!(!catalog_entries(selected_providers(), false).iter().any(|e| e.id.ends_with(LEAVING_SUFFIX)));
+        let ps = selected_providers();
+        assert_eq!(resolve_soon("jw-dnp-coming", ps).map(|(p, s)| (p.code, s)), Some(("dnp", Soon::Coming)));
+        assert_eq!(
+            resolve_soon("jw-nfx-leaving", ps).map(|(p, s)| (p.code, s)),
+            Some(("nfx", Soon::Leaving))
+        );
+        assert!(resolve_soon("jw-nfx", ps).is_none());
+        assert!(resolve_catalog("jw-nfx-leaving", ps).is_none(), "a leaving row is never a JustWatch row");
     }
 
     /// The aggregate row is a union over the install's OWN provider selection, so the selection is

@@ -1,7 +1,8 @@
 //! Movie of the Night's Streaming Availability API (`MOTN_KEY`): each service's real daily Top 10, and the titles
 //! added to it, per country. JustWatch's "Popular on <service>" ranks by what people click on JustWatch and mixes old
 //! catalogue in, so it matched nothing a service shows its own viewers; these lists lead those rows, and a billboard
-//! reads a Top 10 place as attention.
+//! reads a Top 10 place as attention. What is leaving a service or coming to it in the next month fills rows of its
+//! own, which JustWatch has no list for.
 //!
 //! The free plan allows 1,000 requests a month, so nothing here is asked on a request's behalf. A request only says
 //! which service in which country a household wants (`Motn::want`). A background pass (`refresh_forever`) fetches
@@ -38,6 +39,14 @@ const SERVICES_AFTER: i64 = 7 * DAY;
 /// How often a pass looks for what is due. A pass with nothing due asks nothing, so a market a household has just
 /// asked for is fetched within minutes rather than the hour.
 const PASS_EVERY: Duration = Duration::from_secs(600);
+/// How often a country's leaving and coming lists are read again: they look a month ahead and change slowly.
+const SOON_AFTER: i64 = 3 * DAY;
+/// How far ahead leaving and coming lists look; the API allows 31 days.
+const SOON_AHEAD: i64 = 30 * DAY;
+/// Pages of leaving or coming titles one pass reads for a country.
+const SOON_PAGES: u32 = 2;
+/// The services the API knows what is coming to.
+const UPCOMING: &[&str] = &["netflix", "prime", "disney", "apple", "hbo"];
 /// The services the API has a Top 10 for.
 const CHARTED: &[&str] = &["netflix", "prime", "disney", "apple", "hbo", "hulu"];
 /// Countries the API doesn't cover, read as a neighbour whose catalogs are nearly the same: Argentina's Netflix Top 10
@@ -56,13 +65,20 @@ pub struct Show {
     pub year: Option<i64>,
     /// The API's 0–100 score as a 0–10 rating; `None` when it has none.
     pub rating: Option<f64>,
-    /// When it was added to the service, for an addition.
-    pub added: Option<i64>,
+    /// When it was added to the service, leaves it or comes to it, for a change.
+    #[serde(alias = "added")]
+    pub at: Option<i64>,
 }
 
 /// What the passes have fetched. A market is `service@COUNTRY`, the country after `STAND_INS`.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct Kept {
+    /// Each market's titles leaving within `SOON_AHEAD`, soonest first, and those coming.
+    leaving: BTreeMap<String, Vec<Show>>,
+    coming: BTreeMap<String, Vec<Show>>,
+    /// When each country's leaving and coming lists were read.
+    soon_at: BTreeMap<String, i64>,
     /// Each market's Top 10, and when it was fetched.
     top: BTreeMap<String, (i64, Vec<Show>)>,
     /// Each market's additions, newest first.
@@ -134,6 +150,29 @@ impl Motn {
         (now() - until < SERVE_FOR).then(|| kept.added.get(&market).cloned().unwrap_or_default())
     }
 
+    /// The service's titles leaving the country within a month, soonest first; `None` when that country's lists
+    /// aren't kept or are too old.
+    pub fn leaving(&self, provider: &Provider, country: &str) -> Option<Vec<Show>> {
+        self.soon(provider, country, |kept| &kept.leaving)
+    }
+
+    /// The titles coming to the service in the country within a month, soonest first; as `leaving`.
+    pub fn coming(&self, provider: &Provider, country: &str) -> Option<Vec<Show>> {
+        self.soon(provider, country, |kept| &kept.coming)
+    }
+
+    fn soon(
+        &self,
+        provider: &Provider,
+        country: &str,
+        lists: fn(&Kept) -> &BTreeMap<String, Vec<Show>>,
+    ) -> Option<Vec<Show>> {
+        let market = market(provider, country)?;
+        let kept = lock(&self.kept);
+        let at = kept.soon_at.get(market_country(&market))?;
+        (now() - at < SERVE_FOR).then(|| lists(&kept).get(&market).cloned().unwrap_or_default())
+    }
+
     pub async fn refresh_forever(self: Arc<Self>) {
         loop {
             self.pass(now()).await;
@@ -155,7 +194,7 @@ impl Motn {
             return;
         }
         if services_due {
-            if let Some(countries) = self.ask("/countries?output_language=en", now).await {
+            if let Some(countries) = self.ask("/countries?output_language=en").await {
                 let services = offered_services(&countries);
                 if !services.is_empty() {
                     let mut kept = lock(&self.kept);
@@ -176,7 +215,7 @@ impl Motn {
                 market_country(market).to_ascii_lowercase(),
                 market_service(market)
             );
-            let Some(answer) = self.ask(&path, now).await else { continue };
+            let Some(answer) = self.ask(&path).await else { continue };
             let shows = answer
                 .as_array()
                 .map(|a| a.iter().filter_map(|s| show(s, None)).collect())
@@ -185,43 +224,72 @@ impl Motn {
         }
 
         let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
-        for country in countries {
+        for &country in &countries {
             let since =
                 lock(&self.kept).added_until.get(country).copied().unwrap_or(0).max(now - FIRST_LOOK_BACK);
             if now - since < REFRESH_AFTER {
                 continue;
             }
-            let catalogs: Vec<&str> =
-                wanted.iter().filter(|m| market_country(m) == country).map(|m| market_service(m)).collect();
-            let mut read: Vec<(String, Show)> = Vec::new();
-            let mut cursor: Option<String> = None;
-            let mut answered = false;
-            for _ in 0..ADDED_PAGES {
-                let path = format!(
-                    "/changes?country={}&change_type=new&item_type=show&catalogs={}&from={since}&to={now}{}",
-                    country.to_ascii_lowercase(),
-                    catalogs.join(","),
-                    cursor.as_deref().map(|c| format!("&cursor={c}")).unwrap_or_default()
-                );
-                let Some(page) = self.ask(&path, now).await else { break };
-                answered = true;
-                read.extend(additions(&page, country));
-                if page["hasMore"].as_bool() != Some(true) {
-                    break;
-                }
-                cursor = page["nextCursor"].as_str().map(str::to_owned);
-            }
-            if answered {
+            let catalogs = services_in(&wanted, country, None);
+            if let Some(read) = self.changes(country, "new", &catalogs, since, now, ADDED_PAGES).await {
                 keep_added(&mut lock(&self.kept), country, read, now);
             }
+        }
+        for &country in &countries {
+            if lock(&self.kept).soon_at.get(country).is_some_and(|at| now - at < SOON_AFTER) {
+                continue;
+            }
+            let all = services_in(&wanted, country, None);
+            let leaving = self.changes(country, "expiring", &all, now, now + SOON_AHEAD, SOON_PAGES).await;
+            let upcoming = services_in(&wanted, country, Some(UPCOMING));
+            let coming = if upcoming.is_empty() {
+                Some(Vec::new())
+            } else {
+                self.changes(country, "upcoming", &upcoming, now, now + SOON_AHEAD, SOON_PAGES).await
+            };
+            let (Some(leaving), Some(coming)) = (leaving, coming) else { continue };
+            let mut kept = lock(&self.kept);
+            keep_soon(&mut kept.leaving, country, leaving);
+            keep_soon(&mut kept.coming, country, coming);
+            kept.soon_at.insert(country.to_owned(), now);
         }
         self.save();
     }
 
+    /// A country's changes of one kind to `catalogs` between `from` and `to`, by market, over at most `pages` pages;
+    /// `None` when not even the first page could be had.
+    async fn changes(
+        &self,
+        country: &str,
+        kind: &str,
+        catalogs: &[&str],
+        from: i64,
+        to: i64,
+        pages: u32,
+    ) -> Option<Vec<(String, Show)>> {
+        let mut read = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page_at in 0..pages {
+            let path = format!(
+                "/changes?country={}&change_type={kind}&item_type=show&catalogs={}&from={from}&to={to}{}",
+                country.to_ascii_lowercase(),
+                catalogs.join(","),
+                cursor.as_deref().map(|c| format!("&cursor={c}")).unwrap_or_default()
+            );
+            let Some(page) = self.ask(&path).await else { return (page_at > 0).then_some(read) };
+            read.extend(changed(&page, country));
+            if page["hasMore"].as_bool() != Some(true) {
+                break;
+            }
+            cursor = page["nextCursor"].as_str().map(str::to_owned);
+        }
+        Some(read)
+    }
+
     /// One request, if the day's budget allows it; `None` on any failure, which is logged.
-    async fn ask(&self, path: &str, now: i64) -> Option<serde_json::Value> {
+    async fn ask(&self, path: &str) -> Option<serde_json::Value> {
         let key = self.key.as_deref()?;
-        if !spend(&mut lock(&self.kept), now) {
+        if !spend(&mut lock(&self.kept), now()) {
             eprintln!("motn: the day's {DAILY_REQUESTS} requests are spent; {path} waits for tomorrow");
             return None;
         }
@@ -293,6 +361,16 @@ fn market_country(market: &str) -> &str {
     market.split_once('@').map_or("", |(_, country)| country)
 }
 
+/// The services wanted in a country, only those in `only` when given.
+fn services_in<'a>(wanted: &'a [String], country: &str, only: Option<&[&str]>) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .filter(|m| market_country(m) == country)
+        .map(|m| market_service(m))
+        .filter(|service| only.is_none_or(|only| only.contains(service)))
+        .collect()
+}
+
 /// Whether the API offers the market's service in its country, as last read; unknown until then.
 fn offered(services: &BTreeMap<String, Vec<String>>, market: &str) -> bool {
     services
@@ -332,7 +410,7 @@ fn spend(kept: &mut Kept, now: i64) -> bool {
 }
 
 /// A show object as a `Show`; `None` without a TMDB id or title.
-fn show(value: &serde_json::Value, added: Option<i64>) -> Option<Show> {
+fn show(value: &serde_json::Value, at: Option<i64>) -> Option<Show> {
     let (kind, id) = value["tmdbId"].as_str()?.split_once('/')?;
     Some(Show {
         series: kind == "tv",
@@ -341,12 +419,13 @@ fn show(value: &serde_json::Value, added: Option<i64>) -> Option<Show> {
         title: value["title"].as_str()?.to_owned(),
         year: value["releaseYear"].as_i64().or_else(|| value["firstAirYear"].as_i64()),
         rating: value["rating"].as_f64().filter(|r| *r > 0.0).map(|r| r / 10.0),
-        added,
+        at,
     })
 }
 
-/// A `/changes` page's additions to a subscription, by market. A title to rent or buy isn't on a service.
-fn additions(page: &serde_json::Value, country: &str) -> Vec<(String, Show)> {
+/// A `/changes` page's changes to a subscription, by market, each dated when the page dates it. A title to rent or
+/// buy isn't on a service.
+fn changed(page: &serde_json::Value, country: &str) -> Vec<(String, Show)> {
     page["changes"]
         .as_array()
         .map(|changes| {
@@ -376,11 +455,28 @@ fn keep_added(kept: &mut Kept, country: &str, read: Vec<(String, Show)>, now: i6
     }
     for (market, list) in kept.added.iter_mut() {
         if market_country(market) == country {
-            list.retain(|s| s.added.is_none_or(|at| now - at < KEEP_ADDED));
-            list.sort_by_key(|s| std::cmp::Reverse(s.added.unwrap_or(0)));
+            list.retain(|s| s.at.is_none_or(|at| now - at < KEEP_ADDED));
+            list.sort_by_key(|s| std::cmp::Reverse(s.at.unwrap_or(0)));
         }
     }
     kept.added_until.insert(country.to_owned(), now);
+}
+
+/// Replace a country's leaving or coming lists with what was just read: each title once per market, soonest first,
+/// and one the API gave no date last.
+fn keep_soon(lists: &mut BTreeMap<String, Vec<Show>>, country: &str, read: Vec<(String, Show)>) {
+    lists.retain(|market, _| market_country(market) != country);
+    for (market, show) in read {
+        let list = lists.entry(market).or_default();
+        if !list.iter().any(|held| held.series == show.series && held.tmdb == show.tmdb) {
+            list.push(show);
+        }
+    }
+    for (market, list) in lists.iter_mut() {
+        if market_country(market) == country {
+            list.sort_by_key(|s| s.at.unwrap_or(i64::MAX));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +487,7 @@ mod tests {
         Provider { code: "x", id: "jw-x", name: "Popular on X", package_ids: &[], motn }
     }
 
-    fn at(title: &str, tmdb: u32, added: i64) -> Show {
+    fn at(title: &str, tmdb: u32, when: i64) -> Show {
         Show {
             series: false,
             tmdb,
@@ -399,8 +495,41 @@ mod tests {
             title: title.into(),
             year: None,
             rating: None,
-            added: Some(added),
+            at: Some(when),
         }
+    }
+
+    #[test]
+    fn leaving_and_coming_lists_are_replaced_per_country_soonest_first() {
+        let mut lists = BTreeMap::from([
+            ("netflix@FI".to_owned(), vec![at("Gone by now", 1, 5)]),
+            ("netflix@US".to_owned(), vec![at("Another country", 2, 5)]),
+        ]);
+        let undated = Show { at: None, ..at("Some day", 3, 0) };
+        keep_soon(
+            &mut lists,
+            "FI",
+            vec![
+                ("netflix@FI".into(), undated),
+                ("netflix@FI".into(), at("Friday", 4, 300)),
+                ("netflix@FI".into(), at("Tomorrow", 5, 100)),
+                ("netflix@FI".into(), at("Tomorrow again", 5, 100)),
+            ],
+        );
+        let titles: Vec<&str> = lists["netflix@FI"].iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["Tomorrow", "Friday", "Some day"]);
+        assert_eq!(lists["netflix@US"].len(), 1, "another country's list is left as it was");
+    }
+
+    #[test]
+    fn a_file_kept_before_leaving_and_coming_lists_still_reads() {
+        let kept: Kept = serde_json::from_str(
+            r#"{"top":{},"added":{"hbo@FI":[{"series":false,"tmdb":1,"imdb":null,"title":"A","year":null,
+                "rating":null,"added":7}]},"added_until":{},"services":{},"services_at":0,"wanted":{},"spent":[0,0]}"#,
+        )
+        .unwrap();
+        assert_eq!(kept.added["hbo@FI"][0].at, Some(7));
+        assert!(kept.leaving.is_empty());
     }
 
     #[test]
@@ -416,14 +545,11 @@ mod tests {
                 title: "Death of the Pastor's Wife".into(),
                 year: Some(2026),
                 rating: Some(6.9),
-                added: None,
+                at: None,
             })
         );
         let unrated = serde_json::json!({"tmdbId": "movie/860508", "title": "The Whisper Man", "rating": 0});
-        assert_eq!(
-            show(&unrated, Some(5)).map(|s| (s.series, s.rating, s.added)),
-            Some((false, None, Some(5)))
-        );
+        assert_eq!(show(&unrated, Some(5)).map(|s| (s.series, s.rating, s.at)), Some((false, None, Some(5))));
         assert_eq!(show(&serde_json::json!({"title": "No id"}), None), None);
     }
 
@@ -437,9 +563,9 @@ mod tests {
             ],
             "shows": {"1": {"tmdbId": "movie/752", "title": "V for Vendetta"}, "2": {"tmdbId": "movie/1", "title": "Rented"}}
         });
-        let read = additions(&page, "AR");
+        let read = changed(&page, "AR");
         assert_eq!(read.len(), 1, "a rental and a change without its show are left out");
-        assert_eq!((read[0].0.as_str(), read[0].1.tmdb, read[0].1.added), ("netflix@AR", 752, Some(100)));
+        assert_eq!((read[0].0.as_str(), read[0].1.tmdb, read[0].1.at), ("netflix@AR", 752, Some(100)));
     }
 
     #[test]

@@ -215,7 +215,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return serve_json(
             &method,
             &headers,
-            manifest_json(&config, state.titles.is_some()),
+            manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
             "public, max-age=3600, stale-while-revalidate=600",
             None,
             false,
