@@ -785,16 +785,46 @@ fn features(
         }
     }
 
-    // An upper bound on runtime, from a parameter, so it drops. Only on FILMS: Wikidata states a series'
-    // runtime per EPISODE, so "under 90 minutes" would read a 45-minute drama as a short film and a
-    // 20-episode season as shorter than a feature. A series is left unjudged rather than judged wrongly.
+    // The original language, from a parameter, so it drops. 93.5% coverage, and the caller meant exactly
+    // this — unlike a demonym read from prose, which is why that one only discounts.
+    //
+    // Applied HERE and not only in the facet lane: the source-kind, label and semantic lanes propose titles
+    // of their own, and without this `?q=based on a book&language=es` answered with Fight Club and Shawshank
+    // — the filter was building a candidate set nobody was checking against.
+    if let Some(want) = parsed.facet.language.as_deref() {
+        let known: Vec<String> = facets
+            .and_then(|f| f.language)
+            .map(|code| String::from_utf8_lossy(&code).to_string())
+            .into_iter()
+            .chain(
+                record
+                    .map(|r| {
+                        r.languages.iter().map(|c| String::from_utf8_lossy(c).to_string()).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+            )
+            .collect();
+        if known.is_empty() {
+            phi *= UNKNOWN_FACET;
+        } else if !known.iter().any(|code| code.eq_ignore_ascii_case(want)) {
+            return None;
+        }
+    }
+
+    // An upper bound on runtime, from a parameter, so it drops — on FILMS. Wikidata states a series' runtime
+    // per EPISODE, so the same number means a 45-minute drama episode and not a short film; a 20-episode
+    // season is not shorter than a feature.
+    //
+    // A series is therefore DISCOUNTED rather than passed free. Leaving it unjudged looked like the humble
+    // choice and was the wrong one: with every long film dropped, `runtime_max=95` answered with Chernobyl,
+    // Sherlock and Dexter — series outranking the films the question was about. Unknown must cost something,
+    // or it wins by default.
     if let Some(max) = parsed.runtime_max {
-        if key.0 == MediaType::Movie {
-            match record.and_then(|r| r.runtime_minutes) {
-                Some(minutes) if minutes > max => return None,
-                Some(_) => {}
-                None => phi *= UNKNOWN_FACET,
-            }
+        match record.and_then(|r| r.runtime_minutes) {
+            _ if key.0 != MediaType::Movie => phi *= UNKNOWN_FACET,
+            Some(minutes) if minutes > max => return None,
+            Some(_) => {}
+            None => phi *= UNKNOWN_FACET,
         }
     }
 
