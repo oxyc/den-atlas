@@ -187,6 +187,8 @@ pub struct Parsed {
     /// The whole query as titles are compared with it.
     title_query: TitleQuery,
     facet: FacetQuery,
+    /// An upper bound on runtime, from a parameter. Minutes.
+    runtime_max: Option<u32>,
     /// Whether the year window was GIVEN by the caller rather than read out of the words.
     ///
     /// Only an explicit parameter may drop a title. A facet guessed from prose may discount, never erase:
@@ -245,6 +247,17 @@ impl Parsed {
     }
 
     /// Set the release-year window from a caller that computed it, overriding whatever the text implied.
+    /// The original language, ISO 639-1. A parameter only, so it DROPS a title on record in another —
+    /// coverage is 93.5%, and unlike a demonym read from prose the caller meant exactly this.
+    pub fn set_language(&mut self, code: &str) {
+        self.facet.language = Some(code.to_ascii_lowercase());
+    }
+
+    /// An upper bound on runtime in minutes. Answers "something short tonight", which atlas could not.
+    pub fn set_runtime_max(&mut self, minutes: u32) {
+        self.runtime_max = Some(minutes);
+    }
+
     pub fn set_year_min(&mut self, year: u16) {
         self.facet.year_min = Some(year);
         self.year_from_param = true;
@@ -367,6 +380,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         labels,
         plot,
         source_kinds,
+        runtime_max: None,
         year_from_param: false,
         people,
         makers,
@@ -441,9 +455,10 @@ pub fn answer(
     // `FACET_LANE` join the candidates.
     let facet_titles: Option<Vec<Key>> =
         indexes.facets.as_ref().filter(|_| parsed.facet.has_strong_facet()).map(|f| {
-            f.filter_years(
+            f.filter_all(
                 parsed.facet.media_type,
                 parsed.facet.country,
+                parsed.facet.language.as_deref(),
                 parsed.facet.decade,
                 parsed.facet.year_min,
                 parsed.facet.year_max,
@@ -668,6 +683,8 @@ pub fn answer(
             "basedOnKind": SourceKinds::names(parsed.source_kinds),
             "yearMin": parsed.facet.year_min,
             "yearMax": parsed.facet.year_max,
+            "language": parsed.facet.language,
+            "runtimeMax": parsed.runtime_max,
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
         },
@@ -740,6 +757,19 @@ fn features(
             phi *= WRONG_TEXT_FACET;
         }
     }
+    // An upper bound on runtime, from a parameter, so it drops. Only on FILMS: Wikidata states a series'
+    // runtime per EPISODE, so "under 90 minutes" would read a 45-minute drama as a short film and a
+    // 20-episode season as shorter than a feature. A series is left unjudged rather than judged wrongly.
+    if let Some(max) = parsed.runtime_max {
+        if key.0 == MediaType::Movie {
+            match record.and_then(|r| r.runtime_minutes) {
+                Some(minutes) if minutes > max => return None,
+                Some(_) => {}
+                None => phi *= UNKNOWN_FACET,
+            }
+        }
+    }
+
     // The release-year window. Same rule as country and decade: a title ON RECORD outside it is not what was
     // asked for; one with no year at all is unknown, and unknown is not a mismatch.
     if parsed.facet.year_min.is_some() || parsed.facet.year_max.is_some() {

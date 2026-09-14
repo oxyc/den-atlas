@@ -34,6 +34,12 @@ pub struct FacetIndex {
     /// (type, tmdb id) → row; the first row wins a duplicate, as in the labels index.
     by_title: HashMap<(MediaType, u32), u32>,
     by_country: HashMap<[u8; 2], Vec<u32>>,
+    /// ISO 639-1 → its titles. The blob has carried the byte since DFI2; nothing could ask for it.
+    ///
+    /// Country is not a usable stand-in. Over the corpus, 1,138 Spanish-LANGUAGE titles are made outside
+    /// Spain — 53% of its Spanish-language cinema — and asking for "spanish" as a country loses every
+    /// Mexican, Argentine, Chilean and Colombian film. The two facts are genuinely different questions.
+    by_language: HashMap<[u8; 2], Vec<u32>>,
     by_decade: HashMap<u16, Vec<u32>>,
     by_type: HashMap<MediaType, Vec<u32>>,
 }
@@ -52,6 +58,7 @@ impl FacetIndex {
             by_title: HashMap::with_capacity(count),
             by_country: HashMap::new(),
             by_decade: HashMap::new(),
+            by_language: HashMap::new(),
             by_type: HashMap::new(),
         };
         for (position, r) in records.as_chunks::<RECORD>().0.iter().enumerate() {
@@ -61,6 +68,11 @@ impl FacetIndex {
             let year = u16::from_le_bytes([r[9], r[10]]);
             if country != [0, 0] {
                 index.by_country.entry(country).or_default().push(position);
+            }
+            // TMDB writes `xx` for "no language"; that is an absence, not a language.
+            let language = [r[5].to_ascii_lowercase(), r[6].to_ascii_lowercase()];
+            if language != [0, 0] && &language != b"xx" {
+                index.by_language.entry(language).or_default().push(position);
             }
             if year >= 1870 {
                 index.by_decade.entry(year / 10 * 10).or_default().push(position);
@@ -126,11 +138,29 @@ impl FacetIndex {
         year_min: Option<u16>,
         year_max: Option<u16>,
     ) -> Vec<(u32, MediaType)> {
+        self.filter_all(media_type, country, None, decade, year_min, year_max)
+    }
+
+    /// As `filter_years`, and by original language.
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_all(
+        &self,
+        media_type: Option<MediaType>,
+        country: Option<&str>,
+        language: Option<&str>,
+        decade: Option<u16>,
+        year_min: Option<u16>,
+        year_max: Option<u16>,
+    ) -> Vec<(u32, MediaType)> {
         let empty: &[u32] = &[];
         let mut sets: Vec<&[u32]> = Vec::new();
         if let Some(country) = country {
             let key = country_key(country);
             sets.push(key.and_then(|k| self.by_country.get(&k)).map_or(empty, Vec::as_slice));
+        }
+        if let Some(language) = language {
+            let key = language_key(language);
+            sets.push(key.and_then(|k| self.by_language.get(&k)).map_or(empty, Vec::as_slice));
         }
         if let Some(decade) = decade {
             sets.push(self.by_decade.get(&decade).map_or(empty, Vec::as_slice));
@@ -160,6 +190,11 @@ impl FacetIndex {
     }
 }
 
+fn language_key(code: &str) -> Option<[u8; 2]> {
+    let bytes = code.as_bytes();
+    (bytes.len() == 2).then(|| [bytes[0].to_ascii_lowercase(), bytes[1].to_ascii_lowercase()])
+}
+
 fn country_key(code: &str) -> Option<[u8; 2]> {
     let bytes = code.as_bytes();
     (bytes.len() == 2).then(|| [bytes[0].to_ascii_uppercase(), bytes[1].to_ascii_uppercase()])
@@ -177,6 +212,9 @@ pub struct FacetQuery {
     pub media_type: Option<MediaType>,
     /// ISO 3166-1 alpha-2.
     pub country: Option<&'static str>,
+    /// ISO 639-1. Never read from prose — a demonym is as often a country as a language, and the corpus
+    /// says the guess is wrong about half the time — so this is set only by an explicit parameter.
+    pub language: Option<String>,
     /// The decade's first year, e.g. 1980.
     pub decade: Option<u16>,
     /// An inclusive release-year window. A bare year ("2019") sets both ends; "recent" and "new" set only
@@ -264,7 +302,11 @@ impl FacetQuery {
     /// A facet ordinary search can't express — a country or a decade. A bare type ("batman movies") is not
     /// one: title and theme search already cover it.
     pub fn has_strong_facet(&self) -> bool {
-        self.country.is_some() || self.decade.is_some() || self.year_min.is_some() || self.year_max.is_some()
+        self.country.is_some()
+            || self.language.is_some()
+            || self.decade.is_some()
+            || self.year_min.is_some()
+            || self.year_max.is_some()
     }
 }
 

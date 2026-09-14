@@ -777,6 +777,15 @@ async fn query_answer(
     if let Some(max) = query_param(query, "year_max").and_then(|v| v.parse().ok()) {
         parsed.set_year_max(max);
     }
+    // `language` is a parameter and never a word. A demonym read from prose picks the wrong axis about half
+    // the time — "spanish" as a country misses 1,138 Spanish-language titles made outside Spain — and only
+    // the caller knows which was meant.
+    if let Some(code) = query_param(query, "language").filter(|c| c.len() == 2) {
+        parsed.set_language(&code);
+    }
+    if let Some(minutes) = query_param(query, "runtime_max").and_then(|v| v.parse().ok()) {
+        parsed.set_runtime_max(minutes);
+    }
     let parsed_in = parsing.elapsed();
     let embedding = Instant::now();
     let unembedded = |e: String| eprintln!("search query left unembedded: {e}");

@@ -112,6 +112,9 @@ pub struct Record {
     pub based_on: Vec<u32>,
     /// What it was adapted from, as kinds rather than ids — the fact "based on a book" needs.
     pub source_kinds: SourceKinds,
+    /// Minutes (P2047). 91.4% of films carry one — but a SERIES' value is per EPISODE, not per series, so
+    /// "under 90 minutes" means something quite different for each and a caller must not treat them alike.
+    pub runtime_minutes: Option<u32>,
 }
 
 /// What a title was adapted from, folded to a closed vocabulary by the dataset (`basedOnKind`).
@@ -375,6 +378,7 @@ impl Facts {
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
                 broadcasters: entities(raw.broadcaster),
+                runtime_minutes: raw.runtime_minutes,
                 based_on: entities(raw.based_on),
                 source_kinds: SourceKinds(
                     raw.based_on_kind
@@ -526,6 +530,7 @@ struct RawRecord {
     titles: Option<RawTitles>,
     based_on: Option<Vec<String>>,
     based_on_kind: Option<Vec<String>>,
+    runtime_minutes: Option<u32>,
 }
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
