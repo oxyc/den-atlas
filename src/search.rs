@@ -189,6 +189,8 @@ pub struct Parsed {
     facet: FacetQuery,
     /// An upper bound on runtime, from a parameter. Minutes.
     runtime_max: Option<u32>,
+    /// A broadcaster's Q-id, from a parameter. Series-only.
+    broadcaster: Option<u32>,
     /// Whether the year window was GIVEN by the caller rather than read out of the words.
     ///
     /// Only an explicit parameter may drop a title. A facet guessed from prose may discount, never erase:
@@ -258,6 +260,11 @@ impl Parsed {
         self.runtime_max = Some(minutes);
     }
 
+    /// The network or service a series first aired on (P449), by Q-id.
+    pub fn set_broadcaster(&mut self, qid: u32) {
+        self.broadcaster = Some(qid);
+    }
+
     pub fn set_year_min(&mut self, year: u16) {
         self.facet.year_min = Some(year);
         self.year_from_param = true;
@@ -309,6 +316,17 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
     let mut source_kinds: u16 = 0;
     let mut people: Vec<u32> = Vec::new();
     let mut at = 0;
+    // A matcher that can only LIFT a title claims its facet without eating the word; one that decides which
+    // titles are eligible at all consumes it.
+    //
+    // Consuming everything was quietly expensive. `rest` is what the plot vectors are asked about and what
+    // sets λ, so a single word claimed by a boost-only table emptied both: `q=medieval` answered with the 43
+    // titles on that facet, led by the 2022 film *Medieval* and twelve of its neighbours, where `q=medieval
+    // knights` — one word longer, vectors alive — answered with A Knight's Tale. And since a non-exact title
+    // scores `t = score · λ`, `q=drama` gave EVERY fuzzy title match a score of zero.
+    //
+    // Genres, labels and plot facets only ever add weight, so nothing is lost by leaving their words in play;
+    // the facet still lifts, and the query still means what it says.
     'words: while at < tokens.len() {
         for span in (1..=MAX_PHRASE_WORDS.min(tokens.len() - at)).rev() {
             let phrase = tokens[at..at + span].join(" ");
@@ -322,19 +340,16 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
             for &(words, axis, value) in PLOT_PHRASES {
                 if words == phrase && !plot.contains(&(axis, value)) {
                     plot.push((axis, value));
-                    matched = true;
                 }
             }
             for &(words, genre) in GENRES {
                 if words == phrase && !genres.contains(&genre) {
                     genres.push(genre);
-                    matched = true;
                 }
             }
             for (folded, name, mood) in &label_names {
                 if *folded == phrase && !labels.iter().any(|(n, m)| n == name && m == mood) {
                     labels.push(((*name).to_owned(), *mood));
-                    matched = true;
                 }
             }
             // A one-word name ("Nolan", "Common") counts only as the whole query: inside a longer one it is more
@@ -381,6 +396,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         plot,
         source_kinds,
         runtime_max: None,
+        broadcaster: None,
         year_from_param: false,
         people,
         makers,
@@ -480,6 +496,9 @@ pub fn answer(
     if let Some(facts) = indexes.facts.as_ref() {
         if parsed.source_kinds != 0 {
             named_titles.extend(facts.titles_with_source_kind(parsed.source_kinds));
+        }
+        if let Some(qid) = parsed.broadcaster {
+            named_titles.extend(facts.titles_on_broadcaster(qid));
         }
         for &genre in &parsed.genres {
             named_titles.extend(facts.titles_with_genre(genre));
@@ -685,6 +704,7 @@ pub fn answer(
             "yearMax": parsed.facet.year_max,
             "language": parsed.facet.language,
             "runtimeMax": parsed.runtime_max,
+            "broadcaster": parsed.broadcaster,
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
         },
@@ -757,6 +777,14 @@ fn features(
             phi *= WRONG_TEXT_FACET;
         }
     }
+    // The broadcaster, from a parameter, so it drops — but only for series, since a film has no such fact
+    // and would otherwise be judged against a statement that cannot exist for it.
+    if let Some(qid) = parsed.broadcaster {
+        if key.0 == MediaType::Tv && !record.is_some_and(|r| r.broadcasters.contains(&qid)) {
+            return None;
+        }
+    }
+
     // An upper bound on runtime, from a parameter, so it drops. Only on FILMS: Wikidata states a series'
     // runtime per EPISODE, so "under 90 minutes" would read a 45-minute drama as a short film and a
     // 20-episode season as shorter than a feature. A series is left unjudged rather than judged wrongly.
@@ -970,6 +998,40 @@ mod tests {
             let n = phrase.split_whitespace().count();
             assert!(n <= MAX_PHRASE_WORDS, "{phrase:?} is {n} words, past the {MAX_PHRASE_WORDS}-word span");
         }
+    }
+
+    /// A boost-only matcher must claim its facet WITHOUT eating the word. `rest` is what the vectors are
+    /// asked about and what sets λ, so consuming it emptied both — `q=medieval` answered with 43 titles led
+    /// by the 2022 film of that name, and `q=drama` gave every fuzzy title match a score of zero.
+    #[test]
+    fn a_genre_or_theme_word_stays_in_the_query() {
+        // Standing in for `parse`, which needs the indexes: the loop's contract is that SOURCE_PHRASES
+        // consume and the boost-only tables do not.
+        let consumed = |query: &str| {
+            let tokens = words(query);
+            let mut rest: Vec<String> = Vec::new();
+            let mut at = 0;
+            'words: while at < tokens.len() {
+                for span in (1..=MAX_PHRASE_WORDS.min(tokens.len() - at)).rev() {
+                    let phrase = tokens[at..at + span].join(" ");
+                    if SOURCE_PHRASES.iter().any(|&(w, _)| w == phrase) {
+                        at += span;
+                        continue 'words;
+                    }
+                }
+                rest.push(tokens[at].clone());
+                at += 1;
+            }
+            rest.join(" ")
+        };
+        // Boost-only words survive, so the vectors still see them and λ stays > 0.
+        assert_eq!(consumed("medieval"), "medieval");
+        assert_eq!(consumed("drama"), "drama");
+        assert_eq!(consumed("slow burn"), "slow burn");
+        assert_eq!(consumed("bleak thriller"), "bleak thriller");
+        // A source phrase decides eligibility, so it is still eaten.
+        assert_eq!(consumed("based on a book"), "");
+        assert_eq!(consumed("recent based on a novel"), "recent");
     }
 
     #[test]

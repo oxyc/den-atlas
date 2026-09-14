@@ -186,6 +186,19 @@ impl SourceKinds {
 }
 
 impl Facts {
+    /// Every series a given broadcaster first aired (P449), by the broadcaster's Q-id.
+    ///
+    /// 92.1% of series carry one and nothing could ask: `q=hbo` answered by trigram with *Oh Boy!* and
+    /// *A Coffee in Berlin*. Films carry none at all, so this is a series-only fact and a caller asking for
+    /// one is asking for series.
+    pub fn titles_on_broadcaster(&self, qid: u32) -> Vec<(MediaType, u32)> {
+        self.records
+            .iter()
+            .filter(|(_, record)| record.broadcasters.contains(&qid))
+            .map(|(&key, _)| key)
+            .collect()
+    }
+
     /// Every title adapted from any of the kinds in `mask`, and every title carrying `genre`.
     ///
     /// These exist because a facet that cannot PROPOSE candidates cannot rank them. Country and decade have

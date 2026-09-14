@@ -786,6 +786,13 @@ async fn query_answer(
     if let Some(minutes) = query_param(query, "runtime_max").and_then(|v| v.parse().ok()) {
         parsed.set_runtime_max(minutes);
     }
+    // A broadcaster's Wikidata Q-id, with or without the Q ("Q1193900" or "1193900").
+    if let Some(qid) = query_param(query, "broadcaster")
+        .map(|v| v.trim_start_matches(['Q', 'q']).to_owned())
+        .and_then(|v| v.parse().ok())
+    {
+        parsed.set_broadcaster(qid);
+    }
     let parsed_in = parsing.elapsed();
     let embedding = Instant::now();
     let unembedded = |e: String| eprintln!("search query left unembedded: {e}");
