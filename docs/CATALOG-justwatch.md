@@ -134,8 +134,20 @@ No cache crate — hand-roll a tiny TTL map (§4) to avoid pulling in `moka`. `t
   (and tolerate a trailing `/catalog/{type}/{id}/{extra}.json`). Parse `type` ∈ {`movie`→MOVIE,
   `series`→SHOW}; `id` ∈ provider ids or `jw-trending`. Unknown id/type → empty `metas` 200 (or 404
   for a truly unknown path, matching the existing style).
-- Response body: `{ "metas": [ { "id": "tt…", "type": "movie|series", "name": "<title>",
-  "poster": "https://images.metahub.space/poster/medium/tt…/img" } ] }`.
+- Response body: `{ "metas": [ { "id": "tt…", "imdb_id": "tt…", "moviedb_id": 123,
+  "type": "movie|series", "name": "<title>",
+  "poster": "https://images.metahub.space/poster/medium/tt…/img", "posterPath": "/abc.jpg",
+  "imdbRating": "7.0", "releaseInfo": "1980" } ] }`. `poster` is always there; `posterPath` is TMDB's own
+  path and is present only where the dataset's metadata sidecar holds one — about 91% of a films chart and
+  51% of a series chart, measured on the deployed rows.
+- **The two ids can denote different entities, so never mix identity from one with a field from the other.**
+  TMDB splits an anthology into one show per story where IMDb keeps a single entry: *Monster: The Lizzie
+  Borden Story* is `moviedb_id` 299939 but `imdb_id` tt13207736 — the whole *Monster* anthology. Neither id
+  is wrong, and for a plain Stremio client the IMDb id IS the identity, so metahub art keyed by it is
+  correct on its own terms. But a consumer that keys on TMDB ids and then draws the metahub `poster` gets
+  Dahmer's artwork on the Lizzie Borden show, which is worse than no artwork because nothing on screen says
+  so. Such a consumer must take art from `posterPath`, and may fall back to `poster` for **films only**,
+  whose two ids agree in practice. The same caution applies to any other field taken from the IMDb side.
 - Serve via the existing `serve_json`-style path so it gets an fnv **ETag + conditional 304**; set
   `Cache-Control: public, max-age=3600` (HTTP-layer; the 6h freshness is the in-process cache).
 - Landing page: add a line noting the catalog rows + **JustWatch attribution** ("Data from
