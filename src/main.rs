@@ -219,6 +219,18 @@ async fn main() {
     }
     let motn = Arc::new(motn::Motn::new(env_opt("MOTN_KEY"), cache_dir.as_deref().map(std::path::Path::new)));
     catalog = catalog.with_motn(Arc::clone(&motn));
+    // A catalog row names TMDB's poster path beside JustWatch's metahub URL for every title the dataset
+    // knows, so a client draws first-party art where there is any and keeps metahub for the rest. Read once
+    // here rather than through the query indexes, which are released when idle (see `CatalogState::posters`).
+    if let Some(blob) = dataset.as_ref().and_then(|d| d.metadata.as_ref()) {
+        match plotrows::read_posters(&blob.path) {
+            Ok(posters) => {
+                eprintln!("catalog posters: {} titles from {}", posters.len(), blob.name);
+                catalog = catalog.with_posters(Arc::new(posters));
+            }
+            Err(e) => eprintln!("catalog posters unavailable ({e}) — rows carry metahub art alone"),
+        }
+    }
 
     // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
     // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.

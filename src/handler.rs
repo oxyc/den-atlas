@@ -488,6 +488,9 @@ async fn handle_catalog(
     // A fixed-country config wins; an `auto` config takes the forwarded `country` extra; else default.
     let forwarded = extra_value(extra, "country");
     let country = config.country(forwarded.as_deref(), &state.default_country);
+    // Stremio pages with `skip`. Anything unparseable is the first page rather than an error: a row is
+    // worth serving whole to a client that asked for it oddly.
+    let skip = extra_value(extra, "skip").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let answer = state.catalog.metas_json(id, type_, &country, &config.providers).await;
     // A refresh is what moves the catalog's health, so a change is noticed here as it happens.
     note_health(state);
@@ -510,7 +513,8 @@ async fn handle_catalog(
             if r.stale {
                 timing.push_str(", cache;desc=stale");
             }
-            let mut resp = serve_json(method, headers, r.body, cc, None, false).await;
+            let mut resp =
+                serve_json(method, headers, crate::catalog::page_of(&r.body, skip), cc, None, false).await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
             // state /health calls `stale_catalog`, so the row carries the same slug.
             if !r.fresh {

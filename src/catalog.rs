@@ -6,11 +6,16 @@ use crate::cache::{Lookup, TtlCache};
 use crate::justwatch::{ObjectType, TrendingItem, TrendingSource};
 use crate::motn::{self, Motn};
 use crate::util::lock;
+use den_index::MediaType;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+
+/// TMDB poster paths from the dataset's metadata sidecar, by (media type, tmdb id). The media type is half
+/// the key because TMDB's film and series id spaces overlap — 95 is Armageddon as a film, Buffy as a series.
+type Posters = HashMap<(MediaType, u32), Box<str>>;
 
 #[derive(Debug)]
 pub struct Provider {
@@ -295,6 +300,13 @@ pub struct CatalogState {
     /// simultaneous calls and earned this host a 403 from JustWatch. What upstream cares about is
     /// the total, so that is what has to be capped — the queue is bounded by the request timeout.
     upstream: Arc<tokio::sync::Semaphore>,
+    /// TMDB poster paths by (media type, tmdb id), from the dataset's metadata sidecar; `None` where the
+    /// release ships none.
+    ///
+    /// Resident, rather than read from the query indexes that hold the same data: those load on demand and
+    /// are released after ten idle minutes, while rows render on a background refresh. A poster that
+    /// appeared or vanished with index warmth would be worse than one that is simply absent.
+    posters: Option<Arc<Posters>>,
     /// Movie of the Night's kept lists, which lead a service's rows where they exist (`motn.rs`).
     motn: Option<Arc<Motn>>,
     /// The rows asked for lately, which `refresh_due` keeps fresh, by cache key.
@@ -381,6 +393,7 @@ impl CatalogState {
             last_refresh_ok: AtomicBool::new(true),
             upstream: Arc::new(tokio::sync::Semaphore::new(MAX_UPSTREAM_INFLIGHT)),
             motn: None,
+            posters: None,
             asked: Mutex::new(HashMap::new()),
             refreshes_ahead: AtomicBool::new(false),
         }
@@ -394,6 +407,11 @@ impl CatalogState {
     /// The same, with a service's rows led by Movie of the Night's lists where they are kept.
     pub fn with_motn(self, motn: Arc<Motn>) -> Self {
         Self { motn: Some(motn), ..self }
+    }
+
+    /// The same, naming TMDB's poster path beside each meta the dataset holds one for.
+    pub fn with_posters(self, posters: Arc<Posters>) -> Self {
+        Self { posters: Some(posters), ..self }
     }
 
     /// Whether the last JustWatch refresh succeeded — the `/health` freshness signal (ADDON-02).
@@ -516,7 +534,7 @@ impl CatalogState {
                 Soon::Coming => motn.coming(provider, country),
             };
             let items = motn::trending(&shows.unwrap_or_default(), matches!(obj, ObjectType::Show));
-            let body = render_metas(&items, stremio_type);
+            let body = render_metas(&items, stremio_type, self.posters.as_deref());
             return Some(CatalogResponse { body, fresh: true, upstream: None, stale: false });
         }
         let is_trending = catalog_id == TRENDING_ID && !providers.is_empty();
@@ -617,7 +635,7 @@ impl CatalogState {
         match fetched {
             // Complete: cache it and call it fresh.
             Some(a) if a.complete => {
-                let body = render_metas(&a.items, stremio_type);
+                let body = render_metas(&a.items, stremio_type, self.posters.as_deref());
                 self.cache.put(&key, body.clone());
                 self.last_refresh_ok.store(true, Ordering::Relaxed);
                 Some(CatalogResponse { body, fresh: true, upstream, stale: false })
@@ -629,7 +647,7 @@ impl CatalogState {
                 self.last_refresh_ok.store(false, Ordering::Relaxed);
                 let (body, stale) = match self.cache.get(&key) {
                     Lookup::Fresh(v) | Lookup::Stale(v) => (v, true),
-                    Lookup::Miss => (render_metas(&a.items, stremio_type), false),
+                    Lookup::Miss => (render_metas(&a.items, stremio_type, self.posters.as_deref()), false),
                 };
                 Some(CatalogResponse { body, fresh: false, upstream, stale })
             }
@@ -640,7 +658,7 @@ impl CatalogState {
                 self.last_refresh_ok.store(false, Ordering::Relaxed);
                 let (body, stale) = match self.cache.get(&key) {
                     Lookup::Fresh(v) | Lookup::Stale(v) => (v, true),
-                    Lookup::Miss => (render_metas(&[], stremio_type), false),
+                    Lookup::Miss => (render_metas(&[], stremio_type, self.posters.as_deref()), false),
                 };
                 Some(CatalogResponse { body, fresh: false, upstream, stale })
             }
@@ -843,11 +861,46 @@ fn led_by(lead: Vec<TrendingItem>, rest: Vec<TrendingItem>) -> Vec<TrendingItem>
     items
 }
 
+/// `body` from `skip` on, as Stremio pages a catalog.
+///
+/// A row that ignored `skip` answered its whole first page to every ask, so a client paging on scroll was
+/// handed the titles it already had, over and over, with nothing to say the row had ended. The charts
+/// upstream are about a hundred long, so past that this answers an empty page — which is exactly what tells
+/// a client there is no more. A body that will not parse is served as it is: paging is not worth an error.
+pub fn page_of(body: &str, skip: usize) -> String {
+    if skip == 0 {
+        return body.to_owned();
+    }
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_owned();
+    };
+    if let Some(metas) = parsed.get_mut("metas").and_then(|m| m.as_array_mut()) {
+        metas.drain(..skip.min(metas.len()));
+    }
+    parsed.to_string()
+}
+
+/// TMDB's poster path for one item, where the dataset holds one for that exact title. The media type is half
+/// the key: TMDB's movie and TV id spaces overlap, so id 95 is Armageddon as a film and Buffy as a series.
+fn poster_path(
+    posters: Option<&Posters>,
+    media_type: Option<MediaType>,
+    moviedb: Option<i64>,
+) -> Option<&str> {
+    let id = u32::try_from(moviedb?).ok()?;
+    Some(posters?.get(&(media_type?, id))?.as_ref())
+}
+
 /// Render items as Stremio catalog metas. `id` is the IMDb id (a plain Stremio client + Cinemeta resolve
 /// the detail page from it); `imdb_id` + `moviedb_id` are the extra keys the Den app maps rows through
 /// (it bridges everything via TMDB — an item without `moviedb_id` won't render there). Poster is
 /// metahub-by-IMDb (Cinemeta's own source), so no TMDB fetch is needed to draw the grid.
-pub fn render_metas(items: &[TrendingItem], stremio_type: &str) -> String {
+pub fn render_metas(items: &[TrendingItem], stremio_type: &str, posters: Option<&Posters>) -> String {
+    let media_type = match stremio_type {
+        "movie" => Some(MediaType::Movie),
+        "series" => Some(MediaType::Tv),
+        _ => None,
+    };
     let metas: Vec<serde_json::Value> = items
         .iter()
         .map(|it| {
@@ -860,6 +913,12 @@ pub fn render_metas(items: &[TrendingItem], stremio_type: &str) -> String {
             });
             if let Some(tmdb) = it.moviedb {
                 m["moviedb_id"] = serde_json::json!(tmdb);
+            }
+            // TMDB's own path for the same title, where the dataset holds one. `poster` above is left exactly
+            // as it was: the sidecar carries most films but a minority of series, so metahub stays the only
+            // art for the rest, and a client prefers this and falls back to that.
+            if let Some(path) = poster_path(posters, media_type, it.moviedb) {
+                m["posterPath"] = serde_json::json!(path);
             }
             // JustWatch's IMDb score → the Den card's star (the app maps `imdbRating` → voteAverage; a
             // detail visit later upgrades it to the OMDb/IMDb value). Emitted as a string, Stremio-style.
@@ -1015,6 +1074,41 @@ mod tests {
         assert!(r.body.contains(r#""moviedb_id":42"#), "emits moviedb_id so the Den app can map the row");
         assert!(r.body.contains(r#""type":"movie""#));
         assert!(r.body.contains("images.metahub.space/poster/medium/tt1/img"));
+    }
+
+    /// The web draws TMDB art where the dataset has it and metahub where it doesn't. Both keys therefore
+    /// have to travel: the sidecar covers most films but only a minority of series, so a row that dropped
+    /// `poster` in favour of `posterPath` would lose the art for half the series on a service page.
+    #[test]
+    fn a_meta_names_tmdbs_poster_path_where_the_dataset_holds_one() {
+        let mut posters: Posters = HashMap::new();
+        posters.insert((MediaType::Movie, 42), "/abc.jpg".into());
+        let body = render_metas(&[item("tt1", "A", 0)], "movie", Some(&posters));
+        assert!(body.contains(r#""posterPath":"/abc.jpg""#));
+        assert!(body.contains("images.metahub.space/poster/medium/tt1/img"), "metahub stays the fallback");
+
+        // TMDB's film and series ids overlap — 95 is Armageddon and Buffy — so the media type is half the key.
+        let series = render_metas(&[item("tt1", "A", 0)], "series", Some(&posters));
+        assert!(!series.contains("posterPath"), "a film's poster must not be claimed for a series id");
+
+        // No sidecar, no claim: the row is exactly what it was before this existed.
+        assert!(!render_metas(&[item("tt1", "A", 0)], "movie", None).contains("posterPath"));
+    }
+
+    /// Without this a client paging on scroll was handed the same first page forever, since the row ignored
+    /// `skip` entirely — an endless list of titles it already had, and no way to learn the row had ended.
+    #[test]
+    fn a_row_pages_with_skip_and_ends_rather_than_repeating() {
+        let body = render_metas(&[item("tt1", "A", 0), item("tt2", "B", 1)], "movie", None);
+        assert_eq!(page_of(&body, 0), body, "the first page is the row itself, untouched");
+
+        let second = page_of(&body, 1);
+        assert!(!second.contains(r#""id":"tt1""#), "what the client already has is not sent again");
+        assert!(second.contains(r#""id":"tt2""#));
+
+        // Past the end is an empty page, which is what stops a client rather than repeating the row.
+        assert!(page_of(&body, 2).contains(r#""metas":[]"#));
+        assert!(page_of(&body, 99).contains(r#""metas":[]"#), "a skip beyond the row is empty, not a panic");
     }
 
     #[tokio::test]

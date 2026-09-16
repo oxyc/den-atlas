@@ -105,7 +105,17 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
             name: e.name,
             den_provider_id: e.package_ids.first().copied(),
             den_provider_ids: e.package_ids.to_vec(),
-            extra: if auto { vec![CatalogExtra { name: "country", is_required: false }] } else { Vec::new() },
+            extra: {
+                let mut extra = if auto {
+                    vec![CatalogExtra { name: "country", is_required: false }]
+                } else {
+                    Vec::new()
+                };
+                // Stremio pages a catalog with `skip`. Declaring none left a client paging on scroll asking
+                // for the same first page forever, with nothing to tell it the row had ended.
+                extra.push(CatalogExtra { name: "skip", is_required: false });
+                extra
+            },
         })
         .collect();
     if title_search {
