@@ -45,6 +45,9 @@ pub struct TrendingItem {
     pub rating: Option<f64>,
     /// Original release year from JustWatch (free — same response), surfaced as the card year.
     pub year: Option<i64>,
+    /// When it arrives on the service, or leaves it — Unix seconds, and only the leaving and coming charts
+    /// have one. A popularity chart is about now, so there is no date to carry and this is `None`.
+    pub at: Option<i64>,
 }
 
 /// The source seam — the real JustWatch client in prod, a fake in tests. `country` is per-request (an
@@ -285,7 +288,7 @@ pub fn parse_popular(body: &str) -> Chart {
         let rating = content.scoring.and_then(|s| s.imdb_score);
         let year = content.original_release_year;
         let rank = out.len();
-        out.push(TrendingItem { imdb, moviedb, title, rank, rating, year });
+        out.push(TrendingItem { imdb, moviedb, title, rank, rating, year, at: None });
     }
     Chart { items: out, present: true, edges: total }
 }
@@ -418,6 +421,7 @@ pub fn parse_new_titles(body: &str, want: ObjectType) -> Vec<TrendingItem> {
             rank,
             rating: content.scoring.and_then(|s| s.imdb_score),
             year: content.original_release_year,
+            at: None,
         });
     }
     out
@@ -712,7 +716,8 @@ mod tests {
                 title: "Alpha".into(),
                 rank: 0,
                 rating: Some(7.4),
-                year: Some(1999)
+                year: Some(1999),
+                at: None
             }
         );
         assert_eq!(
@@ -723,7 +728,8 @@ mod tests {
                 title: "Beta".into(),
                 rank: 1,
                 rating: None,
-                year: None
+                year: None,
+                at: None
             }
         );
     }

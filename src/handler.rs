@@ -2175,6 +2175,7 @@ mod tests {
                     rank: 0,
                     rating: None,
                     year: None,
+                    at: None,
                 }]
             }
         }
@@ -2488,6 +2489,7 @@ mod tests {
                 rank: 0,
                 rating: None,
                 year: None,
+                at: None,
             }])
         }
         async fn new_titles(
@@ -2529,6 +2531,7 @@ mod tests {
                 rank: 0,
                 rating: None,
                 year: None,
+                at: None,
             }])
         }
         async fn new_titles(

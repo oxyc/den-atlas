@@ -410,6 +410,8 @@ pub fn trending(shows: &[Show], series: bool) -> Vec<TrendingItem> {
             rank,
             rating: s.rating,
             year: s.year,
+            // The one source here that knows a date: when this title lands on the service, or leaves it.
+            at: s.at,
         })
         .collect()
 }

@@ -137,9 +137,13 @@ No cache crate — hand-roll a tiny TTL map (§4) to avoid pulling in `moka`. `t
 - Response body: `{ "metas": [ { "id": "tt…", "imdb_id": "tt…", "moviedb_id": 123,
   "type": "movie|series", "name": "<title>",
   "poster": "https://images.metahub.space/poster/medium/tt…/img", "posterPath": "/abc.jpg",
-  "imdbRating": "7.0", "releaseInfo": "1980" } ] }`. `poster` is always there; `posterPath` is TMDB's own
-  path and is present only where the dataset's metadata sidecar holds one — about 91% of a films chart and
-  51% of a series chart, measured on the deployed rows.
+  "imdbRating": "7.0", "releaseInfo": "1980", "denAt": 1789000000 } ] }`. `poster` is always there;
+  `posterPath` is TMDB's own path and is present only where the dataset's metadata sidecar holds one — about
+  91% of a films chart and 51% of a series chart, measured on the deployed rows.
+- `denAt` is when the title arrives on the service, or leaves it, in Unix seconds. **Only the `-leaving` and
+  `-coming` charts carry one** — a popularity chart is about now, and a title with no date simply omits the
+  key. It is the one fact here no other source has: TMDB has no arrival date at all, so a consumer without
+  `denAt` can order a "coming soon" row only by the order it was sent in, and can say "soon" but never "Friday".
 - **The two ids can denote different entities, so never mix identity from one with a field from the other.**
   TMDB splits an anthology into one show per story where IMDb keeps a single entry: *Monster: The Lizzie
   Borden Story* is `moviedb_id` 299939 but `imdb_id` tt13207736 — the whole *Monster* anthology. Neither id

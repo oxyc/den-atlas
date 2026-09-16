@@ -842,6 +842,7 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
                 rank: i,
                 rating: r.rating,
                 year: r.year,
+                at: r.at,
             }
         })
         .collect()
@@ -929,6 +930,12 @@ pub fn render_metas(items: &[TrendingItem], stremio_type: &str, posters: Option<
             if let Some(year) = it.year {
                 m["releaseInfo"] = serde_json::json!(year.to_string());
             }
+            // When it arrives on the service, or leaves it — Unix seconds, and only the leaving and coming
+            // charts carry one. JustWatch is the only source for it: TMDB has no arrival date at all, so
+            // without this a "Coming soon" card can say nothing more precise than "soon".
+            if let Some(at) = it.at {
+                m["denAt"] = serde_json::json!(at);
+            }
             m
         })
         .collect();
@@ -960,6 +967,7 @@ mod tests {
             rank,
             rating: None,
             year: None,
+            at: None,
         }
     }
 
@@ -1093,6 +1101,15 @@ mod tests {
 
         // No sidecar, no claim: the row is exactly what it was before this existed.
         assert!(!render_metas(&[item("tt1", "A", 0)], "movie", None).contains("posterPath"));
+    }
+
+    /// The date is what a "coming" row is for: without it a card can only say "soon", and the row can only be
+    /// shown in whatever order it arrived in. A popularity chart has no date and must not invent one.
+    #[test]
+    fn a_meta_names_when_it_arrives_where_the_chart_knows() {
+        let dated = TrendingItem { at: Some(1_789_000_000), ..item("tt1", "A", 0) };
+        assert!(render_metas(&[dated], "series", None).contains(r#""denAt":1789000000"#));
+        assert!(!render_metas(&[item("tt1", "A", 0)], "series", None).contains("denAt"));
     }
 
     /// Without this a client paging on scroll was handed the same first page forever, since the row ignored
