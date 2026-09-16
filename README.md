@@ -19,8 +19,10 @@ It implements the Den **`dataset`** resource (the Stremio superset — see the D
 installing Atlas there is harmless; only Den acts on it.
 
 ## Facts, not tokens
-Atlas ships **derived data only** — no raw TMDB overviews/posters/text (ToS-clean, exactly what the Den
-backfill asserts) and **nothing personal**. There is no per-user state and no token; `/configure` only
+Atlas ships **derived data** — labels and vectors — beside a **metadata sidecar** of TMDB titles, poster
+paths and years, so a client draws a card without a per-result TMDB call. That sidecar is a cache and is
+kept no longer than the six months TMDB's terms allow; no overviews and no raw text, and **nothing
+personal**. There is no per-user state and no token; `/configure` only
 picks the catalog region and services, carried in plaintext in the install URL. Personalisation (your
 taste vector) never leaves your device. Every blob is **sha256-pinned** in the descriptor, so the app
 verifies what it downloads and a mismatch keeps the prior cache.
