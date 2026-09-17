@@ -98,7 +98,9 @@ for c in cases:
         print(f"          {b}")
     if args.verbose:
         for h in hits[:5]:
+            kind = "tv" if h.get("type") == "series" else "movie"
             print(f"          . {key(h):14} {str(h.get('title'))[:40]:42} s={h.get('score')}")
+            print(f"            https://www.themoviedb.org/{kind}/{h.get('id')}")
     failed += bool(bad)
     passed += not bad
 
