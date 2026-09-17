@@ -17,97 +17,296 @@
     "  min_hits      n         at least this many results (the 'endless' rule)",
     "  all_type      t         every hit is this media type"
   ],
-
   "cases": [
-    { "q": "wire", "split": "dev", "lane": "title-exact", "observed": "pass",
-      "assert": { "rank_at_most": { "series:1438": 1 } },
-      "note": "One word, and the show is not called that. Title weight must still beat theme." },
-
-    { "q": "merli", "split": "dev", "lane": "title-fuzzy", "observed": "pass",
-      "assert": { "rank_at_most": { "series:62914": 1 } },
-      "note": "Unaccented query against an accented title (Merlí), competing with five Merlins." },
-
-    { "q": "insiduous", "split": "dev", "lane": "title-typo", "observed": "FAIL",
-      "assert": { "in_top": { "movie:49018": 5 } },
-      "note": "Real typo. `insidious` returns it at #1, so the index has it and one transposed letter loses it entirely — top hits become Good Boy, Office Space, Toni Erdmann on pure sem." },
-
-    { "q": "forrest gump", "split": "test", "lane": "title-exact", "observed": "pass",
-      "assert": { "rank_at_most": { "movie:13": 1 } } },
-
-    { "q": "the bridge", "split": "test", "lane": "title-ambiguous", "observed": "pass",
-      "assert": { "in_top": { "series:45016": 3 } },
-      "note": "Three works share the title; the Nordic one is the one a Nordic household means." },
-
-    { "q": "luis zahera", "split": "dev", "lane": "person", "observed": "pass",
-      "assert": { "in_top": { "movie:33273": 5 }, "min_hits": 10 },
-      "note": "Person lane (p=1.0). Cell 211, The Beasts, The Realm are all genuinely his." },
-
-    { "q": "swedish crime", "split": "dev", "lane": "country+genre", "observed": "FAIL",
-      "assert": { "in_top": { "movie:15472": 10 }, "not_in_top": { "movie:473033": 10 } },
-      "note": "Worst failure found. Returns Uncut Gems #1, then Dogville, Only God Forgives, Filth — lab=1.0 on `crime` while `swedish` is dropped on the floor. Dragon Tattoo does appear, below four non-Swedish films." },
-
-    { "q": "swedish police series", "split": "dev", "lane": "country+theme+type", "observed": "FAIL",
-      "assert": { "not_in_top": { "series:125910": 3 }, "in_top": { "series:64023": 5 }, "all_type": "series" },
-      "note": "Returns Swedish series ordered by popularity ALONE — every hit scores on pop and nothing else, so `police` contributes literally zero. Young Royals (a boarding-school drama) is #1; Modus, an actual police series, is #10. The Bridge at #2 is popularity, not matching." },
-
-    { "q": "spanish series", "split": "test", "lane": "country+type", "observed": "pass",
-      "assert": { "all_type": "series", "min_hits": 20 },
-      "note": "Facet lane works; ordering is pure popularity (every hit scores on pop only). Correct set, unconsidered order." },
-
-    { "q": "nordic comedies", "split": "test", "lane": "region+genre", "observed": "pass",
-      "assert": { "in_top": { "series:68126": 5 }, "min_hits": 20 },
-      "note": "Genuinely good — Norsemen, Fallet, Kitchen Stories, Fatso. `Olaf Presents` is the one intruder." },
-
-    { "q": "books", "split": "dev", "lane": "word-sense", "observed": "FAIL",
-      "assert": { "not_in_top": { "movie:444539": 3 } },
-      "note": "Reads as a title substring: The Bookshop, Booksmart, Black Books, Nightbooks. A person typing `books` means adaptations. This is the `based on a book` case the source comments already name." },
-
-    { "q": "love stories", "split": "dev", "lane": "word-sense", "observed": "FAIL",
-      "assert": { "min_hits": 20, "not_in_top": { "movie:1245552": 1 } },
-      "note": "Returns a literal title match then six films called `Love Story`. The query asks for a kind of film, not for that name." },
-
-    { "q": "similar to love actually", "split": "dev", "lane": "intent", "observed": "FAIL",
-      "assert": { "in_top": { "movie:508": 10 } },
-      "note": "Love Actually itself is absent from all 40 hits. `similar to X` is a More Like This request expressed in words, and nothing parses it — the phrase becomes leftover and drags the vector lane somewhere unrelated." },
-
-    { "q": "relaxing series", "split": "dev", "lane": "vibe", "observed": "FAIL",
-      "assert": { "not_in_top": { "series:88989": 5 }, "all_type": "series" },
-      "note": "Returns Nine Perfect Strangers, Homecoming, The I-Land — psychological thrillers. `relaxing` matches no label, so sem alone decides and lands on the opposite mood. A wrong answer here is worse than none." },
-
-    { "q": "feel good movies", "split": "dev", "lane": "vibe", "observed": "weak",
-      "assert": { "min_hits": 20 },
-      "note": "Matches the feel-good label weakly (lab 0.55-0.65) and surfaces obscure foreign titles nobody asked for. Not wrong, but a household browsing `feel good` expects recognisable films — popularity is under-weighted once the label is soft." },
-
-    { "q": "time travel", "split": "test", "lane": "theme", "observed": "pass",
-      "assert": { "in_top": { "movie:24420": 5 } },
-      "note": "Works well: label + sem + partial title all agree." },
-
-    { "q": "russian doll", "split": "dev", "lane": "word-sense", "observed": "unjudged",
-      "assert": {},
-      "note": "Named in the source comments as a known collision — the series against a literal reading. Fill in once someone decides which the right answer is." },
-
-    { "q": "brazil", "split": "dev", "lane": "word-sense", "observed": "unjudged",
-      "assert": {},
-      "note": "Country facet against Gilliam's 1985 film. Source comments name it; WRONG_TEXT_FACET = 0.15 is the current answer, which is the system declining to choose." },
-
-    { "q": "1917", "split": "dev", "lane": "word-sense", "observed": "unjudged",
-      "assert": {},
-      "note": "Year window against the film. Same shape." },
-
-    { "q": "new girl", "split": "test", "lane": "word-sense", "observed": "unjudged",
-      "assert": {},
-      "note": "Title against two ordinary words." },
-
-    { "q": "old", "split": "test", "lane": "word-sense", "observed": "unjudged",
-      "assert": {},
-      "note": "Shyamalan's Old against an age/era reading." },
-
-    { "q": "medieval", "split": "dev", "lane": "facet-coverage", "observed": "FAIL",
-      "assert": { "min_scored": 20, "not_in_top": { "movie:545609": 12 } },
-      "note": "Only FIVE of 40 hits score above zero; the rest is popularity padding — Extraction, Killer Elite, The Gunman, modern action films with s=0.0. The era facet reaches 43 titles corpus-wide because coverage is 6.2-6.4% (den-dataset#4). Two bugs in one case: the coverage, and padding a thin result set with irrelevance so it looks full. Goes green when the facets pass completes." },
-
-    { "q": "horror but not gory", "split": "dev", "lane": "negation", "observed": "FAIL",
-      "assert": {},
-      "note": "Negation is unparsed anywhere. A dense retriever encodes `gory` as similarity to gore, so this returns MORE of what was excluded. Assertions need a judged exclusion list first." }
+    {
+      "q": "wire",
+      "split": "dev",
+      "lane": "title-exact",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "series:1438": 1
+        }
+      },
+      "note": "One word, and the show is not called that. Title weight must still beat theme."
+    },
+    {
+      "q": "merli",
+      "split": "dev",
+      "lane": "title-fuzzy",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "series:62914": 1
+        }
+      },
+      "note": "Unaccented query against an accented title (Merlí), competing with five Merlins."
+    },
+    {
+      "q": "insiduous",
+      "split": "dev",
+      "lane": "title-typo",
+      "observed": "FAIL",
+      "assert": {
+        "in_top": {
+          "movie:49018": 5
+        }
+      },
+      "note": "Real typo. `insidious` returns it at #1, so the index has it and one transposed letter loses it entirely — top hits become Good Boy, Office Space, Toni Erdmann on pure sem."
+    },
+    {
+      "q": "forrest gump",
+      "split": "test",
+      "lane": "title-exact",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:13": 1
+        }
+      }
+    },
+    {
+      "q": "the bridge",
+      "split": "test",
+      "lane": "title-ambiguous",
+      "observed": "pass",
+      "assert": {
+        "in_top": {
+          "series:45016": 3
+        }
+      },
+      "note": "Three works share the title; the Nordic one is the one a Nordic household means."
+    },
+    {
+      "q": "luis zahera",
+      "split": "dev",
+      "lane": "person",
+      "observed": "pass",
+      "assert": {
+        "in_top": {
+          "movie:33273": 5
+        },
+        "min_hits": 10
+      },
+      "note": "Person lane (p=1.0). Cell 211, The Beasts, The Realm are all genuinely his."
+    },
+    {
+      "q": "swedish crime",
+      "split": "dev",
+      "lane": "country+genre",
+      "observed": "FAIL",
+      "assert": {
+        "in_top": {
+          "movie:15472": 10
+        },
+        "not_in_top": {
+          "movie:473033": 10
+        }
+      },
+      "note": "Worst failure found. Returns Uncut Gems #1, then Dogville, Only God Forgives, Filth — lab=1.0 on `crime` while `swedish` is dropped on the floor. Dragon Tattoo does appear, below four non-Swedish films."
+    },
+    {
+      "q": "swedish police series",
+      "split": "dev",
+      "lane": "country+theme+type",
+      "observed": "FAIL",
+      "assert": {
+        "not_in_top": {
+          "series:125910": 3
+        },
+        "in_top": {
+          "series:64023": 5
+        },
+        "all_type": "series"
+      },
+      "note": "Returns Swedish series ordered by popularity ALONE — every hit scores on pop and nothing else, so `police` contributes literally zero. Young Royals (a boarding-school drama) is #1; Modus, an actual police series, is #10. The Bridge at #2 is popularity, not matching."
+    },
+    {
+      "q": "spanish series",
+      "split": "test",
+      "lane": "country+type",
+      "observed": "pass",
+      "assert": {
+        "all_type": "series",
+        "min_hits": 20
+      },
+      "note": "Facet lane works; ordering is pure popularity (every hit scores on pop only). Correct set, unconsidered order."
+    },
+    {
+      "q": "nordic comedies",
+      "split": "test",
+      "lane": "region+genre",
+      "observed": "pass",
+      "assert": {
+        "in_top": {
+          "series:68126": 5
+        },
+        "min_hits": 20
+      },
+      "note": "Genuinely good — Norsemen, Fallet, Kitchen Stories, Fatso. `Olaf Presents` is the one intruder."
+    },
+    {
+      "q": "books",
+      "split": "dev",
+      "lane": "word-sense",
+      "observed": "FAIL",
+      "assert": {
+        "not_in_top": {
+          "movie:444539": 3
+        }
+      },
+      "note": "Reads as a title substring: The Bookshop, Booksmart, Black Books, Nightbooks. A person typing `books` means adaptations. This is the `based on a book` case the source comments already name."
+    },
+    {
+      "q": "love stories",
+      "split": "dev",
+      "lane": "word-sense",
+      "observed": "FAIL",
+      "assert": {
+        "min_hits": 20,
+        "not_in_top": {
+          "movie:1245552": 1
+        }
+      },
+      "note": "Returns a literal title match then six films called `Love Story`. The query asks for a kind of film, not for that name."
+    },
+    {
+      "q": "similar to love actually",
+      "split": "dev",
+      "lane": "intent",
+      "observed": "FAIL",
+      "assert": {
+        "in_top": {
+          "movie:508": 10
+        }
+      },
+      "note": "Love Actually itself is absent from all 40 hits. `similar to X` is a More Like This request expressed in words, and nothing parses it — the phrase becomes leftover and drags the vector lane somewhere unrelated."
+    },
+    {
+      "q": "relaxing series",
+      "split": "dev",
+      "lane": "vibe",
+      "observed": "FAIL",
+      "assert": {
+        "not_in_top": {
+          "series:88989": 5
+        },
+        "all_type": "series"
+      },
+      "note": "Returns Nine Perfect Strangers, Homecoming, The I-Land — psychological thrillers. `relaxing` matches no label, so sem alone decides and lands on the opposite mood. A wrong answer here is worse than none."
+    },
+    {
+      "q": "feel good movies",
+      "split": "dev",
+      "lane": "vibe",
+      "observed": "weak",
+      "assert": {
+        "min_hits": 20
+      },
+      "note": "Matches the feel-good label weakly (lab 0.55-0.65) and surfaces obscure foreign titles nobody asked for. Not wrong, but a household browsing `feel good` expects recognisable films — popularity is under-weighted once the label is soft."
+    },
+    {
+      "q": "time travel",
+      "split": "test",
+      "lane": "theme",
+      "observed": "pass",
+      "assert": {
+        "in_top": {
+          "movie:24420": 5
+        }
+      },
+      "note": "Works well: label + sem + partial title all agree."
+    },
+    {
+      "q": "russian doll",
+      "split": "dev",
+      "lane": "word-sense",
+      "observed": "partial",
+      "assert": {
+        "rank_at_most": {
+          "series:84977": 1
+        },
+        "in_top": {
+          "movie:1826": 5
+        }
+      },
+      "note": "Named in the source comments as a known collision. Diagnosed 2026-09-17: the tail is NOT popularity padding — those hits carry phi=0.15, i.e. WRONG_TEXT_FACET. They arrived through a facet lane that read `russian doll` as a concept (the tail is time-loop and second-chance shows: Someday or One Day, Somewhere Between, 18 Again, The 7 Lives of Lea) and were then discounted by 85% because the words also look like a title. ASSERTED HERE: only the uncontroversial half — the show first, the partial title match near it. NOT asserted: whether concept-matched neighbours belong in a title-shaped query and where. That is a product decision, not a judgement about these twelve results, and it is what the word-sense work (den-atlas#11) has to settle. Do not add assertions for the tail until it is."
+    },
+    {
+      "q": "brazil",
+      "split": "dev",
+      "lane": "word-sense",
+      "observed": "FAIL",
+      "assert": {
+        "rank_at_most": {
+          "movie:68": 1
+        },
+        "min_score": {
+          "movie:68": 1.2
+        }
+      },
+      "note": "Country facet against Gilliam's 1985 film. Diagnosed 2026-09-17: EVERY hit carries phi=0.15 (WRONG_TEXT_FACET) - including Brazil itself, which scores 0.3176 where 'new girl', 'old' and '1917' (phi=1.0, same shape of query) all score above 2.0. So the country reading wins outright and the film survives on rank alone. 12 of 40 hits score 0.0, all of them discounted country matches. ASSERTED against search.rs's OWN invariant - an exact title (T >= 0.6, so >= 1.2) always beats a match on theme alone - which Brazil at 0.3176 misses by a factor of four. NOT asserted: whether Brazilian titles belong at all. That is a product decision, see den-atlas#11."
+    },
+    {
+      "q": "1917",
+      "split": "dev",
+      "lane": "word-sense",
+      "observed": "partial",
+      "assert": {
+        "rank_at_most": {
+          "movie:530915": 1
+        },
+        "min_scored": 5
+      },
+      "note": "Year window against the film. The film wins cleanly (s=2.31, phi=1.0), so the collision is benign here. But 9 of 40 hits score exactly 0.0 at phi=1.0 — Dunkirk, Valiant One — undiscounted results that matched nothing, which is the separate padding defect, not a word-sense one."
+    },
+    {
+      "q": "new girl",
+      "split": "test",
+      "lane": "word-sense",
+      "observed": "partial",
+      "assert": {
+        "rank_at_most": {
+          "series:1420": 1
+        },
+        "min_scored": 5
+      },
+      "note": "Title against two ordinary words. Resolves correctly (s=2.03, phi=1.0). 12 of 40 hits score 0.0 at phi=1.0 — the padding defect again, in a query with no word-sense problem at all."
+    },
+    {
+      "q": "old",
+      "split": "test",
+      "lane": "word-sense",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:631843": 1
+        }
+      },
+      "note": "Shyamalan's Old against an age/era reading. Resolves correctly (s=2.15) and NO hit scores zero — the one word-sense case in the set that is simply fine. Kept as a regression guard."
+    },
+    {
+      "q": "medieval",
+      "split": "dev",
+      "lane": "facet-coverage",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:545609": 12
+        }
+      },
+      "note": "Only FIVE of 40 hits score above zero; the rest is popularity padding — Extraction, Killer Elite, The Gunman, modern action films with s=0.0. The era facet reaches 43 titles corpus-wide because coverage is 6.2-6.4% (den-dataset#4). Two bugs in one case: the coverage, and padding a thin result set with irrelevance so it looks full. Goes green when the facets pass completes."
+    },
+    {
+      "q": "horror but not gory",
+      "split": "dev",
+      "lane": "negation",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 10
+      },
+      "note": "Negation is unparsed anywhere, and a dense retriever encodes `gory` as similarity to gore, so this returns more of what was excluded. A proper assertion needs a judged exclusion list, which needs somebody to name gory titles; min_scored is a placeholder that at least fails when the query returns nothing real. Fill in when den-atlas#11's negation work starts."
+    }
   ]
 }

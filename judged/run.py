@@ -50,6 +50,12 @@ def check(case, hits):
             bad.append(f"{k} must NOT be in top {n}, is at {keys.index(k) + 1}")
     if (m := a.get("min_hits")) and len(hits) < m:
         bad.append(f"wanted >= {m} hits, got {len(hits)}")
+    for k, want in a.get("min_score", {}).items():
+        got = next((h.get("score") or 0 for h in hits if key(h) == k), None)
+        if got is None:
+            bad.append(f"{k} wanted score >= {want}, absent")
+        elif got < want:
+            bad.append(f"{k} wanted score >= {want}, got {got}")
     if m := a.get("min_scored"):
         scored = sum(1 for h in hits if (h.get("score") or 0) > 0)
         if scored < m:
@@ -59,7 +65,8 @@ def check(case, hits):
         if off:
             bad.append(f"every hit should be {t}; also saw {sorted(off)}")
     return bad, sum(len(a.get(f, {})) if isinstance(a.get(f), dict) else bool(a.get(f))
-                    for f in ("rank_at_most", "in_top", "not_in_top", "min_hits", "min_scored", "all_type"))
+                    for f in ("rank_at_most", "in_top", "not_in_top", "min_hits", "min_scored",
+                              "min_score", "all_type"))
 
 
 ap = argparse.ArgumentParser()
