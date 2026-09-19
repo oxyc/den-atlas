@@ -11,6 +11,8 @@
 //! A title match is weighted so that an exact title (T ≥ 0.6, so ≥ 1.2) always beats a match on theme alone (at
 //! most 0.6 + 0.25 + 0.10 + 0.15 = 1.10); semantic vectors count for more the more of the query is left over (λ),
 //! and far less once an exact title answered, since they hold no titles and would only add what sounds alike.
+//! A country or date inferred from the same words cannot discount an exact title: ambiguous text keeps both
+//! readings alive, while explicit request constraints still filter normally.
 //! A near title match counts only for the leftover's share (T·λ): a query of words atlas reads ("bleak") asks for
 //! the theme, not for "Leak" or "Bleach". Popularity counts only as far as the title is relevant at all (R, the
 //! strongest of its other signals), so a famous title that merely sounds alike doesn't pass a closer one.
@@ -45,8 +47,8 @@ const SEMANTIC_SPAN_Z: f64 = 3.5;
 /// What a candidate keeps when the query names a country or decade it has no record of: unknown isn't a mismatch.
 const UNKNOWN_FACET: f64 = 0.6;
 /// What a candidate keeps when it CONTRADICTS a facet that was guessed from the query's words rather than
-/// given as a parameter. Heavy enough that the facet still orders the answer, light enough that an exact
-/// title survives it: `russian doll` must not be able to erase Russian Doll.
+/// given as a parameter. Heavy enough that the facet still orders the answer. It is not applied to an exact
+/// title: `brazil` may name both a country and Gilliam's film, and neither reading should erase the other.
 const WRONG_TEXT_FACET: f64 = 0.15;
 /// A title typed exactly scores this plus popularity's share; a near match at most `FUZZY_CAP`.
 const EXACT_TITLE: f64 = 0.6;
@@ -665,7 +667,8 @@ pub fn answer(
             });
             // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
             // for it, a request a card.
-            if let Some(imdb) = indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
+            if let Some(imdb) =
+                indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
             {
                 hit["imdbId"] = serde_json::json!(imdb);
             }
@@ -736,12 +739,22 @@ fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
 /// becomes a 0...1 signal against its own scan, then the stronger one spends the existing semantic budget —
 /// never their sum, which would count the same query twice and break the exact-title invariant.
 fn semantic_evidence(found: &Found) -> (f64, f64, f64) {
-    let strength = |z: Option<f64>| {
-        z.map_or(0.0, |z| ((z - SEMANTIC_FLOOR_Z) / SEMANTIC_SPAN_Z).clamp(0.0, 1.0))
-    };
+    let strength =
+        |z: Option<f64>| z.map_or(0.0, |z| ((z - SEMANTIC_FLOOR_Z) / SEMANTIC_SPAN_Z).clamp(0.0, 1.0));
     let plot = strength(found.plot_z);
     let premise = strength(found.premise_z);
     (plot, premise, plot.max(premise))
+}
+
+/// A facet guessed from query text is an interpretation, not an explicit constraint. Keep its mismatch penalty
+/// for ordinary candidates, but never let it break the exact-title floor. Any penalty already in `phi` came from
+/// another constraint or unknown data and remains intact.
+fn discount_text_facet(phi: f64, exact: bool) -> f64 {
+    if exact {
+        phi
+    } else {
+        phi * WRONG_TEXT_FACET
+    }
 }
 
 /// A candidate's features, or `None` when a facet it has a record of contradicts the query.
@@ -756,6 +769,20 @@ fn features(
     let facets = indexes.facets.as_ref().and_then(|f| f.title(id, kind));
     let record = indexes.facts.as_ref().and_then(|f| f.get(id, kind));
 
+    let pop = popularity(facets.map_or(0, |f| f.votes), found.export.as_ref().map(|e| e.1));
+
+    // T is known before applying inferred facet penalties because an exact name resolves that ambiguity. A
+    // caller-supplied constraint still filters below; only a facet guessed from these same words yields to it.
+    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
+    let mut t: f64 = 0.0;
+    let mut exact = false;
+    let also_named = found.names.iter().map(String::as_str);
+    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
+        let (score, is_exact) = parsed.title_query.score(title);
+        exact |= is_exact;
+        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
+    }
+
     // Φ: a country or decade the title is on record as not having removes it; one it has no record of discounts it.
     let mut phi = 1.0;
     if let Some(country) = parsed.facet.country {
@@ -769,10 +796,9 @@ fn features(
             phi = UNKNOWN_FACET;
         } else if !known.contains(&code) {
             // Read out of the words, so it may only discount. A demonym is as often part of a TITLE as it is
-            // a claim about origin — `russian doll` lost Russian Doll this way, `brazil` lost Gilliam's —
-            // and the corpus shows the guess is wrong about half the time anyway: "spanish" as a country
-            // misses 1,138 Spanish-LANGUAGE titles. Discounting lets a real title still win on its name.
-            phi *= WRONG_TEXT_FACET;
+            // a claim about origin, and the corpus shows the guess is wrong about half the time: "spanish" as
+            // a country misses 1,138 Spanish-LANGUAGE titles. An exact title keeps both readings alive.
+            phi = discount_text_facet(phi, exact);
         }
     }
     // The broadcaster, from a parameter, so it drops — but only for series, since a film has no such fact
@@ -843,7 +869,7 @@ fn features(
                     if parsed.year_from_param {
                         return None;
                     }
-                    phi *= WRONG_TEXT_FACET;
+                    phi = discount_text_facet(phi, exact);
                 }
             }
             None => phi *= UNKNOWN_FACET,
@@ -855,7 +881,9 @@ fn features(
             .map(i64::from)
             .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
         match year {
-            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => phi *= WRONG_TEXT_FACET,
+            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => {
+                phi = discount_text_facet(phi, exact);
+            }
             Some(_) => {}
             None => phi = UNKNOWN_FACET,
         }
@@ -874,19 +902,6 @@ fn features(
             Some(_) => return None,
             None => phi *= UNKNOWN_FACET,
         }
-    }
-
-    let pop = popularity(facets.map_or(0, |f| f.votes), found.export.as_ref().map(|e| e.1));
-
-    // T: the better of its export and display titles against the whole query.
-    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
-    let mut t: f64 = 0.0;
-    let mut exact = false;
-    let also_named = found.names.iter().map(String::as_str);
-    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
-        let (score, is_exact) = parsed.title_query.score(title);
-        exact |= is_exact;
-        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
     }
 
     let (plot_sem, premise_sem, sem) = semantic_evidence(found);
@@ -1096,6 +1111,19 @@ mod tests {
         assert!(W_TITLE * FUZZY_CAP < exact);
         // And a title merely by someone the query names.
         assert!(W_PERSON + W_POPULARITY < exact);
+    }
+
+    #[test]
+    fn an_inferred_facet_cannot_discount_an_exact_title() {
+        let (_, exact) = TitleQuery::new("brazil").score("Brazil");
+        assert!(exact);
+        assert_eq!(discount_text_facet(1.0, exact), 1.0);
+        assert_eq!(
+            discount_text_facet(UNKNOWN_FACET, exact),
+            UNKNOWN_FACET,
+            "an unrelated unknown-data penalty remains"
+        );
+        assert_eq!(discount_text_facet(1.0, false), WRONG_TEXT_FACET);
     }
 
     #[test]

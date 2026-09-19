@@ -1998,6 +1998,32 @@ mod tests {
         assert_eq!(first["f"]["semPremise"], 0.0);
     }
 
+    /// A word may be both a facet and a title. Reading `brazil` as country BR must not multiply the exact
+    /// title's whole score by WRONG_TEXT_FACET merely because Gilliam's film is recorded under other countries.
+    #[tokio::test]
+    async fn query_search_keeps_the_exact_title_floor_across_an_inferred_facet_collision() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-brazil-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let metadata_path = dir.join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata[0]["title"] = serde_json::json!("Brazil");
+        std::fs::write(&metadata_path, metadata.to_string()).unwrap();
+
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,0,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let answer: serde_json::Value =
+            serde_json::from_str(&body_of(get(&state, "/index/query.json?q=brazil").await).await).unwrap();
+        let first = &answer["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(1)));
+        assert!(first["score"].as_f64().unwrap() >= 1.2, "{answer}");
+        assert_eq!(first["f"]["phi"], 1.0, "{answer}");
+    }
+
     /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards
     /// with what a client's hide rules read, paged — and empty, not an error, for a facet nobody carries.
     #[tokio::test]
