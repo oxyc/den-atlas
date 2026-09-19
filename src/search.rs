@@ -2,14 +2,17 @@
 //!
 //! The query is read for what it names — a country, a decade, a type, a genre, one of atlas's labels, a plot facet —
 //! and the words left over. Every lane then only proposes titles: a fuzzy title match (TMDB's export titles and the
-//! display titles atlas draws with), the facet's titles, a label's or plot facet's titles, and the plot vectors'
-//! nearest to the leftover. Every candidate is scored on every signal, whichever lane found it:
+//! display titles atlas draws with), the facet's titles, a label's or plot facet's titles, and the plot and
+//! premise vectors' nearest to the leftover. Every candidate is scored on every signal, whichever lane found it:
 //!
-//! `S = Φ · [2.0·T + w_sem·Sem + 0.25·L + 0.10·PF + 0.15·Pop·R]`, `w_sem = 0.6·(0.3 + 0.7·λ)·(1 − 0.7·exact)`
+//! `S = Φ · [2.0·T + w_sem·max(Sem_plot, Sem_premise) + 0.25·L + 0.10·PF + 0.15·Pop·R]`,
+//! `w_sem = 0.6·(0.3 + 0.7·λ)·(1 − 0.7·exact)`
 //!
 //! A title match is weighted so that an exact title (T ≥ 0.6, so ≥ 1.2) always beats a match on theme alone (at
-//! most 0.6 + 0.25 + 0.10 + 0.15 = 1.10); the plot vectors count for more the more of the query is left over (λ),
+//! most 0.6 + 0.25 + 0.10 + 0.15 = 1.10); semantic vectors count for more the more of the query is left over (λ),
 //! and far less once an exact title answered, since they hold no titles and would only add what sounds alike.
+//! A country or date inferred from the same words cannot discount an exact title: ambiguous text keeps both
+//! readings alive, while explicit request constraints still filter normally.
 //! A near title match counts only for the leftover's share (T·λ): a query of words atlas reads ("bleak") asks for
 //! the theme, not for "Leak" or "Bleach". Popularity counts only as far as the title is relevant at all (R, the
 //! strongest of its other signals), so a famous title that merely sounds alike doesn't pass a closer one.
@@ -44,8 +47,8 @@ const SEMANTIC_SPAN_Z: f64 = 3.5;
 /// What a candidate keeps when the query names a country or decade it has no record of: unknown isn't a mismatch.
 const UNKNOWN_FACET: f64 = 0.6;
 /// What a candidate keeps when it CONTRADICTS a facet that was guessed from the query's words rather than
-/// given as a parameter. Heavy enough that the facet still orders the answer, light enough that an exact
-/// title survives it: `russian doll` must not be able to erase Russian Doll.
+/// given as a parameter. Heavy enough that the facet still orders the answer. It is not applied to an exact
+/// title: `brazil` may name both a country and Gilliam's film, and neither reading should erase the other.
 const WRONG_TEXT_FACET: f64 = 0.15;
 /// A title typed exactly scores this plus popularity's share; a near match at most `FUZZY_CAP`.
 const EXACT_TITLE: f64 = 0.6;
@@ -60,8 +63,6 @@ const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 const TITLE_LANE: usize = 50;
 const FACET_LANE: usize = 500;
 const LANE: usize = 200;
-/// Titles like an exact title, drawn right after it.
-const SIMILAR: usize = 12;
 /// Votes (facets.bin) and TMDB popularity at which a title counts as fully popular.
 const POPULAR_VOTES: f64 = 5000.0;
 const POPULAR_POPULARITY: f64 = 50.0;
@@ -410,8 +411,10 @@ struct Found {
     export: Option<(String, f64)>,
     /// The names it matched by in the display title index: its displayed title, or another name it goes by.
     names: Vec<String>,
-    /// How far its vector stands above the scan's mean, in standard deviations.
-    z: Option<f64>,
+    /// How far its plot and premise vectors stand above their own scans' means, in standard deviations.
+    /// The two distributions are normalised separately: their raw dot products are not one score space.
+    plot_z: Option<f64>,
+    premise_z: Option<f64>,
 }
 
 /// A candidate's features and score.
@@ -420,6 +423,8 @@ struct Scored {
     score: f64,
     exact: bool,
     t: f64,
+    plot_sem: f64,
+    premise_sem: f64,
     sem: f64,
     lab: f64,
     pf: f64,
@@ -550,7 +555,9 @@ pub fn answer(
             found.entry(key).or_default();
         }
     }
-    // The plot vectors' nearest to the leftover, within the facet when there is one.
+    // The plot and premise vectors' nearest to the leftover, within the facet when there is one. Each scan is
+    // standardised against its own corpus distribution; taking their stronger normalised answer below lets the
+    // premise representation propose a title without doubling the semantic term's weight.
     if let Some(vector) = vector {
         let (near, stats) = indexes.plot.scan_vector(
             vector,
@@ -559,8 +566,21 @@ pub fn answer(
         );
         if stats.sd > 0.0 {
             for n in near {
-                found.entry((n.media_type, n.tmdb_id)).or_default().z =
+                found.entry((n.media_type, n.tmdb_id)).or_default().plot_z =
                     Some((f64::from(n.score) - stats.mean) / stats.sd);
+            }
+        }
+        if let Some(premise) = &indexes.premise {
+            let (near, stats) = premise.scan_vector(
+                vector,
+                |id, kind| wanted(kind) && facet_set.as_ref().is_none_or(|set| set.contains(&(kind, id))),
+                LANE,
+            );
+            if stats.sd > 0.0 {
+                for n in near {
+                    found.entry((n.media_type, n.tmdb_id)).or_default().premise_z =
+                        Some((f64::from(n.score) - stats.mean) / stats.sd);
+                }
             }
         }
     }
@@ -591,32 +611,14 @@ pub fn answer(
         b.score.total_cmp(&a.score).then(votes(b.key).cmp(&votes(a.key))).then(a.key.cmp(&b.key))
     });
 
-    // An exact title leads the titles most like it — but never ahead of another title the query NAMED.
-    // `hobbit` is exactly the 1977 film, and putting its neighbours straight behind it left twelve animated
-    // films that had matched nothing, scoring 0, above the Jackson trilogy, which had matched by name.
-    if let Some(top) = scored.first().filter(|s| s.exact) {
-        let (kind, id) = top.key;
+    // An exact title leads the other titles the query NAMED, then the theme-only tail. More Like This used to
+    // insert twelve additional neighbours here with score 0.0, after the retain above had correctly dropped
+    // every irrelevant candidate. That made a full-looking result list by contradicting the score contract.
+    if scored.first().is_some_and(|s| s.exact) {
         let mut iter = scored.into_iter();
         let first = iter.next().expect("a top hit");
-        // Everything already scored keeps the place its score earned, neighbour or not.
         let ranked: Vec<Scored> = iter.collect();
-        let known: HashSet<Key> = ranked.iter().map(|s| s.key).chain([first.key]).collect();
-        // Only the neighbours nothing else found are new here, and they carry no score of their own.
-        let mut neighbours: Vec<Scored> = Vec::new();
-        let mut seen: HashSet<Key> = HashSet::new();
-        for n in indexes.more_like_this(id, kind).iter().take(SIMILAR) {
-            let key = (kind, *n);
-            if !wanted(key.0) || known.contains(&key) || !seen.insert(key) {
-                continue;
-            }
-            if let Some(mut s) = features(indexes, parsed, key, &Found::default(), &plot_confidence) {
-                s.score = 0.0;
-                if drawable(&s.key) {
-                    neighbours.push(s);
-                }
-            }
-        }
-        scored = order_around_exact(first, ranked, neighbours);
+        scored = order_around_exact(first, ranked);
     }
 
     let total = scored.len();
@@ -659,12 +661,14 @@ pub fn answer(
                 "posterPath": card.and_then(|c| c.poster_path.clone()),
                 "year": card.and_then(|c| c.year),
                 "genreIds": crate::plotrows::genres(indexes, s.key),
-                "f": {"t": round(s.t), "sem": round(s.sem), "lab": round(s.lab), "pf": round(s.pf), "p": s.person,
-                      "pop": round(s.pop), "phi": s.phi},
+                "f": {"t": round(s.t), "sem": round(s.sem), "semPlot": round(s.plot_sem),
+                      "semPremise": round(s.premise_sem), "lab": round(s.lab), "pf": round(s.pf),
+                      "p": s.person, "pop": round(s.pop), "phi": s.phi},
             });
             // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
             // for it, a request a card.
-            if let Some(imdb) = indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
+            if let Some(imdb) =
+                indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
             {
                 hit["imdbId"] = serde_json::json!(imdb);
             }
@@ -731,6 +735,28 @@ fn score(s: &Scored, w_sem: f64, in_facet: bool) -> f64 {
             + W_POPULARITY * s.pop * relevance)
 }
 
+/// Plot prose and premise tags are different representations with different dot-product distributions. Each
+/// becomes a 0...1 signal against its own scan, then the stronger one spends the existing semantic budget —
+/// never their sum, which would count the same query twice and break the exact-title invariant.
+fn semantic_evidence(found: &Found) -> (f64, f64, f64) {
+    let strength =
+        |z: Option<f64>| z.map_or(0.0, |z| ((z - SEMANTIC_FLOOR_Z) / SEMANTIC_SPAN_Z).clamp(0.0, 1.0));
+    let plot = strength(found.plot_z);
+    let premise = strength(found.premise_z);
+    (plot, premise, plot.max(premise))
+}
+
+/// A facet guessed from query text is an interpretation, not an explicit constraint. Keep its mismatch penalty
+/// for ordinary candidates, but never let it break the exact-title floor. Any penalty already in `phi` came from
+/// another constraint or unknown data and remains intact.
+fn discount_text_facet(phi: f64, exact: bool) -> f64 {
+    if exact {
+        phi
+    } else {
+        phi * WRONG_TEXT_FACET
+    }
+}
+
 /// A candidate's features, or `None` when a facet it has a record of contradicts the query.
 fn features(
     indexes: &Indexes,
@@ -742,6 +768,20 @@ fn features(
     let (kind, id) = key;
     let facets = indexes.facets.as_ref().and_then(|f| f.title(id, kind));
     let record = indexes.facts.as_ref().and_then(|f| f.get(id, kind));
+
+    let pop = popularity(facets.map_or(0, |f| f.votes), found.export.as_ref().map(|e| e.1));
+
+    // T is known before applying inferred facet penalties because an exact name resolves that ambiguity. A
+    // caller-supplied constraint still filters below; only a facet guessed from these same words yields to it.
+    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
+    let mut t: f64 = 0.0;
+    let mut exact = false;
+    let also_named = found.names.iter().map(String::as_str);
+    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
+        let (score, is_exact) = parsed.title_query.score(title);
+        exact |= is_exact;
+        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
+    }
 
     // Φ: a country or decade the title is on record as not having removes it; one it has no record of discounts it.
     let mut phi = 1.0;
@@ -756,10 +796,9 @@ fn features(
             phi = UNKNOWN_FACET;
         } else if !known.contains(&code) {
             // Read out of the words, so it may only discount. A demonym is as often part of a TITLE as it is
-            // a claim about origin — `russian doll` lost Russian Doll this way, `brazil` lost Gilliam's —
-            // and the corpus shows the guess is wrong about half the time anyway: "spanish" as a country
-            // misses 1,138 Spanish-LANGUAGE titles. Discounting lets a real title still win on its name.
-            phi *= WRONG_TEXT_FACET;
+            // a claim about origin, and the corpus shows the guess is wrong about half the time: "spanish" as
+            // a country misses 1,138 Spanish-LANGUAGE titles. An exact title keeps both readings alive.
+            phi = discount_text_facet(phi, exact);
         }
     }
     // The broadcaster, from a parameter, so it drops — but only for series, since a film has no such fact
@@ -830,7 +869,7 @@ fn features(
                     if parsed.year_from_param {
                         return None;
                     }
-                    phi *= WRONG_TEXT_FACET;
+                    phi = discount_text_facet(phi, exact);
                 }
             }
             None => phi *= UNKNOWN_FACET,
@@ -842,7 +881,9 @@ fn features(
             .map(i64::from)
             .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
         match year {
-            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => phi *= WRONG_TEXT_FACET,
+            Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => {
+                phi = discount_text_facet(phi, exact);
+            }
             Some(_) => {}
             None => phi = UNKNOWN_FACET,
         }
@@ -863,20 +904,7 @@ fn features(
         }
     }
 
-    let pop = popularity(facets.map_or(0, |f| f.votes), found.export.as_ref().map(|e| e.1));
-
-    // T: the better of its export and display titles against the whole query.
-    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
-    let mut t: f64 = 0.0;
-    let mut exact = false;
-    let also_named = found.names.iter().map(String::as_str);
-    for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
-        let (score, is_exact) = parsed.title_query.score(title);
-        exact |= is_exact;
-        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
-    }
-
-    let sem = found.z.map_or(0.0, |z| ((z - SEMANTIC_FLOOR_Z) / SEMANTIC_SPAN_Z).clamp(0.0, 1.0));
+    let (plot_sem, premise_sem, sem) = semantic_evidence(found);
 
     let mut lab: f64 = 0.0;
     if !parsed.genres.is_empty()
@@ -907,20 +935,17 @@ fn features(
         _ => 0.0,
     };
 
-    Some(Scored { key, score: 0.0, exact, t, sem, lab, pf, person, pop, phi })
+    Some(Scored { key, score: 0.0, exact, t, plot_sem, premise_sem, sem, lab, pf, person, pop, phi })
 }
 
 /// The order around an exact title: the title itself, then everything else the query matched by name in the
-/// order its score earned, then More Like This's own titles in its order, then the theme-only tail.
-///
-/// `ranked` arrives sorted; `neighbours` are the ones only More Like This found, which carry no score. They
-/// belong ahead of a title that merely sounds alike and behind one the query actually named.
-fn order_around_exact(first: Scored, ranked: Vec<Scored>, neighbours: Vec<Scored>) -> Vec<Scored> {
+/// order its score earned, then the theme-only tail. `ranked` contains only positive-score candidates: this
+/// function must never make a query look fuller by inventing zero-score More Like This answers.
+fn order_around_exact(first: Scored, ranked: Vec<Scored>) -> Vec<Scored> {
     let (named, tail): (Vec<Scored>, Vec<Scored>) = ranked.into_iter().partition(|s| s.t > 0.0);
-    let mut ordered = Vec::with_capacity(1 + named.len() + neighbours.len() + tail.len());
+    let mut ordered = Vec::with_capacity(1 + named.len() + tail.len());
     ordered.push(first);
     ordered.extend(named);
-    ordered.extend(neighbours);
     ordered.extend(tail);
     ordered
 }
@@ -1089,6 +1114,32 @@ mod tests {
     }
 
     #[test]
+    fn an_inferred_facet_cannot_discount_an_exact_title() {
+        let (_, exact) = TitleQuery::new("brazil").score("Brazil");
+        assert!(exact);
+        assert_eq!(discount_text_facet(1.0, exact), 1.0);
+        assert_eq!(
+            discount_text_facet(UNKNOWN_FACET, exact),
+            UNKNOWN_FACET,
+            "an unrelated unknown-data penalty remains"
+        );
+        assert_eq!(discount_text_facet(1.0, false), WRONG_TEXT_FACET);
+    }
+
+    #[test]
+    fn premise_and_plot_are_normalised_separately_and_share_one_semantic_budget() {
+        let plot_only = Found { plot_z: Some(3.2), ..Found::default() };
+        let (plot, premise, combined) = semantic_evidence(&plot_only);
+        assert!((plot - 0.2).abs() < 1e-9 && premise == 0.0 && combined == plot);
+
+        let both = Found { plot_z: Some(3.2), premise_z: Some(4.6), ..Found::default() };
+        let (plot, premise, combined) = semantic_evidence(&both);
+        assert!((plot - 0.2).abs() < 1e-9);
+        assert!((premise - 0.6).abs() < 1e-9);
+        assert_eq!(combined, premise, "the stronger lane wins; the two lanes are not added");
+    }
+
+    #[test]
     fn popularity_reads_votes_and_else_the_export() {
         assert_eq!(popularity(5000, Some(1.0)), 1.0, "votes win");
         assert_eq!(popularity(0, Some(50.0)), 1.0);
@@ -1097,16 +1148,18 @@ mod tests {
         assert!(attention(30_000, None) > attention(5000, None), "ordering keeps apart what popularity caps");
     }
 
-    /// `hobbit` is exactly the 1977 animated film, so More Like This ran on it and its twelve animated
-    /// neighbours — scoring 0, matching nothing — were placed directly behind it, above the Jackson trilogy
-    /// (0.72–1.06) which had matched the query by name. A neighbour may lead the tail, never a title named.
+    /// `hobbit` is exactly the 1977 animated film. Search used to put twelve More Like This neighbours carrying
+    /// score 0 directly behind it. Exact-title ordering may rearrange real query matches; it must not manufacture
+    /// candidates that the scoring contract already rejected.
     #[test]
-    fn more_like_this_never_outranks_a_title_the_query_named() {
+    fn exact_title_ordering_contains_only_the_queries_scored_candidates() {
         let hit = |id, score, t| Scored {
             key: (MediaType::Movie, id),
             score,
             exact: false,
             t,
+            plot_sem: 0.0,
+            premise_sem: 0.0,
             sem: 0.0,
             lab: 0.0,
             pf: 0.0,
@@ -1121,9 +1174,10 @@ mod tests {
             hit(49051, 0.8127, 0.3241),  // The Hobbit: An Unexpected Journey
             hit(672, 0.2682, 0.0),       // Harry Potter and the Chamber of Secrets — theme only
         ];
-        let neighbours = vec![hit(808, 0.0, 0.0), hit(330457, 0.0, 0.0)]; // Shrek, Frozen II
-        let ids: Vec<u32> = order_around_exact(anchor, ranked, neighbours).iter().map(|s| s.key.1).collect();
-        assert_eq!(ids, vec![1362, 122917, 49051, 808, 330457, 672]);
+        let ordered = order_around_exact(anchor, ranked);
+        let ids: Vec<u32> = ordered.iter().map(|s| s.key.1).collect();
+        assert_eq!(ids, vec![1362, 122917, 49051, 672]);
+        assert!(ordered.iter().all(|s| s.score > 0.0));
     }
 
     #[test]
@@ -1133,6 +1187,8 @@ mod tests {
             score: 0.0,
             exact: false,
             t: 0.0,
+            plot_sem: sem,
+            premise_sem: 0.0,
             sem,
             lab: 0.0,
             pf: 0.0,
