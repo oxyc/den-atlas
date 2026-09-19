@@ -168,8 +168,9 @@ attention (a place in Trending Everywhere, the household's "new on" lists, and t
 quality, multiplied by the library's taste and discounted where the library's own More Like This already
 reaches. It describes each title from what atlas holds: the labels, `facets.bin`, and the dataset's Wikidata
 facts file (`factsSlimFile`, else `factsFile`) when the release carries one; a candidate's `hint` (release
-date, genres, countries and popularity) fills only what those leave unknown. Ratings in client hints are ignored;
-quality uses only Atlas's own upstream catalog scores, including JustWatch's IMDb scores. `unjudged` names the 20
+date, genres, countries, popularity, rating and votes) fills only what those leave unknown. Rating hints affect only
+that response: Atlas never writes them to catalogs, its dataset or replay fixtures. Existing upstream scores,
+including JustWatch's IMDb scores, remain in Atlas's own catalog output. `unjudged` names the 20
 titles atlas knows nothing about that are most worth describing; a client that can describe them asks again
 with their hints, since an undescribed title is dropped once enough are judged. `library` is
 `[{type,id,weight,at,hint?}]`,

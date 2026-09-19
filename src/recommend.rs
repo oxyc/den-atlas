@@ -5,9 +5,9 @@
 //! asked TMDB what a title is, this reads what atlas already holds: the dataset's labels (primary genre,
 //! animation, subgenres, moods), `facets.bin` (country, original language, year) and, once the dataset
 //! publishes them, the Wikidata facts (dates with their precision, genres, makers, cast, franchise). What a
-//! client got from TMDB lists it already fetched for its own rows — release date, genres and popularity —
-//! arrives as a per-candidate hint and fills only what atlas doesn't know. Ratings come only from Atlas's own
-//! upstream catalog data, including JustWatch's IMDb scores.
+//! client got from TMDB lists it already fetched for its own rows — release date, genres, popularity and rating —
+//! arrives as a per-candidate hint and fills only what atlas doesn't know. Hints live for this request alone: no
+//! TMDB rating is copied into Atlas's catalogs, dataset or kept replay fixtures.
 //!
 //! What a billboard shows is not the leading row. A "Because you watched X" row is the nearest neighbours of
 //! a title already watched, and after enough history that neighbourhood IS the history. A billboard is the
@@ -41,7 +41,8 @@ const ANTICIPATION_DAYS: f64 = 45.0;
 const RATING_PRIOR_VOTES: f64 = 200.0;
 /// What a title is worth before anyone has said: a little above TMDB's middle, where most rated titles land.
 const RATING_PRIOR: f64 = 6.6;
-/// Votes a rating needs to count as independently established when duplicate candidates are merged.
+/// Votes a counted rating needs before it replaces an upstream catalog score. A 7.2 on 18 votes must not read
+/// over an established IMDb score and put a poorly received release at the top of a billboard.
 const COUNTED_ENOUGH: f64 = 100.0;
 /// Days after its release beyond which a title arriving on a service is catalogue joining it, not something new.
 const CATALOGUE_DAYS: f64 = 730.0;
@@ -211,6 +212,10 @@ pub struct Hint {
     /// ISO 3166-1 alpha-2.
     pub countries: Option<Vec<String>>,
     pub popularity: Option<f64>,
+    /// A transient TMDB score supplied by the caller. Never written into an Atlas artifact or response.
+    pub rating: Option<f64>,
+    /// The TMDB vote count behind `rating`, under the same transient boundary.
+    pub votes: Option<f64>,
     pub adult: Option<bool>,
     pub imdb_id: Option<String>,
 }
@@ -470,17 +475,33 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
-        // Ratings in Atlas come only from JustWatch's own IMDb score. Client hints are TMDB-derived and may
-        // describe dates, genres and availability, but never carry a score across this boundary.
-        if let Some(rating) = listed.and_then(|l| l.rating) {
-            title.rating = Some(rating);
-            match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
-                Some(votes) => title.votes = Some(f64::from(votes)),
-                None => {
-                    title.votes = Some(RATING_PRIOR_VOTES);
-                    title.estimated_votes = true;
+        let hinted = hint.and_then(|h| {
+            h.rating
+                .filter(|rating| rating.is_finite() && *rating > 0.0 && *rating <= 10.0)
+                .map(|rating| {
+                    let votes = h.votes.filter(|votes| votes.is_finite() && *votes >= 0.0);
+                    (rating, votes)
+                })
+        });
+        match (hinted, listed.and_then(|l| l.rating)) {
+            // A transient TMDB score replaces an upstream score only when enough votes stand behind it.
+            (Some((rating, votes)), listed_rating) if listed_rating.is_none() || counted(votes) => {
+                title.rating = Some(rating);
+                title.votes = votes;
+            }
+            // JustWatch gives IMDb's score without its vote count. TMDB's count for the title, where the facets hold
+            // one, says how far it stands; without one it is trusted as far as the prior's own weight.
+            (_, Some(rating)) => {
+                title.rating = Some(rating);
+                match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
+                    Some(votes) => title.votes = Some(f64::from(votes)),
+                    None => {
+                        title.votes = Some(RATING_PRIOR_VOTES);
+                        title.estimated_votes = true;
+                    }
                 }
             }
+            _ => {}
         }
         title.popularity = hint.and_then(|h| h.popularity);
         title.adult = hint.and_then(|h| h.adult).unwrap_or(false);
@@ -618,7 +639,8 @@ fn best(a: Option<Placing>, b: Option<Placing>) -> Option<Placing> {
 
 /// The same title from two sources is one candidate holding everything both knew about it; the first says
 /// what it knows first, except where the second knows it better. Atlas's own lists come first in the pool
-/// and may name a title only by year, so a candidate carrying the exact date must not lose to them.
+/// and may name a title by its year and a vote-less score, so a client candidate's exact date and counted rating
+/// must not lose to them.
 fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
     fn either<T>(x: Vec<T>, y: Vec<T>) -> Vec<T> {
         if x.is_empty() {
@@ -981,9 +1003,21 @@ pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::
             })
             .collect()
     };
+    // Replay files are durable diagnostic artifacts. Keep the request shape, but never copy transient TMDB rating
+    // metadata into one; those fields are allowed only in the live request or the bounded den-edge cache.
+    let mut request = raw.clone();
+    for collection in ["library", "candidates"] {
+        for item in request[collection].as_array_mut().into_iter().flatten() {
+            if let Some(hint) = item.get_mut("hint").and_then(serde_json::Value::as_object_mut) {
+                for field in ["rating", "votes", "voteAverage", "voteCount"] {
+                    hint.remove(field);
+                }
+            }
+        }
+    }
     serde_json::json!({
         "now": now,
-        "request": raw,
+        "request": request,
         "lists": {
             "arrivals": lists.arrivals.iter().map(|list| listed(list)).collect::<Vec<_>>(),
             "everywhere": listed(&lists.everywhere),
@@ -1391,8 +1425,17 @@ mod tests {
 
     #[test]
     fn a_fixture_reads_back_as_the_request_lists_and_moment_it_was_ranked_with() {
-        let raw =
-            serde_json::json!({"surface": "movies", "library": [{"type": "movie", "id": 1, "weight": 1.0}]});
+        let raw = serde_json::json!({
+            "surface": "movies",
+            "library": [{
+                "type": "movie", "id": 1, "weight": 1.0,
+                "hint": {"genreIds": [18], "rating": 8.4, "votes": 1200}
+            }],
+            "candidates": [{
+                "type": "movie", "id": 7,
+                "hint": {"releaseDate": "2026-09-01", "voteAverage": 9.1, "voteCount": 20_000}
+            }]
+        });
         let lists = Lists {
             arrivals: vec![vec![Listed {
                 key: (MediaType::Movie, 7),
@@ -1412,6 +1455,9 @@ mod tests {
         let (request, back, now) = replayed(&fixture(&raw, &lists, 20_709.5)).unwrap();
         assert_eq!(now, 20_709.5);
         assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
+        assert_eq!(request.library[0].hint.genre_ids, Some(vec![18]));
+        assert_eq!((request.library[0].hint.rating, request.library[0].hint.votes), (None, None));
+        assert_eq!(request.candidates[0].hint.release_date.as_deref(), Some("2026-09-01"));
         assert_eq!(
             (back.arrivals, back.everywhere, back.popular, back.charts),
             (lists.arrivals, lists.everywhere, lists.popular, lists.charts)
