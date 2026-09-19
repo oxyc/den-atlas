@@ -408,7 +408,9 @@ pub fn trending(shows: &[Show], series: bool) -> Vec<TrendingItem> {
             moviedb: Some(i64::from(s.tmdb)),
             title: s.title.clone(),
             rank,
-            rating: s.rating,
+            // Movie of the Night's score is an average of several unnamed online sources. The catalog field is
+            // explicitly `imdbRating`, so only JustWatch's sourced IMDb score may occupy it.
+            rating: None,
             year: s.year,
             // The one source here that knows a date: when this title lands on the service, or leaves it.
             at: s.at,
@@ -733,12 +735,14 @@ mod tests {
         let mut series = at("Moria", 322_428, 0);
         series.series = true;
         series.imdb = Some("tt41559147".into());
-        let film = Show { imdb: Some("tt11561116".into()), ..at("The Whisper Man", 860_508, 0) };
+        let film =
+            Show { imdb: Some("tt11561116".into()), rating: Some(8.9), ..at("The Whisper Man", 860_508, 0) };
         let items = trending(&[series.clone(), film, at("No imdb", 5, 0)], false);
         assert_eq!(
             items.iter().map(|i| (i.imdb.as_str(), i.rank)).collect::<Vec<_>>(),
             vec![("tt11561116", 0)]
         );
+        assert_eq!(items[0].rating, None, "a multi-source aggregate is not relabeled as IMDb");
         assert_eq!(trending(&[series], true)[0].moviedb, Some(322_428));
     }
 

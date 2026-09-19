@@ -852,7 +852,13 @@ pub fn aggregate_inverse_rank(lists: &[Vec<TrendingItem>]) -> Vec<TrendingItem> 
 fn led_by(lead: Vec<TrendingItem>, rest: Vec<TrendingItem>) -> Vec<TrendingItem> {
     let mut items = lead;
     for item in rest {
-        if !items.iter().any(|held| held.imdb == item.imdb) {
+        if let Some(held) = items.iter_mut().find(|held| held.imdb == item.imdb) {
+            // The leading Movie of the Night chart carries no attributable score. If JustWatch also named the
+            // title, keep its explicitly sourced IMDb rating without changing the chart's rank or title.
+            if held.rating.is_none() {
+                held.rating = item.rating;
+            }
+        } else {
             items.push(item);
         }
     }
@@ -951,12 +957,14 @@ mod tests {
 
     #[test]
     fn a_kept_list_leads_a_row_and_justwatch_follows_without_repeats() {
-        let led =
-            led_by(vec![item("tt2", "Top", 0)], vec![item("tt1", "Other", 0), item("tt2", "Top again", 1)]);
+        let mut duplicate = item("tt2", "Top again", 1);
+        duplicate.rating = Some(7.4);
+        let led = led_by(vec![item("tt2", "Top", 0)], vec![item("tt1", "Other", 0), duplicate]);
         assert_eq!(
             led.iter().map(|i| (i.imdb.as_str(), i.rank)).collect::<Vec<_>>(),
             vec![("tt2", 0), ("tt1", 1)]
         );
+        assert_eq!(led[0].rating, Some(7.4), "the duplicate's attributable JustWatch IMDb score survives");
     }
 
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {

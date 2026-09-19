@@ -123,7 +123,7 @@ origin.
 | `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
-| `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total}`. The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot vectors on the leftover) is scored `Φ·[2.0·title + w·semantic + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match; an exact title leads its More Like This. 40 a page, at most 100 |
+| `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total}`. The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
 | `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the dataset's plot facets (`plotFacetsFile`: ending, era, structure, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
@@ -159,9 +159,11 @@ Index queries (`INDEX_QUERIES`) answer from the dataset's plot and premise index
 index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load on the first
 query — the answer's `Server-Timing` carries `load;dur=<ms>` then — and are released after 10 idle minutes,
 so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries":true` when they're on.
-Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`); the
-facet lane reads the dataset's `facets.bin`. Taste weights stay with the client: `score` returns the raw
-boosts.
+Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`). Unified
+query search scans both plot and premise vectors when the latter exist, normalises each scan against its own
+distribution, and lets the stronger one spend the single semantic weight; a missing premise index preserves
+plot-only behaviour. The facet lane reads the dataset's `facets.bin`. Taste weights stay with the client:
+`score` returns the raw boosts.
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows include the relevant
@@ -176,8 +178,9 @@ attention (a place in Trending Everywhere, the household's "new on" lists, and t
 quality, multiplied by the library's taste and discounted where the library's own More Like This already
 reaches. It describes each title from what atlas holds: the labels, `facets.bin`, and the dataset's Wikidata
 facts file (`factsSlimFile`, else `factsFile`) when the release carries one; a candidate's `hint` (release
-date, genres, countries and popularity) fills only what those leave unknown. Ratings in client hints are ignored;
-quality uses only Atlas's own upstream catalog scores, including JustWatch's IMDb scores. `unjudged` names the 20
+date, genres, countries, popularity, rating and votes) fills only what those leave unknown. Rating hints affect only
+that response: Atlas never writes them to catalogs, its dataset or replay fixtures. Existing upstream scores,
+including JustWatch's IMDb scores, remain in Atlas's own catalog output. `unjudged` names the 20
 titles atlas knows nothing about that are most worth describing; a client that can describe them asks again
 with their hints, since an undescribed title is dropped once enough are judged. `library` is
 `[{type,id,weight,at,hint?}]`,

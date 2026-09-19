@@ -1932,8 +1932,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Search in one request: an exact title leads its similar titles, a typo still finds its title, a country
-    /// filters, a label and a plot facet each propose and lift their titles — and the reading comes back too.
+    /// Search in one request: an exact title returns only scored query matches, a typo still finds its title, a
+    /// country filters, a label and a plot facet each propose and lift their titles — and the reading comes back.
     #[tokio::test]
     async fn query_searches_titles_facets_labels_and_plot_facets_in_one_ranking() {
         let state = index_state("den-atlas-query");
@@ -1948,9 +1948,11 @@ mod tests {
                 .collect()
         };
 
-        // "One" is exact; More Like This for movie 1 is 3 then 2 (premise-led), drawn right after it.
+        // "One" is exact. More Like This for movie 1 is 3 then 2, but neither matched this query and search
+        // must not reinsert them with score zero merely to fill the page.
         let one = json(body_of(get(&state, &ask("one")).await).await);
-        assert_eq!(keys(&one)[..3], ["movie:1", "movie:3", "movie:2"], "{one}");
+        assert_eq!(keys(&one), ["movie:1"], "{one}");
+        assert!(one["hits"].as_array().unwrap().iter().all(|h| h["score"].as_f64().unwrap() > 0.0));
         assert_eq!(one["hits"][0]["title"], "One");
         assert_eq!(one["hits"][0]["posterPath"], "/1.jpg");
         assert_eq!(one["hits"][0]["imdbId"], "tt0000001", "from the facts, so a client needn't ask TMDB");
@@ -1988,6 +1990,68 @@ mod tests {
         let uno = json(body_of(get(&state, &ask("uno")).await).await);
         assert_eq!(keys(&uno)[0], "movie:1", "{uno}");
         assert_eq!(uno["people"], serde_json::json!([]));
+    }
+
+    /// Unified query search scans the optional premise index with the same query vector, admits a title only
+    /// that representation found, and remains plot-semantic when a dataset does not ship the optional pair.
+    #[tokio::test]
+    async fn query_search_uses_premise_semantics_and_preserves_plot_only_fallback() {
+        let answer = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-premise-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let with_premise = answer(body_of(get(&state, "/index/query.json?q=zzzz").await).await);
+        let first = &with_premise["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(2)));
+        assert_eq!(first["f"]["semPlot"], 0.0, "movie 2 is not a strong plot-vector answer");
+        assert!(first["f"]["semPremise"].as_f64().unwrap() > 0.0, "{with_premise}");
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-plot-only-{}", std::process::id()));
+        let mut ds = crate::queries::write_fixture(&dir);
+        ds.premise_labels = None;
+        ds.premise_vectors = None;
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let plot_only = answer(body_of(get(&state, "/index/query.json?q=zzzz").await).await);
+        let first = &plot_only["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(3)));
+        assert!(first["f"]["semPlot"].as_f64().unwrap() > 0.0, "{plot_only}");
+        assert_eq!(first["f"]["semPremise"], 0.0);
+    }
+
+    /// A word may be both a facet and a title. Reading `brazil` as country BR must not multiply the exact
+    /// title's whole score by WRONG_TEXT_FACET merely because Gilliam's film is recorded under other countries.
+    #[tokio::test]
+    async fn query_search_keeps_the_exact_title_floor_across_an_inferred_facet_collision() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-brazil-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let metadata_path = dir.join("metadata.json");
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+        metadata[0]["title"] = serde_json::json!("Brazil");
+        std::fs::write(&metadata_path, metadata.to_string()).unwrap();
+
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,0,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let answer: serde_json::Value =
+            serde_json::from_str(&body_of(get(&state, "/index/query.json?q=brazil").await).await).unwrap();
+        let first = &answer["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(1)));
+        assert!(first["score"].as_f64().unwrap() >= 1.2, "{answer}");
+        assert_eq!(first["f"]["phi"], 1.0, "{answer}");
     }
 
     /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards
@@ -2104,8 +2168,8 @@ mod tests {
         assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
 
-        // JustWatch's IMDb score rests on the facet count where one exists. Legacy clients may still send
-        // rating fields, but serde ignores them and Atlas never imports the score.
+        // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one. A transient client score on
+        // too few votes does not replace it, while a well-counted one may rank this response without being emitted.
         let known = crate::recommend::Knowledge { indexes: &indexes };
         let listed = crate::recommend::Listed {
             key: (den_index::MediaType::Movie, 2),
@@ -2115,12 +2179,17 @@ mod tests {
         };
         let title = known.title(listed.key, None, Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(500.0), false));
-        let client: crate::recommend::Hint =
-            serde_json::from_str(r#"{"rating":7.2,"votes":180,"voteAverage":9.1,"voteCount":20000}"#)
-                .unwrap();
-        let title = known.title((den_index::MediaType::Movie, 99), Some(&client), Some(&listed));
+        let few: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":18}"#).unwrap();
+        let title = known.title((den_index::MediaType::Movie, 99), Some(&few), Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(200.0), true));
-        assert_eq!(known.title((den_index::MediaType::Movie, 100), Some(&client), None).rating, None);
+        let enough: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
+        let hinted = known.title((den_index::MediaType::Movie, 99), Some(&enough), Some(&listed));
+        assert_eq!((hinted.rating, hinted.votes), (Some(7.2), Some(180.0)));
+        assert!(answer["slides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|slide| { slide.get("rating").is_none() && slide.get("votes").is_none() }));
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.

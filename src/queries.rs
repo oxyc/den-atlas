@@ -409,17 +409,36 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
         }
         (labels.to_string(), vectors)
     }
+    // Eight zero-vector series make the fixture's semantic-score distribution large enough for one clear
+    // movie match to cross search.rs's z=2.5 floor. They deliberately have no cards: route tests can prove
+    // which of the four drawable titles each semantic index proposes without expanding every other fixture.
     let plot = blobs(&[
         (1, "movie", "Drama", &[("Heist", 0.9)], &[("Tense", 0.8)], [100, 0, 0]),
         (2, "movie", "Drama", &[("Heist", 0.8)], &[], [90, 10, 0]),
         (3, "movie", "Comedy", &[("Heist", 0.6), ("Campy/Cult", 0.9)], &[], [0, 100, 0]),
         (4, "tv", "Drama", &[("Heist", 0.95)], &[], [100, 0, 0]),
+        (101, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (102, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (103, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (104, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (105, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (106, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (107, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (108, "tv", "Drama", &[], &[], [0, 0, 0]),
     ]);
     let premise = blobs(&[
         (1, "movie", "Drama", &[("Heist", 0.9)], &[("Tense", 0.8)], [100, 0, 0]),
         (2, "movie", "Drama", &[("Heist", 0.8)], &[], [0, 100, 0]),
         (3, "movie", "Comedy", &[("Heist", 0.6), ("Campy/Cult", 0.9)], &[], [95, 0, 0]),
         (4, "tv", "Drama", &[("Heist", 0.95)], &[], [100, 0, 0]),
+        (101, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (102, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (103, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (104, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (105, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (106, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (107, "tv", "Drama", &[], &[], [0, 0, 0]),
+        (108, "tv", "Drama", &[], &[], [0, 0, 0]),
     ]);
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("labels.json"), &plot.0).unwrap();
@@ -457,11 +476,11 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
         "factsSlimFile": "facts-slim.json",
         "plotFacetsFile": "plot-facets.json",
         "metadataFile": "metadata.json", "metadataBytes": metadata.len(), "metadataSha256": "f",
-        "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 4,
+        "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 12,
         "quantization": "int8",
         "labelsFile": "labels.json", "labelsBytes": plot.0.len(), "labelsSha256": "a",
         "vectorsFile": "vectors.bin", "vectorsBytes": plot.1.len(), "vectorsSha256": "b",
-        "premiseEmbeddingModel": "pm", "premiseDims": 3, "premiseCount": 4,
+        "premiseEmbeddingModel": "pm", "premiseDims": 3, "premiseCount": 12,
         "premiseLabelsFile": "premise-labels.json", "premiseLabelsBytes": premise.0.len(),
         "premiseLabelsSha256": "c",
         "premiseVectorsFile": "premise-vectors.bin", "premiseVectorsBytes": premise.1.len(),
@@ -497,7 +516,7 @@ mod tests {
         assert!(queries.release_if_idle());
 
         // A query that held the index across the release still has it; the next query reloads.
-        assert_eq!(indexes.plot.len(), 4);
+        assert_eq!(indexes.plot.len(), 12);
         let (_, reload) = queries.get(counted).await.unwrap();
         assert!(reload.is_some(), "the query after a release loads again");
         assert_eq!(loads.get(), 2);
