@@ -52,7 +52,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let log = state.log_requests.then(|| {
         (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri()), request_id(req.headers()))
     });
-    let mut resp = route(State(state), req).await;
+    let mut resp = crate::tos::guard_response(route(State(state), req).await).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
@@ -236,18 +236,20 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return json_response(body, status);
     }
     if route == "/manifest.json" {
-        return serve_json(
-            &method,
-            &headers,
-            manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
-            "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
-            None,
-            false,
-        )
-        .await;
+        return crate::tos::trusted(
+            serve_json(
+                &method,
+                &headers,
+                manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
+                "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
+                None,
+                false,
+            )
+            .await,
+        );
     }
     if route == "/dataset.json" {
-        return match ds {
+        return crate::tos::trusted(match ds {
             Some(ds) => {
                 // The descriptor embeds absolute blob URLs built from the request's own
                 // host/scheme, so those headers are part of what the body says.
@@ -270,7 +272,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
                 RELOAD_WAIT,
             ),
-        };
+        });
     }
     // Blob routes exist only when the dataset loaded (their names come from the meta).
     if let Some(ds) = ds {
@@ -304,7 +306,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         }
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
-        return handle_catalog(&method, &headers, rest, &config, &state).await;
+        return crate::tos::trusted(handle_catalog(&method, &headers, rest, &config, &state).await);
     }
     if let Some(rest) = route.strip_prefix("/index/") {
         return handle_index(&method, &headers, rest, &query, &state).await;
@@ -533,6 +535,7 @@ const MAX_ROW_PAGE: usize = 100;
 /// One `/index/…` question, parsed before the index loads, so a malformed path never pays for a load.
 enum IndexQuestion {
     Taxonomy,
+    Schema,
     Rows {
         media_type: den_index::MediaType,
         mood: bool,
@@ -563,6 +566,7 @@ impl IndexQuestion {
         let parts: Vec<&str> = route.split('/').collect();
         match parts.as_slice() {
             ["taxonomy"] => Some(Self::Taxonomy),
+            ["schema"] => Some(Self::Schema),
             ["rows", type_, family, label] => {
                 let mood = match *family {
                     "subgenre" => false,
@@ -599,6 +603,7 @@ impl IndexQuestion {
                 "subgenres": plot.subgenre_labels(),
                 "moods": plot.mood_labels(),
             }),
+            Self::Schema => crate::schema::document(indexes),
             Self::Rows { media_type, mood, label } => {
                 let number = |key: &str, default: usize| {
                     query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -610,7 +615,18 @@ impl IndexQuestion {
                 } else {
                     plot.titles_with_subgenre(label, Some(*media_type), floor, skip, limit)
                 };
-                serde_json::json!({ "ids": titles.iter().map(|&(id, _)| id).collect::<Vec<u32>>() })
+                let total = if *mood {
+                    plot.count_with_mood(label, Some(*media_type), floor)
+                } else {
+                    plot.count_with_subgenre(label, Some(*media_type), floor)
+                };
+                let family = if *mood { "mood" } else { "subgenre" };
+                let constraints = [(family.to_owned(), label.clone())];
+                serde_json::json!({
+                    "ids": titles.iter().map(|&(id, _)| id).collect::<Vec<u32>>(),
+                    "total": total,
+                    "coverage": crate::schema::row_coverage(indexes, *media_type, &constraints),
+                })
             }
             Self::Similar { media_type, tmdb_id } => serde_json::json!({
                 "ids": &*indexes.more_like_this(*tmdb_id, *media_type),
@@ -1380,7 +1396,7 @@ async fn serve_blob(
     )
     .await;
     // A blob has one phase — the body streams after this, so `total` is time to the response head.
-    with_timing(resp, &format!("total;dur={}", ms(started.elapsed())))
+    crate::tos::trusted(with_timing(resp, &format!("total;dur={}", ms(started.elapsed()))))
 }
 
 /// First value of `key` in a `k=v&k2=v2` query string (the datasetVersion is hex, so no percent-decoding).
@@ -1624,7 +1640,7 @@ mod tests {
         // stamp from any optional blob passed; declaring metadata + facets but not the two premise
         // blobs left exactly that hole open for premise, and a premise route serving the wrong blob
         // passed too. The loop's floor below is tied to what this writes.
-        std::fs::write(dir.join("meta.json"), b"METADATA").unwrap();
+        std::fs::write(dir.join("meta.json"), b"[]").unwrap();
         std::fs::write(dir.join("facets.bin"), b"FACETS").unwrap();
         std::fs::write(dir.join("premise-labels.json"), b"PLABELS").unwrap();
         std::fs::write(dir.join("premise-vectors.bin"), b"PVECTORS").unwrap();
@@ -1634,7 +1650,7 @@ mod tests {
                  "quantization":"int8",
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "metadataFile":"meta.json","metadataBytes":8,"metadataSha256":"c",
+                 "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c",
                  "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d",
                  "premiseEmbeddingModel":"pm","premiseDims":2,"premiseCount":1,
                  "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
@@ -1722,6 +1738,17 @@ mod tests {
         let taxonomy = json(body_of(taxonomy).await);
         assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
         assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
+        let schema = json(body_of(get(&state, "/index/schema.json").await).await);
+        // 12 titles, 8 of them unlabelled: `count` and `denominator` must differ, or a client reports a
+        // fraction of the corpus as though it were the whole of it.
+        assert_eq!(schema["population"]["count"], 12);
+        assert_eq!(
+            schema["fields"]["tone"]["coverage"],
+            serde_json::json!({
+                "count": 3, "denominator": 12, "ratio": 0.25
+            })
+        );
+        assert_eq!(schema["fields"]["mood"]["coverage"]["count"], 1);
 
         for (path, want) in [
             ("/index/rows/movie/subgenre/Heist.json", serde_json::json!([1, 2, 3])),
@@ -1732,7 +1759,12 @@ mod tests {
             // Premise leads: 3 (its premise score, +¼ as the plot agrees, −¼ for another genre) beats 2.
             ("/index/similar/movie/1.json", serde_json::json!([3, 2])),
         ] {
-            assert_eq!(json(body_of(get(&state, path).await).await)["ids"], want, "{path}");
+            let answer = json(body_of(get(&state, path).await).await);
+            assert_eq!(answer["ids"], want, "{path}");
+            if path.starts_with("/index/rows/") {
+                let denominator = if path.contains("/series/") { 1 } else { 3 };
+                assert_eq!(answer["coverage"]["denominator"], denominator, "{path}");
+            }
         }
         assert!(body_of(get(&state, "/dataset.json").await).await.contains(r#""queries":true"#));
     }
@@ -2406,7 +2438,7 @@ mod tests {
         assert_eq!(body_of(facets).await, "FACETS", "the facets route served another blob");
         let meta = get(&state, "/meta.json").await;
         assert_eq!(meta.status(), 200);
-        assert_eq!(body_of(meta).await, "METADATA", "the metadata route served another blob");
+        assert_eq!(body_of(meta).await, "[]", "the metadata route served another blob");
         let pl = get(&state, "/premise-labels.json").await;
         assert_eq!(pl.status(), 200);
         assert_eq!(body_of(pl).await, "PLABELS", "the premise-labels route served another blob");
@@ -2447,7 +2479,7 @@ mod tests {
         for (path, name, sha, bytes) in [
             (&["labels"][..], "labels.json", "a", 6u64),
             (&["vectors"][..], "vectors.bin", "b", 8),
-            (&["metadata"][..], "meta.json", "c", 8),
+            (&["metadata"][..], "meta.json", "c", 2),
             (&["facets"][..], "facets.bin", "d", 6),
             (&["premise", "labels"][..], "premise-labels.json", "e", 7),
             (&["premise", "vectors"][..], "premise-vectors.bin", "f", 8),
