@@ -2074,8 +2074,8 @@ mod tests {
         assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
 
-        // JustWatch's IMDb score rests on the facet count where one exists. Legacy clients may still send
-        // rating fields, but serde ignores them and Atlas never imports the score.
+        // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one. A transient client score on
+        // too few votes does not replace it, while a well-counted one may rank this response without being emitted.
         let known = crate::recommend::Knowledge { indexes: &indexes };
         let listed = crate::recommend::Listed {
             key: (den_index::MediaType::Movie, 2),
@@ -2085,12 +2085,17 @@ mod tests {
         };
         let title = known.title(listed.key, None, Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(500.0), false));
-        let client: crate::recommend::Hint =
-            serde_json::from_str(r#"{"rating":7.2,"votes":180,"voteAverage":9.1,"voteCount":20000}"#)
-                .unwrap();
-        let title = known.title((den_index::MediaType::Movie, 99), Some(&client), Some(&listed));
+        let few: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":18}"#).unwrap();
+        let title = known.title((den_index::MediaType::Movie, 99), Some(&few), Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(200.0), true));
-        assert_eq!(known.title((den_index::MediaType::Movie, 100), Some(&client), None).rating, None);
+        let enough: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
+        let hinted = known.title((den_index::MediaType::Movie, 99), Some(&enough), Some(&listed));
+        assert_eq!((hinted.rating, hinted.votes), (Some(7.2), Some(180.0)));
+        assert!(answer["slides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|slide| { slide.get("rating").is_none() && slide.get("votes").is_none() }));
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.
