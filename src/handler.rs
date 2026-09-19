@@ -1902,8 +1902,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Search in one request: an exact title leads its similar titles, a typo still finds its title, a country
-    /// filters, a label and a plot facet each propose and lift their titles — and the reading comes back too.
+    /// Search in one request: an exact title returns only scored query matches, a typo still finds its title, a
+    /// country filters, a label and a plot facet each propose and lift their titles — and the reading comes back.
     #[tokio::test]
     async fn query_searches_titles_facets_labels_and_plot_facets_in_one_ranking() {
         let state = index_state("den-atlas-query");
@@ -1960,6 +1960,42 @@ mod tests {
         let uno = json(body_of(get(&state, &ask("uno")).await).await);
         assert_eq!(keys(&uno)[0], "movie:1", "{uno}");
         assert_eq!(uno["people"], serde_json::json!([]));
+    }
+
+    /// Unified query search scans the optional premise index with the same query vector, admits a title only
+    /// that representation found, and remains plot-semantic when a dataset does not ship the optional pair.
+    #[tokio::test]
+    async fn query_search_uses_premise_semantics_and_preserves_plot_only_fallback() {
+        let answer = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-premise-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let with_premise = answer(body_of(get(&state, "/index/query.json?q=zzzz").await).await);
+        let first = &with_premise["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(2)));
+        assert_eq!(first["f"]["semPlot"], 0.0, "movie 2 is not a strong plot-vector answer");
+        assert!(first["f"]["semPremise"].as_f64().unwrap() > 0.0, "{with_premise}");
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-query-plot-only-{}", std::process::id()));
+        let mut ds = crate::queries::write_fixture(&dir);
+        ds.premise_labels = None;
+        ds.premise_vectors = None;
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            ..AppState::for_test(Some(ds))
+        });
+        let plot_only = answer(body_of(get(&state, "/index/query.json?q=zzzz").await).await);
+        let first = &plot_only["hits"][0];
+        assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(3)));
+        assert!(first["f"]["semPlot"].as_f64().unwrap() > 0.0, "{plot_only}");
+        assert_eq!(first["f"]["semPremise"], 0.0);
     }
 
     /// A plot facet row: the titles carrying every facet named, most confident then most voted, drawn as cards
