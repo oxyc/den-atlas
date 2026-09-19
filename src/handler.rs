@@ -1739,11 +1739,13 @@ mod tests {
         assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
         assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
         let schema = json(body_of(get(&state, "/index/schema.json").await).await);
-        assert_eq!(schema["population"]["count"], 4);
+        // 12 titles, 8 of them unlabelled: `count` and `denominator` must differ, or a client reports a
+        // fraction of the corpus as though it were the whole of it.
+        assert_eq!(schema["population"]["count"], 12);
         assert_eq!(
             schema["fields"]["tone"]["coverage"],
             serde_json::json!({
-                "count": 3, "denominator": 4, "ratio": 0.75
+                "count": 3, "denominator": 12, "ratio": 0.25
             })
         );
         assert_eq!(schema["fields"]["mood"]["coverage"]["count"], 1);

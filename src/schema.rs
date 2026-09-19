@@ -185,12 +185,15 @@ mod tests {
         let queries = crate::queries::IndexQueries::new(&crate::queries::write_fixture(&dir));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
         let schema = document(&indexes);
-        assert_eq!(schema["population"]["count"], 4);
+        // The fixture carries 12 titles and 8 of them have no labels at all, so `count` and `denominator`
+        // differ — which is the whole point of this endpoint. A client asking "how many heist films" must be
+        // told 4 OF 12, never 4, or it reports a fraction of the corpus as though it were all of it.
+        assert_eq!(schema["population"]["count"], 12);
         assert_eq!(schema["fields"]["subgenre"]["coverage"]["count"], 4);
-        assert_eq!(schema["fields"]["subgenre"]["coverage"]["denominator"], 4);
+        assert_eq!(schema["fields"]["subgenre"]["coverage"]["denominator"], 12);
         assert_eq!(schema["fields"]["mood"]["coverage"]["count"], 1);
         assert_eq!(schema["fields"]["tone"]["coverage"]["count"], 3);
-        assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 4);
+        assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 12);
         assert_eq!(schema["semantics"]["groupBy"], false);
     }
 }
