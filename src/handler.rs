@@ -2085,10 +2085,9 @@ mod tests {
         };
         let title = known.title(listed.key, None, Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(500.0), false));
-        let client: crate::recommend::Hint = serde_json::from_str(
-            r#"{"rating":7.2,"votes":180,"voteAverage":9.1,"voteCount":20000}"#,
-        )
-        .unwrap();
+        let client: crate::recommend::Hint =
+            serde_json::from_str(r#"{"rating":7.2,"votes":180,"voteAverage":9.1,"voteCount":20000}"#)
+                .unwrap();
         let title = known.title((den_index::MediaType::Movie, 99), Some(&client), Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(200.0), true));
         assert_eq!(known.title((den_index::MediaType::Movie, 100), Some(&client), None).rating, None);
