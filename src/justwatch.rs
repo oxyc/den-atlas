@@ -705,7 +705,7 @@ mod tests {
     ]}}}"#;
 
     #[test]
-    fn parses_ranks_and_carries_tmdb_rating_and_year() {
+    fn parses_ranks_and_carries_imdb_rating_and_year() {
         let items = parse_popular(FIXTURE).items;
         assert_eq!(items.len(), 2, "items without a valid tt id are dropped");
         assert_eq!(

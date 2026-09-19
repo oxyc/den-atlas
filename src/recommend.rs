@@ -6,7 +6,8 @@
 //! animation, subgenres, moods), `facets.bin` (country, original language, year) and, once the dataset
 //! publishes them, the Wikidata facts (dates with their precision, genres, makers, cast, franchise). What a
 //! client got from TMDB lists it already fetched for its own rows — release date, genres and popularity —
-//! arrives as a per-candidate hint and fills only what atlas doesn't know. Ratings remain JustWatch's IMDb data.
+//! arrives as a per-candidate hint and fills only what atlas doesn't know. Ratings come only from Atlas's own
+//! upstream catalog data, including JustWatch's IMDb scores.
 //!
 //! What a billboard shows is not the leading row. A "Because you watched X" row is the nearest neighbours of
 //! a title already watched, and after enough history that neighbourhood IS the history. A billboard is the
@@ -335,12 +336,12 @@ pub struct Title<'a> {
     pub imdb_id: Option<String>,
 }
 
-/// A title from one of atlas's own JustWatch lists.
+/// A title from one of Atlas's own upstream lists.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Listed {
     pub key: Key,
     pub imdb_id: Option<String>,
-    /// JustWatch's IMDb score.
+    /// The upstream catalog's score; JustWatch supplies its IMDb score here.
     pub rating: Option<f64>,
     pub year: Option<i64>,
 }
