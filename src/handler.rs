@@ -1923,6 +1923,7 @@ mod tests {
         assert_eq!(keys(&one)[..3], ["movie:1", "movie:3", "movie:2"], "{one}");
         assert_eq!(one["hits"][0]["title"], "One");
         assert_eq!(one["hits"][0]["posterPath"], "/1.jpg");
+        assert_eq!(one["hits"][0]["rating"], 7.1);
         assert_eq!(one["hits"][0]["imdbId"], "tt0000001", "from the facts, so a client needn't ask TMDB");
         assert!(one["hits"][0]["f"]["t"].as_f64().unwrap() >= 0.6);
 
@@ -1975,6 +1976,7 @@ mod tests {
         assert_eq!(bittersweet["total"], 3);
         assert_eq!(bittersweet["titles"][0]["title"], "Two");
         assert_eq!(bittersweet["titles"][0]["posterPath"], "/2.jpg");
+        assert_eq!(bittersweet["titles"][0]["rating"], 8.4);
         // Movie 1: primary genre Drama, and crime and drama from its facts.
         assert_eq!(bittersweet["titles"][2]["genreIds"], serde_json::json!([18, 80]));
         let paged = json(

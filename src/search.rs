@@ -658,6 +658,7 @@ pub fn answer(
                 "title": name,
                 "posterPath": card.and_then(|c| c.poster_path.clone()),
                 "year": card.and_then(|c| c.year),
+                "rating": card.and_then(|c| c.vote_average),
                 "genreIds": crate::plotrows::genres(indexes, s.key),
                 "f": {"t": round(s.t), "sem": round(s.sem), "lab": round(s.lab), "pf": round(s.pf), "p": s.person,
                       "pop": round(s.pop), "phi": s.phi},

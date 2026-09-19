@@ -85,6 +85,8 @@ pub struct Card {
     pub title: String,
     pub poster_path: Option<String>,
     pub year: Option<i64>,
+    /// TMDB's 0–10 score. Optional because sidecars published before this field remain valid.
+    pub vote_average: Option<f64>,
 }
 
 /// The metadata sidecar (`metadataFile`) as cards by title.
@@ -97,6 +99,7 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
         title: Option<String>,
         poster_path: Option<String>,
         year: Option<i64>,
+        vote_average: Option<f64>,
     }
     let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let cards: Vec<RawCard> =
@@ -111,7 +114,12 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
             };
             Some((
                 (media_type, c.tmdb_id),
-                Card { title: c.title?, poster_path: c.poster_path, year: c.year },
+                Card {
+                    title: c.title?,
+                    poster_path: c.poster_path,
+                    year: c.year,
+                    vote_average: c.vote_average,
+                },
             ))
         })
         .collect())
@@ -216,6 +224,7 @@ pub fn row(
                 "title": card.title,
                 "posterPath": card.poster_path,
                 "year": card.year,
+                "rating": card.vote_average,
                 "genreIds": genres(indexes, key),
             });
             // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
@@ -347,5 +356,22 @@ pub(crate) mod tests {
         assert!(facets.matching(MediaType::Movie, &[pair("ending", "sad")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[pair("colour", "blue")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[]).is_empty());
+    }
+
+    #[test]
+    fn cards_read_optional_ratings_without_rejecting_legacy_sidecars() {
+        let path = std::env::temp_dir().join(format!("den-atlas-cards-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"[
+              {"tmdbId":1,"mediaType":"movie","title":"Rated","posterPath":"/1.jpg","year":2026,"voteAverage":8.4},
+              {"tmdbId":2,"mediaType":"movie","title":"Legacy","posterPath":"/2.jpg","year":1999}
+            ]"#,
+        )
+        .unwrap();
+        let cards = read_cards(&path).unwrap();
+        std::fs::remove_file(path).ok();
+        assert_eq!(cards[&(MediaType::Movie, 1)].vote_average, Some(8.4));
+        assert_eq!(cards[&(MediaType::Movie, 2)].vote_average, None);
     }
 }

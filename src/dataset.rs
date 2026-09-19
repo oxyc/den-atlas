@@ -44,7 +44,7 @@ pub struct Meta {
     pub vectors_bytes: u64,
     #[serde(rename = "lastModifiedHttp")]
     pub last_modified_http: Option<String>,
-    // Metadata sidecar (optional) — a ≤6-month synced cache of tmdbId→{title,poster_path,year} so the app
+    // Metadata sidecar (optional) — a ≤6-month synced cache of tmdbId→{title,poster_path,year,voteAverage?} so the app
     // renders semantic/ANN neighbour cards without a per-result TMDB call. Absent ⇒ served labels+vectors only.
     #[serde(rename = "metadataFile")]
     pub metadata_file: Option<String>,

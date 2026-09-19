@@ -433,8 +433,8 @@ pub fn write_fixture(dir: &std::path::Path) -> Dataset {
     std::fs::write(dir.join("facts-slim.json"), crate::facts::tests::SAMPLE).unwrap();
     std::fs::write(dir.join("plot-facets.json"), crate::plotrows::tests::SAMPLE).unwrap();
     let metadata = serde_json::json!([
-        {"tmdbId": 1, "mediaType": "movie", "title": "One", "posterPath": "/1.jpg", "year": 1985},
-        {"tmdbId": 2, "mediaType": "movie", "title": "Two", "posterPath": "/2.jpg", "year": 1995},
+        {"tmdbId": 1, "mediaType": "movie", "title": "One", "posterPath": "/1.jpg", "year": 1985, "voteAverage": 7.1},
+        {"tmdbId": 2, "mediaType": "movie", "title": "Two", "posterPath": "/2.jpg", "year": 1995, "voteAverage": 8.4},
         {"tmdbId": 3, "mediaType": "movie", "title": "Three", "posterPath": null, "year": 1985},
         {"tmdbId": 4, "mediaType": "tv", "title": "Four", "posterPath": "/4.jpg", "year": 2010},
     ])
