@@ -220,6 +220,19 @@ pub struct Fitted {
     pub people: f64,
     /// How much of its similar and profile evidence counted: 1 with a vector.
     pub confidence: f64,
+    /// The personal signal that added most to the score, measured in log-score lift.
+    pub reason: Option<FitReason>,
+    pub reason_lift: f64,
+}
+
+/// A human-explainable part of household fit. Kept separate from the numeric diagnostics because those are on
+/// different scales; `Fitted::reason_lift` is what makes these comparable with the other scoring factors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitReason {
+    Similar,
+    Profile,
+    People,
+    Franchise,
 }
 
 impl<'a> Fit<'a> {
@@ -290,27 +303,55 @@ impl<'a> Fit<'a> {
         let profile = z(self.lifted(features), self.profile);
         let people = self.following(features);
         let similar = features.row.and_then(|row| self.nearest(row)).map(|s| z(s, self.similar));
-        let mut evidence = match similar {
-            Some(similar) => W_SIMILAR * similar + W_PROFILE * profile,
-            None => profile,
-        };
         let confidence = if similar.is_some() {
             1.0
         } else {
             THIN * [GENRE, LANGUAGE, COUNTRY].iter().filter(|&&family| features.has(family)).count() as f64
                 / 3.0
         };
-        evidence *= confidence;
+        let similar_term = similar.map_or(0.0, |similar| W_SIMILAR * similar * confidence);
+        let profile_term = if similar.is_some() { W_PROFILE * profile } else { profile } * confidence;
+        let people_term = W_PEOPLE * people;
+        let mut evidence = similar_term + profile_term + people_term;
         if let (Some(similar), Some(row)) = (similar, features.row) {
             if let Some(against) = self.repelled(row).map(|s| z(s, self.similar)) {
                 evidence -= REPULSION * (against - similar).max(0.0);
             }
         }
-        let mut fit = 1.0 / (1.0 + (MIDPOINT - evidence - W_PEOPLE * people).exp());
-        if features.franchise.is_some_and(|f| self.franchises.get(&f).copied().unwrap_or(0.0) > 0.0) {
-            fit += (1.0 - fit) * FRANCHISE_LIFT;
+        let franchise =
+            features.franchise.is_some_and(|f| self.franchises.get(&f).copied().unwrap_or(0.0) > 0.0);
+        let fitted = |evidence: f64, franchise: bool| {
+            let mut fit = 1.0 / (1.0 + (MIDPOINT - evidence).exp());
+            if franchise {
+                fit += (1.0 - fit) * FRANCHISE_LIFT;
+            }
+            fit
+        };
+        let fit = fitted(evidence, franchise);
+        // Every term below is the log lift it gives fit², the exact way fit enters the final score. Removing one
+        // positive additive term is a counterfactual against the same title and all its other evidence; franchise
+        // is the same comparison before its final lift. Unlike the public raw terms, these numbers share a scale.
+        let lift = |term: f64| {
+            if term <= 0.0 {
+                0.0
+            } else {
+                2.0 * (fit / fitted(evidence - term, franchise)).ln()
+            }
+        };
+        let mut reason = None;
+        let mut reason_lift = 0.0;
+        for (candidate, candidate_lift) in [
+            (FitReason::Similar, lift(similar_term)),
+            (FitReason::Profile, lift(profile_term)),
+            (FitReason::People, lift(people_term)),
+            (FitReason::Franchise, if franchise { 2.0 * (fit / fitted(evidence, false)).ln() } else { 0.0 }),
+        ] {
+            if candidate_lift > reason_lift {
+                reason = Some(candidate);
+                reason_lift = candidate_lift;
+            }
         }
-        Fitted { fit, similar, profile, people, confidence }
+        Fitted { fit, similar, profile, people, confidence, reason, reason_lift }
     }
 
     /// What fit makes of a title before its plot is read: its profile and its people, weighed as `of` weighs them. The
@@ -423,6 +464,34 @@ mod tests {
         Features::of(indexes, key, &Knowledge { indexes }.title(key, None, None))
     }
 
+    /// The fit equation before reasons were attributed, kept here as a regression oracle for the refactor.
+    fn old_fit(taste: &Fit<'_>, features: &Features) -> f64 {
+        let profile = z(taste.lifted(features), taste.profile);
+        let people = taste.following(features);
+        let similar = features.row.and_then(|row| taste.nearest(row)).map(|s| z(s, taste.similar));
+        let mut evidence = match similar {
+            Some(similar) => W_SIMILAR * similar + W_PROFILE * profile,
+            None => profile,
+        };
+        let confidence = if similar.is_some() {
+            1.0
+        } else {
+            THIN * [GENRE, LANGUAGE, COUNTRY].iter().filter(|&&family| features.has(family)).count() as f64
+                / 3.0
+        };
+        evidence *= confidence;
+        if let (Some(similar), Some(row)) = (similar, features.row) {
+            if let Some(against) = taste.repelled(row).map(|s| z(s, taste.similar)) {
+                evidence -= REPULSION * (against - similar).max(0.0);
+            }
+        }
+        let mut fit = 1.0 / (1.0 + (MIDPOINT - evidence - W_PEOPLE * people).exp());
+        if features.franchise.is_some_and(|f| taste.franchises.get(&f).copied().unwrap_or(0.0) > 0.0) {
+            fit += (1.0 - fit) * FRANCHISE_LIFT;
+        }
+        fit
+    }
+
     #[test]
     fn a_title_is_released_between_two_days_when_any_day_it_could_be_falls_between() {
         // Sorted by first day: a dated day, a year known only as a year, and a day well after.
@@ -464,5 +533,75 @@ mod tests {
             .unwrap()
             .of(&features(&indexes, TWO));
         assert!(disliking.fit < plain.fit, "{disliking:?} {plain:?}");
+    }
+
+    #[tokio::test]
+    async fn attributing_a_reason_does_not_change_the_fit_equation() {
+        let indexes = indexes("same-fit").await;
+        let taste = Fit::new(
+            &indexes,
+            indexes.corpus(),
+            &[(features(&indexes, ONE), 1.0), (features(&indexes, THREE), -1.5)],
+        )
+        .unwrap();
+        for candidate in [features(&indexes, ONE), features(&indexes, TWO), features(&indexes, THREE)] {
+            let fitted = taste.of(&candidate);
+            assert!((fitted.fit - old_fit(&taste, &candidate)).abs() < 1e-12, "{fitted:?}");
+        }
+        let thin = Features::of(&indexes, (MediaType::Movie, 77), &Title::default());
+        assert!((taste.of(&thin).fit - old_fit(&taste, &thin)).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn the_largest_personal_score_lift_names_the_fit_reason() {
+        let indexes = indexes("reasons").await;
+        let corpus = indexes.corpus();
+        let blank = || Fit {
+            indexes: &indexes,
+            corpus,
+            liked: Vec::new(),
+            disliked: Vec::new(),
+            lift: HashMap::new(),
+            unseen: [0.0; 8],
+            people: HashMap::new(),
+            franchises: HashMap::new(),
+            similar: (0.0, 1.0),
+            profile: (0.0, 1.0),
+        };
+
+        let mut similar = blank();
+        similar.liked.push((features(&indexes, ONE).row.unwrap(), 1.0));
+        let plot_only = Features {
+            row: features(&indexes, TWO).row,
+            values: Vec::new(),
+            people: Vec::new(),
+            franchise: None,
+        };
+        let raw = similar.nearest(plot_only.row.unwrap()).unwrap();
+        similar.similar = (raw - 2.0, 1.0);
+        assert_eq!(similar.of(&plot_only).reason, Some(FitReason::Similar));
+
+        let mut profile = blank();
+        let values = [(GENRE, 1), (LANGUAGE, 2), (COUNTRY, 3)];
+        profile.lift.extend(values.into_iter().map(|value| (value, 2.0)));
+        let profile_only = Features {
+            row: None,
+            values: values.into_iter().map(|value| (value, 1.0)).collect(),
+            people: Vec::new(),
+            franchise: None,
+        };
+        assert_eq!(profile.of(&profile_only).reason, Some(FitReason::Profile));
+
+        let mut people = blank();
+        people.people.insert(42, 2.0);
+        let people_only =
+            Features { row: None, values: Vec::new(), people: vec![(42, 1.0)], franchise: None };
+        assert_eq!(people.of(&people_only).reason, Some(FitReason::People));
+
+        let mut franchise = blank();
+        franchise.franchises.insert(7, 1.0);
+        let franchise_only =
+            Features { row: None, values: Vec::new(), people: Vec::new(), franchise: Some(7) };
+        assert_eq!(franchise.of(&franchise_only).reason, Some(FitReason::Franchise));
     }
 }

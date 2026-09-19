@@ -19,7 +19,7 @@
 use crate::catalog::{new_catalog_id, provider_by_code, Provider, TRENDING_ID};
 use crate::config::Config;
 use crate::facts::{Facts, Released};
-use crate::fit::{Features, Fit, Fitted};
+use crate::fit::{Features, Fit, FitReason, Fitted};
 use crate::queries::Indexes;
 use crate::AppState;
 use den_index::MediaType;
@@ -595,7 +595,44 @@ pub struct Why {
     pub quality: f64,
     pub buzz: f64,
     pub score: f64,
+    pub reason: Option<Reason>,
 }
+
+/// The strongest meaningful contribution to a title's score, already compared on the scorer's scale. Clients map
+/// this stable code to their own short copy instead of comparing the diagnostic terms, which mix z-scores and 0…1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    Similar,
+    Profile,
+    People,
+    Franchise,
+    Arrived,
+    Recent,
+    Upcoming,
+    Timely,
+    Quality,
+    Buzz,
+}
+
+impl Reason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Similar => "similar",
+            Self::Profile => "profile",
+            Self::People => "people",
+            Self::Franchise => "franchise",
+            Self::Arrived => "arrived",
+            Self::Recent => "recent",
+            Self::Upcoming => "upcoming",
+            Self::Timely => "timely",
+            Self::Quality => "quality",
+            Self::Buzz => "buzz",
+        }
+    }
+}
+
+/// Below this log-score lift, a reason is technically true but too slight to put in front of a viewer.
+const REASON_LIFT: f64 = 0.05;
 
 /// A title's score: its fit squared, so fit decides, then merit, timeliness — new, or newly on a household service —
 /// and buzz. Across a real household's pool fit² spans about 35×, merit 2×, timeliness 5× and buzz 1.1×.
@@ -609,7 +646,47 @@ pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> 
         * (MERIT_FLOOR + (1.0 - MERIT_FLOOR) * quality)
         * (TIMELY_FLOOR + (1.0 - TIMELY_FLOOR) * fresh.max(arrived))
         * (1.0 + BUZZ_BONUS * buzz);
-    Why { fit, fresh, arrived, quality, buzz, score }
+    // Compare the multiplicative parts by their log lift over each factor's floor. Household fit reports the same
+    // unit from `fit.rs`, so a z-score can never beat a 0…1 term merely because its raw number is larger.
+    let mut strongest = fit.reason.map(|reason| {
+        let reason = match reason {
+            FitReason::Similar => Reason::Similar,
+            FitReason::Profile => Reason::Profile,
+            FitReason::People => Reason::People,
+            FitReason::Franchise => Reason::Franchise,
+        };
+        (reason, fit.reason_lift)
+    });
+    let mut consider = |reason, lift| {
+        if lift >= REASON_LIFT && strongest.is_none_or(|(_, held)| lift > held) {
+            strongest = Some((reason, lift));
+        }
+    };
+    if quality >= 0.65 && candidate.title.rating.is_some() {
+        consider(Reason::Quality, ((MERIT_FLOOR + (1.0 - MERIT_FLOOR) * quality) / MERIT_FLOOR).ln());
+    }
+    let timely = fresh.max(arrived);
+    if timely > 0.0 {
+        let reason = if arrived >= fresh {
+            Reason::Arrived
+        } else {
+            candidate.title.released.map_or(Reason::Timely, |released| {
+                if released.first_day as f64 > now {
+                    Reason::Upcoming
+                } else if (released.first_day + released.span_days.max(1) - 1) as f64 <= now {
+                    Reason::Recent
+                } else {
+                    Reason::Timely
+                }
+            })
+        };
+        consider(reason, ((TIMELY_FLOOR + (1.0 - TIMELY_FLOOR) * timely) / TIMELY_FLOOR).ln());
+    }
+    if buzz > 0.0 {
+        consider(Reason::Buzz, (1.0 + BUZZ_BONUS * buzz).ln());
+    }
+    let reason = strongest.filter(|(_, lift)| *lift >= REASON_LIFT).map(|(reason, _)| reason);
+    Why { fit, fresh, arrived, quality, buzz, score, reason }
 }
 
 /// Whether a vote count is enough for its rating to replace JustWatch's IMDb score.
@@ -894,6 +971,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
                     "profile": round(why.fit.profile), "people": round(why.fit.people),
                     "confidence": round(why.fit.confidence), "fresh": round(why.fresh),
                     "arrived": round(why.arrived), "quality": round(why.quality), "buzz": round(why.buzz),
+                    "reason": why.reason.map(Reason::code),
                 },
             });
             if let Some(imdb) = &c.title.imdb_id {
@@ -983,9 +1061,10 @@ pub fn describe(indexes: &Indexes, slide: &serde_json::Value) -> String {
         .unwrap_or_else(|| slide["id"].to_string());
     let term = |name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
     let similar = slide["why"]["similar"].as_f64().map_or("-".to_owned(), |z| format!("{z:.1}"));
+    let reason = slide["why"]["reason"].as_str().unwrap_or("-");
     format!(
         "{name} {:.3} (fit {:.2}: similar {similar}, profile {:.1}, people {:.2}; fresh {:.2}, arrived {:.2}, \
-         quality {:.2}, buzz {:.2})",
+         quality {:.2}, buzz {:.2}; reason {reason})",
         term("score"),
         term("fit"),
         term("profile"),
@@ -1375,6 +1454,32 @@ mod tests {
         };
         let picked = pick(vec![cand(1, new(2.0)), cand(2, new(900.0))], now(), 40, all, neutral);
         assert_eq!(ids(&picked), vec![2, 1]);
+    }
+
+    #[test]
+    fn a_timely_reason_says_whether_a_title_is_recent_or_upcoming() {
+        let upcoming = cand(1, Title { released: on("2026-09-20"), ..Title::default() });
+        let recent = cand(2, Title { released: on("2026-09-10"), ..Title::default() });
+        assert_eq!(score(&upcoming, now(), 0.0, neutral(&upcoming)).reason, Some(Reason::Upcoming));
+        assert_eq!(score(&recent, now(), 0.0, neutral(&recent)).reason, Some(Reason::Recent));
+    }
+
+    #[test]
+    fn a_reason_compares_score_lifts_instead_of_incomparable_raw_terms() {
+        let popular = Candidate {
+            rank: Some(Placing { rank: 0.0, of: 10.0 }),
+            ..cand(1, Title { released: on("1997-06-01"), ..Title::default() })
+        };
+        let fitted = Fitted {
+            fit: 0.6,
+            people: 0.2,
+            reason: Some(FitReason::People),
+            reason_lift: 0.2,
+            ..Fitted::default()
+        };
+        let why = score(&popular, now(), 0.0, fitted);
+        assert_eq!(why.buzz, 1.0);
+        assert_eq!(why.reason, Some(Reason::People), "a 10% buzz lift must not beat a 22% taste lift");
     }
 
     #[test]
