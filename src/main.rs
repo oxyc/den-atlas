@@ -17,8 +17,10 @@ mod motn;
 mod plotrows;
 mod queries;
 mod recommend;
+mod schema;
 mod search;
 mod titles;
+mod tos;
 mod util;
 
 use std::sync::Arc;

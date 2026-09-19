@@ -24,6 +24,12 @@ pub struct PlotFacets {
     titles: usize,
 }
 
+pub struct FacetSchema {
+    pub axis: String,
+    pub known: usize,
+    pub values: Vec<(String, usize)>,
+}
+
 impl PlotFacets {
     pub fn read(path: &Path) -> Result<PlotFacets, String> {
         let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -54,6 +60,47 @@ impl PlotFacets {
 
     pub fn len(&self) -> usize {
         self.titles
+    }
+
+    /// Every axis, its known-title coverage, and each value's count. Counts are over distinct title keys even
+    /// if a malformed input repeats a value; schema/count consumers must never mistake duplicate rows for films.
+    pub fn schema(&self) -> Vec<FacetSchema> {
+        let mut axes: Vec<FacetSchema> = self
+            .by_value
+            .iter()
+            .map(|(axis, values)| {
+                let mut known = std::collections::HashSet::new();
+                let mut counts: Vec<(String, usize)> = values
+                    .iter()
+                    .map(|(value, rows)| {
+                        let keys: std::collections::HashSet<Key> = rows.iter().map(|(key, _)| *key).collect();
+                        known.extend(keys.iter().copied());
+                        (value.clone(), keys.len())
+                    })
+                    .collect();
+                counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                FacetSchema { axis: axis.clone(), known: known.len(), values: counts }
+            })
+            .collect();
+        axes.sort_by(|a, b| a.axis.cmp(&b.axis));
+        axes
+    }
+
+    /// Known-title coverage for one axis.
+    pub fn coverage(&self, axis: &str) -> usize {
+        self.coverage_for(axis, None)
+    }
+
+    pub fn coverage_for(&self, axis: &str, media_type: Option<MediaType>) -> usize {
+        self.by_value
+            .get(axis)
+            .into_iter()
+            .flat_map(|values| values.values())
+            .flatten()
+            .map(|(key, _)| *key)
+            .filter(|key| media_type.is_none() || Some(key.0) == media_type)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     }
 
     /// The titles of `media_type` carrying every `(axis, value)`, each at the lowest confidence it carries any
@@ -159,7 +206,10 @@ pub fn row(
     skip: usize,
     limit: usize,
 ) -> serde_json::Value {
-    let Some(cards) = indexes.cards.as_ref() else { return serde_json::json!({ "titles": [], "total": 0 }) };
+    let coverage = crate::schema::row_coverage(indexes, media_type, constraints);
+    let Some(cards) = indexes.cards.as_ref() else {
+        return serde_json::json!({ "titles": [], "total": 0, "coverage": coverage });
+    };
     // Worked out once per type and constraints (`Indexes::row_order`): every page of a row asks for the same order.
     let mut named: Vec<String> = constraints.iter().map(|(axis, value)| format!("{axis}={value}")).collect();
     named.sort_unstable();
@@ -233,7 +283,7 @@ pub fn row(
             title
         })
         .collect();
-    serde_json::json!({ "titles": titles, "total": total })
+    serde_json::json!({ "titles": titles, "total": total, "coverage": coverage })
 }
 
 /// The confidence a label row needs (the label rows' own floor).

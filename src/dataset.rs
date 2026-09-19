@@ -194,7 +194,14 @@ impl Dataset {
             meta.metadata_bytes,
             "application/json",
             meta.metadata_gz_file.as_deref(),
-        );
+        )
+        .and_then(|blob| match crate::tos::verify_file(&blob.path) {
+            Ok(()) => Some(blob),
+            Err(error) => {
+                eprintln!("metadata refused by serving guard ({error}) — serving without it");
+                None
+            }
+        });
         // DT-H premise index — both halves or neither; one without the other is not a usable index.
         let premise_labels = optional_blob(
             dir,
@@ -499,7 +506,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
-        std::fs::write(root.join("meta.json"), b"METADATA").unwrap();
+        std::fs::write(root.join("meta.json"), b"[]").unwrap();
         std::fs::write(root.join("labels.json.gz"), b"LGZ").unwrap();
         std::fs::write(root.join("meta.json.gz"), b"MGZ").unwrap();
         std::fs::write(
@@ -509,7 +516,7 @@ mod tests {
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "labelsGzFile":"labels.json.gz",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "metadataFile":"meta.json","metadataBytes":8,"metadataSha256":"c",
+                 "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c",
                  "metadataGzFile":"meta.json.gz"}"#,
         )
         .unwrap();
@@ -521,6 +528,33 @@ mod tests {
         let md = ds.metadata.as_ref().expect("the sidecar must resolve");
         assert_eq!(gz_name(md).as_deref(), Some("meta.json.gz"), "the sidecar's gz variant is not wired up");
         assert!(ds.vectors.gz.is_none(), "a binary blob was given a gz variant");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Metadata is the one served artifact derived directly from TMDB. Even if a future producer adds an
+    /// overview under a renamed/cased key, it is dropped before a route can expose it.
+    #[test]
+    fn metadata_with_expressive_prose_is_not_served() {
+        let root = std::env::temp_dir().join(format!("den-atlas-prose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
+        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
+        let metadata = br#"[{"tmdbId":1,"mediaType":"movie","title":"X","plot_summary":"prose"}]"#;
+        std::fs::write(root.join("meta.json"), metadata).unwrap();
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            format!(
+                r#"{{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
+                     "quantization":"int8","labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                     "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
+                     "metadataFile":"meta.json","metadataBytes":{},"metadataSha256":"c"}}"#,
+                metadata.len()
+            ),
+        )
+        .unwrap();
+        let ds = Dataset::load(&root).expect("the optional violation must not take down the dataset");
+        assert!(ds.metadata.is_none(), "prose-bearing metadata reached the serving table");
         let _ = std::fs::remove_dir_all(&root);
     }
 
