@@ -117,6 +117,35 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
         .collect())
 }
 
+/// The sidecar's poster paths alone, as `(media type, tmdb id) -> "/abc.jpg"`.
+///
+/// Separate from `read_cards` because the catalog rows want the path and nothing else, and there are 38.5k
+/// of them: keeping each title and year too would hold a `String` per title for no reader. Serde drops what
+/// this struct does not name, so those are never allocated.
+pub fn read_posters(path: &Path) -> Result<HashMap<Key, Box<str>>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RawPoster {
+        tmdb_id: u32,
+        media_type: String,
+        poster_path: Option<String>,
+    }
+    let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let cards: Vec<RawPoster> =
+        serde_json::from_slice(&gunzipped(&raw)?).map_err(|e| format!("{}: parse: {e}", path.display()))?;
+    Ok(cards
+        .into_iter()
+        .filter_map(|c| {
+            let media_type = match c.media_type.as_str() {
+                "movie" => MediaType::Movie,
+                "tv" => MediaType::Tv,
+                _ => return None,
+            };
+            Some(((media_type, c.tmdb_id), c.poster_path?.into_boxed_str()))
+        })
+        .collect())
+}
+
 /// A row: the titles of `media_type` carrying every constraint, most confident first, then most voted — each as
 /// the card a client draws, with what its hide rules read — `skip` then `limit` of them, and how many there are.
 /// A constraint is a plot facet (`tone=bleak`) or one of the labels (`mood=Feel-good`, `subgenre=Heist`), and
