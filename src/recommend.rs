@@ -388,17 +388,15 @@ pub struct Knowledge<'a> {
 
 fn hinted_rating(hint: Option<&Hint>) -> Option<(f64, Option<f64>)> {
     hint.and_then(|h| {
-        h.rating
-            .filter(|rating| rating.is_finite() && *rating > 0.0 && *rating <= 10.0)
-            .map(|rating| {
-                let votes = h.votes.filter(|votes| {
-                    votes.is_finite()
-                        && *votes >= 0.0
-                        && votes.fract() == 0.0
-                        && *votes <= 9_007_199_254_740_991.0
-                });
-                (rating, votes)
-            })
+        h.rating.filter(|rating| rating.is_finite() && *rating > 0.0 && *rating <= 10.0).map(|rating| {
+            let votes = h.votes.filter(|votes| {
+                votes.is_finite()
+                    && *votes >= 0.0
+                    && votes.fract() == 0.0
+                    && *votes <= 9_007_199_254_740_991.0
+            });
+            (rating, votes)
+        })
     })
 }
 
@@ -1486,12 +1484,8 @@ mod tests {
         assert!(kept["request"]["candidates"][0]["hint"].get("voteAverage").is_none());
         assert!(kept["request"]["candidates"][0]["hint"].get("voteCount").is_none());
         assert!(kept["request"]["futureClient"].get("vote_average").is_none());
-        assert!(kept["request"]["futureClient"]["nested"][0]
-            .get("tmdbRating")
-            .is_none());
-        assert!(kept["request"]["futureClient"]["nested"][0]
-            .get("imdbRating")
-            .is_none());
+        assert!(kept["request"]["futureClient"]["nested"][0].get("tmdbRating").is_none());
+        assert!(kept["request"]["futureClient"]["nested"][0].get("imdbRating").is_none());
         let (request, back, now) = replayed(&kept).unwrap();
         assert_eq!(now, 20_709.5);
         assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
