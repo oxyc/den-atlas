@@ -1918,9 +1918,11 @@ mod tests {
                 .collect()
         };
 
-        // "One" is exact; More Like This for movie 1 is 3 then 2 (premise-led), drawn right after it.
+        // "One" is exact. More Like This for movie 1 is 3 then 2, but neither matched this query and search
+        // must not reinsert them with score zero merely to fill the page.
         let one = json(body_of(get(&state, &ask("one")).await).await);
-        assert_eq!(keys(&one)[..3], ["movie:1", "movie:3", "movie:2"], "{one}");
+        assert_eq!(keys(&one), ["movie:1"], "{one}");
+        assert!(one["hits"].as_array().unwrap().iter().all(|h| h["score"].as_f64().unwrap() > 0.0));
         assert_eq!(one["hits"][0]["title"], "One");
         assert_eq!(one["hits"][0]["posterPath"], "/1.jpg");
         assert_eq!(one["hits"][0]["imdbId"], "tt0000001", "from the facts, so a client needn't ask TMDB");
