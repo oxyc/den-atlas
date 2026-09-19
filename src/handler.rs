@@ -2074,8 +2074,8 @@ mod tests {
         assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
 
-        // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one, and a client rating on too few
-        // votes doesn't replace it.
+        // JustWatch's IMDb score rests on the facet count where one exists. Legacy clients may still send
+        // rating fields, but serde ignores them and Atlas never imports the score.
         let known = crate::recommend::Knowledge { indexes: &indexes };
         let listed = crate::recommend::Listed {
             key: (den_index::MediaType::Movie, 2),
@@ -2085,14 +2085,10 @@ mod tests {
         };
         let title = known.title(listed.key, None, Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(500.0), false));
-        let few: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":18}"#).unwrap();
-        let title = known.title((den_index::MediaType::Movie, 99), Some(&few), Some(&listed));
+        let legacy: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
+        let title = known.title((den_index::MediaType::Movie, 99), Some(&legacy), Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(8.0), Some(200.0), true));
-        let enough: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
-        assert_eq!(
-            known.title((den_index::MediaType::Movie, 99), Some(&enough), Some(&listed)).rating,
-            Some(7.2)
-        );
+        assert_eq!(known.title((den_index::MediaType::Movie, 100), Some(&legacy), None).rating, None);
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.
