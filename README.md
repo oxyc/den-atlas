@@ -117,13 +117,14 @@ origin.
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
 | `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
 | `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{taxonomyVersion,subgenres,moods}`, each list most-populated first |
-| `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100 |
+| `GET /index/schema.json` | with `INDEX_QUERIES` on: the self-describing query fields, types, value counts and per-field coverage; every count names both its known-field and full-corpus denominators |
+| `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids,total,coverage}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100; `coverage` names the full corpus, selected-type denominator and known-field population |
 | `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours |
 | `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
 | `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total}`. The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot vectors on the leftover) is scored `Φ·[2.0·title + w·semantic + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match; an exact title leads its More Like This. 40 a page, at most 100 |
-| `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the dataset's plot facets (`plotFacetsFile`: ending, era, structure, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. Rows only: the facets cover part of the corpus, so a missing facet is unknown and nothing filters on them |
+| `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the dataset's plot facets (`plotFacetsFile`: ending, era, structure, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
@@ -161,6 +162,13 @@ so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries"
 Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`); the
 facet lane reads the dataset's `facets.bin`. Taste weights stay with the client: `score` returns the raw
 boosts.
+
+`total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
+counts must use the field coverage and denominators from `/index/schema.json`; browse rows include the relevant
+coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every dynamic JSON
+response is checked at the final HTTP boundary for expressive prose fields, and the TMDB-derived metadata
+sidecar is checked before it can be served. A future MCP/TMDB hydration route therefore fails closed instead of
+re-serving an overview, synopsis, description, tagline, or equivalent prose.
 
 `POST /recommend` ranks what a featured surface leads with — the Den web app's billboard — so no client
 ranks. It is the web app's `billboard.ts` ported: what is new in the world and new to this library, with

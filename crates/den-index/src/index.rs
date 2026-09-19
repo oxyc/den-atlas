@@ -186,6 +186,64 @@ impl Index {
         self.labels_by_size(&self.moods)
     }
 
+    /// Every primary genre and how many usable titles carry it, largest first. Empty genres and records with
+    /// an unknown media type do not count as covered: neither can answer a query.
+    pub fn primary_genre_counts(&self) -> Vec<(&str, usize)> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for record in &self.records {
+            if record.media_type.is_some() && !self.name(record.primary_genre).is_empty() {
+                *counts.entry(record.primary_genre).or_default() += 1;
+            }
+        }
+        self.named_counts(counts)
+    }
+
+    /// Every label in one family and the number of usable titles carrying it at or above `min_confidence`.
+    /// This is the population a displayed label row actually draws from, rather than the number of raw guesses
+    /// the producer happened to retain.
+    pub fn subgenre_counts(&self, min_confidence: f64) -> Vec<(&str, usize)> {
+        self.bucket_counts(&self.subgenres, min_confidence)
+    }
+
+    /// As `subgenre_counts`, for moods.
+    pub fn mood_counts(&self, min_confidence: f64) -> Vec<(&str, usize)> {
+        self.bucket_counts(&self.moods, min_confidence)
+    }
+
+    /// Titles with at least one usable value in a label family. A count without this denominator makes a thin
+    /// classifier pass look like an exhaustive census.
+    pub fn subgenre_coverage(&self, min_confidence: f64) -> usize {
+        self.subgenre_coverage_for(None, min_confidence)
+    }
+
+    /// As `subgenre_coverage`, for moods.
+    pub fn mood_coverage(&self, min_confidence: f64) -> usize {
+        self.mood_coverage_for(None, min_confidence)
+    }
+
+    pub fn subgenre_coverage_for(&self, media_type: Option<MediaType>, min_confidence: f64) -> usize {
+        self.family_coverage(|record| &record.subgenres, media_type, min_confidence)
+    }
+
+    pub fn mood_coverage_for(&self, media_type: Option<MediaType>, min_confidence: f64) -> usize {
+        self.family_coverage(|record| &record.moods, media_type, min_confidence)
+    }
+
+    /// Usable titles by media type. `Index::len()` includes malformed/unknown type rows so it is not an honest
+    /// coverage count for a type filter.
+    pub fn media_type_counts(&self) -> [(MediaType, usize); 2] {
+        let mut movie = 0;
+        let mut tv = 0;
+        for record in &self.records {
+            match record.media_type {
+                Some(MediaType::Movie) => movie += 1,
+                Some(MediaType::Tv) => tv += 1,
+                None => {}
+            }
+        }
+        [(MediaType::Movie, movie), (MediaType::Tv, tv)]
+    }
+
     /// Titles carrying a subgenre label, most confident first, at or above `min_confidence`, optionally of one
     /// type; `skip` then `limit` page through them.
     pub fn titles_with_subgenre(
@@ -209,6 +267,19 @@ impl Index {
         limit: usize,
     ) -> Vec<(u32, MediaType)> {
         self.ranked(&self.moods, label, media_type, min_confidence, skip, limit)
+    }
+
+    pub fn count_with_subgenre(
+        &self,
+        label: &str,
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+    ) -> usize {
+        self.counted(&self.subgenres, label, media_type, min_confidence)
+    }
+
+    pub fn count_with_mood(&self, label: &str, media_type: Option<MediaType>, min_confidence: f64) -> usize {
+        self.counted(&self.moods, label, media_type, min_confidence)
     }
 
     pub fn labels(&self, tmdb_id: u32, media_type: MediaType) -> Option<Labels<'_>> {
@@ -356,6 +427,68 @@ impl Index {
             buckets.iter().map(|(&name, entries)| (self.name(name), entries.len())).collect();
         labels.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         labels.into_iter().map(|(name, _)| name).collect()
+    }
+
+    fn named_counts(&self, counts: HashMap<u32, usize>) -> Vec<(&str, usize)> {
+        let mut named: Vec<(&str, usize)> =
+            counts.into_iter().map(|(name, count)| (self.name(name), count)).collect();
+        named.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        named
+    }
+
+    fn bucket_counts(&self, buckets: &HashMap<u32, Vec<Entry>>, min_confidence: f64) -> Vec<(&str, usize)> {
+        self.named_counts(
+            buckets
+                .iter()
+                .map(|(&name, entries)| {
+                    let count = entries
+                        .iter()
+                        .take_while(|entry| entry.confidence >= min_confidence)
+                        .filter(|entry| self.records[entry.row as usize].media_type.is_some())
+                        .count();
+                    (name, count)
+                })
+                .filter(|(_, count)| *count > 0)
+                .collect(),
+        )
+    }
+
+    fn family_coverage(
+        &self,
+        family: impl Fn(&Record) -> &[(u32, f64)],
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+    ) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.media_type.is_some()
+                    && (media_type.is_none() || record.media_type == media_type)
+                    && family(record).iter().any(|(_, score)| *score >= min_confidence)
+            })
+            .count()
+    }
+
+    fn counted(
+        &self,
+        buckets: &HashMap<u32, Vec<Entry>>,
+        label: &str,
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+    ) -> usize {
+        let Some(bucket) =
+            self.names.iter().position(|name| &**name == label).and_then(|id| buckets.get(&(id as u32)))
+        else {
+            return 0;
+        };
+        bucket
+            .iter()
+            .take_while(|entry| entry.confidence >= min_confidence)
+            .filter(|entry| {
+                let kind = self.records[entry.row as usize].media_type;
+                kind.is_some() && (media_type.is_none() || kind == media_type)
+            })
+            .count()
     }
 
     fn ranked(

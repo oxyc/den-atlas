@@ -22,6 +22,9 @@ const IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 pub struct Indexes {
+    /// Every title in the published corpus. The indexes below may be partial; this is their denominator.
+    pub population: usize,
+    pub dataset_version: String,
     pub plot: Index,
     /// The premise index, when the dataset ships one that loads; without it More Like This is plot-only.
     pub premise: Option<Index>,
@@ -102,6 +105,8 @@ fn memoised<K: Eq + std::hash::Hash, V: ?Sized>(
 type BlobPair = (PathBuf, PathBuf);
 
 pub struct IndexQueries {
+    population: usize,
+    dataset_version: String,
     plot: BlobPair,
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
@@ -123,6 +128,8 @@ impl IndexQueries {
             .zip(ds.premise_vectors.as_ref())
             .map(|(labels, vectors)| (labels.path.clone(), vectors.path.clone()));
         IndexQueries {
+            population: usize::try_from(ds.meta.count).unwrap_or(usize::MAX),
+            dataset_version: ds.meta.dataset_version.clone(),
             plot: (ds.labels.path.clone(), ds.vectors.path.clone()),
             premise,
             facets: ds.facets.as_ref().map(|f| f.path.clone()),
@@ -154,6 +161,8 @@ impl IndexQueries {
         on_load();
         let started = Instant::now();
         let sources = Sources {
+            population: self.population,
+            dataset_version: self.dataset_version.clone(),
             plot: self.plot.clone(),
             premise: self.premise.clone(),
             facets: self.facets.clone(),
@@ -213,6 +222,8 @@ pub async fn release_when_idle(queries: Arc<IndexQueries>) {
 
 /// Where each part of the indexes is read from.
 struct Sources {
+    population: usize,
+    dataset_version: String,
     plot: BlobPair,
     premise: Option<BlobPair>,
     facets: Option<PathBuf>,
@@ -349,6 +360,8 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         seconds(display_took)
     );
     let indexes = Indexes {
+        population: sources.population,
+        dataset_version: sources.dataset_version.clone(),
         plot,
         premise,
         facets,

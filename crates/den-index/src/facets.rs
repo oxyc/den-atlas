@@ -112,6 +112,52 @@ impl FacetIndex {
         self.rows.is_empty()
     }
 
+    /// Titles for which a filterable field is known. `mediaType` is intrinsic to every valid DFI2 row;
+    /// country, language and year may be absent.
+    pub fn coverage(&self, field: &str) -> usize {
+        match field {
+            "mediaType" => self.rows.len(),
+            "country" => {
+                self.rows.iter().filter(|row| row.country.iter().all(u8::is_ascii_alphabetic)).count()
+            }
+            "language" => self
+                .rows
+                .iter()
+                .filter(|row| row.language.iter().all(u8::is_ascii_alphabetic) && &row.language != b"xx")
+                .count(),
+            "year" | "decade" => self.rows.iter().filter(|row| row.year >= 1870).count(),
+            _ => 0,
+        }
+    }
+
+    /// Distinct values and their title counts for the finite-valued facet fields. Year is intentionally exposed
+    /// as a typed range by the schema rather than thousands of values; decade is the enumerable form clients use.
+    pub fn value_counts(&self, field: &str) -> Vec<(String, usize)> {
+        let mut values: Vec<(String, usize)> = match field {
+            "mediaType" => self
+                .by_type
+                .iter()
+                .map(|(kind, rows)| {
+                    (if *kind == MediaType::Tv { "series" } else { "movie" }.to_owned(), rows.len())
+                })
+                .collect(),
+            "country" => self
+                .by_country
+                .iter()
+                .map(|(code, rows)| (String::from_utf8_lossy(code).into_owned(), rows.len()))
+                .collect(),
+            "language" => self
+                .by_language
+                .iter()
+                .map(|(code, rows)| (String::from_utf8_lossy(code).into_owned(), rows.len()))
+                .collect(),
+            "decade" => self.by_decade.iter().map(|(year, rows)| (year.to_string(), rows.len())).collect(),
+            _ => Vec::new(),
+        };
+        values.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        values
+    }
+
     /// Titles matching every given constraint, most-voted first (ties in blob order). Empty when no constraint
     /// is given — the facet lane only fires on a real facet.
     pub fn filter(
