@@ -386,6 +386,22 @@ pub struct Knowledge<'a> {
     pub indexes: &'a Indexes,
 }
 
+fn hinted_rating(hint: Option<&Hint>) -> Option<(f64, Option<f64>)> {
+    hint.and_then(|h| {
+        h.rating
+            .filter(|rating| rating.is_finite() && *rating > 0.0 && *rating <= 10.0)
+            .map(|rating| {
+                let votes = h.votes.filter(|votes| {
+                    votes.is_finite()
+                        && *votes >= 0.0
+                        && votes.fract() == 0.0
+                        && *votes <= 9_007_199_254_740_991.0
+                });
+                (rating, votes)
+            })
+    })
+}
+
 impl<'a> Knowledge<'a> {
     fn facts(&self) -> Option<&'a Facts> {
         self.indexes.facts.as_ref()
@@ -475,12 +491,7 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
-        let hinted = hint.and_then(|h| {
-            h.rating.filter(|rating| rating.is_finite() && *rating > 0.0 && *rating <= 10.0).map(|rating| {
-                let votes = h.votes.filter(|votes| votes.is_finite() && *votes >= 0.0);
-                (rating, votes)
-            })
-        });
+        let hinted = hinted_rating(hint);
         match (hinted, listed.and_then(|l| l.rating)) {
             // A transient TMDB score replaces an upstream score only when enough votes stand behind it.
             (Some((rating, votes)), listed_rating) if listed_rating.is_none() || counted(votes) => {
@@ -1003,19 +1014,34 @@ pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::
     };
     // Replay files are durable diagnostic artifacts. Keep the request shape, but never copy transient TMDB rating
     // metadata into one; those fields are allowed only in the live request or the bounded den-edge cache.
-    let mut request = raw.clone();
-    for collection in ["library", "candidates"] {
-        let Some(items) = request.get_mut(collection).and_then(serde_json::Value::as_array_mut) else {
-            continue;
-        };
-        for item in items {
-            if let Some(hint) = item.get_mut("hint").and_then(serde_json::Value::as_object_mut) {
-                for field in ["rating", "votes", "voteAverage", "voteCount"] {
-                    hint.remove(field);
-                }
+    fn scrub(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(items) => items.iter_mut().for_each(scrub),
+            serde_json::Value::Object(object) => {
+                object.retain(|key, value| {
+                    let normalized: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                    let transient = matches!(
+                        normalized.to_ascii_lowercase().as_str(),
+                        "rating"
+                            | "ratings"
+                            | "votes"
+                            | "voteaverage"
+                            | "votecount"
+                            | "imdbrating"
+                            | "tmdbrating"
+                            | "tmdbvotes"
+                    );
+                    if !transient {
+                        scrub(value);
+                    }
+                    !transient
+                });
             }
+            _ => {}
         }
     }
+    let mut request = raw.clone();
+    scrub(&mut request);
     serde_json::json!({
         "now": now,
         "request": request,
@@ -1435,7 +1461,8 @@ mod tests {
             "candidates": [{
                 "type": "movie", "id": 7,
                 "hint": {"releaseDate": "2026-09-01", "voteAverage": 9.1, "voteCount": 20_000}
-            }]
+            }],
+            "futureClient": {"vote_average": 9.9, "nested": [{"tmdbRating": 9.8, "imdbRating": 9.7}]}
         });
         let lists = Lists {
             arrivals: vec![vec![Listed {
@@ -1458,6 +1485,13 @@ mod tests {
         assert!(kept["request"]["library"][0]["hint"].get("votes").is_none());
         assert!(kept["request"]["candidates"][0]["hint"].get("voteAverage").is_none());
         assert!(kept["request"]["candidates"][0]["hint"].get("voteCount").is_none());
+        assert!(kept["request"]["futureClient"].get("vote_average").is_none());
+        assert!(kept["request"]["futureClient"]["nested"][0]
+            .get("tmdbRating")
+            .is_none());
+        assert!(kept["request"]["futureClient"]["nested"][0]
+            .get("imdbRating")
+            .is_none());
         let (request, back, now) = replayed(&kept).unwrap();
         assert_eq!(now, 20_709.5);
         assert_eq!((request.surface.as_deref(), request.library.len()), (Some("movies"), 1));
@@ -1636,6 +1670,30 @@ mod tests {
         assert_eq!((pick.id, pick.country.as_str(), channel.only()), (337, "SE", Some(MediaType::Movie)));
         assert_eq!(request(serde_json::json!({"service": {"id": 8}})).service.unwrap().country, "");
         assert!(Request::deserialize(&serde_json::json!({"service": {"country": "FI"}})).is_err());
+    }
+
+    #[test]
+    fn rating_hints_accept_only_the_named_fields_and_valid_tmdb_ranges() {
+        let aliases: Hint = serde_json::from_value(serde_json::json!({
+            "voteAverage": 8.4, "voteCount": 1200, "vote_average": 9.1, "vote_count": 20_000
+        }))
+        .unwrap();
+        assert_eq!((aliases.rating, aliases.votes), (None, None));
+
+        for raw in [
+            serde_json::json!({"rating": 0, "votes": 100}),
+            serde_json::json!({"rating": 10.1, "votes": 100}),
+            serde_json::json!({"rating": 8.4, "votes": -1}),
+            serde_json::json!({"rating": 8.4, "votes": 1.5}),
+        ] {
+            let hint: Hint = serde_json::from_value(raw).unwrap();
+            let got = hinted_rating(Some(&hint));
+            if hint.rating.is_some_and(|rating| rating > 0.0 && rating <= 10.0) {
+                assert_eq!(got, Some((8.4, None)));
+            } else {
+                assert_eq!(got, None);
+            }
+        }
     }
 
     #[test]
