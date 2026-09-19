@@ -735,11 +735,8 @@ mod tests {
         let mut series = at("Moria", 322_428, 0);
         series.series = true;
         series.imdb = Some("tt41559147".into());
-        let film = Show {
-            imdb: Some("tt11561116".into()),
-            rating: Some(8.9),
-            ..at("The Whisper Man", 860_508, 0)
-        };
+        let film =
+            Show { imdb: Some("tt11561116".into()), rating: Some(8.9), ..at("The Whisper Man", 860_508, 0) };
         let items = trending(&[series.clone(), film, at("No imdb", 5, 0)], false);
         assert_eq!(
             items.iter().map(|i| (i.imdb.as_str(), i.rank)).collect::<Vec<_>>(),
