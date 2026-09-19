@@ -5,8 +5,9 @@
 //! asked TMDB what a title is, this reads what atlas already holds: the dataset's labels (primary genre,
 //! animation, subgenres, moods), `facets.bin` (country, original language, year) and, once the dataset
 //! publishes them, the Wikidata facts (dates with their precision, genres, makers, cast, franchise). What a
-//! client got from TMDB lists it already fetched for its own rows — release date, genres, popularity,
-//! rating — arrives as a per-candidate hint and fills only what atlas doesn't know.
+//! client got from TMDB lists it already fetched for its own rows — release date, genres and popularity —
+//! arrives as a per-candidate hint and fills only what atlas doesn't know. Ratings come only from Atlas's own
+//! upstream catalog data, including JustWatch's IMDb scores.
 //!
 //! What a billboard shows is not the leading row. A "Because you watched X" row is the nearest neighbours of
 //! a title already watched, and after enough history that neighbourhood IS the history. A billboard is the
@@ -40,8 +41,7 @@ const ANTICIPATION_DAYS: f64 = 45.0;
 const RATING_PRIOR_VOTES: f64 = 200.0;
 /// What a title is worth before anyone has said: a little above TMDB's middle, where most rated titles land.
 const RATING_PRIOR: f64 = 6.6;
-/// Votes a counted rating needs before it replaces JustWatch's IMDb score. TMDB's 7.2 on 18 votes read over IMDb's
-/// 5.4 put a poorly received release at the top of a billboard.
+/// Votes a rating needs to count as independently established when duplicate candidates are merged.
 const COUNTED_ENOUGH: f64 = 100.0;
 /// Days after its release beyond which a title arriving on a service is catalogue joining it, not something new.
 const CATALOGUE_DAYS: f64 = 730.0;
@@ -211,8 +211,6 @@ pub struct Hint {
     /// ISO 3166-1 alpha-2.
     pub countries: Option<Vec<String>>,
     pub popularity: Option<f64>,
-    pub rating: Option<f64>,
-    pub votes: Option<f64>,
     pub adult: Option<bool>,
     pub imdb_id: Option<String>,
 }
@@ -338,12 +336,12 @@ pub struct Title<'a> {
     pub imdb_id: Option<String>,
 }
 
-/// A title from one of atlas's own JustWatch lists.
+/// A title from one of Atlas's own upstream lists.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Listed {
     pub key: Key,
     pub imdb_id: Option<String>,
-    /// JustWatch's IMDb score.
+    /// The upstream catalog's score; JustWatch supplies its IMDb score here.
     pub rating: Option<f64>,
     pub year: Option<i64>,
 }
@@ -472,25 +470,17 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
-        match (hint.and_then(|h| h.rating.map(|rating| (rating, h.votes))), listed.and_then(|l| l.rating)) {
-            // A client's rating over JustWatch's only when enough votes stand behind it (`COUNTED_ENOUGH`).
-            (Some((rating, votes)), listed_rating) if listed_rating.is_none() || counted(votes) => {
-                title.rating = Some(rating);
-                title.votes = votes;
-            }
-            // JustWatch gives IMDb's score without its vote count. TMDB's count for the title, where the facets hold
-            // one, says how far it stands; without one it is trusted as far as the prior's own weight.
-            (_, Some(rating)) => {
-                title.rating = Some(rating);
-                match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
-                    Some(votes) => title.votes = Some(f64::from(votes)),
-                    None => {
-                        title.votes = Some(RATING_PRIOR_VOTES);
-                        title.estimated_votes = true;
-                    }
+        // Ratings in Atlas come only from JustWatch's own IMDb score. Client hints are TMDB-derived and may
+        // describe dates, genres and availability, but never carry a score across this boundary.
+        if let Some(rating) = listed.and_then(|l| l.rating) {
+            title.rating = Some(rating);
+            match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
+                Some(votes) => title.votes = Some(f64::from(votes)),
+                None => {
+                    title.votes = Some(RATING_PRIOR_VOTES);
+                    title.estimated_votes = true;
                 }
             }
-            _ => {}
         }
         title.popularity = hint.and_then(|h| h.popularity);
         title.adult = hint.and_then(|h| h.adult).unwrap_or(false);
@@ -628,8 +618,7 @@ fn best(a: Option<Placing>, b: Option<Placing>) -> Option<Placing> {
 
 /// The same title from two sources is one candidate holding everything both knew about it; the first says
 /// what it knows first, except where the second knows it better. Atlas's own lists come first in the pool
-/// and name a title by its year and a vote-less score, so a client list's exact date and counted rating
-/// must not lose to them.
+/// and may name a title only by year, so a candidate carrying the exact date must not lose to them.
 fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
     fn either<T>(x: Vec<T>, y: Vec<T>) -> Vec<T> {
         if x.is_empty() {
