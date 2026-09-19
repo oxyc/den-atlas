@@ -2091,9 +2091,11 @@ mod tests {
         let enough: crate::recommend::Hint = serde_json::from_str(r#"{"rating":7.2,"votes":180}"#).unwrap();
         let hinted = known.title((den_index::MediaType::Movie, 99), Some(&enough), Some(&listed));
         assert_eq!((hinted.rating, hinted.votes), (Some(7.2), Some(180.0)));
-        assert!(answer["slides"].as_array().unwrap().iter().all(|slide| {
-            slide.get("rating").is_none() && slide.get("votes").is_none()
-        }));
+        assert!(answer["slides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|slide| { slide.get("rating").is_none() && slide.get("votes").is_none() }));
     }
 
     /// Off without `INDEX_QUERIES`, and a malformed or oversized request is a 400.
