@@ -1005,7 +1005,9 @@ pub fn fixture(raw: &serde_json::Value, lists: &Lists, now: f64) -> serde_json::
     // metadata into one; those fields are allowed only in the live request or the bounded den-edge cache.
     let mut request = raw.clone();
     for collection in ["library", "candidates"] {
-        let Some(items) = request.get_mut(collection).and_then(serde_json::Value::as_array_mut) else { continue };
+        let Some(items) = request.get_mut(collection).and_then(serde_json::Value::as_array_mut) else {
+            continue;
+        };
         for item in items {
             if let Some(hint) = item.get_mut("hint").and_then(serde_json::Value::as_object_mut) {
                 for field in ["rating", "votes", "voteAverage", "voteCount"] {
