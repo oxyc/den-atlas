@@ -921,11 +921,6 @@ pub fn render_metas(items: &[TrendingItem], stremio_type: &str, posters: Option<
             if let Some(path) = poster_path(posters, media_type, it.moviedb) {
                 m["posterPath"] = serde_json::json!(path);
             }
-            // JustWatch's IMDb score → the Den card's star (the app maps `imdbRating` → voteAverage; a
-            // detail visit later upgrades it to the OMDb/IMDb value). Emitted as a string, Stremio-style.
-            if let Some(rating) = it.rating {
-                m["imdbRating"] = serde_json::json!(format!("{rating:.1}"));
-            }
             // Original release year → the card year (Stremio `releaseInfo`; the app reads its first 4 digits).
             if let Some(year) = it.year {
                 m["releaseInfo"] = serde_json::json!(year.to_string());
@@ -1082,6 +1077,16 @@ mod tests {
         assert!(r.body.contains(r#""moviedb_id":42"#), "emits moviedb_id so the Den app can map the row");
         assert!(r.body.contains(r#""type":"movie""#));
         assert!(r.body.contains("images.metahub.space/poster/medium/tt1/img"));
+    }
+
+    #[test]
+    fn catalog_metas_never_transport_source_ratings() {
+        let rated = TrendingItem { rating: Some(7.4), ..item("tt1", "A", 0) };
+        let body: serde_json::Value = serde_json::from_str(&render_metas(&[rated], "movie", None)).unwrap();
+        let meta = &body["metas"][0];
+        assert!(meta.get("imdbRating").is_none());
+        assert!(meta.get("rating").is_none());
+        assert!(meta.get("voteAverage").is_none());
     }
 
     /// The web draws TMDB art where the dataset has it and metahub where it doesn't. Both keys therefore
