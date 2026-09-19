@@ -175,8 +175,13 @@ titles atlas knows nothing about that are most worth describing; a client that c
 with their hints, since an undescribed title is dropped once enough are judged. `library` is
 `[{type,id,weight,at,hint?}]`,
 `owned` every title the library holds, which never appears; `hide` is the household's rules
-(`minYear`, `genres`, `languages`, `anime`). Each slide's `why` gives its terms. `Server-Timing` carries
-`lists;dur=` and `rank;dur=`. Bodies over 512 KiB are refused.
+(`minYear`, `genres`, `languages`, `anime`). Each slide's `why` gives its terms. Its `reason` is the strongest
+meaningful contribution on the scorer's common scale: `similar`, `profile`, `people`, `franchise`, `arrived`,
+`recent`, `upcoming`, `timely`, `quality` or `buzz` (or `null` when none is strong enough). Clients can turn that
+stable code into short copy. The raw `score`, `fit`, `similar`, `profile`, `people`, `confidence`, `fresh`, `arrived`,
+`quality` and `buzz` terms remain alongside it for diagnostics and richer future explanations; they are deliberately
+not directly comparable with one another. `Server-Timing` carries `lists;dur=` and `rank;dur=`. Bodies over 512 KiB
+are refused.
 
 `surface` is `home` (both types, the default), `movies` or `series`. `services` is the household's
 `[{id,country?}]`: `id` a provider id from the catalogs' `denProviderIds`, `country` ISO 3166-1 alpha-2, else

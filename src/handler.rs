@@ -2053,6 +2053,13 @@ mod tests {
             .map(|s| (s["type"].as_str().unwrap().to_owned(), s["id"].as_u64().unwrap()))
             .collect();
         assert_eq!(slides, vec![("movie".to_owned(), 2)], "{answer}");
+        let why = &answer["slides"][0]["why"];
+        assert!(why["reason"].is_string(), "{answer}");
+        for term in ["score", "fit", "profile", "people", "confidence", "fresh", "arrived", "quality", "buzz"]
+        {
+            assert!(why[term].is_number(), "why.{term} is retained: {answer}");
+        }
+        assert!(why.get("similar").is_some(), "nullable why.similar is retained: {answer}");
         assert_eq!(answer["facts"], true);
         assert_eq!(answer["datasetVersion"], "v1");
         assert_eq!(answer["libraryUnjudged"], 0);
