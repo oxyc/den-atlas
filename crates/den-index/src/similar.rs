@@ -439,12 +439,16 @@ pub fn more_like_this_pooled(
             held.push(*id);
         }
     }
-    for id in held {
-        if out.len() == MAX_ROW {
-            break;
-        }
-        out.push(id);
-    }
+    // The held items go back in right after the visible screenful, in score order — NOT at the end of the
+    // row. Appended, they were the last thing added to a 200-long list, so on a dense anchor the main loop
+    // filled MAX_ROW first and they were dropped entirely: The Wire's 11th highest-scoring candidate is
+    // Homicide: Life on the Street, and a 200-title "more like The Wire" had no Homicide in it.
+    //
+    // The cap's job is the first twenty. Past that, a held item is simply the next-best answer.
+    let tail = out.split_off(out.len().min(KEEP));
+    out.extend(held);
+    out.extend(tail);
+    out.truncate(MAX_ROW);
     out
 }
 
