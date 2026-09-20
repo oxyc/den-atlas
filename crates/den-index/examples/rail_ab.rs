@@ -89,6 +89,7 @@ struct JevFacets {
     by_key: HashMap<String, Vec<(String, String, f64)>>,
     world: HashMap<String, f64>,
     nouls: HashMap<String, Vec<(String, f64)>>,
+    critique: HashMap<String, Vec<(String, f64)>>,
     prevalence: HashMap<(String, String), f64>,
     key: String,
 }
@@ -96,6 +97,9 @@ struct JevFacets {
 impl Facets for JevFacets {
     fn facets(&self, id: u32) -> Vec<(String, String, f64)> {
         self.by_key.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    }
+    fn critique(&self, id: u32) -> Vec<(String, f64)> {
+        self.critique.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
     }
     fn nouls(&self, id: u32) -> Vec<(String, f64)> {
         self.nouls.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
@@ -114,6 +118,7 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     let mut by_key: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
     let mut world: HashMap<String, f64> = HashMap::new();
     let mut nouls: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let mut critique_raw: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut counts: HashMap<(String, String), f64> = HashMap::new();
     let mut total: f64 = 0.0;
     for (k, axes) in v.as_object().into_iter().flatten() {
@@ -123,6 +128,17 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
         }
         let mut list = Vec::new();
         for (axis, pair) in axes.as_object().into_iter().flatten() {
+            if axis == "__critique" {
+                critique_raw.insert(
+                    k.clone(),
+                    pair.as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(n, p)| Some((n.clone(), p.as_f64()?)))
+                        .collect(),
+                );
+                continue;
+            }
             if axis == "__nouls" {
                 let list = pair
                     .as_object()
@@ -145,10 +161,34 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
         }
         by_key.insert(k.clone(), list);
     }
+    // Center the critique profile on the per-axis mean within this media type, once, here — raw cosine
+    // over seventeen mostly-low values is dominated by a shared baseline (Oz 0.885 / Angel 0.792 against
+    // The Wire; centered, +0.700 / +0.274). Every title gets every axis, so a missing answer is centered
+    // to -mean rather than silently skipped by the cosine's name intersection.
+    let same: Vec<&String> = critique_raw.keys().filter(|k| k.starts_with(key)).collect();
+    let mut axes: Vec<String> = critique_raw.values().flat_map(|m| m.keys().cloned()).collect();
+    axes.sort();
+    axes.dedup();
+    let mut means: HashMap<String, f64> = HashMap::new();
+    for axis in &axes {
+        let sum: f64 = same.iter().map(|k| critique_raw[*k].get(axis).copied().unwrap_or(0.0)).sum();
+        means.insert(axis.clone(), sum / same.len().max(1) as f64);
+    }
+    let critique: HashMap<String, Vec<(String, f64)>> = critique_raw
+        .iter()
+        .map(|(k, m)| {
+            let centered = axes
+                .iter()
+                .map(|a| (a.clone(), m.get(a).copied().unwrap_or(0.0) - means[a]))
+                .collect();
+            (k.clone(), centered)
+        })
+        .collect();
+
     // Prevalence within the seed's own media type: `continuity = episodic` is rare among films and common
     // among series, and a share computed over both would misprice it for each.
     let prevalence = counts.into_iter().map(|(k, n)| (k, n / total.max(1.0))).collect();
-    JevFacets { by_key, world, nouls, prevalence, key: key.to_string() }
+    JevFacets { by_key, world, nouls, critique, prevalence, key: key.to_string() }
 }
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {

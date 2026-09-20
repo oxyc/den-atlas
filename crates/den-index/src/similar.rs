@@ -155,6 +155,23 @@ const W_WORLD: f64 = 2.50;
 /// harness names as a miss, indistinguishable. The noul cosine separates them, and drops Bates Motel from
 /// the top twenty to rank 1,509 of 7,528 on its own.
 const W_NOUL: f64 = 1.60;
+/// Agreement on what two works ARGUE ABOUT.
+///
+/// The one signal that connects The Wire and Oz, which nothing shipped could: they are the same kind of
+/// show to a human — a sociological study of a closed American institution — and every vector space,
+/// facet axis and label family puts them far apart. Both now read high on `justice-system`, `institution`
+/// and `the-state`.
+///
+/// Centered on the per-axis corpus mean before comparing, because raw cosine over seventeen mostly-low
+/// values is dominated by a shared baseline: it scored Oz 0.885 and Angel 0.792, ranking them correctly
+/// and separating them by almost nothing. Centered, the same pair is +0.700 and +0.274.
+///
+/// A WEIGHT and not a nominator, measured. Ranked by critique alone Oz sits 329th of 7,529 against The
+/// Wire — against premise rank 4,450 and plot 1,134, so the signal is real — and Angel sits 2,893rd. But
+/// nominating the 400 nearest critique profiles, which does reach Oz, still did not put it in the row and
+/// cost mean same-genre share 47% -> 49%. Oz is reachable and not competitive; forcing it past twenty
+/// better-scoring candidates would be tuning to one pair.
+const W_CRITIQUE: f64 = 1.40;
 
 /// Cosine between two titles' noul vectors, over the union of the dimensions either one carries.
 fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
@@ -176,6 +193,12 @@ fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> 
 /// `Authorship` — `den-index` does not know where a facet comes from.
 pub trait Facets {
     fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)>;
+    /// The critique profile — what the work argues about — CENTERED on the corpus mean per axis, so the
+    /// caller does the centering once rather than every comparison.
+    fn critique(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+        let _ = tmdb_id;
+        Vec::new()
+    }
     /// The 75 taxonomy nouls with their probabilities, for the cosine term.
     fn nouls(&self, tmdb_id: u32) -> Vec<(String, f64)> {
         let _ = tmdb_id;
@@ -291,6 +314,7 @@ pub fn more_like_this_pooled(
     let seed_facets: Vec<(String, String, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
     let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
     let seed_nouls: Vec<(String, f64)> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
+    let seed_critique: Vec<(String, f64)> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
 
     // One index's cosine between the seed and a candidate, when that index holds both.
     let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
@@ -369,9 +393,15 @@ pub fn more_like_this_pooled(
             let nc = facets
                 .and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id)))
                 .unwrap_or(0.0);
+            // Already centered, so this can be negative — arguing about different things is evidence
+            // against a pair, not merely absence of evidence for it.
+            let cr = facets
+                .and_then(|f| noul_cosine(&seed_critique, &f.critique(id)))
+                .unwrap_or(0.0);
             let score = base
                 + spread
-                    * (W_TONE * t + W_NOUL * nc + W_MAKER * maker + W_HOME * home + W_FACET * fa
+                    * (W_TONE * t + W_NOUL * nc + W_CRITIQUE * cr + W_MAKER * maker + W_HOME * home
+                        + W_FACET * fa
                         - W_WORLD * world);
             (id, score, dominant)
         })
