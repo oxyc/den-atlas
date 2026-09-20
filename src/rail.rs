@@ -154,11 +154,7 @@ impl den_index::Facets for SeedFacets<'_> {
     }
 
     fn prevalence(&self, axis: &str, value: &str) -> f64 {
-        self.rail
-            .prevalence
-            .get(&(self.media, axis.to_string(), value.to_string()))
-            .copied()
-            .unwrap_or(1.0)
+        self.rail.prevalence.get(&(self.media, axis.to_string(), value.to_string())).copied().unwrap_or(1.0)
     }
 
     fn world(&self, tmdb_id: u32) -> f64 {
@@ -207,12 +203,7 @@ impl den_index::Facets for SeedFacets<'_> {
         };
         let mine = score(&(self.media, other));
         // Only reached for a candidate the tone floor would otherwise cut, so the scan is rare.
-        self.rail
-            .critique_raw
-            .keys()
-            .filter(|k| k.0 == self.media && score(k) > mine)
-            .count()
-            < n
+        self.rail.critique_raw.keys().filter(|k| k.0 == self.media && score(k) > mine).count() < n
     }
 }
 

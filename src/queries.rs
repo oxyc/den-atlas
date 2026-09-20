@@ -69,11 +69,17 @@ impl Indexes {
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
             let Some(rail) = self.rail_facets.as_ref() else {
-                return den_index::more_like_this(Some(&self.plot), self.premise.as_ref(), tmdb_id, media_type)
-                    .into();
+                return den_index::more_like_this(
+                    Some(&self.plot),
+                    self.premise.as_ref(),
+                    tmdb_id,
+                    media_type,
+                )
+                .into();
             };
             let facets = crate::rail::SeedFacets { rail, media: media_type };
-            let authorship = self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
+            let authorship =
+                self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
             den_index::more_like_this_pooled(
                 Some(&self.plot),
                 self.premise.as_ref(),
