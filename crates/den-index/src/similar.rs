@@ -183,6 +183,30 @@ const W_NOUL: f64 = 1.60;
 /// cost mean same-genre share 47% -> 49%. Oz is reachable and not competitive; forcing it past twenty
 /// better-scoring candidates would be tuning to one pair.
 const W_CRITIQUE: f64 = 1.40;
+/// Coverage of the seed's DEFINING arguments, idf-weighted — kept ALONGSIDE the cosine, not instead of it.
+///
+/// The cosine is what pushes a tonal impostor away: Bates Motel sits at -0.32 on it, and coverage alone
+/// cannot say that. Coverage is what pulls the right titles in, because it asks only about the arguments
+/// the seed is actually built on. Ranked by coverage against The Wire rather than cosine: Oz 329 -> 136,
+/// Homicide 316 -> 60, Show Me a Hero 197 -> 67, We Own This City 184 -> 10, Deadwood 42 -> 13 — while
+/// Bates Motel goes 4,830 -> 6,042 and Angel 2,893 -> 3,212.
+const W_COVERAGE: f64 = 1.40;
+
+/// Idf-weighted coverage of the seed's defining arguments by a candidate.
+fn critique_coverage(defining: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
+    if defining.is_empty() || theirs.is_empty() {
+        return None;
+    }
+    let total: f64 = defining.iter().map(|(_, w)| w).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let covered: f64 = defining
+        .iter()
+        .filter_map(|(name, w)| theirs.iter().find(|(n, _)| n == name).map(|(_, p)| w * p))
+        .sum();
+    Some(covered / total)
+}
 
 /// Cosine between two titles' noul vectors, over the union of the dimensions either one carries.
 fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
@@ -204,6 +228,22 @@ fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> 
 /// `Authorship` — `den-index` does not know where a facet comes from.
 pub trait Facets {
     fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)>;
+    /// The seed's DEFINING arguments — axes it reads >= 0.8 on — each with its idf weight, and a
+    /// candidate's raw probability on them. Coverage of these, not cosine over all seventeen.
+    fn critique_defining(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+        let _ = tmdb_id;
+        Vec::new()
+    }
+    /// A candidate's raw (uncentered) critique probabilities, for coverage.
+    fn critique_raw(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+        let _ = tmdb_id;
+        Vec::new()
+    }
+    /// Whether this candidate is among the seed's `n` best by critique coverage, corpus-wide.
+    fn critique_top(&self, tmdb_id: u32, other: u32, n: usize) -> bool {
+        let _ = (tmdb_id, other, n);
+        false
+    }
     /// The critique profile — what the work argues about — CENTERED on the corpus mean per axis, so the
     /// caller does the centering once rather than every comparison.
     fn critique(&self, tmdb_id: u32) -> Vec<(String, f64)> {
@@ -326,6 +366,7 @@ pub fn more_like_this_pooled(
     let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
     let seed_nouls: Vec<(String, f64)> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
     let seed_critique: Vec<(String, f64)> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
+    let seed_defining: Vec<(String, f64)> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
 
     // One index's cosine between the seed and a candidate, when that index holds both.
     let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
@@ -409,9 +450,13 @@ pub fn more_like_this_pooled(
             let cr = facets
                 .and_then(|f| noul_cosine(&seed_critique, &f.critique(id)))
                 .unwrap_or(0.0);
+            let cov = facets
+                .and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id)))
+                .unwrap_or(0.0);
             let score = base
                 + spread
-                    * (W_TONE * t + W_NOUL * nc + W_CRITIQUE * cr + W_MAKER * maker + W_HOME * home
+                    * (W_TONE * t + W_NOUL * nc + W_CRITIQUE * cr + W_COVERAGE * cov + W_MAKER * maker
+                        + W_HOME * home
                         + W_FACET * fa
                         - W_WORLD * world);
             (id, score, dominant)

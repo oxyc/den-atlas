@@ -90,6 +90,8 @@ struct JevFacets {
     world: HashMap<String, f64>,
     nouls: HashMap<String, Vec<(String, f64)>>,
     critique: HashMap<String, Vec<(String, f64)>>,
+    critique_raw: HashMap<String, Vec<(String, f64)>>,
+    idf: HashMap<String, f64>,
     prevalence: HashMap<(String, String), f64>,
     key: String,
 }
@@ -98,6 +100,55 @@ impl Facets for JevFacets {
     fn facets(&self, id: u32) -> Vec<(String, String, f64)> {
         self.by_key.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
     }
+    /// Axes the seed reads >= 0.8 on, weighted by ln(N / titles >= 0.7 on that axis): its defining
+    /// arguments, with a common one worth less than a rare one.
+    fn critique_defining(&self, id: u32) -> Vec<(String, f64)> {
+        self.critique_raw(id)
+            .into_iter()
+            .filter(|(_, p)| *p >= 0.8)
+            .map(|(a, _)| {
+                let w = self.idf.get(&a).copied().unwrap_or(0.0);
+                (a, w)
+            })
+            .filter(|(_, w)| *w > 0.0)
+            .collect()
+    }
+
+    fn critique_raw(&self, id: u32) -> Vec<(String, f64)> {
+        self.critique_raw.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    }
+
+    fn critique_top(&self, seed: u32, other: u32, n: usize) -> bool {
+        let defining = self.critique_defining(seed);
+        if defining.is_empty() {
+            return false;
+        }
+        let score = |id: &str| {
+            self.critique_raw
+                .get(id)
+                .and_then(|theirs| {
+                    let total: f64 = defining.iter().map(|(_, w)| w).sum();
+                    (total > 0.0).then(|| {
+                        defining
+                            .iter()
+                            .filter_map(|(a, w)| theirs.iter().find(|(n, _)| n == a).map(|(_, p)| w * p))
+                            .sum::<f64>()
+                            / total
+                    })
+                })
+                .unwrap_or(0.0)
+        };
+        let mine = score(&format!("{}:{}", self.key, other));
+        // How many titles of this media type beat it. Cheap enough at 7.5k rows, and this only runs for
+        // candidates that would otherwise be cut by the tone floor.
+        let better = self
+            .critique_raw
+            .keys()
+            .filter(|k| k.starts_with(&self.key) && score(k) > mine)
+            .count();
+        better < n
+    }
+
     fn critique(&self, id: u32) -> Vec<(String, f64)> {
         self.critique.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
     }
@@ -174,6 +225,17 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
         let sum: f64 = same.iter().map(|k| critique_raw[*k].get(axis).copied().unwrap_or(0.0)).sum();
         means.insert(axis.clone(), sum / same.len().max(1) as f64);
     }
+    // idf over titles of this media type reading >= 0.7 on an axis.
+    let mut idf: HashMap<String, f64> = HashMap::new();
+    for axis in &axes {
+        let n = same.iter().filter(|k| critique_raw[**k].get(axis).copied().unwrap_or(0.0) >= 0.7).count();
+        idf.insert(axis.clone(), ((same.len().max(1) as f64) / (n.max(1) as f64)).ln().max(0.0));
+    }
+    let critique_raw_vecs: HashMap<String, Vec<(String, f64)>> = critique_raw
+        .iter()
+        .map(|(k, m)| (k.clone(), m.iter().map(|(a, p)| (a.clone(), *p)).collect()))
+        .collect();
+
     let critique: HashMap<String, Vec<(String, f64)>> = critique_raw
         .iter()
         .map(|(k, m)| {
@@ -188,7 +250,7 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     // Prevalence within the seed's own media type: `continuity = episodic` is rare among films and common
     // among series, and a share computed over both would misprice it for each.
     let prevalence = counts.into_iter().map(|(k, n)| (k, n / total.max(1.0))).collect();
-    JevFacets { by_key, world, nouls, critique, prevalence, key: key.to_string() }
+    JevFacets { by_key, world, nouls, critique, critique_raw: critique_raw_vecs, idf, prevalence, key: key.to_string() }
 }
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {
@@ -256,6 +318,7 @@ fn main() {
         ("Paddington", 116149, MediaType::Movie),
         ("Once", 5723, MediaType::Movie),
         ("Angel", 2426, MediaType::Tv),
+        ("Oz", 3322, MediaType::Tv),
         // A pair the rail already gets right, both ways round: a regression guard, not a defect. The premise
         // index ranks each the other's #1 while plot ranks them 166th and 43rd — premise earning its place.
         ("Love Again", 758336, MediaType::Movie),
@@ -271,6 +334,7 @@ fn main() {
         (137, vec![("Palm Springs", 587792)]),
         (1396, vec![("Better Call Saul", 60059)]),
         (5723, vec![("Begin Again", 198277), ("Sing Street", 369557), ("Flora and Son", 1059811)]),
+        (3322, vec![("The Wire", 1438)]),
         (758336, vec![("Voicemails for Isabelle", 614945)]),
         (614945, vec![("Love Again", 758336)]),
     ]);
@@ -336,7 +400,7 @@ fn main() {
         println!("{line}");
     }
 
-    if let Some(wire) = anchors.iter().find(|a| a.1 == 1438) {
+    if let Some(wire) = anchors.iter().find(|a| a.1 == 3322) {
         println!("\nThe Wire, pooled scorer:");
         let auth = FactsAuthorship {
             makers: &makers,
