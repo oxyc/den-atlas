@@ -134,6 +134,46 @@ const W_MAKER: f64 = 1.20;
 /// own. HBO is 131 titles in this corpus, so it discriminates; "made for television" would not.
 const W_HOME: f64 = 0.15;
 
+/// How hard shared narrative facets pull a candidate up, as a fraction of the pool's spread.
+///
+/// The axes come from the completed model pass and say what the vectors cannot: The Wire is
+/// `ensemble-led 0.98` / `person-vs-system 0.97` / `single-city 1.00`, and Angel — which the vectors put
+/// 12th on it — is `single-lead 1.00` / `person-vs-person 0.37` / `hybrid` continuity. Nothing in the label
+/// taxonomy expresses that difference, which is why Angel survived the tonal floor.
+const W_FACET: f64 = 2.00;
+
+/// One title's facet choices: axis -> (value, confidence). Supplied by the caller for the same reason as
+/// `Authorship` — `den-index` does not know where a facet comes from.
+pub trait Facets {
+    fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)>;
+    /// Share of the corpus carrying this axis value, for rarity weighting. A shared `chronology = linear`
+    /// is worth almost nothing (76% of titles) where a shared `conflict = person-vs-system` is worth a lot.
+    fn prevalence(&self, axis: &str, value: &str) -> f64;
+}
+
+/// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1.
+fn facet_agreement(f: &dyn Facets, seed: &[(String, String, f64)], other: u32) -> Option<f64> {
+    let theirs = f.facets(other);
+    if seed.is_empty() || theirs.is_empty() {
+        return None; // Unknown is not none.
+    }
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (axis, value, conf) in seed {
+        let Some((_, their_value, their_conf)) = theirs.iter().find(|(a, _, _)| a == axis) else { continue };
+        // ln(1/prevalence): a value the whole corpus shares carries almost no evidence.
+        let weight = conf * (1.0 / f.prevalence(axis, value).max(1e-6)).ln().max(0.0);
+        den += weight;
+        if their_value == value {
+            num += weight * their_conf;
+        }
+    }
+    if den <= 0.0 {
+        return None;
+    }
+    Some(num / den)
+}
+
 /// What the facts know about a title that the vectors cannot: who made it, and where it lived.
 ///
 /// Two jobs, and the first is the one that matters. A weight can only re-order candidates the vectors
@@ -177,6 +217,7 @@ pub fn more_like_this_pooled(
     tmdb_id: u32,
     media_type: MediaType,
     authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
 ) -> Vec<u32> {
     let mut pool: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -206,6 +247,7 @@ pub fn more_like_this_pooled(
         return Vec::new();
     };
     let seed = seed_labels(&mine);
+    let seed_facets: Vec<(String, String, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
 
     // One index's cosine between the seed and a candidate, when that index holds both.
     let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
@@ -277,7 +319,10 @@ pub fn more_like_this_pooled(
             let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th));
             let maker = authorship.map_or(0.0, |a| a.makers(id));
             let home = authorship.map_or(0.0, |a| a.home(id));
-            (id, base + spread * (W_TONE * t + W_MAKER * maker + W_HOME * home), dominant)
+            // A candidate with no facets scores the term at 0 rather than being penalised or exempted: it
+            // simply brings no facet evidence, which is different from bringing disagreeing evidence.
+            let fa = facets.and_then(|f| facet_agreement(f, &seed_facets, id)).unwrap_or(0.0);
+            (id, base + spread * (W_TONE * t + W_MAKER * maker + W_HOME * home + W_FACET * fa), dominant)
         })
         .collect();
     final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
@@ -358,7 +403,7 @@ mod tests {
         ]);
         // 9 is absent from the premise index entirely, so the shipped scorer can never return it.
         assert!(!more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&9));
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>).contains(&9));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>).contains(&9));
     }
 
     /// The Bates Motel case: same primary genre, so the cross-genre penalty never fires on it, but it shares
@@ -375,7 +420,7 @@ mod tests {
             (3, "tv", "Crime", false, &[("Serial Killer", 0.9)], &[("Dark & Gritty", 0.9)], [95, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>);
+        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>);
         assert!(out.contains(&2), "the title sharing the seed's labels must survive");
         assert!(!out.contains(&3), "a same-genre title sharing only a generic mood must not");
         // The shipped scorer keeps the miss and ranks it ABOVE the real neighbour.
@@ -405,7 +450,7 @@ mod tests {
             (8, "movie", "Romance", false, &[("Romantic Drama", 0.6)], &[("Feel-good", 0.6)], [40, 0, 0]),
         ]);
         let plot = fixture(&[(1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None::<&dyn Authorship>);
+        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None::<&dyn Authorship>, None::<&dyn Facets>);
         assert_eq!(none.first(), Some(&2), "on vectors alone the closer, unrelated title leads");
         assert!(none.iter().position(|x| *x == 3).is_some_and(|p| p > 2), "and the sibling sits down the row");
         struct SameHand;
@@ -417,7 +462,7 @@ mod tests {
                 if id == 3 { 1.0 } else { 0.0 }
             }
         }
-        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&SameHand));
+        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&SameHand), None::<&dyn Facets>);
         assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
     }
 
@@ -429,7 +474,7 @@ mod tests {
             (2, "tv", "Crime", false, &[], &[], [90, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, &[("Police Procedural", 0.9)], &[], [100, 0, 0])]);
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>).contains(&2));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>).contains(&2));
     }
 
     #[test]

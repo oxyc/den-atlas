@@ -9,7 +9,7 @@
 //! twenty carrying the anchor's own primary genre, and the share carrying one single subgenre. Those are the
 //! measurable form of "it reads as a genre shelf", which no per-title assertion can express.
 
-use den_index::{more_like_this, more_like_this_pooled, Authorship, Index, MediaType};
+use den_index::{more_like_this, more_like_this_pooled, Authorship, Facets, Index, MediaType};
 use std::collections::{HashMap, HashSet};
 
 /// `mediaType:tmdbId` -> the Wikidata q-ids credited as director, writer or creator.
@@ -64,7 +64,7 @@ fn share(set: &Credits, key: &str, id: u32, mine: &HashSet<String>) -> f64 {
 }
 
 fn load_credits(dir: &str, fields: &[&str]) -> Credits {
-    let raw = std::fs::read(format!("{dir}/facts-c85c707b0b18.json")).expect("facts");
+    let raw = std::fs::read(format!("{dir}/facts-merged.json")).expect("facts");
     let v: serde_json::Value = serde_json::from_slice(&raw).expect("facts json");
     let mut out: HashMap<(u32, String), HashSet<String>> = HashMap::new();
     for r in v["records"].as_array().into_iter().flatten() {
@@ -82,6 +82,49 @@ fn load_credits(dir: &str, fields: &[&str]) -> Credits {
         }
     }
     out
+}
+
+/// Facets from the completed model pass, keyed `mediaType:tmdbId`.
+struct JevFacets {
+    by_key: HashMap<String, Vec<(String, String, f64)>>,
+    prevalence: HashMap<(String, String), f64>,
+    key: String,
+}
+
+impl Facets for JevFacets {
+    fn facets(&self, id: u32) -> Vec<(String, String, f64)> {
+        self.by_key.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    }
+    fn prevalence(&self, axis: &str, value: &str) -> f64 {
+        self.prevalence.get(&(axis.to_string(), value.to_string())).copied().unwrap_or(1.0)
+    }
+}
+
+fn load_facets(dir: &str, key: &str) -> JevFacets {
+    let raw = std::fs::read(format!("{dir}/jev-facets.json")).expect("jev-facets");
+    let v: serde_json::Value = serde_json::from_slice(&raw).expect("facets json");
+    let mut by_key: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+    let mut counts: HashMap<(String, String), f64> = HashMap::new();
+    let mut total: f64 = 0.0;
+    for (k, axes) in v.as_object().into_iter().flatten() {
+        let same_type = k.starts_with(key);
+        if same_type {
+            total += 1.0;
+        }
+        let mut list = Vec::new();
+        for (axis, pair) in axes.as_object().into_iter().flatten() {
+            let (Some(val), Some(conf)) = (pair[0].as_str(), pair[1].as_f64()) else { continue };
+            list.push((axis.to_string(), val.to_string(), conf));
+            if same_type {
+                *counts.entry((axis.to_string(), val.to_string())).or_insert(0.0) += 1.0;
+            }
+        }
+        by_key.insert(k.clone(), list);
+    }
+    // Prevalence within the seed's own media type: `continuity = episodic` is rare among films and common
+    // among series, and a share computed over both would misprice it for each.
+    let prevalence = counts.into_iter().map(|(k, n)| (k, n / total.max(1.0))).collect();
+    JevFacets { by_key, prevalence, key: key.to_string() }
 }
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {
@@ -126,6 +169,8 @@ fn main() {
     let premise = load(&dir, "labels-premise.json", "vectors-premise.bin");
     let makers = load_credits(&dir, &["directors", "screenwriters", "creators", "makers"]);
     let homes = load_credits(&dir, &["broadcaster", "productionCompanies"]);
+    let facets_tv = load_facets(&dir, "tv");
+    let facets_movie = load_facets(&dir, "movie");
 
     // Anchors chosen to cover the reported defects and the cases the rail already gets right, so a change
     // that only helps The Wire is visible as such.
@@ -155,7 +200,8 @@ fn main() {
     // Titles a viewer would expect, and ones the row should not contain. Checked in both arms.
     let wanted: HashMap<u32, Vec<(&str, u32)>> = HashMap::from([
         (1438, vec![("We Own This City", 125949), ("Homicide", 4464), ("Show Me a Hero", 63248),
-                    ("The Corner", 14531), ("Oz", 3322), ("Deadwood", 1406), ("The Deuce", 65817)]),
+                    ("The Corner", 14531), ("Oz", 3322), ("Deadwood", 1406), ("The Deuce", 65817),
+                    ("Treme", 17967), ("Generation Kill", 17035)]),
         (314365, vec![("The Post", 446354), ("She Said", 837881)]),
         (137, vec![("Palm Springs", 587792)]),
         (1396, vec![("Better Call Saul", 60059)]),
@@ -186,7 +232,8 @@ fn main() {
             mine_homes: homes.get(&(*id, key.clone())).cloned().unwrap_or_default(),
             key,
         };
-        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth));
+        let fx: &dyn Facets = if *media == MediaType::Tv { &facets_tv } else { &facets_movie };
+        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth), Some(fx));
         let (a_g, a_s, _) = shape(&plot, &a, *media, &genre);
         let (b_g, b_s, _) = shape(&plot, &b, *media, &genre);
         println!(
@@ -230,7 +277,7 @@ fn main() {
             mine_homes: homes.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default(),
             key: "tv".to_string(),
         };
-        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&auth)).iter().enumerate() {
+        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&auth), Some(&facets_tv)).iter().enumerate() {
             println!("  {:>2}. {}", i + 1, title(&plot, *id, wire.2));
         }
     }
