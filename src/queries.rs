@@ -35,6 +35,9 @@ pub struct Indexes {
     pub facts: Option<Facts>,
     /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
     pub plot_facets: Option<PlotFacets>,
+    /// The per-title signals More Like This ranks on; without them the rail falls back to vectors and
+    /// labels, which is how it worked before they existed.
+    pub rail_facets: Option<crate::rail::RailFacets>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
@@ -55,12 +58,31 @@ const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 128;
 
 impl Indexes {
-    /// More Like This for a title (`den_index::more_like_this`), worked out once while the indexes are loaded: it
-    /// is deterministic for the dataset, and asked again and again — a billboard's seeds on every Home load, the
-    /// title a search names, a detail page.
+    /// More Like This for a title, worked out once while the indexes are loaded: it is deterministic for
+    /// the dataset, and asked again and again — a billboard's seeds on every Home load, the title a search
+    /// names, a detail page.
+    ///
+    /// The pooled scorer when the dataset ships the signals it needs, and the original otherwise. They are
+    /// not small variations of each other: the original draws candidates from the premise index alone, so a
+    /// plot neighbour can never enter the row — measured on The Wire, its plot top-20 and premise top-40 do
+    /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
-            den_index::more_like_this(Some(&self.plot), self.premise.as_ref(), tmdb_id, media_type).into()
+            let Some(rail) = self.rail_facets.as_ref() else {
+                return den_index::more_like_this(Some(&self.plot), self.premise.as_ref(), tmdb_id, media_type)
+                    .into();
+            };
+            let facets = crate::rail::SeedFacets { rail, media: media_type };
+            let authorship = self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
+            den_index::more_like_this_pooled(
+                Some(&self.plot),
+                self.premise.as_ref(),
+                tmdb_id,
+                media_type,
+                authorship.as_ref().map(|a| a as &dyn den_index::Authorship),
+                Some(&facets),
+            )
+            .into()
         })
     }
 
@@ -112,6 +134,7 @@ pub struct IndexQueries {
     facets: Option<PathBuf>,
     facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
+    rail_facets: Option<PathBuf>,
     metadata: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
@@ -135,6 +158,7 @@ impl IndexQueries {
             facets: ds.facets.as_ref().map(|f| f.path.clone()),
             facts: ds.facts.clone(),
             plot_facets: ds.plot_facets.clone(),
+            rail_facets: ds.rail_facets.clone(),
             metadata: ds.metadata.as_ref().map(|m| m.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
@@ -168,6 +192,7 @@ impl IndexQueries {
             facets: self.facets.clone(),
             facts: self.facts.clone(),
             plot_facets: self.plot_facets.clone(),
+            rail_facets: self.rail_facets.clone(),
             metadata: self.metadata.clone(),
         };
         let (indexes, phases) = tokio::task::spawn_blocking(move || load(&sources))
@@ -229,6 +254,7 @@ struct Sources {
     facets: Option<PathBuf>,
     facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
+    rail_facets: Option<PathBuf>,
     metadata: Option<PathBuf>,
 }
 
@@ -248,7 +274,7 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
 /// the facts and the facets.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
-    let (plot, premise, facets, facts, plot_facets, cards) = std::thread::scope(|scope| {
+    let (plot, premise, facets, facts, plot_facets, rail_facets, cards) = std::thread::scope(|scope| {
         let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
         // A broken premise index costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(|| {
@@ -289,6 +315,19 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
+        // The rail's own signals. Read on the load threads beside everything else; a missing or unreadable
+        // blob costs the pooled scorer and nothing more.
+        let rail_facets = scope.spawn(|| {
+            timed(|| {
+                sources.rail_facets.as_ref().and_then(|path| {
+                    let loaded = crate::rail::RailFacets::load(path);
+                    if loaded.is_none() {
+                        eprintln!("rail facets unusable — More Like This falls back to vectors and labels");
+                    }
+                    loaded
+                })
+            })
+        });
         // Plot facet rows need both the facets and the cards to draw them with.
         let plot_facets = scope.spawn(|| {
             timed(|| {
@@ -312,12 +351,21 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
-        (joined(plot), joined(premise), joined(facets), joined(facts), joined(plot_facets), joined(cards))
+        (
+            joined(plot),
+            joined(premise),
+            joined(facets),
+            joined(facts),
+            joined(plot_facets),
+            joined(rail_facets),
+            joined(cards),
+        )
     });
     let ((plot, plot_took), (premise, premise_took), (facets, facets_took)) = (plot, premise, facets);
     let plot = plot?;
     let ((mut facts, facts_took), (plot_facets, plot_facets_took), (cards, cards_took)) =
         (facts, plot_facets, cards);
+    let (rail_facets, rail_facets_took) = rail_facets;
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
@@ -350,13 +398,14 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     });
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, display {}",
+        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, rail facets {}, display {}",
         seconds(plot_took),
         seconds(premise_took),
         seconds(facts_took),
         seconds(cards_took),
         seconds(facets_took),
         seconds(plot_facets_took),
+        seconds(rail_facets_took),
         seconds(display_took)
     );
     let indexes = Indexes {
@@ -367,6 +416,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         facets,
         facts,
         plot_facets,
+        rail_facets,
         cards,
         display,
         similar: Mutex::new(HashMap::new()),

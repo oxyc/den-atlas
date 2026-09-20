@@ -16,6 +16,7 @@ mod metrics;
 mod motn;
 mod plotrows;
 mod queries;
+mod rail;
 mod recommend;
 mod schema;
 mod search;
