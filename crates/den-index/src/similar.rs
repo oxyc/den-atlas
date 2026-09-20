@@ -130,6 +130,27 @@ fn tone(seed: &Seed, theirs: &crate::Labels<'_>) -> f64 {
 /// 726, 2,725 and 2,237. Authorship is the strongest evidence of "you will want this next" that the dataset
 /// holds, and nothing in the ranking path read it.
 const W_MAKER: f64 = 1.20;
+/// A shared home — the same broadcaster or production company — as a small tiebreak, never a lane of its
+/// own. HBO is 131 titles in this corpus, so it discriminates; "made for television" would not.
+const W_HOME: f64 = 0.15;
+
+/// What the facts know about a title that the vectors cannot: who made it, and where it lived.
+///
+/// Two jobs, and the first is the one that matters. A weight can only re-order candidates the vectors
+/// already proposed, and the vectors do not propose a seed's own siblings: The Wire and Oz are both HBO and
+/// Oz is plot rank 1,134, far outside any sane pool. `nominate` lets authorship put a title into the pool on
+/// its own evidence, where the rest of the scorer then judges it like anything else.
+pub trait Authorship {
+    /// Ids that share a maker or a home with the seed, whatever the vectors think of them.
+    fn nominate(&self) -> Vec<u32>;
+    /// Share of the seed's makers this candidate shares, 0..=1.
+    fn makers(&self, tmdb_id: u32) -> f64;
+    /// Share of the seed's broadcasters/production companies this candidate shares, 0..=1.
+    fn home(&self, tmdb_id: u32) -> f64 {
+        let _ = tmdb_id;
+        0.0
+    }
+}
 
 /// Neighbour ids for More Like This, best first — the pooled scorer.
 ///
@@ -144,9 +165,9 @@ const W_MAKER: f64 = 1.20;
 ///  3. **A tonal term over moods and subgenres**, which the shipped scorer never reads. It is the signal that
 ///     separates Homicide (0.77) from Bates Motel (0.27), both of which are `primaryGenre = Crime` and so
 ///     indistinguishable to the cross-genre penalty.
-///  4. **Shared authorship**, via `shared_makers` — what share of the seed's directors/writers/creators a
-///     candidate shares (0 when none, 1 when it is by the same hand). A callback rather than a facts index
-///     because `den-index` deliberately does not know what a fact is; `den-atlas` holds the facts.
+///  4. **Shared authorship**, via `authorship` — which both NOMINATES candidates the vectors rank nowhere
+///     (The Wire and Oz are both HBO; Oz is plot rank 1,134) and weights them once they are in the pool. A
+///     trait rather than a facts index because `den-index` deliberately does not know what a fact is.
 ///
 /// The cross-genre penalty is gone: it punished every one of the seed's own siblings in another genre while
 /// waving through anything that merely shared its genre label.
@@ -155,7 +176,7 @@ pub fn more_like_this_pooled(
     premise: Option<&Index>,
     tmdb_id: u32,
     media_type: MediaType,
-    shared_makers: Option<&dyn Fn(u32) -> f64>,
+    authorship: Option<&dyn Authorship>,
 ) -> Vec<u32> {
     let mut pool: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -164,6 +185,13 @@ pub fn more_like_this_pooled(
             if seen.insert(n.tmdb_id) {
                 pool.push(n.tmdb_id);
             }
+        }
+    }
+    // Facts nominate too. Without this a shared maker can only re-order what the vectors already found, and
+    // the vectors do not find a seed's own siblings.
+    for id in authorship.map(Authorship::nominate).unwrap_or_default() {
+        if id != tmdb_id && seen.insert(id) {
+            pool.push(id);
         }
     }
     if pool.is_empty() {
@@ -214,7 +242,7 @@ pub fn more_like_this_pooled(
             continue;
         }
         let t = tone(&seed, &theirs);
-        let maker = shared_makers.map_or(0.0, |f| f(id));
+        let maker = authorship.map_or(0.0, |a| a.makers(id));
         // The floor is skipped when the candidate carries no confident labels at all — unknown is not none,
         // and filtering on it would silently drop every thinly-labelled title. A shared maker also exempts
         // it: labels are a guess about a title, authorship is a fact about it, and the fact wins.
@@ -247,8 +275,9 @@ pub fn more_like_this_pooled(
                 .and_then(|x| x.labels(id, media_type))
                 .or_else(|| plot.and_then(|x| x.labels(id, media_type)));
             let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th));
-            let maker = shared_makers.map_or(0.0, |f| f(id));
-            (id, base + spread * (W_TONE * t + W_MAKER * maker), dominant)
+            let maker = authorship.map_or(0.0, |a| a.makers(id));
+            let home = authorship.map_or(0.0, |a| a.home(id));
+            (id, base + spread * (W_TONE * t + W_MAKER * maker + W_HOME * home), dominant)
         })
         .collect();
     final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
@@ -329,7 +358,7 @@ mod tests {
         ]);
         // 9 is absent from the premise index entirely, so the shipped scorer can never return it.
         assert!(!more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&9));
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None).contains(&9));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>).contains(&9));
     }
 
     /// The Bates Motel case: same primary genre, so the cross-genre penalty never fires on it, but it shares
@@ -346,7 +375,7 @@ mod tests {
             (3, "tv", "Crime", false, &[("Serial Killer", 0.9)], &[("Dark & Gritty", 0.9)], [95, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None);
+        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>);
         assert!(out.contains(&2), "the title sharing the seed's labels must survive");
         assert!(!out.contains(&3), "a same-genre title sharing only a generic mood must not");
         // The shipped scorer keeps the miss and ranks it ABOVE the real neighbour.
@@ -376,11 +405,19 @@ mod tests {
             (8, "movie", "Romance", false, &[("Romantic Drama", 0.6)], &[("Feel-good", 0.6)], [40, 0, 0]),
         ]);
         let plot = fixture(&[(1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None);
+        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None::<&dyn Authorship>);
         assert_eq!(none.first(), Some(&2), "on vectors alone the closer, unrelated title leads");
         assert!(none.iter().position(|x| *x == 3).is_some_and(|p| p > 2), "and the sibling sits down the row");
-        let same_hand = |id: u32| if id == 3 { 1.0 } else { 0.0 };
-        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&same_hand));
+        struct SameHand;
+        impl Authorship for SameHand {
+            fn nominate(&self) -> Vec<u32> {
+                vec![3]
+            }
+            fn makers(&self, id: u32) -> f64 {
+                if id == 3 { 1.0 } else { 0.0 }
+            }
+        }
+        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&SameHand));
         assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
     }
 
@@ -392,7 +429,7 @@ mod tests {
             (2, "tv", "Crime", false, &[], &[], [90, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, &[("Police Procedural", 0.9)], &[], [100, 0, 0])]);
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None).contains(&2));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>).contains(&2));
     }
 
     #[test]

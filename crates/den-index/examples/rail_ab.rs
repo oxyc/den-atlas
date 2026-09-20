@@ -9,21 +9,68 @@
 //! twenty carrying the anchor's own primary genre, and the share carrying one single subgenre. Those are the
 //! measurable form of "it reads as a genre shelf", which no per-title assertion can express.
 
-use den_index::{more_like_this, more_like_this_pooled, Index, MediaType};
+use den_index::{more_like_this, more_like_this_pooled, Authorship, Index, MediaType};
 use std::collections::{HashMap, HashSet};
 
 /// `mediaType:tmdbId` -> the Wikidata q-ids credited as director, writer or creator.
 ///
 /// Read from the shipped facts sidecar. den-index does not know what a fact is, so the lookup is built here
 /// and passed in as a callback — the same shape den-atlas would use, where `facts.rs` already holds this.
-fn load_makers(dir: &str) -> HashMap<(u32, String), HashSet<String>> {
+type Credits = HashMap<(u32, String), HashSet<String>>;
+
+/// Facts-backed authorship for one seed: who made it, where it lived, and which titles share either.
+struct FactsAuthorship<'a> {
+    makers: &'a Credits,
+    homes: &'a Credits,
+    key: String,
+    mine_makers: HashSet<String>,
+    mine_homes: HashSet<String>,
+}
+
+impl Authorship for FactsAuthorship<'_> {
+    fn nominate(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        // Makers only. Nominating everything that shares a HOME floods the pool — HBO alone is 131 titles —
+        // and measured worse: The Wire kept The Deuce but lost Show Me a Hero, and mean genre share rose
+        // from 46% to 48%. A home is where a title lived, not evidence that it is the same kind of thing.
+        for (set, mine) in [(self.makers, &self.mine_makers)] {
+            if mine.is_empty() {
+                continue;
+            }
+            for ((id, mt), theirs) in set {
+                if *mt == self.key && !theirs.is_disjoint(mine) {
+                    out.push(*id);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+    fn makers(&self, id: u32) -> f64 {
+        share(self.makers, &self.key, id, &self.mine_makers)
+    }
+    fn home(&self, id: u32) -> f64 {
+        share(self.homes, &self.key, id, &self.mine_homes)
+    }
+}
+
+fn share(set: &Credits, key: &str, id: u32, mine: &HashSet<String>) -> f64 {
+    if mine.is_empty() {
+        return 0.0;
+    }
+    set.get(&(id, key.to_string()))
+        .map_or(0.0, |theirs| mine.intersection(theirs).count() as f64 / mine.len() as f64)
+}
+
+fn load_credits(dir: &str, fields: &[&str]) -> Credits {
     let raw = std::fs::read(format!("{dir}/facts-c85c707b0b18.json")).expect("facts");
     let v: serde_json::Value = serde_json::from_slice(&raw).expect("facts json");
     let mut out: HashMap<(u32, String), HashSet<String>> = HashMap::new();
     for r in v["records"].as_array().into_iter().flatten() {
         let (Some(id), Some(mt)) = (r["tmdbId"].as_u64(), r["mediaType"].as_str()) else { continue };
         let mut set = HashSet::new();
-        for field in ["directors", "screenwriters", "creators", "makers"] {
+        for field in fields {
             for q in r[field].as_array().into_iter().flatten() {
                 if let Some(q) = q.as_str() {
                     set.insert(q.to_string());
@@ -77,7 +124,8 @@ fn main() {
     let dir = std::env::args().nth(1).expect("usage: rail_ab <dataset dir>");
     let plot = load(&dir, "labels-t02.json", "vectors-bge-m3.bin");
     let premise = load(&dir, "labels-premise.json", "vectors-premise.bin");
-    let makers = load_makers(&dir);
+    let makers = load_credits(&dir, &["directors", "screenwriters", "creators", "makers"]);
+    let homes = load_credits(&dir, &["broadcaster", "productionCompanies"]);
 
     // Anchors chosen to cover the reported defects and the cases the rail already gets right, so a change
     // that only helps The Wire is visible as such.
@@ -106,7 +154,8 @@ fn main() {
 
     // Titles a viewer would expect, and ones the row should not contain. Checked in both arms.
     let wanted: HashMap<u32, Vec<(&str, u32)>> = HashMap::from([
-        (1438, vec![("We Own This City", 125949), ("Homicide", 4464), ("Show Me a Hero", 63248), ("The Corner", 14531)]),
+        (1438, vec![("We Own This City", 125949), ("Homicide", 4464), ("Show Me a Hero", 63248),
+                    ("The Corner", 14531), ("Oz", 3322), ("Deadwood", 1406), ("The Deuce", 65817)]),
         (314365, vec![("The Post", 446354), ("She Said", 837881)]),
         (137, vec![("Palm Springs", 587792)]),
         (1396, vec![("Better Call Saul", 60059)]),
@@ -129,18 +178,15 @@ fn main() {
         };
         let genre = seed.primary_genre.to_string();
         let a = more_like_this(Some(&plot), Some(&premise), *id, *media);
-        let key = if *media == MediaType::Tv { "tv" } else { "movie" };
-        let mine = makers.get(&(*id, key.to_string())).cloned().unwrap_or_default();
-        let share = |cand: u32| -> f64 {
-            if mine.is_empty() {
-                return 0.0;
-            }
-            match makers.get(&(cand, key.to_string())) {
-                Some(theirs) => mine.intersection(theirs).count() as f64 / mine.len() as f64,
-                None => 0.0,
-            }
+        let key = if *media == MediaType::Tv { "tv" } else { "movie" }.to_string();
+        let auth = FactsAuthorship {
+            makers: &makers,
+            homes: &homes,
+            mine_makers: makers.get(&(*id, key.clone())).cloned().unwrap_or_default(),
+            mine_homes: homes.get(&(*id, key.clone())).cloned().unwrap_or_default(),
+            key,
         };
-        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&share));
+        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth));
         let (a_g, a_s, _) = shape(&plot, &a, *media, &genre);
         let (b_g, b_s, _) = shape(&plot, &b, *media, &genre);
         println!(
@@ -177,12 +223,14 @@ fn main() {
 
     if let Some(wire) = anchors.iter().find(|a| a.1 == 1438) {
         println!("\nThe Wire, pooled scorer:");
-        let mine = makers.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default();
-        let share = |cand: u32| -> f64 {
-            if mine.is_empty() { return 0.0 }
-            makers.get(&(cand, "tv".to_string())).map_or(0.0, |t| mine.intersection(t).count() as f64 / mine.len() as f64)
+        let auth = FactsAuthorship {
+            makers: &makers,
+            homes: &homes,
+            mine_makers: makers.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default(),
+            mine_homes: homes.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default(),
+            key: "tv".to_string(),
         };
-        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&share)).iter().enumerate() {
+        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&auth)).iter().enumerate() {
             println!("  {:>2}. {}", i + 1, title(&plot, *id, wire.2));
         }
     }
