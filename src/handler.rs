@@ -628,9 +628,20 @@ impl IndexQuestion {
                     "coverage": crate::schema::row_coverage(indexes, *media_type, &constraints),
                 })
             }
-            Self::Similar { media_type, tmdb_id } => serde_json::json!({
-                "ids": &*indexes.more_like_this(*tmdb_id, *media_type),
-            }),
+            Self::Similar { media_type, tmdb_id } => {
+                // The row is computed once and memoised, so a later page is a slice rather than a rescore.
+                // `skip`/`limit` because the rail is scrolled: a fixed twenty where hundreds exist reads as
+                // broken. Absent both, the answer is the first screenful, which is what every existing
+                // caller already expects.
+                let row = indexes.more_like_this(*tmdb_id, *media_type);
+                let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let limit = query_param(query, "limit")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(SIMILAR_PAGE)
+                    .min(den_index::MAX_ROW);
+                let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
+                serde_json::json!({"ids": page, "total": row.len()})
+            }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
                 let k = query_param(query, "k")
@@ -680,6 +691,8 @@ fn index_media_type(type_: &str) -> Option<den_index::MediaType> {
 /// the facet lane's cap; pooled suggestions by default.
 const SEMANTIC_K: usize = 24;
 const NEIGHBOUR_K: usize = 12;
+/// One screenful of More Like This, when the caller asks for no page.
+const SIMILAR_PAGE: usize = 20;
 const MAX_NEIGHBOUR_K: usize = 50;
 const FACET_LIMIT: usize = 50;
 const SUGGEST_LIMIT: usize = 20;
@@ -1758,9 +1771,19 @@ mod tests {
             ("/index/rows/movie/mood/Tense.json", serde_json::json!([1])),
             // Premise leads: 3 (its premise score, +¼ as the plot agrees, −¼ for another genre) beats 2.
             ("/index/similar/movie/1.json", serde_json::json!([3, 2])),
+            // The rail is scrolled, so it pages. Absent both params it answers the first screenful, which
+            // is what every existing caller expects.
+            ("/index/similar/movie/1.json?skip=1", serde_json::json!([2])),
+            ("/index/similar/movie/1.json?limit=1", serde_json::json!([3])),
+            ("/index/similar/movie/1.json?skip=1&limit=1", serde_json::json!([2])),
+            ("/index/similar/movie/1.json?skip=99", serde_json::json!([])),
         ] {
             let answer = json(body_of(get(&state, path).await).await);
             assert_eq!(answer["ids"], want, "{path}");
+            if path.starts_with("/index/similar/") {
+                // `total` is the whole row, not the page, so a client knows whether to keep scrolling.
+                assert_eq!(answer["total"], 2, "{path}");
+            }
             if path.starts_with("/index/rows/") {
                 let denominator = if path.contains("/series/") { 1 } else { 3 };
                 assert_eq!(answer["coverage"]["denominator"], denominator, "{path}");

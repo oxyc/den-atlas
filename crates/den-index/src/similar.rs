@@ -9,6 +9,17 @@ const PLOT_K: usize = 20;
 const PREMISE_K: usize = 40;
 const KEEP: usize = 20;
 
+/// How long a pooled row may be.
+///
+/// The rail is scrolled, not glanced at: "any list of titles should return plenty and keep loading on
+/// scroll — never a small fixed slice. A hard cap that leaves 20 results where hundreds exist reads as
+/// broken/empty." Twenty was that cap. Measured on The Wire, the twenty-first through hundredth results
+/// include Generation Kill (45), Homicide: Life on the Street (74), The Sopranos (104) and Deadwood (169) —
+/// all real answers that the cap simply threw away.
+///
+/// The row is computed once and memoised, so serving a later page costs a slice, not a rescore.
+pub const MAX_ROW: usize = 200;
+
 /// Neighbour ids for More Like This, best first.
 ///
 /// The premise index leads when it holds the title: its nearest 40, never mixing animated with live action
@@ -409,16 +420,19 @@ pub fn more_like_this_pooled(
     final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
 
     // Greedy pick under the per-subgenre cap, then a second pass to fill from what the cap held back rather
-    // than reaching further down a worse tail.
+    // than reaching further down a worse tail. The cap counts against the first twenty — a row of two
+    // hundred should not be three police procedurals and then nothing else from the genre.
     let mut taken: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out: Vec<u32> = Vec::new();
     let mut held: Vec<u32> = Vec::new();
     for (id, _, dominant) in &final_scored {
-        if out.len() == KEEP {
+        if out.len() == MAX_ROW {
             break;
         }
         let count = taken.entry(dominant.clone()).or_insert(0);
-        if dominant.is_empty() || *count < SUBGENRE_CAP {
+        // Past the first screenful the cap stops applying: it exists to keep the visible row varied, and
+        // beyond that it would start excluding good answers for being the same kind of thing.
+        if dominant.is_empty() || out.len() >= KEEP || *count < SUBGENRE_CAP {
             *count += 1;
             out.push(*id);
         } else {
@@ -426,7 +440,7 @@ pub fn more_like_this_pooled(
         }
     }
     for id in held {
-        if out.len() == KEEP {
+        if out.len() == MAX_ROW {
             break;
         }
         out.push(id);

@@ -50,7 +50,7 @@ pub struct Indexes {
 type Key = (den_index::MediaType, u32);
 
 /// More Like This answers and row orders kept at most: bounded, and simply started over when full. Both are small
-/// (a row order is at most a few thousand titles, an answer twenty ids).
+/// (a row order is at most a few thousand titles, an answer at most `den_index::MAX_ROW` ids).
 const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 128;
 

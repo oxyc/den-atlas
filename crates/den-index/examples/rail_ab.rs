@@ -298,25 +298,28 @@ fn main() {
             key,
         };
         let fx: &dyn Facets = if *media == MediaType::Tv { &facets_tv } else { &facets_movie };
-        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth), Some(fx));
+        let b_full = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth), Some(fx));
+        // Shape is judged on the visible screenful, not the whole scrollable row, so the numbers stay
+        // comparable with the shipped scorer's twenty.
+        let b: Vec<u32> = b_full.iter().copied().take(20).collect();
         let (a_g, a_s, _) = shape(&plot, &a, *media, &genre);
         let (b_g, b_s, _) = shape(&plot, &b, *media, &genre);
         println!(
             "{name:<16} {:>8.0}% {:>8.0}%   {:>8.0}% {:>8.0}%   {:>4} {:>4}",
-            a_g * 100.0, a_s * 100.0, b_g * 100.0, b_s * 100.0, a.len(), b.len()
+            a_g * 100.0, a_s * 100.0, b_g * 100.0, b_s * 100.0, a.len(), b_full.len()
         );
         ag += a_g; asg += a_s; bg += b_g; bsg += b_s; n += 1.0;
 
         for (label, want) in wanted.get(id).unwrap_or(&Vec::new()) {
             let pa = a.iter().position(|x| x == want).map_or("-".into(), |p| (p + 1).to_string());
-            let pb = b.iter().position(|x| x == want).map_or("-".into(), |p| (p + 1).to_string());
+            let pb = b_full.iter().position(|x| x == want).map_or("-".into(), |p| (p + 1).to_string());
             if pa != pb {
                 notes.push(format!("  want {label:<20} {name:<14} A={pa:<4} B={pb}"));
             }
         }
         for (label, bad) in unwanted.get(id).unwrap_or(&Vec::new()) {
             let pa = a.iter().position(|x| x == bad).map_or("-".into(), |p| (p + 1).to_string());
-            let pb = b.iter().position(|x| x == bad).map_or("-".into(), |p| (p + 1).to_string());
+            let pb = b_full.iter().position(|x| x == bad).map_or("-".into(), |p| (p + 1).to_string());
             if pa != pb {
                 notes.push(format!("  DROP {label:<20} {name:<14} A={pa:<4} B={pb}"));
             }
