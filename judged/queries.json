@@ -5,7 +5,7 @@
     "",
     "These are ASSERTIONS, not graded relevance. Authoring a full ranked ideal per query is expensive and",
     "mostly wasted; what catches a regression is a handful of things that must hold. Each case carries the",
-    "behaviour OBSERVED on 2026-09-17 against the live index, so a case that already fails is a bug the set",
+    "behaviour OBSERVED on 2026-09-20 against the live index (dataset 5b1c3213b6a1), so a case that already fails is a bug the set",
     "is meant to hold us to, not a broken test.",
     "",
     "split: dev tunes, test never does. Tuning against test is how a weight set learns the answers.",
@@ -186,7 +186,7 @@
       "q": "relaxing series",
       "split": "dev",
       "lane": "vibe",
-      "observed": "FAIL",
+      "observed": "pass",
       "assert": {
         "not_in_top": {
           "series:88989": 5
@@ -199,7 +199,7 @@
       "q": "feel good movies",
       "split": "dev",
       "lane": "vibe",
-      "observed": "weak",
+      "observed": "pass",
       "assert": {
         "min_hits": 20
       },
@@ -221,7 +221,7 @@
       "q": "russian doll",
       "split": "dev",
       "lane": "word-sense",
-      "observed": "partial",
+      "observed": "pass",
       "assert": {
         "rank_at_most": {
           "series:84977": 1
@@ -236,7 +236,7 @@
       "q": "brazil",
       "split": "dev",
       "lane": "word-sense",
-      "observed": "FAIL",
+      "observed": "pass",
       "assert": {
         "rank_at_most": {
           "movie:68": 1
@@ -251,7 +251,7 @@
       "q": "1917",
       "split": "dev",
       "lane": "word-sense",
-      "observed": "partial",
+      "observed": "pass",
       "assert": {
         "rank_at_most": {
           "movie:530915": 1
@@ -264,7 +264,7 @@
       "q": "new girl",
       "split": "test",
       "lane": "word-sense",
-      "observed": "partial",
+      "observed": "pass",
       "assert": {
         "rank_at_most": {
           "series:1420": 1
@@ -289,7 +289,7 @@
       "q": "medieval",
       "split": "dev",
       "lane": "facet-coverage",
-      "observed": "FAIL",
+      "observed": "pass",
       "assert": {
         "min_scored": 20,
         "not_in_top": {
@@ -302,7 +302,7 @@
       "q": "horror but not gory",
       "split": "dev",
       "lane": "negation",
-      "observed": "FAIL",
+      "observed": "pass",
       "assert": {
         "min_scored": 10
       },
