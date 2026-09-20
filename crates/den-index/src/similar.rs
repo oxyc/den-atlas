@@ -442,27 +442,27 @@ pub fn more_like_this_pooled(
             // simply brings no facet evidence, which is different from bringing disagreeing evidence.
             let fa = facets.and_then(|f| facet_agreement(f, &seed_facets, id)).unwrap_or(0.0);
             let world = facets.map_or(0.0, |f| (f.world(id) - seed_world).abs());
-            let nc = facets
-                .and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id)))
-                .unwrap_or(0.0);
+            let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
             // against a pair, not merely absence of evidence for it.
-            let cr = facets
-                .and_then(|f| noul_cosine(&seed_critique, &f.critique(id)))
-                .unwrap_or(0.0);
-            let cov = facets
-                .and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id)))
-                .unwrap_or(0.0);
+            let cr = facets.and_then(|f| noul_cosine(&seed_critique, &f.critique(id))).unwrap_or(0.0);
+            let cov =
+                facets.and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id))).unwrap_or(0.0);
             let score = base
                 + spread
-                    * (W_TONE * t + W_NOUL * nc + W_CRITIQUE * cr + W_COVERAGE * cov + W_MAKER * maker
+                    * (W_TONE * t
+                        + W_NOUL * nc
+                        + W_CRITIQUE * cr
+                        + W_COVERAGE * cov
+                        + W_MAKER * maker
                         + W_HOME * home
                         + W_FACET * fa
                         - W_WORLD * world);
             (id, score, dominant)
         })
         .collect();
-    final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    final_scored
+        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
 
     // Greedy pick under the per-subgenre cap, then a second pass to fill from what the cap held back rather
     // than reaching further down a worse tail. The cap counts against the first twenty — a row of two
@@ -547,7 +547,15 @@ mod tests {
         ]);
         // 9 is absent from the premise index entirely, so the shipped scorer can never return it.
         assert!(!more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&9));
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>).contains(&9));
+        assert!(more_like_this_pooled(
+            Some(&plot),
+            Some(&premise),
+            1,
+            MediaType::Tv,
+            None::<&dyn Authorship>,
+            None::<&dyn Facets>
+        )
+        .contains(&9));
     }
 
     /// The Bates Motel case: same primary genre, so the cross-genre penalty never fires on it, but it shares
@@ -564,7 +572,14 @@ mod tests {
             (3, "tv", "Crime", false, &[("Serial Killer", 0.9)], &[("Dark & Gritty", 0.9)], [95, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>);
+        let out = more_like_this_pooled(
+            Some(&plot),
+            Some(&premise),
+            1,
+            MediaType::Tv,
+            None::<&dyn Authorship>,
+            None::<&dyn Facets>,
+        );
         assert!(out.contains(&2), "the title sharing the seed's labels must survive");
         assert!(!out.contains(&3), "a same-genre title sharing only a generic mood must not");
         // The shipped scorer keeps the miss and ranks it ABOVE the real neighbour.
@@ -583,7 +598,15 @@ mod tests {
         let premise = fixture(&[
             (1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0]),
             // Closer on vectors and tonally fine, but by another hand.
-            (2, "movie", "Romance", false, &[("Romantic Drama", 0.8), ("Musical", 0.75)], &[("Feel-good", 0.9)], [95, 0, 0]),
+            (
+                2,
+                "movie",
+                "Romance",
+                false,
+                &[("Romantic Drama", 0.8), ("Musical", 0.75)],
+                &[("Feel-good", 0.9)],
+                [95, 0, 0],
+            ),
             // The sibling: same hand, but the vectors put it well down the pool and it carries no subgenres.
             (3, "movie", "Drama", false, &[], &[("Feel-good", 0.7)], [60, 0, 0]),
             // Filler, so the pool's score spread is a real range rather than the gap between two titles.
@@ -594,19 +617,40 @@ mod tests {
             (8, "movie", "Romance", false, &[("Romantic Drama", 0.6)], &[("Feel-good", 0.6)], [40, 0, 0]),
         ]);
         let plot = fixture(&[(1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None::<&dyn Authorship>, None::<&dyn Facets>);
+        let none = more_like_this_pooled(
+            Some(&plot),
+            Some(&premise),
+            1,
+            MediaType::Movie,
+            None::<&dyn Authorship>,
+            None::<&dyn Facets>,
+        );
         assert_eq!(none.first(), Some(&2), "on vectors alone the closer, unrelated title leads");
-        assert!(none.iter().position(|x| *x == 3).is_some_and(|p| p > 2), "and the sibling sits down the row");
+        assert!(
+            none.iter().position(|x| *x == 3).is_some_and(|p| p > 2),
+            "and the sibling sits down the row"
+        );
         struct SameHand;
         impl Authorship for SameHand {
             fn nominate(&self) -> Vec<u32> {
                 vec![3]
             }
             fn makers(&self, id: u32) -> f64 {
-                if id == 3 { 1.0 } else { 0.0 }
+                if id == 3 {
+                    1.0
+                } else {
+                    0.0
+                }
             }
         }
-        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&SameHand), None::<&dyn Facets>);
+        let with = more_like_this_pooled(
+            Some(&plot),
+            Some(&premise),
+            1,
+            MediaType::Movie,
+            Some(&SameHand),
+            None::<&dyn Facets>,
+        );
         assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
     }
 
@@ -618,7 +662,15 @@ mod tests {
             (2, "tv", "Crime", false, &[], &[], [90, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, &[("Police Procedural", 0.9)], &[], [100, 0, 0])]);
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None::<&dyn Authorship>, None::<&dyn Facets>).contains(&2));
+        assert!(more_like_this_pooled(
+            Some(&plot),
+            Some(&premise),
+            1,
+            MediaType::Tv,
+            None::<&dyn Authorship>,
+            None::<&dyn Facets>
+        )
+        .contains(&2));
     }
 
     #[test]

@@ -141,11 +141,7 @@ impl Facets for JevFacets {
         let mine = score(&format!("{}:{}", self.key, other));
         // How many titles of this media type beat it. Cheap enough at 7.5k rows, and this only runs for
         // candidates that would otherwise be cut by the tone floor.
-        let better = self
-            .critique_raw
-            .keys()
-            .filter(|k| k.starts_with(&self.key) && score(k) > mine)
-            .count();
+        let better = self.critique_raw.keys().filter(|k| k.starts_with(&self.key) && score(k) > mine).count();
         better < n
     }
 
@@ -239,10 +235,8 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     let critique: HashMap<String, Vec<(String, f64)>> = critique_raw
         .iter()
         .map(|(k, m)| {
-            let centered = axes
-                .iter()
-                .map(|a| (a.clone(), m.get(a).copied().unwrap_or(0.0) - means[a]))
-                .collect();
+            let centered =
+                axes.iter().map(|a| (a.clone(), m.get(a).copied().unwrap_or(0.0) - means[a])).collect();
             (k.clone(), centered)
         })
         .collect();
@@ -250,7 +244,16 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     // Prevalence within the seed's own media type: `continuity = episodic` is rare among films and common
     // among series, and a share computed over both would misprice it for each.
     let prevalence = counts.into_iter().map(|(k, n)| (k, n / total.max(1.0))).collect();
-    JevFacets { by_key, world, nouls, critique, critique_raw: critique_raw_vecs, idf, prevalence, key: key.to_string() }
+    JevFacets {
+        by_key,
+        world,
+        nouls,
+        critique,
+        critique_raw: critique_raw_vecs,
+        idf,
+        prevalence,
+        key: key.to_string(),
+    }
 }
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {
@@ -271,11 +274,8 @@ fn shape(index: &Index, ids: &[u32], media: MediaType, seed_genre: &str) -> (f64
             if l.primary_genre == seed_genre {
                 same_genre += 1;
             }
-            if let Some((n, _)) = l
-                .subgenres
-                .iter()
-                .filter(|(_, c)| *c >= 0.55)
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            if let Some((n, _)) =
+                l.subgenres.iter().filter(|(_, c)| *c >= 0.55).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             {
                 *sub.entry((*n).to_string()).or_insert(0) += 1;
             }
@@ -327,9 +327,20 @@ fn main() {
 
     // Titles a viewer would expect, and ones the row should not contain. Checked in both arms.
     let wanted: HashMap<u32, Vec<(&str, u32)>> = HashMap::from([
-        (1438, vec![("We Own This City", 125949), ("Homicide", 4464), ("Show Me a Hero", 63248),
-                    ("The Corner", 14531), ("Oz", 3322), ("Deadwood", 1406), ("The Deuce", 65817),
-                    ("Treme", 17967), ("Generation Kill", 17035)]),
+        (
+            1438,
+            vec![
+                ("We Own This City", 125949),
+                ("Homicide", 4464),
+                ("Show Me a Hero", 63248),
+                ("The Corner", 14531),
+                ("Oz", 3322),
+                ("Deadwood", 1406),
+                ("The Deuce", 65817),
+                ("Treme", 17967),
+                ("Generation Kill", 17035),
+            ],
+        ),
         (314365, vec![("The Post", 446354), ("She Said", 837881)]),
         (137, vec![("Palm Springs", 587792)]),
         (1396, vec![("Better Call Saul", 60059)]),
@@ -338,10 +349,15 @@ fn main() {
         (758336, vec![("Voicemails for Isabelle", 614945)]),
         (614945, vec![("Love Again", 758336)]),
     ]);
-    let unwanted: HashMap<u32, Vec<(&str, u32)>> =
-        HashMap::from([(1438, vec![("Bates Motel", 46786)]), (76331, vec![("Dynasty 1981", 3769), ("Dallas", 6647)])]);
+    let unwanted: HashMap<u32, Vec<(&str, u32)>> = HashMap::from([
+        (1438, vec![("Bates Motel", 46786)]),
+        (76331, vec![("Dynasty 1981", 3769), ("Dallas", 6647)]),
+    ]);
 
-    println!("{:<16} {:>9} {:>9}   {:>9} {:>9}   {:>4} {:>4}", "anchor", "A genre", "A subgen", "B genre", "B subgen", "A n", "B n");
+    println!(
+        "{:<16} {:>9} {:>9}   {:>9} {:>9}   {:>4} {:>4}",
+        "anchor", "A genre", "A subgen", "B genre", "B subgen", "A n", "B n"
+    );
     println!("{}", "-".repeat(82));
     let (mut ag, mut asg, mut bg, mut bsg, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0);
     let mut notes: Vec<String> = Vec::new();
@@ -370,9 +386,18 @@ fn main() {
         let (b_g, b_s, _) = shape(&plot, &b, *media, &genre);
         println!(
             "{name:<16} {:>8.0}% {:>8.0}%   {:>8.0}% {:>8.0}%   {:>4} {:>4}",
-            a_g * 100.0, a_s * 100.0, b_g * 100.0, b_s * 100.0, a.len(), b_full.len()
+            a_g * 100.0,
+            a_s * 100.0,
+            b_g * 100.0,
+            b_s * 100.0,
+            a.len(),
+            b_full.len()
         );
-        ag += a_g; asg += a_s; bg += b_g; bsg += b_s; n += 1.0;
+        ag += a_g;
+        asg += a_s;
+        bg += b_g;
+        bsg += b_s;
+        n += 1.0;
 
         for (label, want) in wanted.get(id).unwrap_or(&Vec::new()) {
             let pa = a.iter().position(|x| x == want).map_or("-".into(), |p| (p + 1).to_string());
@@ -393,7 +418,11 @@ fn main() {
     println!("{}", "-".repeat(82));
     println!(
         "{:<16} {:>8.0}% {:>8.0}%   {:>8.0}% {:>8.0}%",
-        "MEAN", ag / n * 100.0, asg / n * 100.0, bg / n * 100.0, bsg / n * 100.0
+        "MEAN",
+        ag / n * 100.0,
+        asg / n * 100.0,
+        bg / n * 100.0,
+        bsg / n * 100.0
     );
     println!("\nmoves:");
     for line in notes {
@@ -413,8 +442,10 @@ fn main() {
                 key: key.clone(),
             };
             let fx: &dyn Facets = if *media == MediaType::Tv { &facets_tv } else { &facets_movie };
-            println!("
-{name}, pooled scorer:");
+            println!(
+                "
+{name}, pooled scorer:"
+            );
             for (i, id) in
                 more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth), Some(fx))
                     .iter()
