@@ -16,26 +16,33 @@ use std::path::Path;
 
 use crate::facts::Facts;
 
+/// A title, in the key both the blob and the indexes use.
+type Title = (MediaType, u32);
+/// One title's facet choices: `axis`, `value`, the model's confidence.
+type Choices = Vec<(String, String, f64)>;
+/// A named probability per axis — the nouls and the critique profile share this shape.
+type Weights = Vec<(String, f64)>;
+
 /// One media type's rail facets, read once at load.
 #[derive(Default)]
 pub struct RailFacets {
     /// `axis -> (value, confidence)` per title.
-    choices: HashMap<(MediaType, u32), Vec<(String, String, f64)>>,
+    choices: HashMap<Title, Choices>,
     /// How far from a realist world, 0..=1.
-    world: HashMap<(MediaType, u32), f64>,
+    world: HashMap<Title, f64>,
     /// The 75 taxonomy nouls.
-    nouls: HashMap<(MediaType, u32), Vec<(String, f64)>>,
+    nouls: HashMap<Title, Weights>,
     /// The 17 critique axes, raw.
-    critique_raw: HashMap<(MediaType, u32), Vec<(String, f64)>>,
+    critique_raw: HashMap<Title, Weights>,
     /// The same, centered on the per-axis corpus mean within the title's own media type.
-    critique: HashMap<(MediaType, u32), Vec<(String, f64)>>,
+    critique: HashMap<Title, Weights>,
     /// Share of this media type carrying an axis value, for rarity weighting.
     prevalence: HashMap<(MediaType, String, String), f64>,
     /// `ln(N / titles >= 0.7 on this axis)`, per media type.
     idf: HashMap<(MediaType, String), f64>,
 }
 
-fn media_of(key: &str) -> Option<(MediaType, u32)> {
+fn media_of(key: &str) -> Option<Title> {
     let (kind, id) = key.split_once(':')?;
     let media = match kind {
         "tv" => MediaType::Tv,
@@ -128,7 +135,7 @@ impl RailFacets {
     }
 }
 
-fn as_pairs(value: &serde_json::Value) -> Vec<(String, f64)> {
+fn as_pairs(value: &serde_json::Value) -> Weights {
     value
         .as_object()
         .map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect())
@@ -190,7 +197,7 @@ impl den_index::Facets for SeedFacets<'_> {
         if total <= 0.0 {
             return false;
         }
-        let score = |id: &(MediaType, u32)| -> f64 {
+        let score = |id: &Title| -> f64 {
             let Some(theirs) = self.rail.critique_raw.get(id) else { return 0.0 };
             defining
                 .iter()
