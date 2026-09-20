@@ -87,6 +87,8 @@ fn load_credits(dir: &str, fields: &[&str]) -> Credits {
 /// Facets from the completed model pass, keyed `mediaType:tmdbId`.
 struct JevFacets {
     by_key: HashMap<String, Vec<(String, String, f64)>>,
+    world: HashMap<String, f64>,
+    nouls: HashMap<String, Vec<(String, f64)>>,
     prevalence: HashMap<(String, String), f64>,
     key: String,
 }
@@ -94,6 +96,12 @@ struct JevFacets {
 impl Facets for JevFacets {
     fn facets(&self, id: u32) -> Vec<(String, String, f64)> {
         self.by_key.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    }
+    fn nouls(&self, id: u32) -> Vec<(String, f64)> {
+        self.nouls.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    }
+    fn world(&self, id: u32) -> f64 {
+        self.world.get(&format!("{}:{}", self.key, id)).copied().unwrap_or(0.0)
     }
     fn prevalence(&self, axis: &str, value: &str) -> f64 {
         self.prevalence.get(&(axis.to_string(), value.to_string())).copied().unwrap_or(1.0)
@@ -104,6 +112,8 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     let raw = std::fs::read(format!("{dir}/jev-facets.json")).expect("jev-facets");
     let v: serde_json::Value = serde_json::from_slice(&raw).expect("facets json");
     let mut by_key: HashMap<String, Vec<(String, String, f64)>> = HashMap::new();
+    let mut world: HashMap<String, f64> = HashMap::new();
+    let mut nouls: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     let mut counts: HashMap<(String, String), f64> = HashMap::new();
     let mut total: f64 = 0.0;
     for (k, axes) in v.as_object().into_iter().flatten() {
@@ -113,6 +123,20 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
         }
         let mut list = Vec::new();
         for (axis, pair) in axes.as_object().into_iter().flatten() {
+            if axis == "__nouls" {
+                let list = pair
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(n, p)| Some((n.clone(), p.as_f64()?)))
+                    .collect();
+                nouls.insert(k.clone(), list);
+                continue;
+            }
+            if axis == "__world" {
+                world.insert(k.clone(), pair.as_f64().unwrap_or(0.0));
+                continue;
+            }
             let (Some(val), Some(conf)) = (pair[0].as_str(), pair[1].as_f64()) else { continue };
             list.push((axis.to_string(), val.to_string(), conf));
             if same_type {
@@ -124,7 +148,7 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
     // Prevalence within the seed's own media type: `continuity = episodic` is rare among films and common
     // among series, and a share computed over both would misprice it for each.
     let prevalence = counts.into_iter().map(|(k, n)| (k, n / total.max(1.0))).collect();
-    JevFacets { by_key, prevalence, key: key.to_string() }
+    JevFacets { by_key, world, nouls, prevalence, key: key.to_string() }
 }
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {
@@ -191,6 +215,7 @@ fn main() {
         ("Inside Out", 150540, MediaType::Movie),
         ("Paddington", 116149, MediaType::Movie),
         ("Once", 5723, MediaType::Movie),
+        ("Angel", 2426, MediaType::Tv),
         // A pair the rail already gets right, both ways round: a regression guard, not a defect. The premise
         // index ranks each the other's #1 while plot ranks them 166th and 43rd — premise earning its place.
         ("Love Again", 758336, MediaType::Movie),

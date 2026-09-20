@@ -141,11 +141,52 @@ const W_HOME: f64 = 0.15;
 /// 12th on it — is `single-lead 1.00` / `person-vs-person 0.37` / `hybrid` continuity. Nothing in the label
 /// taxonomy expresses that difference, which is why Angel survived the tonal floor.
 const W_FACET: f64 = 2.00;
+/// How hard a mismatch of WORLD is punished. A realist show and a show with vampires in it are not
+/// neighbours however much tone they share — which is the whole of the Angel-on-The-Wire defect, and no
+/// facet axis says it: Angel agrees with The Wire on `scope = single-city` and `setting = urban` because it
+/// is set in Los Angeles. Asymmetric in effect rather than in form: sharing "not fantastical" is the corpus
+/// default and evidence of nothing, so only the DIFFERENCE is scored, never the agreement.
+const W_WORLD: f64 = 2.50;
+/// Cosine over the 75 taxonomy nouls, which reach `labels-t02.json` only as a thresholded top-three and so
+/// were invisible to `tone`.
+///
+/// This is the term `tone` should have been. Measured against The Wire, `tone` scores Oz, Bates Motel,
+/// Generation Kill and The Deuce at an identical **0.257** — three titles we want and the one title the
+/// harness names as a miss, indistinguishable. The noul cosine separates them, and drops Bates Motel from
+/// the top twenty to rank 1,509 of 7,528 on its own.
+const W_NOUL: f64 = 1.60;
+
+/// Cosine between two titles' noul vectors, over the union of the dimensions either one carries.
+fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
+    if seed.is_empty() || theirs.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0;
+    for (name, p) in seed {
+        if let Some((_, q)) = theirs.iter().find(|(n, _)| n == name) {
+            dot += p * q;
+        }
+    }
+    let norm = |v: &[(String, f64)]| v.iter().map(|(_, p)| p * p).sum::<f64>().sqrt();
+    let d = norm(seed) * norm(theirs);
+    (d > 0.0).then(|| dot / d)
+}
 
 /// One title's facet choices: axis -> (value, confidence). Supplied by the caller for the same reason as
 /// `Authorship` — `den-index` does not know where a facet comes from.
 pub trait Facets {
     fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)>;
+    /// The 75 taxonomy nouls with their probabilities, for the cosine term.
+    fn nouls(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+        let _ = tmdb_id;
+        Vec::new()
+    }
+    /// How far this title is from a realist world: vampires, superheroes, time travel, the apocalypse.
+    /// 0 for The Wire, 0.97 for Angel.
+    fn world(&self, tmdb_id: u32) -> f64 {
+        let _ = tmdb_id;
+        0.0
+    }
     /// Share of the corpus carrying this axis value, for rarity weighting. A shared `chronology = linear`
     /// is worth almost nothing (76% of titles) where a shared `conflict = person-vs-system` is worth a lot.
     fn prevalence(&self, axis: &str, value: &str) -> f64;
@@ -248,6 +289,8 @@ pub fn more_like_this_pooled(
     };
     let seed = seed_labels(&mine);
     let seed_facets: Vec<(String, String, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
+    let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
+    let seed_nouls: Vec<(String, f64)> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
 
     // One index's cosine between the seed and a candidate, when that index holds both.
     let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
@@ -322,7 +365,15 @@ pub fn more_like_this_pooled(
             // A candidate with no facets scores the term at 0 rather than being penalised or exempted: it
             // simply brings no facet evidence, which is different from bringing disagreeing evidence.
             let fa = facets.and_then(|f| facet_agreement(f, &seed_facets, id)).unwrap_or(0.0);
-            (id, base + spread * (W_TONE * t + W_MAKER * maker + W_HOME * home + W_FACET * fa), dominant)
+            let world = facets.map_or(0.0, |f| (f.world(id) - seed_world).abs());
+            let nc = facets
+                .and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id)))
+                .unwrap_or(0.0);
+            let score = base
+                + spread
+                    * (W_TONE * t + W_NOUL * nc + W_MAKER * maker + W_HOME * home + W_FACET * fa
+                        - W_WORLD * world);
+            (id, score, dominant)
         })
         .collect();
     final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
