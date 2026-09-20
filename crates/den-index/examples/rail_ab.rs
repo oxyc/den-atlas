@@ -400,17 +400,29 @@ fn main() {
         println!("{line}");
     }
 
-    if let Some(wire) = anchors.iter().find(|a| a.1 == 3322) {
-        println!("\nThe Wire, pooled scorer:");
-        let auth = FactsAuthorship {
-            makers: &makers,
-            homes: &homes,
-            mine_makers: makers.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default(),
-            mine_homes: homes.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default(),
-            key: "tv".to_string(),
-        };
-        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&auth), Some(&facets_tv)).iter().enumerate() {
-            println!("  {:>2}. {}", i + 1, title(&plot, *id, wire.2));
+    // Print one anchor's row in full, built exactly as the loop above builds it — an independently
+    // constructed copy printed a different row than the one being measured, which is worse than no print.
+    if let Ok(want) = std::env::var("RAIL_SHOW") {
+        if let Some((name, id, media)) = anchors.iter().find(|a| a.0 == want) {
+            let key = if *media == MediaType::Tv { "tv" } else { "movie" }.to_string();
+            let auth = FactsAuthorship {
+                makers: &makers,
+                homes: &homes,
+                mine_makers: makers.get(&(*id, key.clone())).cloned().unwrap_or_default(),
+                mine_homes: homes.get(&(*id, key.clone())).cloned().unwrap_or_default(),
+                key: key.clone(),
+            };
+            let fx: &dyn Facets = if *media == MediaType::Tv { &facets_tv } else { &facets_movie };
+            println!("
+{name}, pooled scorer:");
+            for (i, id) in
+                more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&auth), Some(fx))
+                    .iter()
+                    .enumerate()
+                    .take(20)
+            {
+                println!("  {:>2}. {}", i + 1, title(&plot, *id, *media));
+            }
         }
     }
 }
