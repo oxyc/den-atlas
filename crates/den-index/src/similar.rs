@@ -70,6 +70,12 @@ const SUBGENRE_CAP: usize = 3;
 /// Labels below this confidence are noise and are not part of what the seed IS.
 const MIN_CONFIDENCE: f64 = 0.55;
 
+/// The seed's confident labels, kept split by family because `tone` judges each family separately.
+struct Seed {
+    subgenres: Vec<(String, f64)>,
+    moods: Vec<(String, f64)>,
+}
+
 /// The seed's labels a candidate is measured against: subgenres and moods it carries confidently.
 ///
 /// Weighted by confidence alone. Weighting each label by its rarity as well — `ln(N / titles carrying it)`,
@@ -77,34 +83,57 @@ const MIN_CONFIDENCE: f64 = 0.55;
 /// this corpus: mean single-subgenre share rose 15% to 17%, The Corner fell from 10th to 13th in The Wire's
 /// row, and it did not remove the miss it was aimed at (Angel, which carries both of The Wire's moods and
 /// none of its subgenres, held 7th either way). Recorded here so the next person does not re-derive it.
-fn seed_labels(labels: &crate::Labels<'_>) -> Vec<(String, f64)> {
-    labels
-        .subgenres
-        .iter()
-        .chain(labels.moods.iter())
-        .filter(|(_, c)| *c >= MIN_CONFIDENCE)
-        .map(|(n, c)| ((*n).to_string(), *c))
-        .collect()
+fn seed_labels(labels: &crate::Labels<'_>) -> Seed {
+    let keep = |pairs: &[(&str, f64)]| -> Vec<(String, f64)> {
+        pairs.iter().filter(|(_, c)| *c >= MIN_CONFIDENCE).map(|(n, c)| ((*n).to_string(), *c)).collect()
+    };
+    Seed { subgenres: keep(&labels.subgenres), moods: keep(&labels.moods) }
 }
 
-/// How much of the SEED the candidate covers, confidence-weighted.
+/// How much of the SEED the candidate covers, confidence-weighted, averaged over the label families the
+/// candidate actually has.
 ///
 /// Coverage of the seed, deliberately not Jaccard: a candidate is not less like The Wire for carrying labels
 /// The Wire lacks. Jaccard punishes exactly the broad, many-labelled titles this is meant to surface.
-fn tone(seed: &[(String, f64)], theirs: &crate::Labels<'_>) -> f64 {
-    let total: f64 = seed.iter().map(|(_, c)| c).sum();
-    if total <= 0.0 {
-        return 1.0; // Unknown is not none: an unlabelled seed gates nothing.
-    }
-    let has = |name: &str| {
-        theirs.subgenres.iter().chain(theirs.moods.iter()).any(|(n, c)| *n == name && *c >= MIN_CONFIDENCE)
+///
+/// Per family, because "unknown is not none" has to hold within a title as well as across the corpus.
+/// Flora and Son carries three moods and NO subgenres; scored against one pooled total it covered 0.23 of
+/// Once and was cut by the floor — punished for missing subgenres it does not have rather than for being
+/// unlike Once. Judged on the family it actually carries it scores 0.50 and survives, which is right: it is
+/// the same director's film about the same thing.
+fn tone(seed: &Seed, theirs: &crate::Labels<'_>) -> f64 {
+    // A family the candidate says nothing in asks nothing of it, and neither does one the seed is silent on.
+    let covered = |family: &[(String, f64)], theirs: &[(&str, f64)]| -> Option<f64> {
+        let total: f64 = family.iter().map(|(_, c)| c).sum();
+        if total <= 0.0 || !theirs.iter().any(|(_, c)| *c >= MIN_CONFIDENCE) {
+            return None;
+        }
+        let has = |name: &str| theirs.iter().any(|(n, c)| *n == name && *c >= MIN_CONFIDENCE);
+        Some(family.iter().filter(|(n, _)| has(n)).map(|(_, c)| c).sum::<f64>() / total)
     };
-    seed.iter().filter(|(n, _)| has(n)).map(|(_, c)| c).sum::<f64>() / total
+    let sub_cov = covered(&seed.subgenres, &theirs.subgenres);
+    let mood_cov = covered(&seed.moods, &theirs.moods);
+    match (sub_cov, mood_cov) {
+        (Some(s), Some(m)) => (s + m) / 2.0,
+        (Some(s), None) => s,
+        (None, Some(m)) => m,
+        // The candidate carries no confident labels at all: unknown is not none, so it is not gated.
+        (None, None) => 1.0,
+    }
 }
+
+/// How hard a shared director/writer/creator pulls a candidate up, as a fraction of the pool's spread.
+///
+/// Large on purpose. Once, Begin Again, Sing Street and Flora and Son are one film made four times by John
+/// Carney — a musician meets a musician and the songs carry the story — and all four credit him in the
+/// shipped facts. Yet none of the other three reaches Once's row on vectors alone: their premise ranks are
+/// 726, 2,725 and 2,237. Authorship is the strongest evidence of "you will want this next" that the dataset
+/// holds, and nothing in the ranking path read it.
+const W_MAKER: f64 = 1.20;
 
 /// Neighbour ids for More Like This, best first — the pooled scorer.
 ///
-/// Three differences from `more_like_this`, each answering a measured defect:
+/// Four differences from `more_like_this`, each answering a measured defect:
 ///
 ///  1. **The pool is the union of both indexes**, not premise's top 40. Today a plot neighbour can only add a
 ///     quarter to a premise candidate that was already there; it can never enter the row. Measured on The
@@ -115,6 +144,9 @@ fn tone(seed: &[(String, f64)], theirs: &crate::Labels<'_>) -> f64 {
 ///  3. **A tonal term over moods and subgenres**, which the shipped scorer never reads. It is the signal that
 ///     separates Homicide (0.77) from Bates Motel (0.27), both of which are `primaryGenre = Crime` and so
 ///     indistinguishable to the cross-genre penalty.
+///  4. **Shared authorship**, via `shared_makers` — what share of the seed's directors/writers/creators a
+///     candidate shares (0 when none, 1 when it is by the same hand). A callback rather than a facts index
+///     because `den-index` deliberately does not know what a fact is; `den-atlas` holds the facts.
 ///
 /// The cross-genre penalty is gone: it punished every one of the seed's own siblings in another genre while
 /// waving through anything that merely shared its genre label.
@@ -123,6 +155,7 @@ pub fn more_like_this_pooled(
     premise: Option<&Index>,
     tmdb_id: u32,
     media_type: MediaType,
+    shared_makers: Option<&dyn Fn(u32) -> f64>,
 ) -> Vec<u32> {
     let mut pool: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
@@ -181,10 +214,12 @@ pub fn more_like_this_pooled(
             continue;
         }
         let t = tone(&seed, &theirs);
+        let maker = shared_makers.map_or(0.0, |f| f(id));
         // The floor is skipped when the candidate carries no confident labels at all — unknown is not none,
-        // and filtering on it would silently drop every thinly-labelled title.
+        // and filtering on it would silently drop every thinly-labelled title. A shared maker also exempts
+        // it: labels are a guess about a title, authorship is a fact about it, and the fact wins.
         let unlabelled = theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < MIN_CONFIDENCE);
-        if !unlabelled && t < TONE_FLOOR {
+        if !unlabelled && maker <= 0.0 && t < TONE_FLOOR {
             continue;
         }
         let base = W_PREMISE * p.unwrap_or(premise_floor) + W_PLOT * l.unwrap_or(plot_floor);
@@ -212,7 +247,8 @@ pub fn more_like_this_pooled(
                 .and_then(|x| x.labels(id, media_type))
                 .or_else(|| plot.and_then(|x| x.labels(id, media_type)));
             let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th));
-            (id, base + W_TONE * spread * t, dominant)
+            let maker = shared_makers.map_or(0.0, |f| f(id));
+            (id, base + spread * (W_TONE * t + W_MAKER * maker), dominant)
         })
         .collect();
     final_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
@@ -293,7 +329,7 @@ mod tests {
         ]);
         // 9 is absent from the premise index entirely, so the shipped scorer can never return it.
         assert!(!more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&9));
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&9));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None).contains(&9));
     }
 
     /// The Bates Motel case: same primary genre, so the cross-genre penalty never fires on it, but it shares
@@ -310,12 +346,42 @@ mod tests {
             (3, "tv", "Crime", false, &[("Serial Killer", 0.9)], &[("Dark & Gritty", 0.9)], [95, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, seed_subs, seed_moods, [100, 0, 0])]);
-        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv);
+        let out = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None);
         assert!(out.contains(&2), "the title sharing the seed's labels must survive");
         assert!(!out.contains(&3), "a same-genre title sharing only a generic mood must not");
         // The shipped scorer keeps the miss and ranks it ABOVE the real neighbour.
         let shipped = more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv);
         assert_eq!(shipped, vec![3, 2]);
+    }
+
+    /// The Once case. Begin Again, Sing Street and Flora and Son are the same director's films about the
+    /// same thing, and none reaches Once's row on vectors alone — their premise ranks are 726, 2,725 and
+    /// 2,237. Authorship is a fact about a title where a label is a guess, so it both lifts and exempts from
+    /// the tonal floor: Flora and Son carries no subgenres at all.
+    #[test]
+    fn a_shared_maker_lifts_a_sibling_the_vectors_rank_nowhere() {
+        let seed_subs: &[(&str, f64)] = &[("Romantic Drama", 0.75), ("Musical", 0.7)];
+        let seed_moods: &[(&str, f64)] = &[("Tearjerker", 0.6), ("Feel-good", 0.6)];
+        let premise = fixture(&[
+            (1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0]),
+            // Closer on vectors and tonally fine, but by another hand.
+            (2, "movie", "Romance", false, &[("Romantic Drama", 0.8), ("Musical", 0.75)], &[("Feel-good", 0.9)], [95, 0, 0]),
+            // The sibling: same hand, but the vectors put it well down the pool and it carries no subgenres.
+            (3, "movie", "Drama", false, &[], &[("Feel-good", 0.7)], [60, 0, 0]),
+            // Filler, so the pool's score spread is a real range rather than the gap between two titles.
+            (4, "movie", "Romance", false, &[("Romantic Drama", 0.8)], &[("Feel-good", 0.8)], [88, 0, 0]),
+            (5, "movie", "Romance", false, &[("Musical", 0.8)], &[("Tearjerker", 0.8)], [80, 0, 0]),
+            (6, "movie", "Romance", false, &[("Romantic Drama", 0.7)], &[("Tearjerker", 0.7)], [72, 0, 0]),
+            (7, "movie", "Romance", false, &[("Musical", 0.7)], &[("Feel-good", 0.7)], [55, 0, 0]),
+            (8, "movie", "Romance", false, &[("Romantic Drama", 0.6)], &[("Feel-good", 0.6)], [40, 0, 0]),
+        ]);
+        let plot = fixture(&[(1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0])]);
+        let none = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, None);
+        assert_eq!(none.first(), Some(&2), "on vectors alone the closer, unrelated title leads");
+        assert!(none.iter().position(|x| *x == 3).is_some_and(|p| p > 2), "and the sibling sits down the row");
+        let same_hand = |id: u32| if id == 3 { 1.0 } else { 0.0 };
+        let with = more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Movie, Some(&same_hand));
+        assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
     }
 
     /// A candidate with no confident labels is not filtered out: unknown is not none.
@@ -326,7 +392,7 @@ mod tests {
             (2, "tv", "Crime", false, &[], &[], [90, 0, 0]),
         ]);
         let plot = fixture(&[(1, "tv", "Crime", false, &[("Police Procedural", 0.9)], &[], [100, 0, 0])]);
-        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv).contains(&2));
+        assert!(more_like_this_pooled(Some(&plot), Some(&premise), 1, MediaType::Tv, None).contains(&2));
     }
 
     #[test]

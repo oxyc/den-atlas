@@ -10,7 +10,32 @@
 //! measurable form of "it reads as a genre shelf", which no per-title assertion can express.
 
 use den_index::{more_like_this, more_like_this_pooled, Index, MediaType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// `mediaType:tmdbId` -> the Wikidata q-ids credited as director, writer or creator.
+///
+/// Read from the shipped facts sidecar. den-index does not know what a fact is, so the lookup is built here
+/// and passed in as a callback — the same shape den-atlas would use, where `facts.rs` already holds this.
+fn load_makers(dir: &str) -> HashMap<(u32, String), HashSet<String>> {
+    let raw = std::fs::read(format!("{dir}/facts-c85c707b0b18.json")).expect("facts");
+    let v: serde_json::Value = serde_json::from_slice(&raw).expect("facts json");
+    let mut out: HashMap<(u32, String), HashSet<String>> = HashMap::new();
+    for r in v["records"].as_array().into_iter().flatten() {
+        let (Some(id), Some(mt)) = (r["tmdbId"].as_u64(), r["mediaType"].as_str()) else { continue };
+        let mut set = HashSet::new();
+        for field in ["directors", "screenwriters", "creators", "makers"] {
+            for q in r[field].as_array().into_iter().flatten() {
+                if let Some(q) = q.as_str() {
+                    set.insert(q.to_string());
+                }
+            }
+        }
+        if !set.is_empty() {
+            out.insert((id as u32, mt.to_string()), set);
+        }
+    }
+    out
+}
 
 fn load(dir: &str, labels: &str, vectors: &str) -> Index {
     let l = std::fs::read(format!("{dir}/{labels}")).expect("labels");
@@ -52,6 +77,7 @@ fn main() {
     let dir = std::env::args().nth(1).expect("usage: rail_ab <dataset dir>");
     let plot = load(&dir, "labels-t02.json", "vectors-bge-m3.bin");
     let premise = load(&dir, "labels-premise.json", "vectors-premise.bin");
+    let makers = load_makers(&dir);
 
     // Anchors chosen to cover the reported defects and the cases the rail already gets right, so a change
     // that only helps The Wire is visible as such.
@@ -71,6 +97,11 @@ fn main() {
         ("Spirited Away", 129, MediaType::Movie),
         ("Inside Out", 150540, MediaType::Movie),
         ("Paddington", 116149, MediaType::Movie),
+        ("Once", 5723, MediaType::Movie),
+        // A pair the rail already gets right, both ways round: a regression guard, not a defect. The premise
+        // index ranks each the other's #1 while plot ranks them 166th and 43rd — premise earning its place.
+        ("Love Again", 758336, MediaType::Movie),
+        ("Voicemails for Isabelle", 614945, MediaType::Movie),
     ];
 
     // Titles a viewer would expect, and ones the row should not contain. Checked in both arms.
@@ -79,6 +110,9 @@ fn main() {
         (314365, vec![("The Post", 446354), ("She Said", 837881)]),
         (137, vec![("Palm Springs", 587792)]),
         (1396, vec![("Better Call Saul", 60059)]),
+        (5723, vec![("Begin Again", 198277), ("Sing Street", 369557), ("Flora and Son", 1059811)]),
+        (758336, vec![("Voicemails for Isabelle", 614945)]),
+        (614945, vec![("Love Again", 758336)]),
     ]);
     let unwanted: HashMap<u32, Vec<(&str, u32)>> =
         HashMap::from([(1438, vec![("Bates Motel", 46786)]), (76331, vec![("Dynasty 1981", 3769), ("Dallas", 6647)])]);
@@ -95,7 +129,18 @@ fn main() {
         };
         let genre = seed.primary_genre.to_string();
         let a = more_like_this(Some(&plot), Some(&premise), *id, *media);
-        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media);
+        let key = if *media == MediaType::Tv { "tv" } else { "movie" };
+        let mine = makers.get(&(*id, key.to_string())).cloned().unwrap_or_default();
+        let share = |cand: u32| -> f64 {
+            if mine.is_empty() {
+                return 0.0;
+            }
+            match makers.get(&(cand, key.to_string())) {
+                Some(theirs) => mine.intersection(theirs).count() as f64 / mine.len() as f64,
+                None => 0.0,
+            }
+        };
+        let b = more_like_this_pooled(Some(&plot), Some(&premise), *id, *media, Some(&share));
         let (a_g, a_s, _) = shape(&plot, &a, *media, &genre);
         let (b_g, b_s, _) = shape(&plot, &b, *media, &genre);
         println!(
@@ -132,7 +177,12 @@ fn main() {
 
     if let Some(wire) = anchors.iter().find(|a| a.1 == 1438) {
         println!("\nThe Wire, pooled scorer:");
-        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2).iter().enumerate() {
+        let mine = makers.get(&(wire.1, "tv".to_string())).cloned().unwrap_or_default();
+        let share = |cand: u32| -> f64 {
+            if mine.is_empty() { return 0.0 }
+            makers.get(&(cand, "tv".to_string())).map_or(0.0, |t| mine.intersection(t).count() as f64 / mine.len() as f64)
+        };
+        for (i, id) in more_like_this_pooled(Some(&plot), Some(&premise), wire.1, wire.2, Some(&share)).iter().enumerate() {
             println!("  {:>2}. {}", i + 1, title(&plot, *id, wire.2));
         }
     }
