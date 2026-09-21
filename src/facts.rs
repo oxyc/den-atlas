@@ -404,10 +404,22 @@ impl Facts {
         // A two-letter code out of the dictionary; anything else is not one and is skipped rather than
         // truncated into a plausible wrong country. `fold` applies the case the JSON reader applied —
         // countries upper, languages lower — because callers compare these to literals.
-        let code = |id: u32, fold: fn(&u8) -> u8| -> Option<[u8; 2]> {
-            let text = strings.get(id)?;
-            let bytes = text.as_bytes();
-            (bytes.len() == 2).then(|| [fold(&bytes[0]), fold(&bytes[1])])
+        //
+        // The two extra rules are the JSON reader's `codes()`, and they are here so the two agree on
+        // inputs the current corpus happens not to contain: a code must be ALPHABETIC (`"1A"` is not a
+        // country), and a list is DEDUPLICATED after casing (`["us", "US"]` is one country, not two, and
+        // a duplicate would double that country's weight wherever a caller counts them).
+        let codes_of = |ids: &[u32], fold: fn(&u8) -> u8| -> Vec<[u8; 2]> {
+            let mut out: Vec<[u8; 2]> = Vec::new();
+            for &id in ids {
+                let Some(text) = strings.get(id) else { continue };
+                let [a, b] = text.as_bytes() else { continue };
+                let code = [fold(a), fold(b)];
+                if code.iter().all(u8::is_ascii_alphabetic) && !out.contains(&code) {
+                    out.push(code);
+                }
+            }
+            out
         };
 
         // Entity lists hold INDICES into the entity table, not Q-ids — the store interns them so a
@@ -460,16 +472,8 @@ impl Facts {
                         }
                         out
                     },
-                    countries: countries
-                        .get(row)
-                        .iter()
-                        .filter_map(|&id| code(id, u8::to_ascii_uppercase))
-                        .collect(),
-                    languages: languages
-                        .get(row)
-                        .iter()
-                        .filter_map(|&id| code(id, u8::to_ascii_lowercase))
-                        .collect(),
+                    countries: codes_of(countries.get(row), u8::to_ascii_uppercase),
+                    languages: codes_of(languages.get(row), u8::to_ascii_lowercase),
                     makers: makers_row,
                     cast: cast_row,
                     // A raw Q-id, not an entity index: the entity table holds almost no franchises.
@@ -503,8 +507,12 @@ impl Facts {
             for alias in std::iter::once(name)
                 .chain(ent_alias.get(den_store::Row(at)).iter().filter_map(|&id| strings.get(id)))
             {
+                // Two characters, as the JSON reader required. A one-character key is not a name anyone
+                // searches; the two readers are held to answering identically, and this was the one place
+                // they did not — an entity folding to "X" was findable from the store and not from the
+                // file, which the comparison test's four hard-coded names could never show.
                 let key = name_key(alias);
-                if !key.is_empty() {
+                if key.chars().count() >= 2 {
                     named.push((fnv1a(&key), qid));
                 }
             }
