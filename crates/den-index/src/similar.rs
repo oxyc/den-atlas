@@ -140,6 +140,26 @@ fn tone(seed: &Seed, theirs: &crate::Labels<'_>) -> f64 {
 /// shipped facts. Yet none of the other three reaches Once's row on vectors alone: their premise ranks are
 /// 726, 2,725 and 2,237. Authorship is the strongest evidence of "you will want this next" that the dataset
 /// holds, and nothing in the ranking path read it.
+///
+/// Swept with `den-atlas rail-ab`, against the mean rank of the titles a viewer would expect and — as the
+/// counterweight that number needs — the share of the visible twenty crediting one of the seed's own
+/// makers. That share is what raising this buys the row at: past some point it stops being "more like
+/// this" and becomes "more by this person", which is a row the detail screen already has.
+///
+/// ```text
+/// W_MAKER   want mean rank    same-maker share
+///   0.00        57.9                7%
+///   0.40        48.6                8%
+///   0.80        43.2                8%
+///   1.20        37.3               10%
+///   1.60        34.9               13%
+///   2.00        33.0               13%
+///   2.60        30.3               15%
+/// ```
+///
+/// The marginal return falls off here: 9.3 ranks per point of maker share below 0.4, 2.0 across 0.8→1.2,
+/// 0.8 above 1.6. The level is optimistic — most expected titles are expected BECAUSE they share a maker,
+/// so the scale flatters the weight — but the shape of the curve is what picks the knee, and it picks 1.20.
 const W_MAKER: f64 = 1.20;
 /// A shared home — the same broadcaster or production company — as a small tiebreak, never a lane of its
 /// own. HBO is 131 titles in this corpus, so it discriminates; "made for television" would not.
