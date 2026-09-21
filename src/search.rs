@@ -63,9 +63,18 @@ const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 const TITLE_LANE: usize = 50;
 const FACET_LANE: usize = 500;
 const LANE: usize = 200;
-/// Votes (facets.bin) and TMDB popularity at which a title counts as fully popular.
+/// The vote count at which a title counts as fully popular.
 const POPULAR_VOTES: f64 = 5000.0;
-const POPULAR_POPULARITY: f64 = 50.0;
+/// Votes a point of TMDB export popularity is worth, for the titles the store has no count for.
+///
+/// Measured, not chosen: over the 47,547 store rows that have both a vote count and an entry in the
+/// 2026-09-20 export, a log-log fit gives `votes = 39.8 * popularity^0.997` — near enough linear to use a
+/// single factor. It is a weak relation and deliberately used only where nothing better exists: the two
+/// quantities measure different things (popularity is a ~30-day activity score, the count is
+/// cumulative-forever), and the ratio is not constant across the range — the median falls from ~37 votes
+/// per point below popularity 5 to ~7 above 100. That tail is why `attention` clamps the conversion at
+/// POPULAR_VOTES rather than trusting it to extrapolate.
+const VOTES_PER_POPULARITY: f64 = 39.8;
 pub const PAGE: usize = 40;
 pub const MAX_PAGE: usize = 100;
 
@@ -704,19 +713,29 @@ pub fn answer(
     })
 }
 
-/// How popular a title is, 0 to 1: by its votes (facets.bin), else by TMDB's popularity in the daily export, for
-/// a title facets.bin has no record of.
+/// How popular a title is, 0 to 1: by its votes (the store), else by TMDB's popularity in the daily export, for
+/// a title the store has no count for.
 pub(crate) fn popularity(votes: u32, export: Option<f64>) -> f64 {
     attention(votes, export).min(1.0)
 }
 
 /// `popularity` without its ceiling, for ordering: past "fully popular", a title with more votes still comes first.
+///
+/// One scale. The export branch is converted to an equivalent vote count first, rather than divided by a
+/// "fully popular" constant of its own — two separate normalisations agree at the anchor by construction
+/// and nowhere else, because a log ratio grows faster the smaller its denominator. Measured against the
+/// 2026-09-20 export, that let three titles with no vote count at all outrank the corpus's most-voted
+/// one: Resident Evil scored 1.608 on popularity 556 against Inception's 1.245 on 40,175 votes.
 pub(crate) fn attention(votes: u32, export: Option<f64>) -> f64 {
-    match export {
-        _ if votes > 0 => f64::from(votes).ln_1p() / POPULAR_VOTES.ln_1p(),
-        Some(popularity) => popularity.max(0.0).ln_1p() / POPULAR_POPULARITY.ln_1p(),
-        None => 0.0,
-    }
+    let votes = match export {
+        _ if votes > 0 => f64::from(votes),
+        // Never above the anchor: a title we have no count for may reach "fully popular" on the export's
+        // word, but it may not pass a title that earned the same place with votes. The clamp is also
+        // where the conversion is least trustworthy — see VOTES_PER_POPULARITY.
+        Some(popularity) => (popularity.max(0.0) * VOTES_PER_POPULARITY).min(POPULAR_VOTES),
+        None => return 0.0,
+    };
+    votes.ln_1p() / POPULAR_VOTES.ln_1p()
 }
 
 /// `S`, with `in_facet` for a title the query NAMED — inside its country or decade, carrying its genre, or
@@ -1143,10 +1162,28 @@ mod tests {
     #[test]
     fn popularity_reads_votes_and_else_the_export() {
         assert_eq!(popularity(5000, Some(1.0)), 1.0, "votes win");
-        assert_eq!(popularity(0, Some(50.0)), 1.0);
-        assert!(popularity(0, Some(1.0)) < 0.2);
+        assert_eq!(popularity(0, Some(1000.0)), 1.0, "the export can reach fully popular");
+        assert!(popularity(0, Some(1.0)) < popularity(0, Some(10.0)), "and orders below it");
         assert_eq!(popularity(0, None), 0.0);
         assert!(attention(30_000, None) > attention(5000, None), "ordering keeps apart what popularity caps");
+    }
+
+    /// The export branch used to be normalised by a "fully popular" constant of its own, which agreed with
+    /// the vote branch at 1.0 and diverged above it. Against the 2026-09-20 export that put three titles
+    /// with no vote count at all above the most-voted title in the corpus — Resident Evil's popularity of
+    /// 556 scored 1.608 where Inception's 40,175 votes scored 1.245.
+    #[test]
+    fn a_title_with_no_votes_cannot_outrank_one_with_forty_thousand() {
+        let inception = attention(40_175, None);
+        for trending in [556.7, 167.0, 133.0, 5_000.0] {
+            assert!(
+                attention(0, Some(trending)) < inception,
+                "popularity {trending} outranked 40,175 votes ({} vs {inception})",
+                attention(0, Some(trending))
+            );
+        }
+        // ...and it still orders them against each other below that line.
+        assert!(attention(0, Some(10.0)) > attention(0, Some(1.0)));
     }
 
     /// `hobbit` is exactly the 1977 animated film. Search used to put twelve More Like This neighbours carrying
