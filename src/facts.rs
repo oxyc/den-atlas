@@ -820,8 +820,8 @@ pub(crate) mod tests {
             return;
         };
         let mapped = crate::store::MappedStore::open(std::path::Path::new(&store_path)).expect("store");
-        let from_store = Facts::from_store(&mapped.view()).expect("facts from the store");
-        let from_json = Facts::read(std::path::Path::new(&facts_path)).expect("facts from json");
+        let mut from_store = Facts::from_store(&mapped.view()).expect("facts from the store");
+        let mut from_json = Facts::read(std::path::Path::new(&facts_path)).expect("facts from json");
 
         assert_eq!(from_store.len(), from_json.len(), "record count");
 
@@ -901,6 +901,34 @@ pub(crate) mod tests {
             let b = from_json.people_named(name);
             assert_eq!(a, b, "people_named({name:?})");
         }
+
+        // A TITLE'S OTHER NAMES. Compared separately because they are not on a `Record` — they live in
+        // their own map, handed to the display title index by `take_titles`. That is exactly why the record
+        // comparison above passed for all 47,618 records while the writer stored only `titles.aliases` and
+        // dropped `titles.en` and `titles.orig`: 14,534 titles had a name findable neither as an alias nor
+        // as their card title, which is most of the original-language corpus.
+        let store_titles = from_store.take_titles();
+        let json_titles = from_json.take_titles();
+        let mut name_diff = Vec::new();
+        for (key, want) in &json_titles {
+            match store_titles.get(key) {
+                Some(got) if got == want => {}
+                Some(got) => name_diff.push(format!("{key:?}: store {got:?} vs json {want:?}")),
+                None => name_diff.push(format!("{key:?}: no names in the store; json has {want:?}")),
+            }
+        }
+        for key in store_titles.keys() {
+            if !json_titles.contains_key(key) {
+                name_diff.push(format!("{key:?}: names in the store the json does not have"));
+            }
+        }
+        assert!(
+            name_diff.is_empty(),
+            "{} of {} titles have different names; first few:\n{}",
+            name_diff.len(),
+            json_titles.len(),
+            name_diff.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+        );
     }
 
     /// `basedOn` was parsed away entirely, so "films based on a book" could not be answered from a file that
