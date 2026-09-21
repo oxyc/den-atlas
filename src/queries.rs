@@ -393,10 +393,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     let (store, store_took) = store;
     // The facts come out of the store, so this runs AFTER it rather than beside it. `factsFile` is a
     // 43 MB JSON blob that atlas alone reads — nothing serves it and no client fetches it — and parsing
-    // it was 1.04 s of a 1.6 s load. The sidecar stays as a fallback for a generation published before
-    // the store carried them.
-    // The facts, out of the store. `factsFile` is 43 MB of the release and was 1.04 s of a 1.6 s load,
-    // read by atlas alone — nothing serves it and no client fetches it.
+    // it was 1.04 s of a 1.6 s load, now 0.38 s off the store.
     //
     // Switched on only once `Facts::from_store` answered IDENTICALLY to the JSON reader on the real
     // corpus: 0 of 47,618 records differ. Getting there found four real losses in the store, three of
