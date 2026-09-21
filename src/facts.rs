@@ -95,11 +95,11 @@ pub struct Record {
     pub released: Option<Released>,
     /// TMDB genre ids through the file's `genreMap`, series' genres named as films' (see `recommend::fold_genre`).
     pub genres: Vec<u16>,
-    /// Where it was made: its production companies' countries, else its country of origin (ISO 3166-1).
+    /// Its country of origin (ISO 3166-1).
     pub countries: Vec<[u8; 2]>,
     /// ISO 639-1, every original language Wikidata gives.
     pub languages: Vec<[u8; 2]>,
-    /// Its directors and creators.
+    /// Who authored it: directors, creators and screenwriters.
     pub makers: Vec<u32>,
     /// Its cast, unordered: Wikidata rarely says who is billed first.
     pub cast: Vec<u32>,
@@ -107,9 +107,6 @@ pub struct Record {
     pub franchise: Option<u32>,
     /// Where a series first aired (P449): its network or service.
     pub broadcasters: Vec<u32>,
-    /// The works it is adapted FROM (P144), as Q-ids — so two adaptations of one novel can be linked to each
-    /// other. What KIND of work each is lives in `source_kinds`, because the id alone cannot answer it.
-    pub based_on: Vec<u32>,
     /// What it was adapted from, as kinds rather than ids — the fact "based on a book" needs.
     pub source_kinds: SourceKinds,
     /// Minutes (P2047). 91.4% of films carry one — but a SERIES' value is per EPISODE, not per series, so
@@ -375,13 +372,18 @@ impl Facts {
                     }
                 }
             }
+            // Directors, creators AND screenwriters. Screenwriters were harvested all along and dropped
+            // here, on a reading of "maker" that Wikidata does not share: P58 is 70% of records, and it
+            // is the only credit linking David Simon to We Own This City and The Plot Against America —
+            // 2 of his 8 titles, unreachable from the rail's heaviest term. `rail_ab.rs` built its maker
+            // set from the raw JSON including screenwriters, so W_MAKER was tuned against this union and
+            // serving used a smaller one.
             let mut makers = entities(raw.directors);
-            for id in entities(raw.creators) {
+            for id in entities(raw.creators).into_iter().chain(entities(raw.screenwriters)) {
                 if !makers.contains(&id) {
                     makers.push(id);
                 }
             }
-            let production = codes(raw.production_countries, u8::to_ascii_uppercase);
             if let Some(t) = raw.titles {
                 let mut names: Vec<Box<str>> = Vec::new();
                 for title in t.en.into_iter().chain(t.orig).chain(t.aliases.unwrap_or_default()) {
@@ -398,18 +400,16 @@ impl Facts {
                 // A film is released; a series starts.
                 released: raw.released.or(raw.started).and_then(|r| Released::parse(&r.date, &r.precision)),
                 genres,
-                countries: if production.is_empty() {
-                    codes(raw.countries, u8::to_ascii_uppercase)
-                } else {
-                    production
-                },
+                // `countries` alone. This used to prefer a `productionCountries` field that the harvester
+                // has never shipped — 0 of 47,618 records — so the preferred branch was unreachable and a
+                // test asserted that it won.
+                countries: codes(raw.countries, u8::to_ascii_uppercase),
                 languages: codes(raw.languages, u8::to_ascii_lowercase),
                 makers,
                 cast: entities(raw.cast),
                 franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
                 broadcasters: entities(raw.broadcaster),
                 runtime_minutes: raw.runtime_minutes,
-                based_on: entities(raw.based_on),
                 source_kinds: SourceKinds(
                     raw.based_on_kind
                         .unwrap_or_default()
@@ -550,15 +550,14 @@ struct RawRecord {
     started: Option<RawReleased>,
     genres: Option<Vec<String>>,
     countries: Option<Vec<String>>,
-    production_countries: Option<Vec<String>>,
     languages: Option<Vec<String>>,
     directors: Option<Vec<String>>,
     creators: Option<Vec<String>>,
+    screenwriters: Option<Vec<String>>,
     cast: Option<Vec<String>>,
     franchise: Option<OneOrMany>,
     broadcaster: Option<Vec<String>>,
     titles: Option<RawTitles>,
-    based_on: Option<Vec<String>>,
     based_on_kind: Option<Vec<String>>,
     runtime_minutes: Option<u32>,
 }
@@ -602,8 +601,9 @@ pub(crate) mod tests {
         {"mediaType": "movie", "tmdbId": 1, "imdbId": ["tt0000001", "tt9999999"],
          "titles": {"en": "One", "orig": "하나", "aliases": ["Uno", "One"]},
          "released": {"date": "2026-09-01", "precision": "day"},
-         "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "cast": ["Q2", "Q3", "Q2"],
-         "productionCountries": ["se", "DK"], "countries": ["US"], "languages": ["SV"], "franchise": ["Q50"],
+         "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "screenwriters": ["Q1", "Q9"],
+         "cast": ["Q2", "Q3", "Q2"],
+         "countries": ["us", "DK"], "languages": ["SV"], "franchise": ["Q50"],
          "basedOn": ["Q60", "Q61"], "basedOnKind": ["book", "play"]},
         {"mediaType": "tv", "tmdbId": 1, "started": {"date": "2010-00-00", "precision": "year"},
          "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "broadcaster": ["Q80"], "hasVector": false},
@@ -612,19 +612,19 @@ pub(crate) mod tests {
     }"#;
 
     /// `basedOn` was parsed away entirely, so "films based on a book" could not be answered from a file that
-    /// carried the answer. The kinds come pre-folded by the producer; the Q-ids link adaptations of one source.
+    /// carried the answer. The kinds come pre-folded by the producer; the Q-ids are NOT read — "adaptations
+    /// of the same source" is a relation nothing asks for, and a parsed-but-unread field is how the next
+    /// reader concludes it is load-bearing.
     #[test]
     fn reads_what_a_title_was_adapted_from() {
         let facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
         let film = facts.get(1, MediaType::Movie).unwrap();
-        assert_eq!(film.based_on, vec![60, 61]);
         assert!(film.source_kinds.contains(SourceKinds::BOOK));
         assert!(film.source_kinds.contains(SourceKinds::PLAY), "a title can be adapted from several kinds");
         assert!(!film.source_kinds.contains(SourceKinds::SCREEN));
 
         // Absent means UNKNOWN, not "an original work" — nothing may rank a missing statement as a negative.
         let series = facts.get(1, MediaType::Tv).unwrap();
-        assert!(series.based_on.is_empty());
         assert!(series.source_kinds.is_empty());
     }
 
@@ -644,9 +644,9 @@ pub(crate) mod tests {
         assert_eq!(film.imdb_id.as_deref(), Some("tt0000001"));
         // An unmapped genre is simply not known; the map's own order is kept.
         assert_eq!(film.genres, vec![80, 18]);
-        assert_eq!(film.makers, vec![1]);
+        assert_eq!(film.makers, vec![1, 9], "a screenwriter is a maker, and one credited twice counts once");
         assert_eq!(film.cast, vec![2, 3], "a repeated statement counts once");
-        assert_eq!(film.countries, vec![*b"SE", *b"DK"], "production countries win over origin");
+        assert_eq!(film.countries, vec![*b"US", *b"DK"], "countries are upper-cased, in the order given");
         assert_eq!(film.languages, vec![*b"sv"]);
         assert_eq!(film.franchise, Some(50));
         assert_eq!(film.released, Some(Released { first_day: days_from_civil(2026, 9, 1), span_days: 1 }));
