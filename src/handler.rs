@@ -208,6 +208,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 state.index.as_ref().is_some_and(|index| index.facts_unusable()),
                 state.index.as_ref().is_some_and(|index| index.store_unusable()),
                 state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+                state.index.as_ref().is_some_and(|index| index.votes_unusable()),
             ),
             StatusCode::OK,
         );
@@ -226,6 +227,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             state.index.as_ref().is_some_and(|index| index.facts_unusable()),
             state.index.as_ref().is_some_and(|index| index.store_unusable()),
             state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+            state.index.as_ref().is_some_and(|index| index.votes_unusable()),
         );
         let serious = now.is_some_and(|(reason, _)| loses_a_feature(reason));
         let body = health_body(
@@ -235,6 +237,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             state.index.as_ref().is_some_and(|index| index.facts_unusable()),
             state.index.as_ref().is_some_and(|index| index.store_unusable()),
             state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+            state.index.as_ref().is_some_and(|index| index.votes_unusable()),
         );
         let status = if serious { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
         return json_response(body, status);
@@ -352,7 +355,10 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
 /// nineteen minutes and surfaced as bad search results rather than as a signal, so the two must not look
 /// alike to a monitor.
 pub(crate) fn loses_a_feature(reason: &str) -> bool {
-    matches!(reason, "dataset_unavailable" | "facts_unusable" | "store_unusable" | "rows_unusable")
+    matches!(
+        reason,
+        "dataset_unavailable" | "facts_unusable" | "store_unusable" | "rows_unusable" | "votes_unusable"
+    )
 }
 
 /// What `/health` reports: `None` when healthy, else the reason slug and a one-sentence detail.
@@ -367,6 +373,7 @@ pub(crate) fn health_state(
     facts_unusable: bool,
     store_unusable: bool,
     rows_unusable: bool,
+    votes_unusable: bool,
 ) -> Option<(&'static str, &'static str)> {
     if !dataset_loaded {
         Some(("dataset_unavailable", "dataset failed to load; refresh with scripts/fetch-dataset.sh"))
@@ -404,6 +411,16 @@ pub(crate) fn health_state(
         // else wrong anywhere, which is why this needed a reason of its own rather than folding into the
         // two above.
         Some(("rows_unusable", "the dataset's facet rows did not read; every browse row is empty"))
+    } else if votes_unusable {
+        // A row that is FULL and in the wrong order, which is the one failure here that looks like a
+        // working addon. Neither vote source has a count — IMDb's daily dump has not landed and the
+        // store's `votes` column reads nothing — so every browse row falls back to tmdb-id order, which
+        // is how *La Job* came to sit beside *Game of Thrones*. It shipped once, silently, because
+        // `votes_of` answered 0 for every title and said nothing.
+        Some((
+            "votes_unusable",
+            "no vote counts from IMDb or the store; every browse row falls back to tmdb-id order",
+        ))
     } else {
         None
     }
@@ -418,6 +435,7 @@ fn health_body(
     facts_unusable: bool,
     store_unusable: bool,
     rows_unusable: bool,
+    votes_unusable: bool,
 ) -> String {
     match health_state(
         dataset_loaded,
@@ -426,6 +444,7 @@ fn health_body(
         facts_unusable,
         store_unusable,
         rows_unusable,
+        votes_unusable,
     ) {
         None => r#"{"status":"ok"}"#.to_owned(),
         Some((reason, detail)) => {
@@ -451,6 +470,7 @@ fn note_health(state: &AppState) {
         state.index.as_ref().is_some_and(|index| index.facts_unusable()),
         state.index.as_ref().is_some_and(|index| index.store_unusable()),
         state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+        state.index.as_ref().is_some_and(|index| index.votes_unusable()),
     );
     let slug = now.map_or("ok", |(reason, _)| reason);
     let mut last = crate::util::lock(&state.health);
@@ -1519,12 +1539,12 @@ mod tests {
 
     #[test]
     fn health_ok_when_dataset_loaded_and_fresh() {
-        assert_eq!(health_body(true, true, false, false, false, false), r#"{"status":"ok"}"#);
+        assert_eq!(health_body(true, true, false, false, false, false, false), r#"{"status":"ok"}"#);
     }
 
     #[test]
     fn health_stale_catalog_when_last_refresh_failed() {
-        let body = health_body(true, false, false, false, false, false);
+        let body = health_body(true, false, false, false, false, false, false);
         assert!(body.contains(r#""status":"degraded""#));
         assert!(body.contains(r#""reason":"stale_catalog""#));
     }
@@ -1533,14 +1553,13 @@ mod tests {
     /// recommendations and search have lost them.
     #[test]
     fn health_reports_facts_that_did_not_read() {
-        let body = health_body(true, true, false, true, false, false);
+        let body = health_body(true, true, false, true, false, false, false);
         assert!(body.contains(r#""reason":"facts_unusable""#), "{body}");
         // It ranks below every catalog and dataset state.
-        assert!(health_body(true, true, true, true, false, false)
+        assert!(health_body(true, true, true, true, false, false, false)
             .contains(r#""reason":"catalog_schema_suspect""#));
-        assert!(
-            health_body(false, true, false, true, false, false).contains(r#""reason":"dataset_unavailable""#)
-        );
+        assert!(health_body(false, true, false, true, false, false, false)
+            .contains(r#""reason":"dataset_unavailable""#));
     }
 
     /// A partial schema break is a SUCCESSFUL refresh by every other measure — the row is short but
@@ -1548,23 +1567,23 @@ mod tests {
     /// trace was a line on stderr that nothing reads.
     #[test]
     fn health_reports_a_suspected_schema_break() {
-        let body = health_body(true, true, true, false, false, false);
+        let body = health_body(true, true, true, false, false, false, false);
         assert!(body.contains(r#""status":"degraded""#), "{body}");
         assert!(body.contains(r#""reason":"catalog_schema_suspect""#), "{body}");
         // It ranks BELOW the two that mean rows are missing entirely.
-        assert!(health_body(true, false, true, false, false, false).contains(r#""reason":"stale_catalog""#));
-        assert!(
-            health_body(false, true, true, false, false, false).contains(r#""reason":"dataset_unavailable""#)
-        );
+        assert!(health_body(true, false, true, false, false, false, false)
+            .contains(r#""reason":"stale_catalog""#));
+        assert!(health_body(false, true, true, false, false, false, false)
+            .contains(r#""reason":"dataset_unavailable""#));
     }
 
     #[test]
     fn health_dataset_unavailable_when_dataset_missing() {
         // Dataset-unavailable outranks stale: even with a fresh catalog, no dataset is the reported reason.
-        let body = health_body(false, true, false, false, false, false);
+        let body = health_body(false, true, false, false, false, false, false);
         assert!(body.contains(r#""reason":"dataset_unavailable""#));
         // …and it still takes precedence when the catalog is also stale (the more severe condition wins).
-        assert!(health_body(false, false, true, false, false, false)
+        assert!(health_body(false, false, true, false, false, false, false)
             .contains(r#""reason":"dataset_unavailable""#));
     }
 
@@ -2456,26 +2475,48 @@ mod tests {
         assert!(loses_a_feature("dataset_unavailable"));
         assert!(loses_a_feature("facts_unusable"));
         assert!(loses_a_feature("rows_unusable"));
+        assert!(loses_a_feature("votes_unusable"));
         assert!(!loses_a_feature("stale_catalog"), "older rows are not an outage");
         assert!(!loses_a_feature("catalog_schema_suspect"), "short rows are not an outage");
         assert!(!loses_a_feature("ok"));
 
         // Every reason health_state can produce is classified: a new one must be considered, not defaulted.
-        for (loaded, fresh, suspect, facts, store, rows) in [
-            (false, true, false, false, false, false),
-            (true, false, false, false, false, false),
-            (true, true, true, false, false, false),
-            (true, true, false, true, false, false),
-            (true, true, false, false, true, false),
-            (true, true, false, false, false, true),
+        for (loaded, fresh, suspect, facts, store, rows, votes) in [
+            (false, true, false, false, false, false, false),
+            (true, false, false, false, false, false, false),
+            (true, true, true, false, false, false, false),
+            (true, true, false, true, false, false, false),
+            (true, true, false, false, true, false, false),
+            (true, true, false, false, false, true, false),
+            (true, true, false, false, false, false, true),
         ] {
-            let (reason, _) = health_state(loaded, fresh, suspect, facts, store, rows).expect("degraded");
+            let (reason, _) =
+                health_state(loaded, fresh, suspect, facts, store, rows, votes).expect("degraded");
             assert!(
                 loses_a_feature(reason) || matches!(reason, "stale_catalog" | "catalog_schema_suspect"),
                 "unclassified reason {reason}"
             );
         }
-        assert!(health_state(true, true, false, false, false, false).is_none());
+        assert!(health_state(true, true, false, false, false, false, false).is_none());
+    }
+
+    /// A corpus no source can order must be REPORTED, and must count as losing a feature.
+    ///
+    /// This is the one degradation that looks like a working addon: every browse row comes back full,
+    /// in tmdb-id order. It shipped once — *La Job* (tv:5) beside *Game of Thrones* — and nothing said a
+    /// word, because `votes_of` answered 0 for every title and 0 is a valid vote count.
+    #[test]
+    fn a_corpus_with_no_vote_counts_is_degraded_and_serious() {
+        let (reason, detail) =
+            health_state(true, true, false, false, false, false, true).expect("no vote source is degraded");
+        assert_eq!(reason, "votes_unusable");
+        assert!(detail.contains("tmdb-id order"), "the detail should say what goes wrong: {detail}");
+        assert!(loses_a_feature(reason), "den-update must treat it as serious enough to roll back");
+
+        // It ranks below every reason that means rows are missing or empty: a row in the wrong order is
+        // still a row.
+        assert_eq!(health_state(true, true, false, false, false, true, true).unwrap().0, "rows_unusable");
+        assert_eq!(health_state(true, true, false, true, false, false, true).unwrap().0, "facts_unusable");
     }
 
     /// An unreadable store must be REPORTED, and must count as losing a feature.
@@ -2486,15 +2527,18 @@ mod tests {
     /// bad deploy stays deployed.
     #[test]
     fn an_unreadable_store_is_degraded_and_serious() {
-        let (reason, detail) =
-            health_state(true, true, false, false, true, false).expect("an unreadable store is degraded");
+        let (reason, detail) = health_state(true, true, false, false, true, false, false)
+            .expect("an unreadable store is degraded");
         assert_eq!(reason, "store_unusable");
         assert!(detail.contains("More Like This"), "the detail should say what is lost: {detail}");
         assert!(loses_a_feature(reason), "den-update must treat it as serious enough to roll back");
 
         // It ranks BELOW the reasons that mean rows are missing entirely, and above nothing else.
-        assert_eq!(health_state(false, true, false, false, true, false).unwrap().0, "dataset_unavailable");
-        assert_eq!(health_state(true, false, false, false, true, false).unwrap().0, "stale_catalog");
+        assert_eq!(
+            health_state(false, true, false, false, true, false, false).unwrap().0,
+            "dataset_unavailable"
+        );
+        assert_eq!(health_state(true, false, false, false, true, false, false).unwrap().0, "stale_catalog");
     }
 
     #[test]

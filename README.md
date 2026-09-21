@@ -158,6 +158,16 @@ plot-only behaviour. The facet lane reads the store's country, language, year an
 read a `facets.bin` sidecar, which covered 9,086 fewer titles. Taste weights stay with the client:
 `score` returns the raw boosts.
 
+Vote counts — what every browse row is ORDERED by — come from IMDb's public
+[`title.ratings`](https://datasets.imdbws.com/) dump (`IMDB_RATINGS`), downloaded once a day and joined onto
+the store's `imdb` column as it is read, so what stays resident is one `u32` and one `f32` per store row
+rather than the dump's 1.7 M. 47,562 of the corpus's 47,618 rows match it. The store's own `votes` column is
+the fallback for a row the dump does not name and for the window before the first fetch lands — which is
+stated in the load line (`row order: …`) rather than left to be inferred. When NEITHER source has a count,
+`/health` reports `votes_unusable`: rows still come back full, in tmdb-id order, which is the one degradation
+here that looks like a working addon. `/recommend` reads the same dump's `averageRating` where no upstream
+list scored a title, in place of the flat prior it used to rate those with.
+
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows include the relevant
 coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every JSON
@@ -218,6 +228,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
+| `IMDB_RATINGS` | on | IMDb's daily `title.ratings` dump joined onto the store's `imdb` column — the vote count browse rows are ordered by and the score `/recommend` rates a title with. Only alongside `INDEX_QUERIES`. Empty or `0` ⇒ off, and row order comes from the store's own `votes` column alone; with that column gone too, rows come back in tmdb-id order and `/health` reports `votes_unusable` |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
 | `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json` (a service channel's as `<surface>-service-<id>[-<country>].json`): the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |

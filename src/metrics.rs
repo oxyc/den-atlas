@@ -58,6 +58,7 @@ pub fn render(state: &AppState) -> String {
         state.index.as_ref().is_some_and(|index| index.facts_unusable()),
         state.index.as_ref().is_some_and(|index| index.store_unusable()),
         state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+        state.index.as_ref().is_some_and(|index| index.votes_unusable()),
     );
     let reason = health.map_or("ok", |(reason, _)| reason);
     gauge(

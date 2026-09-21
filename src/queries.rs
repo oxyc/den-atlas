@@ -17,6 +17,7 @@ use crate::dataset::Dataset;
 use crate::facts::Facts;
 use crate::fit::Corpus;
 use crate::plotrows::{cards_from_store, Card, PlotFacets};
+use crate::ratings::{Ratings, RatingsIndex};
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
 use den_titlesearch::{TitleIndex, TitleRecord};
@@ -50,6 +51,11 @@ pub struct Indexes {
     /// The mapped store and its corpus-wide aggregates: the artifact everything above was read out of,
     /// kept because the rail addresses its columns per candidate rather than copying them.
     pub store: crate::store::LoadedStore,
+    /// IMDb's daily `title.ratings` dump, joined onto the store's rows (`ratings`). The LIVE holder, not a
+    /// snapshot: the indexes outlive a refresh, and a vote count that reached the process should reach the
+    /// next row it orders rather than waiting for an idle release. `None` when the fetch is switched off,
+    /// and empty until the first one lands — see `votes_of`.
+    pub ratings: Option<Arc<Ratings>>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
@@ -113,14 +119,53 @@ impl Indexes {
         self.corpus.get_or_init(|| Corpus::of(self))
     }
 
-    /// A title's TMDB vote count — what every browse row is ORDERED by.
+    /// A title's vote count — what every browse row is ORDERED by.
     ///
-    /// From the store's `votes` column. It used to come from `facets.bin`, which fell 9,007 titles behind
-    /// the corpus because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how
-    /// *La Job* (tv:5) came to sit next to *Game of Thrones*. 0 for a row the store has no count for, which
-    /// is what the blob answered for a title it did not describe.
+    /// IMDb's `numVotes` where the ratings index names the row, else the store's own `votes` column
+    /// (TMDB's count). It used to come from `facets.bin`, which fell 9,007 titles behind the corpus
+    /// because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how *La Job*
+    /// (tv:5) came to sit next to *Game of Thrones*. 0 only when NEITHER source has a count, which
+    /// `IndexQueries::votes_unusable` reports to `/health` rather than leaving to be noticed on a screen.
     pub fn votes(&self, media_type: den_index::MediaType, tmdb_id: u32) -> u32 {
-        votes_of(&self.store, media_type, tmdb_id)
+        let ratings = self.ratings.as_ref().and_then(|r| r.index());
+        votes_of(&self.store, ratings.as_deref(), media_type, tmdb_id)
+    }
+
+    /// IMDb's own score and vote count for a title, where the dump named it. `/recommend` reads this where
+    /// it used to substitute a prior for a rating nobody supplied.
+    pub fn imdb_rating(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<(u32, f32)> {
+        let ratings = self.ratings.as_ref()?.index()?;
+        ratings.of(row_of(&self.store, media_type, tmdb_id)?)
+    }
+
+    /// Whether the store's own `votes` column holds a count for any row — the fallback source for row
+    /// order, and the half of `votes_unusable` that only a load can answer. Scanned rather than
+    /// remembered: one pass over the corpus's `u32`s, at load only.
+    pub(crate) fn store_has_votes(&self) -> bool {
+        self.store.view().per_row::<u32>("votes").is_ok_and(|votes| votes.iter().any(|&v| v > 0))
+    }
+
+    /// Which source is ordering browse rows, for the load line.
+    ///
+    /// Stated at EVERY load, including the ordinary one. Until the first IMDb fetch lands the order comes
+    /// from the store's `votes` column, which is deliberate — it is the only source atlas has in that
+    /// window — and costs nothing while the producer still writes the column. When the producer stops,
+    /// the same window means "ordered by nothing", and a state that is only ever visible by its absence
+    /// from a log is one nobody sees.
+    fn row_order_source(&self) -> String {
+        let ratings = self.ratings.as_ref().and_then(|r| r.index());
+        match (ratings, self.store_has_votes()) {
+            (Some(index), store_votes) => format!(
+                "row order: IMDb numVotes for {} of {} rows, the store's `votes` for the rest ({})",
+                index.matched(),
+                self.population,
+                if store_votes { "which it has" } else { "which it has NOT" }
+            ),
+            (None, true) => "row order: the store's `votes` column — no IMDb ratings index yet".to_owned(),
+            (None, false) => "row order: NOTHING — no IMDb ratings index and no `votes` column in the \
+                              store; every browse row falls back to tmdb-id order"
+                .to_owned(),
+        }
     }
 
     /// A browse row's order (`plotrows::row`), worked out once per type and constraints: every page of a row, and
@@ -134,13 +179,35 @@ impl Indexes {
     }
 }
 
-/// A title's vote count, out of the store. Shared by `Indexes::votes` and the display index's ranking,
-/// which used to read the column with two copies of the same four lines.
-fn votes_of(loaded: &crate::store::LoadedStore, media_type: den_index::MediaType, tmdb_id: u32) -> u32 {
-    let view = loaded.view();
+/// A title's store row, `None` when the store does not hold it.
+fn row_of(
+    loaded: &crate::store::LoadedStore,
+    media_type: den_index::MediaType,
+    tmdb_id: u32,
+) -> Option<usize> {
     let media = u8::from(media_type == den_index::MediaType::Tv);
-    let row = view.row_of(media, tmdb_id).ok().flatten();
-    row.and_then(|row| view.per_row::<u32>("votes").ok()?.get(row.0).copied()).unwrap_or(0)
+    loaded.view().row_of(media, tmdb_id).ok().flatten().map(|row| row.0)
+}
+
+/// A title's vote count: IMDb's `numVotes` first, the store's `votes` column after it. Shared by
+/// `Indexes::votes` and the display index's ranking, which used to read the column with two copies of the
+/// same four lines.
+///
+/// The store's column is read with `.ok()`, so a store that no longer carries it still orders rows off
+/// IMDb rather than failing the load. That tolerance is exactly what used to make the failure silent when
+/// there was only ONE source — hence `Indexes::store_has_votes` and `IndexQueries::votes_unusable`, which
+/// ask once, at load, whether either source has anything at all.
+fn votes_of(
+    loaded: &crate::store::LoadedStore,
+    ratings: Option<&RatingsIndex>,
+    media_type: den_index::MediaType,
+    tmdb_id: u32,
+) -> u32 {
+    let Some(row) = row_of(loaded, media_type, tmdb_id) else { return 0 };
+    if let Some(votes) = ratings.and_then(|index| index.votes(row)) {
+        return votes;
+    }
+    loaded.view().per_row::<u32>("votes").ok().and_then(|votes| votes.get(row).copied()).unwrap_or(0)
 }
 
 /// The facet index from the store's own columns, so attribute search covers the whole corpus.
@@ -152,12 +219,19 @@ fn votes_of(loaded: &crate::store::LoadedStore, media_type: den_index::MediaType
 ///
 /// The country and language taken are the FIRST each title lists, which is what the blob held: one code per
 /// title. A title with several origins is findable by the one Wikidata lists first, exactly as it was.
+///
+/// The vote count is IMDb's where the ratings index names the row, the store's column otherwise — the same
+/// order `votes_of` uses, so attribute search and a browse row rank on one number rather than two. A
+/// SNAPSHOT of the ratings index, unlike `votes_of`: this builds a table, and the table is rebuilt on the
+/// next index load. The store's column is optional here (`.unwrap_or(&[])`) so a store that has dropped it
+/// still yields a facet index off IMDb instead of turning every browse row empty.
 fn facet_index_from(
     facts: &Facts,
     store: &den_store::Store<'_>,
+    ratings: Option<&RatingsIndex>,
 ) -> Result<FacetIndex, den_store::StoreError> {
     let keys = store.per_row::<u64>("keys")?;
-    let votes = store.per_row::<u32>("votes")?;
+    let votes = store.per_row::<u32>("votes").unwrap_or(&[]);
     let mut index = FacetIndex::empty();
     for (i, &packed) in keys.iter().enumerate() {
         let media_type =
@@ -173,7 +247,7 @@ fn facet_index_from(
             record.countries.first().copied().unwrap_or([0, 0]),
             record.languages.first().copied().unwrap_or([0, 0]),
             year,
-            votes.get(i).copied().unwrap_or(0),
+            ratings.and_then(|index| index.votes(i)).unwrap_or_else(|| votes.get(i).copied().unwrap_or(0)),
         );
     }
     Ok(index)
@@ -220,6 +294,11 @@ pub struct IndexQueries {
     /// every browse row (`/index/row?ending=bittersweet`) answers `{"titles":[],"total":0}` with nothing
     /// else wrong. That had no health reason at all, so a whole screen could go blank on a green addon.
     rows_unusable: AtomicBool,
+    /// Whether the store's own `votes` column held a count for no row at the last load. Half of
+    /// `votes_unusable`; the other half is whether the IMDb ratings index has landed, which is live.
+    store_votes_absent: AtomicBool,
+    /// IMDb's ratings, joined onto this store's rows. `None` when `IMDB_RATINGS` is off.
+    ratings: Option<Arc<Ratings>>,
 }
 
 impl IndexQueries {
@@ -233,7 +312,29 @@ impl IndexQueries {
             facts_unusable: AtomicBool::new(false),
             store_unusable: AtomicBool::new(false),
             rows_unusable: AtomicBool::new(false),
+            store_votes_absent: AtomicBool::new(false),
+            ratings: None,
         }
+    }
+
+    /// The IMDb ratings these indexes order rows by. Separate from `new` because the fetch is switchable
+    /// (`IMDB_RATINGS`) and every test that only wants a dataset should not have to name it.
+    pub fn with_ratings(mut self, ratings: Option<Arc<Ratings>>) -> Self {
+        self.ratings = ratings;
+        self
+    }
+
+    /// Whether NEITHER vote source can order a browse row: the store's `votes` column held nothing at the
+    /// last load, and no IMDb ratings index has landed.
+    ///
+    /// This is the signal the silent-zero failure never had. `votes_of` answered 0 for every row when the
+    /// column could not be read, so every browse row collapsed into tmdb-id order — *La Job* beside *Game
+    /// of Thrones* — while every request answered 200 and nothing was logged. It is deliberately LIVE on
+    /// the ratings side: a fetch that lands clears it without waiting for an idle release. An index that
+    /// exists always names at least one row, since `ratings::join` refuses one that matched nothing.
+    pub fn votes_unusable(&self) -> bool {
+        self.store_votes_absent.load(Ordering::Relaxed)
+            && self.ratings.as_ref().and_then(|r| r.index()).is_none()
     }
 
     /// Whether the last index load failed on the store: every `/index/…` route then answers 503.
@@ -268,6 +369,7 @@ impl IndexQueries {
             dataset_version: self.dataset_version.clone(),
             taxonomy_version: self.taxonomy_version.clone(),
             store: self.store.clone(),
+            ratings: self.ratings.clone(),
         };
         let loaded = tokio::task::spawn_blocking(move || load(&sources))
             .await
@@ -297,6 +399,9 @@ impl IndexQueries {
         self.facts_unusable.store(indexes.facts.is_none(), Ordering::Relaxed);
         // Same reasoning for the twelve `facet_*` sections and the browse rows they fill.
         self.rows_unusable.store(indexes.plot_facets.is_none(), Ordering::Relaxed);
+        // And for the vote counts every browse row is ordered by, which had no signal at all: a store
+        // whose `votes` column will not read ordered every row by nothing and said so nowhere.
+        self.store_votes_absent.store(!indexes.store_has_votes(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
@@ -342,6 +447,9 @@ struct Sources {
     /// is a property of the pass that labelled it — so both indexes are stamped with it here.
     taxonomy_version: String,
     store: PathBuf,
+    /// IMDb's ratings, when the fetch is on. The indexes keep the holder — not the index it currently
+    /// has — so a refresh that lands between two loads reaches the rows in between.
+    ratings: Option<Arc<Ratings>>,
 }
 
 /// Load the indexes ONCE, synchronously, for a command-line tool.
@@ -355,6 +463,9 @@ pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
         dataset_version: ds.meta.dataset_version.clone(),
         taxonomy_version: ds.meta.taxonomy_version.clone(),
         store: ds.store.clone(),
+        // No ratings fetch for a one-shot tool: it would download 8 MB to rank the run it then exits
+        // from. A tool measures row order off the store's own `votes` column, and says so here.
+        ratings: None,
     };
     load(&sources).map(|(indexes, _phases)| indexes)
 }
@@ -387,6 +498,10 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     });
     let store = store?;
     let population = store.store.rows();
+    // One snapshot of the ratings index for everything this load BUILDS out of it — the facet index and
+    // the display index's ranking — so the two cannot disagree about a title's vote count within a load.
+    // `Indexes::votes` reads the live holder instead; a table is rebuilt at the next load, a lookup is not.
+    let ratings = sources.ratings.as_ref().and_then(|r| r.index());
 
     let (plot, premise, cards) = std::thread::scope(|scope| {
         let view = || store.view();
@@ -443,7 +558,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // 9,086 titles behind the corpus it was searching.
     let (facets, facets_took) = timed(|| {
         let facts = facts.as_ref()?;
-        facet_index_from(facts, &store.view())
+        facet_index_from(facts, &store.view(), ratings.as_deref())
             .map_err(|e| eprintln!("facet index unusable ({e}) — attribute search is off"))
             .ok()
     });
@@ -452,7 +567,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
         cards.as_ref().map(|cards| {
-            let votes = |kind, id| f64::from(votes_of(&store, kind, id));
+            let votes = |kind, id| f64::from(votes_of(&store, ratings.as_deref(), kind, id));
             // Each title under its display name, and every other name the facts give it: its original title and
             // aliases ("기생충", "Gisaengchung").
             TitleIndex::build(
@@ -497,12 +612,14 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         facts,
         plot_facets,
         store,
+        ratings: sources.ratings.clone(),
         cards,
         display,
         similar: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
     };
+    eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {
         indexes.corpus();
     });
@@ -519,14 +636,21 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
 /// them living in a separate blob.
 #[cfg(test)]
 pub fn write_fixture(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true)
+    write_fixture_as(dir, "One", true, true)
+}
+
+/// The same fixture with every `votes` count zeroed, for the tests about a corpus no source can order:
+/// what the store will look like once the producer stops writing the column.
+#[cfg(test)]
+pub fn write_fixture_voteless(dir: &std::path::Path) -> Dataset {
+    write_fixture_as(dir, "One", true, false)
 }
 
 /// The same fixture with a different display title for movie 1, for the tests about a word that is both a
 /// facet and a title ("brazil").
 #[cfg(test)]
 pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
-    write_fixture_as(dir, movie_one, true)
+    write_fixture_as(dir, movie_one, true, true)
 }
 
 /// The same fixture with no premise vectors, for the tests about a dataset whose store carries only the
@@ -534,11 +658,11 @@ pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
 /// section of the store now, so the store is what has to lack it.
 #[cfg(test)]
 pub fn write_fixture_plot_only(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", false)
+    write_fixture_as(dir, "One", false, true)
 }
 
 #[cfg(test)]
-fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool) -> Dataset {
+fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes: bool) -> Dataset {
     use crate::store::fixture::{Entity, Title};
     // Days since 1970-01-01, the store's unit for a release date.
     const D1985: i32 = 5479;
@@ -625,6 +749,11 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool) -> Da
         premise: vector([0, 0, 0], premise),
         ..Title::default()
     }));
+    if !votes {
+        for title in &mut titles {
+            title.votes = 0;
+        }
+    }
     let entities = [
         Entity { qid: 1, name: "A Director", tmdb: Some(11), aliases: Vec::new() },
         // People search indexes the aliases as well as the name.
@@ -689,5 +818,92 @@ mod tests {
         let queries = IndexQueries::new(&ds);
         assert!(queries.get(|| ()).await.is_err());
         assert!(queries.store_unusable(), "a failed load must reach /health");
+    }
+
+    /// The IMDb dump, joined onto a real store. Movie 1 is the fixture's only row with a `tt…` id, so it
+    /// is the one the dump can name, and every other row must still be ordered by the store's own column.
+    #[tokio::test]
+    async fn imdb_vote_counts_win_and_the_store_s_column_is_the_fallback() {
+        use den_index::MediaType::{Movie, Tv};
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-imdb-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+
+        assert_eq!(indexes.votes(Movie, 1), 9000, "IMDb's numVotes, not the store's 100");
+        assert_eq!(indexes.votes(Movie, 2), 500, "no IMDb id on this row: the store's column");
+        assert_eq!(indexes.votes(Tv, 4), 300);
+        assert_eq!(indexes.votes(Movie, 999), 0, "a title the store does not hold");
+        assert_eq!(indexes.imdb_rating(Movie, 1), Some((9000, 8.4)));
+        assert_eq!(indexes.imdb_rating(Movie, 2), None, "no score where the dump named no row");
+
+        // Attribute search ranks on the same number a browse row does, so the facet index takes the join
+        // too rather than reading the store's column on its own.
+        let facets = indexes.facets.as_ref().expect("the fixture builds a facet index");
+        assert_eq!(facets.title(1, Movie).map(|t| t.votes), Some(9000));
+        assert_eq!(facets.title(2, Movie).map(|t| t.votes), Some(500));
+        assert!(!queries.votes_unusable(), "both sources have counts");
+    }
+
+    /// The silent-zero failure, as `/health` now sees it: a store with no usable `votes` column and no
+    /// IMDb index orders every browse row by tmdb id, and must SAY so. The same store with the dump
+    /// joined on is ordered again — so the flag is live on the ratings side, not frozen at load.
+    #[tokio::test]
+    async fn no_vote_counts_from_either_source_is_reported() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-novotes-{}", std::process::id()));
+        let ds = write_fixture_voteless(&dir);
+
+        let queries = IndexQueries::new(&ds);
+        assert!(!queries.votes_unusable(), "nothing is claimed before a load");
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        assert!(!indexes.store_has_votes());
+        assert_eq!(indexes.votes(Movie, 1), 0);
+        assert!(queries.votes_unusable(), "no source at all must reach /health");
+
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        assert_eq!(indexes.votes(Movie, 1), 9000, "IMDb alone orders the rows it names");
+        assert!(!queries.votes_unusable(), "one source is enough");
+    }
+
+    /// `/recommend` used to rate a title no upstream list had scored with `RATING_PRIOR` — the same 6.6
+    /// for every one of them. IMDb's dump has a real score for 99.9% of the corpus, and a real count to
+    /// stand it on, so neither number is a guess any more and `estimated_votes` stays truthful.
+    #[tokio::test]
+    async fn recommend_rates_a_title_no_list_scored_with_imdb_s_own_score() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-rate-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        let known = crate::recommend::Knowledge { indexes: &indexes };
+
+        let title = known.title((Movie, 1), None, None);
+        assert_eq!(title.rating, Some(f64::from(8.4f32)), "IMDb's score, where there was none");
+        assert_eq!(title.votes, Some(9000.0));
+        assert!(!title.estimated_votes, "a real count is not an estimate");
+        assert!(crate::recommend::quality(&title) > 0.3, "a real 8.4 beats the 6.6 prior's 0.3");
+
+        // A title the dump does not name is unchanged: no score, and `quality` still reads the prior.
+        let title = known.title((Movie, 2), None, None);
+        assert_eq!((title.rating, title.votes, title.estimated_votes), (None, None, false));
+        assert!((crate::recommend::quality(&title) - 0.3).abs() < 1e-9, "still the prior's 0.3");
+
+        // And where JustWatch does supply an IMDb score, the count under it is IMDb's own rather than the
+        // store's TMDB count — the facet index carries the same join.
+        let listed =
+            crate::recommend::Listed { key: (Movie, 1), imdb_id: None, rating: Some(7.0), year: None };
+        let title = known.title(listed.key, None, Some(&listed));
+        assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(7.0), Some(9000.0), false));
+    }
+
+    /// A one-line `title.ratings` dump naming the fixture's movie 1, joined onto its store.
+    fn dump(ds: &Dataset) -> crate::ratings::RatingsIndex {
+        let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");
+        let tsv = "tconst\taverageRating\tnumVotes\ntt0000001\t8.4\t9000\n";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, tsv.as_bytes()).unwrap();
+        crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).expect("the dump names movie 1")
     }
 }

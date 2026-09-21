@@ -18,6 +18,7 @@ mod plotrows;
 mod queries;
 mod rail;
 mod railab;
+mod ratings;
 mod recommend;
 mod schema;
 mod search;
@@ -313,12 +314,32 @@ async fn main() {
     // the first query.
     let index = std::env::var("INDEX_QUERIES")
         .is_ok_and(|v| !v.is_empty() && v != "0")
-        .then(|| dataset.as_ref().map(|ds| Arc::new(queries::IndexQueries::new(ds))))
+        .then(|| dataset.as_ref().map(queries::IndexQueries::new))
         .flatten();
+    // IMDb's daily `title.ratings` dump, joined onto the store by its `imdb` column: the vote count every
+    // browse row is ordered by, and the score /recommend rates a title with. ON unless IMDB_RATINGS is
+    // empty or 0 — the inverse of TITLE_SEARCH above, because this changes no catalog the TV can see, it
+    // only replaces a number atlas already sorts on.
+    //
+    // OFF, atlas orders rows by the store's `votes` column alone. That is exactly today's behaviour and
+    // costs nothing while the producer still writes the column; once it stops, off means every browse row
+    // comes back in tmdb-id order and /health reports `votes_unusable`.
+    //
+    // Only alongside the index routes: nothing else reads a vote count, so an atlas serving catalogs alone
+    // would be downloading 8 MB a day for no reader.
+    let ratings_off = std::env::var("IMDB_RATINGS").is_ok_and(|v| v.is_empty() || v == "0");
+    let ratings = (index.is_some() && !ratings_off)
+        .then(|| dataset.as_ref().map(|ds| ratings::Ratings::new(ds.store.clone(), ratings::RATINGS_URL)))
+        .flatten()
+        .and_then(|built| {
+            built.map_err(|e| eprintln!("imdb ratings disabled (reqwest build failed: {e})")).ok()
+        })
+        .map(Arc::new);
+    let index = index.map(|queries| Arc::new(queries.with_ratings(ratings.clone())));
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
-    let health = handler::health_state(dataset.is_some(), true, false, false, false, false)
+    let health = handler::health_state(dataset.is_some(), true, false, false, false, false, false)
         .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
@@ -338,6 +359,9 @@ async fn main() {
     }
     if let Some(index) = &state.index {
         tokio::spawn(queries::release_when_idle(Arc::clone(index)));
+    }
+    if let Some(ratings) = &ratings {
+        tokio::spawn(ratings::refresh_forever(Arc::clone(ratings)));
     }
     if state.motn.enabled() {
         tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
@@ -381,7 +405,7 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} motn={}",
+         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} motn={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -392,6 +416,7 @@ async fn main() {
         on(state.embed.is_some()),
         on(state.titles.is_some()),
         on(state.index.is_some()),
+        on(ratings.is_some()),
         on(state.motn.enabled()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;

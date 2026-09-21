@@ -489,6 +489,11 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
+        // IMDb's own score and count for this title, out of the daily dump joined onto the store
+        // (`ratings`): a real rating for 99.9% of the corpus, where the branches below used to depend on
+        // some upstream list having named the title at all. Asked for only where it is needed — this runs
+        // once per candidate, and the first arm below has a counted rating already.
+        let imdb = || self.indexes.imdb_rating(media_type, id);
         let hinted = hinted_rating(hint);
         match (hinted, listed.and_then(|l| l.rating)) {
             // A transient TMDB score replaces an upstream score only when enough votes stand behind it.
@@ -496,19 +501,33 @@ impl<'a> Knowledge<'a> {
                 title.rating = Some(rating);
                 title.votes = votes;
             }
-            // JustWatch gives IMDb's score without its vote count. TMDB's count for the title, where the facets hold
-            // one, says how far it stands; without one it is trusted as far as the prior's own weight.
+            // JustWatch gives IMDb's score without its vote count. The facets' count for the title, where
+            // they hold one, says how far it stands, then IMDb's own; without either it is trusted as far
+            // as the prior's own weight, and `estimated_votes` says the number is a stand-in.
             (_, Some(rating)) => {
                 title.rating = Some(rating);
-                match facets.map(|f| f.votes).filter(|&votes| votes > 0) {
-                    Some(votes) => title.votes = Some(f64::from(votes)),
+                let stands = facets
+                    .map(|f| f.votes)
+                    .filter(|&votes| votes > 0)
+                    .map(f64::from)
+                    .or_else(|| imdb().map(|(votes, _)| f64::from(votes)));
+                match stands {
+                    Some(votes) => title.votes = Some(votes),
                     None => {
                         title.votes = Some(RATING_PRIOR_VOTES);
                         title.estimated_votes = true;
                     }
                 }
             }
-            _ => {}
+            // Nothing upstream scored it. Its rating stayed `None`, and `quality` then read RATING_PRIOR
+            // for it — the same 6.6 for every title no list happened to name, which is a guess dressed as
+            // a score. IMDb's is a real one, on a real count, so nothing here is estimated.
+            _ => {
+                if let Some((votes, rating)) = imdb() {
+                    title.rating = Some(f64::from(rating));
+                    title.votes = Some(f64::from(votes));
+                }
+            }
         }
         title.popularity = hint.and_then(|h| h.popularity);
         title.adult = hint.and_then(|h| h.adult).unwrap_or(false);
