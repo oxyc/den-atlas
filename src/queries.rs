@@ -28,8 +28,12 @@ pub struct Indexes {
     pub plot: Index,
     /// The premise index, when the dataset ships one that loads; without it More Like This is plot-only.
     pub premise: Option<Index>,
-    /// The facet index, when the dataset ships `facets.bin`; without it the facet lane answers nothing.
+    /// The facet index — country, original language, year, votes — built from the store's own columns
+    /// where there is one, else from `facets.bin`. Without either the facet lane answers nothing.
     pub facets: Option<FacetIndex>,
+    /// Which of the two built it. Reported on the load line, because the two differ by 9,086 titles and a
+    /// silent fall back to the blob is a narrower attribute search that nothing else would show.
+    pub facets_from_store: bool,
     /// The Wikidata facts, when the dataset ships a file that reads; without them `/recommend` reads labels and
     /// facets alone.
     pub facts: Option<Facts>,
@@ -135,6 +139,42 @@ impl Indexes {
     ) -> Arc<[(den_index::MediaType, u32)]> {
         memoised(&self.rows, key, ROW_MEMO, || work().into())
     }
+}
+
+/// The facet index from the store's own columns, so attribute search covers the whole corpus.
+///
+/// `facets.bin` is a separate producer that fell 9,086 titles behind the corpus because nothing rebuilt it,
+/// and the four facts it holds — country, original language, year, vote count — are all in the store. This
+/// reads them from there instead. `den-index` cannot depend on `den-store` (it must keep building for
+/// wasm32 and aarch64-apple-tvos), so the index is FILLED here rather than read there.
+///
+/// The country and language taken are the FIRST each title lists, which is what the blob held: one code per
+/// title. A title with several origins is findable by the one Wikidata lists first, exactly as before.
+fn facet_index_from(
+    facts: &Facts,
+    store: &den_store::Store<'_>,
+) -> Result<FacetIndex, den_store::StoreError> {
+    let keys = store.per_row::<u64>("keys")?;
+    let votes = store.per_row::<u32>("votes")?;
+    let mut index = FacetIndex::empty();
+    for (i, &packed) in keys.iter().enumerate() {
+        let media_type =
+            if (packed >> 32) == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
+        let id = (packed & 0xffff_ffff) as u32;
+        let Some(record) = facts.get(id, media_type) else { continue };
+        // A year, not a date: the blob's unit, and the only granularity a decade bucket or a year window
+        // needs. 0 is "unknown" on both sides, and `insert` treats anything under 1870 as unknown.
+        let year = record.released.map(|r| r.year_of()).and_then(|y| u16::try_from(y).ok()).unwrap_or(0);
+        index.insert(
+            id,
+            media_type,
+            record.countries.first().copied().unwrap_or([0, 0]),
+            record.languages.first().copied().unwrap_or([0, 0]),
+            year,
+            votes.get(i).copied().unwrap_or(0),
+        );
+    }
+    Ok(index)
 }
 
 /// `memo`'s value for `key`, else what `work` gives, kept. The work runs outside the lock: two requests for one key
@@ -245,7 +285,11 @@ impl IndexQueries {
         let took = started.elapsed();
         let count = |n: Option<usize>| n.map_or("none".to_owned(), |n| format!("{n} titles"));
         let premise = count(indexes.premise.as_ref().map(Index::len));
-        let facets = count(indexes.facets.as_ref().map(FacetIndex::len));
+        let facets = format!(
+            "{} ({})",
+            count(indexes.facets.as_ref().map(FacetIndex::len)),
+            if indexes.facets_from_store { "store" } else { "facets.bin" }
+        );
         let facts = count(indexes.facts.as_ref().map(Facts::len));
         let plot_facets = count(indexes.plot_facets.as_ref().map(PlotFacets::len));
         // The store gets counted like everything else. It was the one part of the load that reported no
@@ -441,6 +485,21 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             })
         })
     });
+    // The facet index comes out of the store too, for the same reason: `facets.bin` covers 38,532 titles
+    // and the store covers 47,618, so attribute search ("spanish series", "80s korean horror") was asking
+    // a table 9,086 titles behind the corpus it is searching. The blob stays as the fallback for a dataset
+    // published before the store carried these columns.
+    let (facets, facets_from_store) = match (store.as_ref(), facts.as_ref()) {
+        (Some(loaded), Some(facts)) => match facet_index_from(facts, &loaded.view()) {
+            Ok(built) => (Some(built), true),
+            Err(e) => {
+                eprintln!("facet index unusable from the store ({e}) — falling back to facets.bin");
+                (facets, false)
+            }
+        },
+        _ => (facets, false),
+    };
+
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
@@ -500,6 +559,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         plot,
         premise,
         facets,
+        facets_from_store,
         facts,
         plot_facets,
         store,

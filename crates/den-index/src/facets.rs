@@ -1,6 +1,10 @@
-//! The facet index — each title's country, decade, type and vote count, from `facets.bin` — and the parser
-//! that finds those facets in a search query ("spanish series", "80s korean horror"). Ports of the tvOS
-//! app's `FacetIndex` and `FacetQuery`.
+//! The facet index — each title's country, language, decade, type and vote count — and the parser that
+//! finds those facets in a search query ("spanish series", "80s korean horror").
+//!
+//! Two sources build the same index. `from_blob` reads `facets.bin`, which covers 38,532 titles; `insert`
+//! takes the same five facts from anywhere, which is how den-atlas builds it from the store's own columns
+//! and covers all 47,618. This crate must keep compiling for wasm32 and aarch64-apple-tvos, so it cannot
+//! depend on `den-store` — hence a constructor that takes facts rather than a reader that takes a store.
 
 use crate::MediaType;
 use std::collections::{HashMap, HashSet};
@@ -61,35 +65,61 @@ impl FacetIndex {
             by_language: HashMap::new(),
             by_type: HashMap::new(),
         };
-        for (position, r) in records.as_chunks::<RECORD>().0.iter().enumerate() {
-            let position = position as u32;
-            let media_type = if r[4] == 1 { MediaType::Tv } else { MediaType::Movie };
-            let country = [r[7].to_ascii_uppercase(), r[8].to_ascii_uppercase()];
-            let year = u16::from_le_bytes([r[9], r[10]]);
-            if country != [0, 0] {
-                index.by_country.entry(country).or_default().push(position);
-            }
-            // TMDB writes `xx` for "no language"; that is an absence, not a language.
-            let language = [r[5].to_ascii_lowercase(), r[6].to_ascii_lowercase()];
-            if language != [0, 0] && &language != b"xx" {
-                index.by_language.entry(language).or_default().push(position);
-            }
-            if year >= 1870 {
-                index.by_decade.entry(year / 10 * 10).or_default().push(position);
-            }
-            index.by_type.entry(media_type).or_default().push(position);
-            let tmdb_id = i32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u32;
-            index.by_title.entry((media_type, tmdb_id)).or_insert(position);
-            index.rows.push(Row {
-                tmdb_id,
-                media_type,
-                votes: u32::from_le_bytes([r[11], r[12], r[13], r[14]]),
-                language: [r[5].to_ascii_lowercase(), r[6].to_ascii_lowercase()],
-                country,
-                year,
-            });
+        for r in records.as_chunks::<RECORD>().0 {
+            index.insert(
+                i32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u32,
+                if r[4] == 1 { MediaType::Tv } else { MediaType::Movie },
+                [r[7], r[8]],
+                [r[5], r[6]],
+                u16::from_le_bytes([r[9], r[10]]),
+                u32::from_le_bytes([r[11], r[12], r[13], r[14]]),
+            );
         }
         Some(index)
+    }
+
+    /// An index with no titles, to `insert` into.
+    pub fn empty() -> FacetIndex {
+        FacetIndex {
+            rows: Vec::new(),
+            by_title: HashMap::new(),
+            by_country: HashMap::new(),
+            by_decade: HashMap::new(),
+            by_language: HashMap::new(),
+            by_type: HashMap::new(),
+        }
+    }
+
+    /// Add one title's facets, in the order the caller wants them ranked among equals.
+    ///
+    /// `country` and `language` are taken as written and cased here, so a caller need not know which way
+    /// each goes; `[0, 0]` means the fact is absent. A `year` under 1870 is not a year — the blob writes 0
+    /// for unknown and cinema does not predate it.
+    pub fn insert(
+        &mut self,
+        tmdb_id: u32,
+        media_type: MediaType,
+        country: [u8; 2],
+        language: [u8; 2],
+        year: u16,
+        votes: u32,
+    ) {
+        let position = self.rows.len() as u32;
+        let country = [country[0].to_ascii_uppercase(), country[1].to_ascii_uppercase()];
+        if country != [0, 0] {
+            self.by_country.entry(country).or_default().push(position);
+        }
+        // TMDB writes `xx` for "no language"; that is an absence, not a language.
+        let language = [language[0].to_ascii_lowercase(), language[1].to_ascii_lowercase()];
+        if language != [0, 0] && &language != b"xx" {
+            self.by_language.entry(language).or_default().push(position);
+        }
+        if year >= 1870 {
+            self.by_decade.entry(year / 10 * 10).or_default().push(position);
+        }
+        self.by_type.entry(media_type).or_default().push(position);
+        self.by_title.entry((media_type, tmdb_id)).or_insert(position);
+        self.rows.push(Row { tmdb_id, media_type, votes, language, country, year });
     }
 
     pub fn len(&self) -> usize {
@@ -471,6 +501,48 @@ pub(crate) fn blob(rows: &[(u32, MediaType, &str, u16, u32)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two constructors must build the SAME index, or the source a dataset happens to have decides what
+    /// attribute search finds. `from_blob` reads `facets.bin`; `insert` is what den-atlas fills from the
+    /// store's own columns, which covers 9,086 more titles — a difference in coverage is the point, a
+    /// difference in BEHAVIOUR would be a bug.
+    #[test]
+    fn filling_the_index_by_hand_matches_reading_the_blob() {
+        let rows: &[(u32, MediaType, &str, u16, u32)] = &[
+            (1, MediaType::Movie, "KR", 1985, 100),
+            (2, MediaType::Movie, "kr", 1995, 500), // lower-cased country, as the store may write it
+            (3, MediaType::Movie, "ES", 1985, 50),
+            (4, MediaType::Tv, "KR", 2010, 300),
+            (5, MediaType::Movie, "\0\0", 0, 7), // no country, no year: absent, not a bucket
+        ];
+        let from_blob = FacetIndex::from_blob(&blob(rows)).unwrap();
+        let mut built = FacetIndex::empty();
+        for &(id, media_type, country, year, votes) in rows {
+            let c = country.as_bytes();
+            built.insert(id, media_type, [c[0], c[1]], *b"xx", year, votes);
+        }
+        assert_eq!(built.len(), from_blob.len());
+        for (media_type, country, decade) in [
+            (None, Some("KR"), None),
+            (Some(MediaType::Movie), Some("kr"), None),
+            (None, None, Some(1980u16)),
+            (Some(MediaType::Tv), None, None),
+            (None, Some("ZZ"), None),
+        ] {
+            assert_eq!(
+                built.filter(media_type, country, decade),
+                from_blob.filter(media_type, country, decade),
+                "filter({media_type:?}, {country:?}, {decade:?})"
+            );
+        }
+        for id in 1..=5 {
+            assert_eq!(
+                built.title(id, MediaType::Movie),
+                from_blob.title(id, MediaType::Movie),
+                "title({id})"
+            );
+        }
+    }
 
     fn sample() -> FacetIndex {
         FacetIndex::from_blob(&blob(&[
