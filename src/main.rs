@@ -20,6 +20,7 @@ mod rail;
 mod recommend;
 mod schema;
 mod search;
+mod store;
 mod titles;
 mod tos;
 mod util;
