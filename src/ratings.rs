@@ -139,16 +139,48 @@ impl Ratings {
     }
 }
 
-/// Join now, then daily. A failed join retries hourly and the previous index keeps serving.
+/// How long the boot gate waits for the first dump before serving without one.
 ///
-/// The "no index yet" line is the BOOT GATE, and it says what is ordering rows in that window on purpose.
-/// Today the store's `votes` column covers it and the window costs nothing. When the producer stops
-/// writing that column, this same window means rows come back in tmdb-id order — so the state has to be
-/// named in the log rather than inferred from its absence. `IndexQueries::votes_unusable` is the same fact
-/// as a health signal, for the case where the column is already gone.
+/// A bound, not a target: the join takes ~3 s on the box against an 8.2 MB file, so this is the point at
+/// which "the network is not answering" beats "rows would be ordered by nothing", and starting degraded
+/// and saying so beats not starting at all.
+const FIRST_JOIN_WITHIN: Duration = Duration::from_secs(45);
+
+/// The BOOT GATE: wait for the first join before the server answers anything.
+///
+/// It has to be a real wait rather than a log line. The store no longer carries `votes`
+/// (oxyc/den#118), so between binding the listener and the first dump landing there is no vote count
+/// from any source at all, and every browse row comes back in tmdb-id order — *La Job* beside *Game of
+/// Thrones*, which reads as data rather than as an error.
+///
+/// The window is not rare and it is not only a startup detail: `atlas-dataset-sync` restarts this
+/// process every time a new dataset lands, so without the gate every publish serves a few seconds of
+/// id-ordered browse rows to whoever is looking.
+///
+/// It is NOT needed to survive `den-update`: `wait_probe` retries `probe_atlas` every 2 s for 120 s, so
+/// a degraded `/health` during the join would clear itself well inside the deadline. 45 s sits inside
+/// that budget with room to spare, which is the only thing the probe requires of this.
+pub async fn wait_for_first_join(ratings: &Ratings) {
+    match tokio::time::timeout(FIRST_JOIN_WITHIN, ratings.refresh()).await {
+        Ok(Ok(line)) => eprintln!("{line}"),
+        Ok(Err(e)) => eprintln!(
+            "imdb ratings: first join failed ({e}) — serving with whatever the store holds; /health says \
+             whether that is anything"
+        ),
+        Err(_) => eprintln!(
+            "imdb ratings: no dump within {}s — serving without one; /health says what that costs",
+            FIRST_JOIN_WITHIN.as_secs()
+        ),
+    }
+}
+
+/// Daily, after the boot gate above has taken the first one. A failed join retries hourly and the
+/// previous index keeps serving.
 pub async fn refresh_forever(ratings: Arc<Ratings>) {
+    let mut wait = REFRESH_EVERY;
     loop {
-        let wait = match ratings.refresh().await {
+        tokio::time::sleep(wait).await;
+        wait = match ratings.refresh().await {
             Ok(line) => {
                 eprintln!("{line}");
                 REFRESH_EVERY
@@ -157,13 +189,12 @@ pub async fn refresh_forever(ratings: Arc<Ratings>) {
                 let serving = if ratings.index().is_some() {
                     "keeping the previous index"
                 } else {
-                    "browse rows stay ordered by the store's own `votes` column until one lands"
+                    "browse rows have no vote count from any source — see /health"
                 };
                 eprintln!("imdb ratings refresh failed ({e}); {serving}; retrying in an hour");
                 RETRY_AFTER
             }
         };
-        tokio::time::sleep(wait).await;
     }
 }
 
@@ -336,5 +367,24 @@ mod tests {
         assert_eq!(index.of(0), Some((9000, 8.4)));
 
         assert!(build(&mapped.view(), b"not gzip").is_err());
+    }
+
+    /// The boot gate RETURNS rather than hanging when no dump can be had.
+    ///
+    /// Serving late is a bug too: `atlas-dataset-sync` restarts this process on every publish, so a gate
+    /// that waited forever on an unreachable host would take browse down instead of degrading it. The
+    /// bound is what makes "wait for the join" safe to put in front of the server.
+    #[tokio::test(start_paused = true)]
+    async fn the_boot_gate_gives_up_rather_than_holding_the_server_down() {
+        // A URL nothing answers: the join can only fail or time out, and either must return.
+        let dir = std::env::temp_dir().join(format!("den-atlas-gate-{}", std::process::id()));
+        let ds = crate::queries::write_fixture(&dir);
+        let ratings = Ratings::new(ds.store.clone(), "http://127.0.0.1:1/title.ratings.tsv.gz")
+            .expect("a client builds");
+        let started = tokio::time::Instant::now();
+        wait_for_first_join(&ratings).await;
+        assert!(started.elapsed() <= FIRST_JOIN_WITHIN, "the gate outlived its own bound");
+        assert!(ratings.index().is_none(), "nothing landed, so nothing is served as if it had");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

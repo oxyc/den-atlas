@@ -361,6 +361,10 @@ async fn main() {
         tokio::spawn(queries::release_when_idle(Arc::clone(index)));
     }
     if let Some(ratings) = &ratings {
+        // Awaited, not spawned. The store carries no vote count of its own any more, so until this lands
+        // there is none from any source and every browse row would answer in tmdb-id order — and
+        // `atlas-dataset-sync` restarts this process on every publish, so that window is not rare.
+        ratings::wait_for_first_join(ratings).await;
         tokio::spawn(ratings::refresh_forever(Arc::clone(ratings)));
     }
     if state.motn.enabled() {
