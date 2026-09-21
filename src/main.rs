@@ -190,36 +190,41 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
     // unreadable one degrades the row while every request keeps answering. This check is what
     // `atlas-dataset-sync` runs against a STAGED generation, so a bad store is refused before it
     // replaces a good one rather than after.
-    let store = match dataset.store.as_ref() {
-        None => None,
-        Some(path) => match store::LoadedStore::open(path) {
-            Ok(loaded) => Some(loaded),
-            Err(e) => {
-                eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
-                return 1;
-            }
-        },
+    //
+    // A manifest that declares NO store fails here too. That is not pedantry about a field: without one
+    // the rail silently falls back to the pre-pooled scorer, which draws candidates from the premise
+    // index alone, and `/health` has nothing to go on at the moment the generation lands. Refusing it
+    // here is what keeps a store-less generation from replacing a good one.
+    let Some(path) = dataset.store.as_ref() else {
+        eprintln!(
+            "check: the dataset declares no storeFile — More Like This would fall back to the \
+             pre-pooled scorer, so this generation is refused"
+        );
+        return 1;
     };
-    if let Some(loaded) = &store {
-        // A store whose version does not match the manifest that named it is a mixed generation — the
-        // failure mode a moving release makes easy and nothing else here would notice.
-        if loaded.store.dataset_version() != dataset.meta.dataset_version {
-            eprintln!(
-                "check: store says datasetVersion {} but the manifest says {} — mixed generation",
-                loaded.store.dataset_version(),
-                dataset.meta.dataset_version
-            );
+    let loaded = match store::LoadedStore::open(path) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
             return 1;
         }
+    };
+    // A store whose version does not match the manifest that named it is a mixed generation — the
+    // failure mode a moving release makes easy and nothing else here would notice.
+    if loaded.store.dataset_version() != dataset.meta.dataset_version {
+        eprintln!(
+            "check: store says datasetVersion {} but the manifest says {} — mixed generation",
+            loaded.store.dataset_version(),
+            dataset.meta.dataset_version
+        );
+        return 1;
     }
     println!(
-        "check: ok ({} facts candidate(s), {} usable; store: {})",
+        "check: ok ({} facts candidate(s), {} usable; store: {} rows, {} bytes)",
         dataset.facts.len(),
         u8::from(reads),
-        store.as_ref().map_or_else(
-            || "not declared".to_owned(),
-            |s| format!("{} rows, {} bytes", s.store.rows(), s.store.bytes())
-        )
+        loaded.store.rows(),
+        loaded.store.bytes()
     );
     0
 }
@@ -304,8 +309,8 @@ async fn main() {
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
-    let health =
-        handler::health_state(dataset.is_some(), true, false, false, false).map_or("ok", |(reason, _)| reason);
+    let health = handler::health_state(dataset.is_some(), true, false, false, false)
+        .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
         public_base: env_opt("PUBLIC_BASE_URL"),
@@ -600,6 +605,54 @@ mod tests {
 
     fn app() -> axum::Router {
         axum::Router::new().fallback(handler::handle).with_state(Arc::new(AppState::for_test(None)))
+    }
+
+    /// A staged dataset directory: the two mandatory blobs, and whatever `extra` the meta adds.
+    fn staged(name: &str, extra: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("atlas-check-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("labels.json"), b"{}").unwrap();
+        std::fs::write(dir.join("vectors.bin"), b"\0\0\0\0").unwrap();
+        let meta = format!(
+            r#"{{"datasetVersion":"fixture","taxonomyVersion":"t02","embeddingModel":"bge-m3",
+                 "dims":1024,"count":3,"quantization":"int8-symmetric-x127",
+                 "labelsFile":"labels.json","labelsSha256":"l","labelsBytes":2,
+                 "vectorsFile":"vectors.bin","vectorsSha256":"v","vectorsBytes":4{extra}}}"#
+        );
+        std::fs::write(dir.join("dataset.meta.json"), meta).unwrap();
+        dir
+    }
+
+    /// The gate that decides whether a generation replaces the running one. A manifest with no
+    /// `storeFile` parses, resolves and serves — and answers More Like This with the pre-pooled scorer,
+    /// which draws candidates from the premise index alone. `/health` cannot distinguish that from a
+    /// working addon at the moment of the swap, so the refusal has to happen here.
+    #[test]
+    fn check_refuses_a_dataset_that_declares_no_store() {
+        let dir = staged("no-store", "");
+        assert_eq!(check_dataset(&dir), 1, "a store-less generation must not be swappable in");
+    }
+
+    /// And accepts one that declares a store it can read, whose `datasetVersion` matches the manifest.
+    #[test]
+    fn check_accepts_a_dataset_whose_store_reads() {
+        let Some(fixture) = store::spec_fixture() else { return };
+        let dir = staged("with-store", r#","storeFile":"den.store""#);
+        std::fs::copy(&fixture, dir.join("den.store")).unwrap();
+        assert_eq!(check_dataset(&dir), 0, "a readable store at the manifest's version is fit to swap in");
+    }
+
+    /// A store from a different generation than the manifest naming it: the mixed-generation case a
+    /// moving release makes easy, and the one thing a present-and-readable store can still be wrong about.
+    #[test]
+    fn check_refuses_a_store_from_another_generation() {
+        let Some(fixture) = store::spec_fixture() else { return };
+        let dir = staged("mixed", r#","storeFile":"den.store""#);
+        std::fs::copy(&fixture, dir.join("den.store")).unwrap();
+        let meta = std::fs::read_to_string(dir.join("dataset.meta.json")).unwrap();
+        std::fs::write(dir.join("dataset.meta.json"), meta.replace(r#""fixture""#, r#""v9""#)).unwrap();
+        assert_eq!(check_dataset(&dir), 1, "the store says fixture and the manifest says v9");
     }
 
     /// A client that opens a socket and sends HALF a request head held the whole process open —
