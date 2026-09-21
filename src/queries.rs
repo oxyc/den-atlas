@@ -378,6 +378,28 @@ struct Sources {
     metadata: Option<PathBuf>,
 }
 
+/// Load the indexes ONCE, synchronously, for a command-line tool.
+///
+/// The same `load` serving uses, so a tool measures the corpus as atlas reads it rather than as the tool
+/// re-reads it — which is the mistake `rail-ab` was built on for its whole life: it parsed its own facts
+/// and its own facet sidecar out of files serving does not open, and every number it produced was about
+/// that parse. Nothing here is cached or released; the process exits when it is done.
+pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
+    let queries = IndexQueries::new(ds);
+    let sources = Sources {
+        population: queries.population,
+        dataset_version: queries.dataset_version.clone(),
+        plot: queries.plot.clone(),
+        premise: queries.premise.clone(),
+        facets: queries.facets.clone(),
+        facts: queries.facts.clone(),
+        plot_facets: queries.plot_facets.clone(),
+        store: queries.store.clone(),
+        metadata: queries.metadata.clone(),
+    };
+    load(&sources).map(|(indexes, _phases)| indexes)
+}
+
 /// `work`, and how long it took.
 fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
     let started = std::time::Instant::now();

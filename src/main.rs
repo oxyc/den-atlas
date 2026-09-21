@@ -17,6 +17,7 @@ mod motn;
 mod plotrows;
 mod queries;
 mod rail;
+mod railab;
 mod recommend;
 mod schema;
 mod search;
@@ -266,6 +267,9 @@ async fn main() {
         }
         if command == "check" {
             std::process::exit(check_dataset(std::path::Path::new(path)));
+        }
+        if command == "rail-ab" {
+            std::process::exit(railab::run(std::path::Path::new(path)));
         }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
