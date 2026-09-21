@@ -1,17 +1,19 @@
 # den-atlas
 
-A self-hosted **dataset addon** for [Den](https://github.com/oxyc/den). It serves the shared **feature
+A self-hosted **dataset addon** for [Den](https://github.com/oxyc/den). It holds the shared **feature
 store** — derived labels (genre / subgenre / mood) + quantized semantic vectors for the whole catalog —
-that the Den app downloads once and refreshes, then uses on-device for **similar-titles, category rows,
-primary-genre, and the billboard**. No ad-hoc queries: the app pulls one versioned, checksummed payload
-and does the nearest-neighbour + ranking locally.
+and **answers queries against it**: similar titles, category and facet rows, search, the billboard.
+
+The store stays here. The app used to download it (`labels-*.json`, `vectors-*.bin`, a metadata sidecar,
+a premise index and a facet blob), verify each blob's sha256 and run the nearest-neighbour search
+on-device; since #113 it asks instead, and atlas serves **no files at all** — only JSON answers.
 
 ```
 Den (Apple TV) ──GET /manifest.json──►  atlas   { resources: ["dataset"] }
-               ──GET /dataset.json───►          { version, sha256, dims, labels{url}, vectors{url} }
-               ──GET /labels-t02.json─►          derived labels
-               ──GET /vectors-bge-m3.bin─►       int8 vectors
-Den (on-device) ── sha256-gated cache, stale-while-revalidate ──► ANN + categories + billboard
+               ──GET /dataset.json───►          { datasetVersion, taxonomyVersion, embeddingModel,
+                                                  dims, count, quantization, embed, queries }
+               ──GET /index/similar/…─►         { ids }        ← ranked here, off the mmap'd store
+               ──GET /index/query.json?q=─►     { parse, hits }
 ```
 
 It implements the Den **`dataset`** resource (the Stremio superset — see the Den repo's
@@ -19,13 +21,15 @@ It implements the Den **`dataset`** resource (the Stremio superset — see the D
 installing Atlas there is harmless; only Den acts on it.
 
 ## Facts, not tokens
-Atlas ships **derived data** — labels and vectors — beside a **metadata sidecar** of TMDB titles, poster
-paths and years, so a client draws a card without a per-result TMDB call. That sidecar is a cache and is
-kept no longer than the six months TMDB's terms allow; no overviews and no raw text, and **nothing
-personal**. There is no per-user state and no token; `/configure` only
-picks the catalog region and services, carried in plaintext in the install URL. Personalisation (your
-taste vector) never leaves your device. Every blob is **sha256-pinned** in the descriptor, so the app
-verifies what it downloads and a mismatch keeps the prior cache.
+Atlas answers from **derived data** — labels, vectors, and the titles / poster paths / years the store
+carries so a client draws a card without a per-result TMDB call. No overviews and no raw text, and
+**nothing personal**. There is no per-user state and no token; `/configure` only picks the catalog region
+and services, carried in plaintext in the install URL. Personalisation (your taste vector) never leaves
+your device.
+
+No file leaves atlas, so nothing it serves is a verbatim copy of an upstream artifact: every TMDB-derived
+value it emits is assembled by a route and audited for prohibited prose at the last HTTP boundary
+(`src/tos.rs`).
 
 ## The dataset
 
@@ -55,9 +59,8 @@ Three things about the data that keep being got wrong — see `den-dataset/READM
 *(This section previously described `labels-t01.json` + 384-dim `vectors-e02.bin` and called bge-m3 a
 future upgrade. That was two taxonomy generations out of date.)*
 
-The app re-syncs only when `datasetVersion`/`embeddingModel`/`taxonomyVersion` moves; unchanged blobs are
-served from the on-device cache with no re-download. A change of `embeddingModel` forces a clean re-sync
-into the new vector space.
+`datasetVersion`/`embeddingModel`/`taxonomyVersion` still say when the dataset moved — a client caching
+answers keys on them, and a change of `embeddingModel` invalidates every query vector with it.
 
 ## Catalogs (JustWatch)
 Alongside the dataset, Atlas serves Stremio **catalog** rows of "most popular" titles per streaming
@@ -72,21 +75,17 @@ dataset resource is unaffected; with no outbound internet the rows are simply em
 `JW_COUNTRY`, `JW_PROVIDERS`, `JW_CACHE_TTL_SECS`. Catalog data from JustWatch.
 
 ## Implementation
-A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** whatever the dataset size.
-Blob bodies are **streamed from disk** (never loaded into RAM), gzip is precomputed to a file, and sha256 is
-read from the `dataset.meta.json` sidecar (no startup hashing). (The original TypeScript server is preserved
-at the `legacy-ts` git tag.)
+A small **Rust** (axum + tokio) server — a ~0.8 MB static musl binary, **~2–4 MB RSS** whatever the dataset
+size. The store is **mmap'd**, never read into RAM; its header hash is verified once at load, so the row
+count served as `count` is the store's own rather than a number the manifest claimed. (The original
+TypeScript server is preserved at the `legacy-ts` git tag.)
 
 ## Caching
-Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the blob's sha256, distinct `-gzip`
-variant; a JSON body's 64-bit FNV-1a plus its length) honoring `If-None-Match` (→ `304`), plus `HEAD`. Blobs
-also carry the dataset's `Last-Modified` and honor `If-Modified-Since`; `dataset.json` does not, because its
-body also depends on the request origin and the embed/index flags, so only its ETag can say it changed. Blob
-URLs in the descriptor are version-stamped (`?v=<datasetVersion>`), so a matching hit is served `immutable`
-for a year while a bare path revalidates. Every blob is **range-resumable** (`Accept-Ranges` / `206`); the
-labels JSON (and the metadata sidecar, when the release publishes a `.gz`) is **gzipped** transparently — the
-ETag/checksum is over the raw bytes, so the Den app (which validates the decompressed payload) is
-unaffected. Sit a CDN in front and it caches everything by URL with correct revalidation.
+Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the body's 64-bit FNV-1a plus its
+length) honoring `If-None-Match` (→ `304`), plus `HEAD` and `Range` (`Accept-Ranges` / `206` / `416`).
+`dataset.json` carries no `Last-Modified`: its body moves with the embed/index flags under an unchanged
+dataset date, so only its ETag can say it changed. Nothing varies on a request header. Sit a CDN in front
+and it caches everything by URL with correct revalidation.
 
 | Response | `Cache-Control` |
 |---|---|
@@ -99,21 +98,13 @@ unaffected. Sit a CDN in front and it caches everything by URL with correct reva
 A search query's vector is remembered in memory (1,000 texts, least recently used first, 24 h), keyed by the
 dataset's embedding model and width, so a repeated search does not call den-embed again.
 
-`dataset.json` builds its absolute blob URLs from `X-Forwarded-Proto` + `X-Forwarded-Host`/`Host` (and
-names them in `Vary`), so a proxy in front that forwards those gets URLs on its own origin. To serve the
-blobs from a CDN instead, set `PUBLIC_BASE_URL=https://cdn.example.com/atlas` and point the CDN at this
-origin.
-
 ## Routes
 | Route | Returns |
 |---|---|
 | `GET /`, `GET /configure` | landing/configure page: pick region + services, get the install URL |
 | `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `stale_catalog` (last JustWatch refresh failed), `catalog_schema_suspect` (a served chart came back mostly empty) or `facts_unusable` (the dataset declares a facts file the last index load couldn't read; `/recommend` and search run without facts) |
 | `GET /manifest.json` | the `dataset` + `catalog` manifest (also under a `/<region>_<codes>/` install prefix) |
-| `GET /dataset.json` | the descriptor (absolute blob URLs from the request origin); `503` when the dataset did not load |
-| `GET /labels-<tax>.json` | the derived labels blob |
-| `GET /vectors-<embed>.bin` | the quantized int8 vectors blob |
-| `GET /<blob>` | the optional blobs the descriptor names: metadata sidecar, premise labels + vectors, facets |
+| `GET /dataset.json` | the descriptor — what the dataset IS (`datasetVersion`, `taxonomyVersion`, `embeddingModel`, `dims`, `count`, `quantization`, `signature`, the `embed`/`queries` capability flags). It names no files to download; `503` when the dataset did not load |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
 | `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
 | `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{taxonomyVersion,subgenres,moods}`, each list most-populated first |
@@ -135,7 +126,7 @@ origin.
 Every response carries `Access-Control-Allow-Origin: *` and `OPTIONS` answers the CORS preflight. An
 unknown path — and a refused `/metrics` — is a `404` `{"error":"not_found"}` with `cache-control: no-store`.
 
-Catalog rows, `/embed` and the dataset blobs carry `Server-Timing`: `justwatch;dur=<ms>` when the row
+Catalog rows, `/embed` and the `/index/…` answers carry `Server-Timing`: `justwatch;dur=<ms>` when the row
 was fetched upstream or `cache;desc=hit` when it came from the cache (plus `cache;desc=stale` when the
 last-good copy was served), `embed;dur=<ms>` for the den-embed call, and `total;dur=<ms>`. An answer that
 is stale or a fallback carries `X-Den-Degraded: <reason>` with /health's reason slug — a catalog row
@@ -168,10 +159,10 @@ read a `facets.bin` sidecar, which covered 9,086 fewer titles. Taste weights sta
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows include the relevant
-coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every dynamic JSON
-response is checked at the final HTTP boundary for expressive prose fields, and the TMDB-derived metadata
-sidecar is checked before it can be served. A future MCP/TMDB hydration route therefore fails closed instead of
-re-serving an overview, synopsis, description, tagline, or equivalent prose.
+coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every JSON
+response is checked at the final HTTP boundary for expressive prose fields, and since nothing is served
+verbatim any more, that boundary is the whole guard. A future MCP/TMDB hydration route therefore fails
+closed instead of re-serving an overview, synopsis, description, tagline, or equivalent prose.
 
 `POST /recommend` ranks what a featured surface leads with — the Den web app's billboard — so no client
 ranks. It is the web app's `billboard.ts` ported: what is new in the world and new to this library, with
@@ -219,8 +210,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | the port to listen on |
-| `DATA_DIR` | `data` (the image sets `/app/data`) | directory holding `dataset.meta.json` and the blobs it declares |
-| `PUBLIC_BASE_URL` | derived from the request | origin for the descriptor's blob URLs — set it to serve blobs from a CDN |
+| `DATA_DIR` | `data` (the image sets `/app/data`) | directory holding `dataset.meta.json` and the store it declares |
 | `JW_COUNTRY` | `US` | catalog country when an `auto` install forwards none |
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
@@ -252,19 +242,18 @@ a shape rustfmt disagreed with: `docker-publish` never produced an image, and `d
 reported the box was already at the previous digest — a failure that reads as "nothing to deploy" rather
 than as a broken build. Checking line widths by hand does not substitute: rustfmt also JOINS short wrapped
 lines and SPLITS long array literals, neither of which a width check can predict.
-`fetch-dataset.sh` is anonymous (needs curl, python3 and shasum). It downloads every blob
+`fetch-dataset.sh` is anonymous (needs curl, python3 and shasum). It downloads every file
 `dataset.meta.json` declares and verifies each against the meta's sha256 before moving them into `./data`.
 `storeFile` is the one it REFUSES a release without: the store is the only artifact the server reads, and
-anything else declared beside it is served rather than read. To pick up a new release, re-run it
-and restart the server.
+a manifest that still names the retired sidecars simply fetches files nothing opens. To pick up a new
+release, re-run it and restart the server.
 
-Refreshes stage on the destination filesystem and replace files by rename. An open response keeps
-its original file; subsequent requests check the opened file's size, modification time and Unix
-file identity against startup metadata. A changed file returns `503`, `no-store`, including for
-HEAD and conditional requests, until the server reloads it. This prevents new bytes inheriting an
-old SHA or immutable URL without hashing on requests. The deployment sync stops Atlas after all
-downloads verify, replaces the data, then restarts it. An interrupted replacement stays stopped
-with a recovery marker and no live descriptor until the next successful refresh.
+Refreshes stage on the destination filesystem and replace files by rename. A load that overlaps one is
+refused rather than binding the new files to a descriptor read before them: `Dataset::load` stats
+`dataset.meta.json` on both sides of its own read and compares size, modification time and Unix file
+identity. The deployment sync stops Atlas after all downloads verify, replaces the data, then restarts
+it. An interrupted replacement stays stopped with a recovery marker and no live descriptor until the next
+successful refresh.
 
 The dataset is produced by [den-dataset](https://github.com/oxyc/den-dataset) (`taxonomy-backfill finalize`
 → `publish-dataset.sh`) and published as a GitHub Release — the single source of truth this server and the
@@ -290,7 +279,6 @@ rollback.
 - Image updates go through `den-update`: a new `:latest` is proved against `/health` and `/manifest.json`
   in a throwaway container before its digest is pinned, and a failed proof rolls back.
 - `EMBED_URL=http://den-embed:8080` over the shared Podman network enables `POST /embed`.
-- `PUBLIC_BASE_URL` is only needed to point blob downloads at a CDN in front.
 
 **Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run rebuilds
 the newest `v*` tag (never `main`) with the base images re-pulled and no build cache, and publishes it as
@@ -311,12 +299,10 @@ Smoke test:
 ```sh
 curl -s localhost:8081/health                        # {"status":"ok"}, or "degraded" with a reason
 curl -s localhost:8081/manifest.json | jq .resources # ["dataset","catalog"]
-curl -s -H 'x-forwarded-proto: https' -H 'host: atlas.example.com' \
-     localhost:8081/dataset.json | jq '.count, .vectors.url'
+curl -s localhost:8081/dataset.json | jq '.count, .embeddingModel, .dims'
 curl -s localhost:8081/catalog/movie/jw-nfx.json | jq '.metas | length'  # live JustWatch (needs egress)
 curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8081/metrics  # only with METRICS_TOKEN set
 ```
 
 To install: Den → Settings → Plugins → add `http://<den-ip>:8081/manifest.json` (the app needs https or a
-LAN/private-range host over http). Den then syncs the dataset instead of using its bundled copy; removing
-the addon falls back to the bundled artifact, so discovery never goes blank.
+LAN/private-range host over http). Den's discovery then answers from here.
