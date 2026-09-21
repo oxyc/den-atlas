@@ -63,8 +63,29 @@ fn share(set: &Credits, key: &str, id: u32, mine: &HashSet<String>) -> f64 {
         .map_or(0.0, |theirs| mine.intersection(theirs).count() as f64 / mine.len() as f64)
 }
 
+/// The facts blob in a producer out-dir, whatever this generation calls it.
+///
+/// This used to hard-code `facts-merged.json`, which was deleted from the release as an orphan — it was
+/// byte-identical to the versioned file beside it and no manifest key named it. The harness still
+/// COMPILED, so CI stayed green while it had become unrunnable against a fetched dataset. A tuning tool
+/// nobody can start is the same as one that does not exist.
+fn facts_path(dir: &str) -> std::path::PathBuf {
+    // From the MANIFEST, which is the only thing that knows which of several `facts-*.json` belongs to
+    // this generation. A producer out-dir holds `facts-<ver>.json` for more than one version plus
+    // `facts-entities.json`, `facts-fields.json` and `facts-unversioned.json`, and a first attempt here
+    // that sorted the names and took the last picked `facts-unversioned.json` — a build intermediate.
+    let meta = std::path::Path::new(dir).join("dataset.meta.json");
+    let raw = std::fs::read(&meta)
+        .unwrap_or_else(|e| panic!("{}: {e} — point --dir at a producer out-dir", meta.display()));
+    let doc: serde_json::Value = serde_json::from_slice(&raw).expect("dataset.meta.json");
+    let name =
+        doc["factsFile"].as_str().unwrap_or_else(|| panic!("{} declares no factsFile", meta.display()));
+    std::path::Path::new(dir).join(name)
+}
+
 fn load_credits(dir: &str, fields: &[&str]) -> Credits {
-    let raw = std::fs::read(format!("{dir}/facts-merged.json")).expect("facts");
+    let path = facts_path(dir);
+    let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let v: serde_json::Value = serde_json::from_slice(&raw).expect("facts json");
     let mut out: HashMap<(u32, String), HashSet<String>> = HashMap::new();
     for r in v["records"].as_array().into_iter().flatten() {
