@@ -9,4 +9,8 @@
 data/*.json
 data/*.bin
 data/*.gz
+data/*.store
 !data/.gitkeep
+# Side-by-side copies of other generations, for comparing one against another locally. Same class of
+# thing as `data/`, same reasons, and 159 MB of it was showing up untracked in every status.
+data-*/
