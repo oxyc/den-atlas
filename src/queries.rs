@@ -70,7 +70,11 @@ impl Indexes {
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
-            let Some((store, agg)) = self.store.as_ref().map(|s| (s.view(), &s.aggregates)) else {
+            let facets = self
+                .store
+                .as_ref()
+                .and_then(|s| crate::rail::SeedFacets::new(&s.view(), &s.aggregates, media_type));
+            let Some(facets) = facets else {
                 return den_index::more_like_this(
                     Some(&self.plot),
                     self.premise.as_ref(),
@@ -79,7 +83,6 @@ impl Indexes {
                 )
                 .into();
             };
-            let facets = crate::rail::SeedFacets { store, agg, media: media_type };
             let authorship =
                 self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
             den_index::more_like_this_pooled(
@@ -177,12 +180,14 @@ impl IndexQueries {
         }
     }
 
-    /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
-    /// then run without facts, which only a log line said before.
+    /// Whether the last index load ended without a store: More Like This then falls back to the
+    /// pre-pooled scorer, which draws candidates from the premise index alone.
     pub fn store_unusable(&self) -> bool {
         self.store_unusable.load(Ordering::Relaxed)
     }
 
+    /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
+    /// then run without facts, which only a log line said before.
     pub fn facts_unusable(&self) -> bool {
         self.facts_unusable.load(Ordering::Relaxed)
     }
@@ -225,9 +230,13 @@ impl IndexQueries {
             took.as_secs_f64()
         );
         self.facts_unusable.store(!self.facts.is_empty() && indexes.facts.is_none(), Ordering::Relaxed);
-        // Declared and unread. A store that was never declared is not a fault; one that was and
-        // did not open is the rail quietly answering worse.
-        self.store_unusable.store(self.store.is_some() && indexes.store.is_none(), Ordering::Relaxed);
+        // Absent for ANY reason, including never declared. This used to require `self.store.is_some()`,
+        // on the reasoning that a dataset which never promised a store cannot have broken one — but the
+        // rail ranks on the store now, and the two cases are indistinguishable from the outside: both
+        // answer More Like This with the pre-pooled scorer. A manifest published without `storeFile`
+        // would have degraded every row silently, with `/health` green. `check` refuses such a manifest
+        // outright; this is the second half, for a generation that got past it.
+        self.store_unusable.store(indexes.store.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))

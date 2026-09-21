@@ -78,17 +78,22 @@ impl MappedStore {
     /// stayed green. A store either has what serving needs or it is not a store we can serve.
     pub fn check(&self) -> Result<(), StoreError> {
         let view = self.view();
-        for name in REQUIRED_COLUMNS_U32 {
-            view.per_row::<u32>(name)?;
-        }
         view.per_row::<u64>("keys")?;
-        view.per_row::<u16>("score_intensity")?;
-        view.per_row::<u8>("world")?;
         view.strings()?;
-        for (values, offsets) in REQUIRED_LISTS {
-            view.list::<u32>(values, offsets)?;
-        }
-        view.column::<i8>("vec_plot")?;
+        // The facet arrays and the critique block: the rail's two heaviest terms.
+        view.column::<u32>("facet_v")?;
+        view.column::<u8>("facet_c")?;
+        view.column::<u8>("critique")?;
+        view.column::<u32>("critique_names")?;
+        view.per_row::<u8>("world")?;
+        // The nouls. These are why this function was rewritten: the first version required `makers`,
+        // `cast` and `genres` — none of which the rail reads from the store, since authorship still
+        // comes from the facts — and required none of these. `SeedFacets::nouls` swallows a read error
+        // and returns empty, so a store missing them silently dropped the W_NOUL = 1.60 term on every
+        // request, with no log line and no health signal. Exactly what this exists to prevent.
+        view.column::<u32>("noul_names")?;
+        view.list::<u8>("noul_k_v", "noul_k_o")?;
+        view.list::<u8>("noul_v_v", "noul_v_o")?;
         Ok(())
     }
 }
@@ -117,31 +122,41 @@ impl LoadedStore {
     }
 }
 
-/// Per-row `u32` columns without which the serving path cannot answer.
-const REQUIRED_COLUMNS_U32: &[&str] = &["card_title", "primary_genre", "imdb"];
-
-/// Lists the serving path reads on every More Like This.
-const REQUIRED_LISTS: &[(&str, &str)] = &[
-    ("makers_v", "makers_o"),
-    ("cast_v", "cast_o"),
-    ("genres_v", "genres_o"),
-];
+/// den-spec's three-title store fixture, for every test in this crate that reads a real store.
+///
+/// `None` means SKIP, and it is returned in exactly one case: `DEN_SPEC_OPTIONAL=1`, set on purpose by
+/// someone who knows their checkout has no den-spec. Absent without it, this panics.
+///
+/// It used to be two copies of a `path.is_file().then_some(path)`, both resolving den-spec as
+/// `../../den-spec` — one level too far up from `den-atlas/`, so it landed on `~/Projects/den-spec`,
+/// which does not exist. Every test built on the fixture returned before its first assertion and
+/// reported a pass. A contract test that cannot find its contract has verified nothing, and the only
+/// way a test can say so is to fail.
+#[cfg(test)]
+pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
+    let path = std::env::var("DEN_SPEC_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../den-spec"))
+        .join("vectors/store-v1.store");
+    if path.is_file() {
+        return Some(path);
+    }
+    if std::env::var("DEN_SPEC_OPTIONAL").is_ok() {
+        eprintln!("SKIP: den-spec absent and DEN_SPEC_OPTIONAL is set");
+        return None;
+    }
+    panic!(
+        "{} not found — these tests check den-atlas against the store-v1 contract and cannot do so \
+         without it. Check out den-spec beside this repo, set DEN_SPEC_DIR, or set DEN_SPEC_OPTIONAL=1 \
+         to skip deliberately.",
+        path.display()
+    )
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The fixture den-spec publishes, when it is checked out. Skips rather than passes without it:
-    /// a contract test that reports success when the contract is absent is worse than no test.
-    fn fixture() -> Option<std::path::PathBuf> {
-        let path = std::env::var("DEN_SPEC_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../den-spec")
-            })
-            .join("vectors/store-v1.store");
-        path.is_file().then_some(path)
-    }
+    use crate::store::spec_fixture as fixture;
 
     /// The real store, when a dataset happens to be on this machine. Opt-in via `DEN_STORE`, because the
     /// fixture proves the format and only a real store proves the scale: 131 MB, 89 sections, 47,618 rows,
