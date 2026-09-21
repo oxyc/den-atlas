@@ -233,8 +233,22 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
         );
         return BROKEN;
     }
+    // The two readers SERVING actually uses. `LoadedStore::open` proves the store maps and its rail
+    // sections read; it does not touch the facts or facet-row sections, so a store missing `ent_qid` or
+    // a `facet_*` axis opened cleanly, passed this check, and then degraded at load — the facts falling
+    // through a fallback chain that no longer has a `factsFile` in it, and every browse row answering
+    // empty. Both are exactly what this check exists to refuse before a swap.
+    let view = loaded.view();
+    if let Err(e) = facts::Facts::from_store(&view) {
+        eprintln!("check: the store's facts do not read: {e} — refusing");
+        return BROKEN;
+    }
+    if let Err(e) = crate::plotrows::PlotFacets::from_store(&view) {
+        eprintln!("check: the store's facet rows do not read: {e} — refusing");
+        return BROKEN;
+    }
     println!(
-        "check: ok ({} facts candidate(s), {} usable; store: {} rows, {} bytes)",
+        "check: ok ({} facts candidate(s), {} usable; store: {} rows, {} bytes, facts and rows read)",
         dataset.facts.len(),
         u8::from(reads),
         loaded.store.rows(),
@@ -323,7 +337,7 @@ async fn main() {
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
-    let health = handler::health_state(dataset.is_some(), true, false, false, false)
+    let health = handler::health_state(dataset.is_some(), true, false, false, false, false)
         .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,

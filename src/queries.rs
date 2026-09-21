@@ -218,6 +218,11 @@ pub struct IndexQueries {
     /// Whether the last load ended without a usable store — declared and unreadable, or not declared
     /// at all. Both answer More Like This the same way, so `/health` reports them the same way.
     store_unusable: AtomicBool,
+    /// Whether the last load ended with no facet rows. Its own flag because it is its own feature: the
+    /// store can be perfectly readable and its twelve `facet_*` sections missing or mis-typed, and then
+    /// every browse row (`/index/row?ending=bittersweet`) answers `{"titles":[],"total":0}` with nothing
+    /// else wrong. That had no health reason at all, so a whole screen could go blank on a green addon.
+    rows_unusable: AtomicBool,
 }
 
 impl IndexQueries {
@@ -241,6 +246,7 @@ impl IndexQueries {
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
             store_unusable: AtomicBool::new(false),
+            rows_unusable: AtomicBool::new(false),
         }
     }
 
@@ -254,6 +260,11 @@ impl IndexQueries {
     /// then run without facts, which only a log line said before.
     pub fn facts_unusable(&self) -> bool {
         self.facts_unusable.load(Ordering::Relaxed)
+    }
+
+    /// Whether the last load ended with no facet rows: every browse row is then empty.
+    pub fn rows_unusable(&self) -> bool {
+        self.rows_unusable.load(Ordering::Relaxed)
     }
 
     /// The indexes — loaded first if they aren't in memory — and how long that load took (`None` when they
@@ -301,7 +312,14 @@ impl IndexQueries {
             indexes.plot.len(),
             took.as_secs_f64()
         );
-        self.facts_unusable.store(!self.facts.is_empty() && indexes.facts.is_none(), Ordering::Relaxed);
+        // The facts come from the STORE now, so a declared store counts as a promise of them just as a
+        // declared `factsFile` did. This used to be `!self.facts.is_empty() && …`, which was true while the
+        // JSON was published and became permanently FALSE the moment it stopped: a store whose facts
+        // sections are missing or the wrong width would fall through to a fallback chain with nothing in
+        // it, leave `/recommend`, `imdbId` and people search off, and answer `/health` with `ok`. That is
+        // the nineteen-minute silent degradation this flag exists to make impossible.
+        let promised_facts = !self.facts.is_empty() || self.store.is_some();
+        self.facts_unusable.store(promised_facts && indexes.facts.is_none(), Ordering::Relaxed);
         // Absent for ANY reason, including never declared. This used to require `self.store.is_some()`,
         // on the reasoning that a dataset which never promised a store cannot have broken one — but the
         // rail ranks on the store now, and the two cases are indistinguishable from the outside: both
@@ -309,6 +327,9 @@ impl IndexQueries {
         // would have degraded every row silently, with `/health` green. `check` refuses such a manifest
         // outright; this is the second half, for a generation that got past it.
         self.store_unusable.store(indexes.store.is_none(), Ordering::Relaxed);
+        // A store or a sidecar is a promise of facet rows, the same way either is a promise of facts.
+        let promised_rows = self.store.is_some() || self.plot_facets.is_some();
+        self.rows_unusable.store(promised_rows && indexes.plot_facets.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
