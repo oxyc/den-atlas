@@ -41,9 +41,11 @@ type Key = (MediaType, u32);
 
 /// A facet is shown in a row only at or above this confidence — the same floor the label rows use.
 ///
-/// The store keeps every value the model produced, including the ones it was unsure of, because a store
-/// that has already thrown data away cannot be re-tuned. Deciding what is confident enough to SHOW is the
-/// reader's job, and this is where it happens.
+/// It is a second floor, not the only one. The writer applies FACETS-V2's publication gates, which read
+/// the probability distribution and the validity judgement — neither of which reaches the store — so any
+/// value that is here was already publishable. This floor is on the self-reported confidence the store
+/// does carry, and unlike the writer's it is tunable without a rebuild: the corpus keeps every answer the
+/// model produced, the store is the publication.
 const FACET_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 
 /// The sidecar layout the test-only reader understands (`"schema"` in the file).
