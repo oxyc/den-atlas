@@ -37,7 +37,9 @@ pub struct Indexes {
     pub plot_facets: Option<PlotFacets>,
     /// The per-title signals More Like This ranks on; without them the rail falls back to vectors and
     /// labels, which is how it worked before they existed.
-    pub rail_facets: Option<crate::rail::RailFacets>,
+    /// The mapped store and its corpus-wide aggregates. Absent ⇒ the rail falls back to vectors
+    /// and labels alone, which is how it worked before the store existed.
+    pub store: Option<crate::store::LoadedStore>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
@@ -68,7 +70,13 @@ impl Indexes {
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
-            let Some(rail) = self.rail_facets.as_ref() else {
+            // `LoadedStore::open` already proved this builds — `check` calls the same constructor — so
+            // the `else` below is the no-store case, which `store_unusable` reports.
+            let facets = self
+                .store
+                .as_ref()
+                .and_then(|s| crate::rail::SeedFacets::new(&s.view(), &s.aggregates, media_type).ok());
+            let Some(facets) = facets else {
                 return den_index::more_like_this(
                     Some(&self.plot),
                     self.premise.as_ref(),
@@ -77,7 +85,6 @@ impl Indexes {
                 )
                 .into();
             };
-            let facets = crate::rail::SeedFacets { rail, media: media_type };
             let authorship =
                 self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
             den_index::more_like_this_pooled(
@@ -140,13 +147,16 @@ pub struct IndexQueries {
     facets: Option<PathBuf>,
     facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
-    rail_facets: Option<PathBuf>,
+    store: Option<PathBuf>,
     metadata: Option<PathBuf>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
     /// Whether the dataset declares a facts file the last load couldn't read (`/health`).
     facts_unusable: AtomicBool,
+    /// Whether the last load ended without a usable store — declared and unreadable, or not declared
+    /// at all. Both answer More Like This the same way, so `/health` reports them the same way.
+    store_unusable: AtomicBool,
 }
 
 impl IndexQueries {
@@ -164,12 +174,19 @@ impl IndexQueries {
             facets: ds.facets.as_ref().map(|f| f.path.clone()),
             facts: ds.facts.clone(),
             plot_facets: ds.plot_facets.clone(),
-            rail_facets: ds.rail_facets.clone(),
+            store: ds.store.clone(),
             metadata: ds.metadata.as_ref().map(|m| m.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
+            store_unusable: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the last index load ended without a store: More Like This then falls back to the
+    /// pre-pooled scorer, which draws candidates from the premise index alone.
+    pub fn store_unusable(&self) -> bool {
+        self.store_unusable.load(Ordering::Relaxed)
     }
 
     /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
@@ -198,7 +215,7 @@ impl IndexQueries {
             facets: self.facets.clone(),
             facts: self.facts.clone(),
             plot_facets: self.plot_facets.clone(),
-            rail_facets: self.rail_facets.clone(),
+            store: self.store.clone(),
             metadata: self.metadata.clone(),
         };
         let (indexes, phases) = tokio::task::spawn_blocking(move || load(&sources))
@@ -216,6 +233,13 @@ impl IndexQueries {
             took.as_secs_f64()
         );
         self.facts_unusable.store(!self.facts.is_empty() && indexes.facts.is_none(), Ordering::Relaxed);
+        // Absent for ANY reason, including never declared. This used to require `self.store.is_some()`,
+        // on the reasoning that a dataset which never promised a store cannot have broken one — but the
+        // rail ranks on the store now, and the two cases are indistinguishable from the outside: both
+        // answer More Like This with the pre-pooled scorer. A manifest published without `storeFile`
+        // would have degraded every row silently, with `/health` green. `check` refuses such a manifest
+        // outright; this is the second half, for a generation that got past it.
+        self.store_unusable.store(indexes.store.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
@@ -260,7 +284,7 @@ struct Sources {
     facets: Option<PathBuf>,
     facts: Vec<PathBuf>,
     plot_facets: Option<PathBuf>,
-    rail_facets: Option<PathBuf>,
+    store: Option<PathBuf>,
     metadata: Option<PathBuf>,
 }
 
@@ -280,7 +304,7 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
 /// the facts and the facets.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
-    let (plot, premise, facets, facts, plot_facets, rail_facets, cards) = std::thread::scope(|scope| {
+    let (plot, premise, facets, facts, plot_facets, store, cards) = std::thread::scope(|scope| {
         let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
         // A broken premise index costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(|| {
@@ -321,16 +345,19 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
-        // The rail's own signals. Read on the load threads beside everything else; a missing or unreadable
-        // blob costs the pooled scorer and nothing more.
-        let rail_facets = scope.spawn(|| {
+        // The store: every per-title signal the rail ranks on, mapped rather than parsed. Read on the
+        // load threads beside everything else; without it the pooled scorer is unavailable and More Like
+        // This falls back to vectors and labels, which is how it worked before the store existed.
+        let store = scope.spawn(|| {
             timed(|| {
-                sources.rail_facets.as_ref().and_then(|path| {
-                    let loaded = crate::rail::RailFacets::load(path);
-                    if loaded.is_none() {
-                        eprintln!("rail facets unusable — More Like This falls back to vectors and labels");
+                sources.store.as_ref().and_then(|path| match crate::store::LoadedStore::open(path) {
+                    Ok(loaded) => Some(loaded),
+                    Err(e) => {
+                        // Name the file and the reason. "could not load the dataset" is the message that
+                        // cost nineteen minutes of quiet degradation the last time a blob went bad.
+                        eprintln!("store unusable ({e}) — More Like This falls back to vectors and labels");
+                        None
                     }
-                    loaded
                 })
             })
         });
@@ -363,7 +390,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             joined(facets),
             joined(facts),
             joined(plot_facets),
-            joined(rail_facets),
+            joined(store),
             joined(cards),
         )
     });
@@ -371,7 +398,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     let plot = plot?;
     let ((mut facts, facts_took), (plot_facets, plot_facets_took), (cards, cards_took)) =
         (facts, plot_facets, cards);
-    let (rail_facets, rail_facets_took) = rail_facets;
+    let (store, store_took) = store;
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
@@ -411,7 +438,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         seconds(cards_took),
         seconds(facets_took),
         seconds(plot_facets_took),
-        seconds(rail_facets_took),
+        seconds(store_took),
         seconds(display_took)
     );
     let indexes = Indexes {
@@ -422,7 +449,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         facets,
         facts,
         plot_facets,
-        rail_facets,
+        store,
         cards,
         display,
         similar: Mutex::new(HashMap::new()),

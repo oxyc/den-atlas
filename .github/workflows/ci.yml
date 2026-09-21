@@ -29,6 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # den-spec holds the store format's test vectors. Checked out beside this repo because the store
+      # and rail tests read them — and FAIL without them, deliberately: they exist to catch the rail
+      # drifting from the format, which they can only do if they can find the fixture. Both used to
+      # resolve it one directory too far up and skip, reporting a pass over a store never opened.
+      - uses: actions/checkout@v7
+        with:
+          repository: oxyc/den-spec
+          path: den-spec-checkout
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -36,6 +44,8 @@ jobs:
 
       - name: Tests
         run: cargo test --locked --workspace
+        env:
+          DEN_SPEC_DIR: ${{ github.workspace }}/den-spec-checkout
 
       # Denied, not reported. The lint set here is small and the codebase is clean, so a new warning
       # is a real signal rather than background noise to scroll past.

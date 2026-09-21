@@ -94,28 +94,84 @@ struct JevFacets {
     idf: HashMap<String, f64>,
     prevalence: HashMap<(String, String), f64>,
     key: String,
+    /// The harness's own string dictionary, filled lazily as the scorer asks for names: `ids` maps a
+    /// name to its id, `names` maps back so `prevalence` can recover the pair it was handed.
+    ids: std::cell::RefCell<HashMap<String, den_index::ValueId>>,
+    names: std::cell::RefCell<Vec<String>>,
+    /// Facet axes get their own table — the trait passes an axis as a `u8`, separately from values.
+    axes: std::cell::RefCell<Vec<String>>,
+}
+
+/// Interns a name to the id the trait now passes.
+///
+/// The harness reads JSON, where every axis and value is a string; the scorer compares ids. One table
+/// here gives the same equality the strings had — two names share an id exactly when they are equal —
+/// which is the property the store gets from writing one dictionary.
+impl JevFacets {
+    fn id(&self, name: &str) -> den_index::ValueId {
+        if let Some(found) = self.ids.borrow().get(name) {
+            return *found;
+        }
+        let mut names = self.names.borrow_mut();
+        let next = names.len() as den_index::ValueId;
+        names.push(name.to_owned());
+        self.ids.borrow_mut().insert(name.to_owned(), next);
+        next
+    }
+
+    fn name(&self, id: den_index::ValueId) -> Option<String> {
+        self.names.borrow().get(id as usize).cloned()
+    }
+
+    fn weigh(&self, pairs: &[(String, f64)]) -> Vec<den_index::Weighted> {
+        pairs.iter().map(|(name, p)| (self.id(name), *p)).collect()
+    }
+
+    fn axis(&self, name: &str) -> den_index::Axis {
+        let mut axes = self.axes.borrow_mut();
+        match axes.iter().position(|a| a == name) {
+            Some(found) => found as den_index::Axis,
+            None => {
+                axes.push(name.to_owned());
+                (axes.len() - 1) as den_index::Axis
+            }
+        }
+    }
+
+    fn axis_name(&self, axis: den_index::Axis) -> Option<String> {
+        self.axes.borrow().get(axis as usize).cloned()
+    }
 }
 
 impl Facets for JevFacets {
-    fn facets(&self, id: u32) -> Vec<(String, String, f64)> {
-        self.by_key.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    fn facets(&self, id: u32) -> Vec<(den_index::Axis, den_index::ValueId, f64)> {
+        self.by_key
+            .get(&format!("{}:{}", self.key, id))
+            .map(|rows| rows.iter().map(|(a, v, c)| (self.axis(a), self.id(v), *c)).collect())
+            .unwrap_or_default()
     }
     /// Axes the seed reads >= 0.8 on, weighted by ln(N / titles >= 0.7 on that axis): its defining
     /// arguments, with a common one worth less than a rare one.
-    fn critique_defining(&self, id: u32) -> Vec<(String, f64)> {
-        self.critique_raw(id)
-            .into_iter()
-            .filter(|(_, p)| *p >= 0.8)
-            .map(|(a, _)| {
-                let w = self.idf.get(&a).copied().unwrap_or(0.0);
-                (a, w)
+    fn critique_defining(&self, id: u32) -> Vec<den_index::Weighted> {
+        self.critique_raw
+            .get(&format!("{}:{}", self.key, id))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(_, p)| *p >= 0.8)
+                    .filter_map(|(a, _)| {
+                        let w = self.idf.get(a).copied().unwrap_or(0.0);
+                        (w > 0.0).then(|| (self.id(a), w))
+                    })
+                    .collect()
             })
-            .filter(|(_, w)| *w > 0.0)
-            .collect()
+            .unwrap_or_default()
     }
 
-    fn critique_raw(&self, id: u32) -> Vec<(String, f64)> {
-        self.critique_raw.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    fn critique_raw(&self, id: u32) -> Vec<den_index::Weighted> {
+        self.critique_raw
+            .get(&format!("{}:{}", self.key, id))
+            .map(|rows| self.weigh(rows))
+            .unwrap_or_default()
     }
 
     fn critique_top(&self, seed: u32, other: u32, n: usize) -> bool {
@@ -127,6 +183,7 @@ impl Facets for JevFacets {
             self.critique_raw
                 .get(id)
                 .and_then(|theirs| {
+                    let theirs = self.weigh(theirs);
                     let total: f64 = defining.iter().map(|(_, w)| w).sum();
                     (total > 0.0).then(|| {
                         defining
@@ -145,17 +202,20 @@ impl Facets for JevFacets {
         better < n
     }
 
-    fn critique(&self, id: u32) -> Vec<(String, f64)> {
-        self.critique.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    fn critique(&self, id: u32) -> Vec<den_index::Weighted> {
+        self.critique.get(&format!("{}:{}", self.key, id)).map(|rows| self.weigh(rows)).unwrap_or_default()
     }
-    fn nouls(&self, id: u32) -> Vec<(String, f64)> {
-        self.nouls.get(&format!("{}:{}", self.key, id)).cloned().unwrap_or_default()
+    fn nouls(&self, id: u32) -> Vec<den_index::Weighted> {
+        self.nouls.get(&format!("{}:{}", self.key, id)).map(|rows| self.weigh(rows)).unwrap_or_default()
     }
     fn world(&self, id: u32) -> f64 {
         self.world.get(&format!("{}:{}", self.key, id)).copied().unwrap_or(0.0)
     }
-    fn prevalence(&self, axis: &str, value: &str) -> f64 {
-        self.prevalence.get(&(axis.to_string(), value.to_string())).copied().unwrap_or(1.0)
+    fn prevalence(&self, axis: den_index::Axis, value: den_index::ValueId) -> f64 {
+        let (Some(axis), Some(value)) = (self.axis_name(axis), self.name(value)) else {
+            return 1.0;
+        };
+        self.prevalence.get(&(axis, value)).copied().unwrap_or(1.0)
     }
 }
 
@@ -253,6 +313,9 @@ fn load_facets(dir: &str, key: &str) -> JevFacets {
         idf,
         prevalence,
         key: key.to_string(),
+        ids: Default::default(),
+        names: Default::default(),
+        axes: Default::default(),
     }
 }
 

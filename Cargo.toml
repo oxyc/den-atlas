@@ -11,6 +11,12 @@ name = "den-atlas"
 path = "src/main.rs"
 
 [dependencies]
+# The store: den-spec wire/store-v1. The DECODER is pure and lives in den-core so it also compiles for
+# wasm32 (the tuning playground) and tvOS; the mmap is the one impure step and belongs here, to whoever
+# owns the bytes. Pinned to a tag: this is a binary format contract, and Cargo.lock should say which
+# version of it this build reads.
+den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v1.1" }
+memmap2 = "0.9"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] }
