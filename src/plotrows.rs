@@ -1,10 +1,29 @@
-//! Browse rows from the dataset's plot facets (`plotFacetsFile`): closed axes read from Wikipedia plots — how a
-//! story ends, when it is set, how it is told — which cut across genre in a way a primary genre can't. A row may
-//! also name a mood or subgenre from the labels, alone or with the facets.
+//! Browse rows from the store's facet axes: closed axes read from Wikipedia plots — how a story ends, when
+//! it is set, how it is told — which cut across genre in a way a primary genre can't. A row may also name a
+//! mood or subgenre from the labels, alone or with the facets.
 //!
-//! Rows only, never filters. The file describes a fraction of the corpus, and a title it doesn't describe is
-//! unknown, not a negative: a row lists what the file covers, and nothing may read it as exhaustive. Not
-//! `facets.bin`, which is country, language and year for attribute search.
+//! Rows only, never filters. A title the corpus does not describe is unknown, not a negative: a row lists
+//! what is known, and nothing may read it as exhaustive. Not `facets.bin`, which is country, language and
+//! year for attribute search.
+//!
+//! # These used to come from `plotFacetsFile`
+//!
+//! A 5,336-title JSON sidecar, frozen at a dead `datasetVersion` because nothing rebuilt it. The store
+//! carries the same axes for every title — **47,618** — and three more besides, so the file was describing
+//! 11% of the corpus while the answer for all of it sat in a section beside it.
+//!
+//! Two things the move had to reconcile.
+//!
+//! **Confidence.** The file said `high`/`medium`/`low`; the store keeps the number the model gave. So a row
+//! needs a floor, and there already is one: `DISPLAY_CONFIDENCE_FLOOR`, which the label rows use for the
+//! same decision — "confident enough to put in front of a viewer". Reusing it keeps one rule rather than
+//! inventing a second for the same question.
+//!
+//! **`structure` was three questions.** The file's single `structure` axis mixed how the telling is ordered
+//! (`linear`, `nonlinear`, `framed`, `parallel-strands`) with how much time the story covers (`single-day`)
+//! and whether episodes connect (`anthology`). The store separates them into `chronology`, `timespan` and
+//! `continuity`. `STRUCTURE_ALIAS` maps an incoming `structure=…` onto whichever axis actually answers it,
+//! so a client that still asks the old way keeps working.
 
 use crate::queries::Indexes;
 use den_index::MediaType;
@@ -15,8 +34,29 @@ use std::path::Path;
 
 type Key = (MediaType, u32);
 
-/// The file layout this reader understands (`"schema"` in the file).
+/// A facet is shown in a row only at or above this confidence — the same floor the label rows use.
+///
+/// The store keeps every value the model produced, including the ones it was unsure of, because a store
+/// that has already thrown data away cannot be re-tuned. Deciding what is confident enough to SHOW is the
+/// reader's job, and this is where it happens.
+const FACET_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
+
+/// The sidecar layout the fallback reader understands (`"schema"` in the file).
 const SCHEMA: u32 = 1;
+
+/// `structure=<value>` → the axis in the store that answers it.
+///
+/// The old sidecar's `structure` axis conflated three separate questions; the store asks them separately.
+/// Anything not listed here is a chronology value, which is what `structure` mostly meant.
+const STRUCTURE_ALIAS: &[(&str, &str)] = &[("single-day", "timespan"), ("anthology", "continuity")];
+
+/// The axis a constraint really names, after the alias above.
+fn resolve_axis(axis: &str, value: &str) -> String {
+    if axis != "structure" {
+        return axis.to_owned();
+    }
+    STRUCTURE_ALIAS.iter().find(|(v, _)| *v == value).map_or("chronology", |(_, axis)| *axis).to_owned()
+}
 
 pub struct PlotFacets {
     /// axis → value → the titles carrying it, each with its confidence: 3 high, 2 medium, 1 low.
@@ -31,6 +71,68 @@ pub struct FacetSchema {
 }
 
 impl PlotFacets {
+    /// Every facet the store holds, inverted to axis → value → titles, once, at load.
+    ///
+    /// Inverted rather than scanned per request because a row asks "every title with `ending=bittersweet`",
+    /// which over 47,618 rows x 12 axes is a 571k-cell scan each time. One pass here, then O(1) lookups —
+    /// the same shape the JSON reader built, so nothing downstream changes.
+    pub fn from_store(store: &den_store::Store<'_>) -> Result<PlotFacets, String> {
+        let keys = store.per_row::<u64>("keys").map_err(|e| e.to_string())?;
+        let values = store.column::<u32>("facet_v").map_err(|e| e.to_string())?;
+        let confs = store.column::<u8>("facet_c").map_err(|e| e.to_string())?;
+        let strings = store.strings().map_err(|e| e.to_string())?;
+        let axes = den_store::FACET_AXES.len();
+        if values.len() != keys.len() * axes || confs.len() != keys.len() * axes {
+            return Err(format!(
+                "facets hold {}/{} cells for {} rows x {axes} axes",
+                values.len(),
+                confs.len(),
+                keys.len()
+            ));
+        }
+
+        let floor = (FACET_FLOOR * 100.0).round() as u8;
+        let mut by_value: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
+        let mut described = 0usize;
+        for (row, &packed) in keys.iter().enumerate() {
+            let media = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
+            let key = (media, packed as u32);
+            let mut any = false;
+            for (axis, name) in den_store::FACET_AXES.iter().enumerate() {
+                let at = row * axes + axis;
+                let (value, conf) = (values[at], confs[at]);
+                // A declined axis is stored absent, never as a value, and a value under the floor is one
+                // the classifier was not sure of — review material, not a row.
+                if value == den_store::NONE_U32 || conf < floor {
+                    continue;
+                }
+                let Some(value) = strings.get(value) else { continue };
+                any = true;
+                // The 3/2/1 scale the row order sorts on, from the same thresholds the labels use.
+                let confidence = match f64::from(conf) / 100.0 {
+                    c if c >= 0.8 => 3,
+                    c if c >= 0.7 => 2,
+                    _ => 1,
+                };
+                by_value
+                    .entry((*name).to_owned())
+                    .or_default()
+                    .entry(value.to_owned())
+                    .or_default()
+                    .push((key, confidence));
+            }
+            if any {
+                described += 1;
+            }
+        }
+        Ok(PlotFacets { by_value, titles: described })
+    }
+
+    /// The old `plotFacetsFile` sidecar.
+    ///
+    /// Kept as a FALLBACK for a dataset published before the store carried facets — the same
+    /// degrade-rather-than-fail rule every other optional blob here follows. Production no longer ships
+    /// one; `from_store` is the path that runs.
     pub fn read(path: &Path) -> Result<PlotFacets, String> {
         let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         PlotFacets::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
@@ -93,7 +195,7 @@ impl PlotFacets {
 
     pub fn coverage_for(&self, axis: &str, media_type: Option<MediaType>) -> usize {
         self.by_value
-            .get(axis)
+            .get(if axis == "structure" { "chronology" } else { axis })
             .into_iter()
             .flat_map(|values| values.values())
             .flatten()
@@ -108,6 +210,8 @@ impl PlotFacets {
     pub fn matching(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
         let mut lists: Vec<&Vec<(Key, u8)>> = Vec::with_capacity(constraints.len());
         for (axis, value) in constraints {
+            // `structure=…` is the old sidecar's spelling; resolve it to whichever axis answers it.
+            let axis = &resolve_axis(axis, value);
             match self.by_value.get(axis).and_then(|values| values.get(value)) {
                 Some(list) => lists.push(list),
                 None => return Vec::new(),
@@ -230,7 +334,7 @@ pub fn row(
             Vec::new()
         };
         let popularity = |(media_type, id): Key| {
-            let votes = indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).map_or(0, |t| t.votes);
+            let votes = indexes.votes(media_type, id);
             let kind = match media_type {
                 MediaType::Movie => den_titlesearch::MediaType::Movie,
                 MediaType::Tv => den_titlesearch::MediaType::Tv,

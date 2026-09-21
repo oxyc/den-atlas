@@ -105,6 +105,27 @@ impl Indexes {
         self.corpus.get_or_init(|| Corpus::of(self))
     }
 
+    /// A title's TMDB vote count — what every browse row is ORDERED by.
+    ///
+    /// From the STORE first. It used to come only from `facets.bin`, which fell 9,007 titles behind the
+    /// corpus because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how
+    /// *La Job* (tv:5) came to sit next to *Game of Thrones*. The store carries one for 47,551 of 47,618
+    /// rows, 9,019 more than the blob.
+    ///
+    /// `facets.bin` remains the fallback while it is still shipped, so a dataset published before the
+    /// `votes` section existed keeps ordering its rows the way it always did.
+    pub fn votes(&self, media_type: den_index::MediaType, tmdb_id: u32) -> u32 {
+        let from_store = self.store.as_ref().and_then(|loaded| {
+            let view = loaded.view();
+            let media = u8::from(media_type == den_index::MediaType::Tv);
+            let row = view.row_of(media, tmdb_id).ok().flatten()?;
+            view.per_row::<u32>("votes").ok()?.get(row.0).copied()
+        });
+        from_store.unwrap_or_else(|| {
+            self.facets.as_ref().and_then(|f| f.title(tmdb_id, media_type)).map_or(0, |t| t.votes)
+        })
+    }
+
     /// A browse row's order (`plotrows::row`), worked out once per type and constraints: every page of a row, and
     /// every visit to a screen, asks for the same one.
     pub(crate) fn row_order(
@@ -308,7 +329,7 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
 /// the facts and the facets.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
-    let (plot, premise, facets, facts, plot_facets, store, cards) = std::thread::scope(|scope| {
+    let (plot, premise, facets, facts, store, cards) = std::thread::scope(|scope| {
         let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
         // A broken premise index costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(|| {
@@ -365,16 +386,6 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
-        // Plot facet rows need both the facets and the cards to draw them with.
-        let plot_facets = scope.spawn(|| {
-            timed(|| {
-                sources.plot_facets.as_ref().and_then(|path| {
-                    PlotFacets::read(path)
-                        .map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty"))
-                        .ok()
-                })
-            })
-        });
         let cards = scope.spawn(|| {
             timed(|| {
                 sources.metadata.as_ref().and_then(|path| {
@@ -388,27 +399,48 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
-        (
-            joined(plot),
-            joined(premise),
-            joined(facets),
-            joined(facts),
-            joined(plot_facets),
-            joined(store),
-            joined(cards),
-        )
+        (joined(plot), joined(premise), joined(facets), joined(facts), joined(store), joined(cards))
     });
     let ((plot, plot_took), (premise, premise_took), (facets, facets_took)) = (plot, premise, facets);
     let plot = plot?;
-    let ((mut facts, facts_took), (plot_facets, plot_facets_took), (cards, cards_took)) =
-        (facts, plot_facets, cards);
+    let ((mut facts, facts_took), (cards, cards_took)) = (facts, cards);
     let (store, store_took) = store;
+    // The facet rows come out of the store, so this runs AFTER it rather than beside it. It used to read
+    // `plotFacetsFile`, a 5,336-title sidecar frozen at a dead datasetVersion; the store answers the same
+    // axes for all 47,618 titles, and three more besides.
+    let (plot_facets, plot_facets_took) = timed(|| {
+        let from_store = store.as_ref().and_then(|s| {
+            PlotFacets::from_store(&s.view())
+                .map_err(|e| eprintln!("facet rows unusable ({e}) — falling back to plotFacetsFile"))
+                .ok()
+        });
+        // The sidecar only when there is no store to read them from: a dataset published before the
+        // `facet_v` sections existed still gets its rows, at the 5,336 titles it described.
+        from_store.or_else(|| {
+            sources.plot_facets.as_ref().and_then(|path| {
+                PlotFacets::read(path)
+                    .map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty"))
+                    .ok()
+            })
+        })
+    });
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
         cards.as_ref().map(|cards| {
             let votes = |kind, id| {
-                facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes))
+                store
+                    .as_ref()
+                    .and_then(|loaded| {
+                        let view = loaded.view();
+                        let media = u8::from(kind == den_index::MediaType::Tv);
+                        let row = view.row_of(media, id).ok().flatten()?;
+                        view.per_row::<u32>("votes").ok()?.get(row.0).copied()
+                    })
+                    .map(f64::from)
+                    .unwrap_or_else(|| {
+                        facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes))
+                    })
             };
             // Each title under its display name, and every other name the facts give it: its original title and
             // aliases ("기생충", "Gisaengchung").
