@@ -257,11 +257,18 @@ pub struct Card {
 /// cannot emit one, so this is a guard rather than a behaviour, and a blank label is not a card.
 /// `posterPath` keeps whatever string the store holds, empty included, because `read_cards` did: only
 /// the ABSENT id (`u32::MAX`) is `None`.
+///
+/// **`card_poster` is optional and the rest are not**, which is the asymmetry to keep. A poster is one
+/// field of a card and the clients have two other ways to get one — den-edge's batch metadata route, and
+/// the metahub URL the Stremio metas already carry — so its absence costs artwork. Reading it with `?`
+/// cost the entire map: the producer is dropping the section (oxyc/den#118), and a store published
+/// against that version of this function would have emptied every plot row and left search with no
+/// display titles, while `/health` stayed green. A title and a name, by contrast, are what a card IS.
 pub fn cards_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Card>, String> {
     let err = |e: den_store::StoreError| e.to_string();
     let keys = store.per_row::<u64>("keys").map_err(err)?;
     let titles = store.per_row::<u32>("card_title").map_err(err)?;
-    let posters = store.per_row::<u32>("card_poster").map_err(err)?;
+    let posters = store.per_row::<u32>("card_poster").unwrap_or(&[]);
     let years = store.per_row::<i16>("card_year").map_err(err)?;
     let strings = store.strings().map_err(err)?;
 
@@ -275,7 +282,7 @@ pub fn cards_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Car
             (media_type, packed as u32),
             Card {
                 title: title.to_owned(),
-                poster_path: strings.get(posters[i]).map(str::to_owned),
+                poster_path: posters.get(i).and_then(|&id| strings.get(id)).map(str::to_owned),
                 year: (years[i] != den_store::NONE_I16).then(|| i64::from(years[i])),
             },
         );
@@ -326,6 +333,8 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
 pub fn posters_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Box<str>>, String> {
     let err = |e: den_store::StoreError| e.to_string();
     let keys = store.per_row::<u64>("keys").map_err(err)?;
+    // Strict, unlike `cards_from_store`: this map IS the poster paths, so a store without the section has
+    // nothing for it to return. `main` logs that and the catalog rows carry metahub art alone.
     let posters = store.per_row::<u32>("card_poster").map_err(err)?;
     let strings = store.strings().map_err(err)?;
     Ok(keys
@@ -832,6 +841,44 @@ pub(crate) mod tests {
         assert!(facets.matching(MediaType::Movie, &[pair("ending", "sad")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[pair("colour", "blue")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[]).is_empty());
+    }
+
+    /// A store with no `card_poster` section still has cards — the producer is dropping it (oxyc/den#118).
+    ///
+    /// Written because the failure this prevents is invisible from the outside. `cards_from_store` read
+    /// the section with `?`, so a poster-less store returned `Err` before building a single card; the
+    /// caller turns that into `None`, `/index/row` then answers `{"titles":[],"total":0}` with a 200, and
+    /// `/health` stays green. Browse and search would have gone empty on a publish, with nothing saying
+    /// why. Posters are the one card field with somewhere else to come from — den-edge's batch metadata
+    /// route, and the metahub URL the Stremio metas already carry — so their absence costs artwork, and a
+    /// title's absence is what would cost the card.
+    #[test]
+    fn cards_survive_a_store_that_dropped_the_poster_section() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-noposter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("s.store");
+        let title = crate::store::fixture::Title {
+            media: 0,
+            tmdb_id: 7,
+            card: Some(("Heat", Some("/heat.jpg"), Some(1995))),
+            plot: vec![0, 0],
+            premise: vec![0, 0],
+            ..crate::store::fixture::Title::default()
+        };
+        crate::store::fixture::write_omitting(&path, "v9", 2, &[title], &[], &["card_poster"]);
+
+        let mapped = crate::store::MappedStore::open(&path).expect("a store without card_poster opens");
+        let cards = cards_from_store(&mapped.view()).expect("cards without a poster section");
+        let card = cards.get(&(MediaType::Movie, 7)).expect("the card is still there");
+        assert_eq!(card.title, "Heat", "the title is what makes it a card");
+        assert_eq!(card.year, Some(1995));
+        assert_eq!(card.poster_path, None, "no section means no poster, not a wrong one");
+
+        // The poster-only reader is allowed to fail: it exists to serve artwork and its caller already
+        // logs and falls back to metahub art. What it must not do is take the cards down with it.
+        assert!(posters_from_store(&mapped.view()).is_err(), "the poster map has nothing to build from");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The store's cards against the sidecar's, on the REAL artifacts. Opt-in via `DEN_STORE` +

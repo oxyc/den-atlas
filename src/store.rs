@@ -229,6 +229,10 @@ pub(crate) mod fixture {
         strings: Vec<String>,
         ids: HashMap<String, u32>,
         sections: Vec<(&'static str, u32, Vec<u8>)>,
+        /// Sections to leave out, so a test can write the store a LATER producer writes. Omission is
+        /// the only way to cover a reader's tolerance of a dropped section, and a fixture that always
+        /// writes everything quietly stops describing the artifact when the producer drops one.
+        omit: &'static [&'static str],
     }
 
     impl Builder {
@@ -249,6 +253,9 @@ pub(crate) mod fixture {
         }
 
         fn section(&mut self, name: &'static str, width: u32, bytes: Vec<u8>) {
+            if self.omit.contains(&name) {
+                return;
+            }
             self.sections.push((name, width, bytes));
         }
 
@@ -293,6 +300,18 @@ pub(crate) mod fixture {
         titles: &[Title<'_>],
         entities: &[Entity<'_>],
     ) {
+        write_omitting(path, dataset_version, dim, titles, entities, &[]);
+    }
+
+    /// `write`, without the named sections — for a reader that must tolerate one being dropped.
+    pub(crate) fn write_omitting(
+        path: &std::path::Path,
+        dataset_version: &str,
+        dim: usize,
+        titles: &[Title<'_>],
+        entities: &[Entity<'_>],
+        omit: &'static [&'static str],
+    ) {
         let mut titles = titles.to_vec();
         titles.sort_by_key(|t| (u64::from(t.media) << 32) | u64::from(t.tmdb_id));
         let rows = titles.len();
@@ -317,7 +336,7 @@ pub(crate) mod fixture {
             u32::try_from(named.iter().position(|&q| q == qid).expect("entity")).expect("entity index")
         };
 
-        let mut b = Builder { strings: Vec::new(), ids: HashMap::new(), sections: Vec::new() };
+        let mut b = Builder { strings: Vec::new(), ids: HashMap::new(), sections: Vec::new(), omit };
 
         let keys: Vec<u64> =
             titles.iter().map(|t| (u64::from(t.media) << 32) | u64::from(t.tmdb_id)).collect();
