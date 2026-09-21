@@ -109,6 +109,12 @@ pub struct Meta {
     pub plot_facets_file: Option<String>,
     #[serde(rename = "plotFacetsGzFile")]
     pub plot_facets_gz_file: Option<String>,
+    // The store (den-spec wire/store-v1) — every per-title signal the serving path reads, plus both
+    // vector matrices, in one mmap'd file. Read from disk, NEVER served: it is an implementation detail
+    // of this server, not an artifact a client fetches. Absent ⇒ the rail falls back to vectors and
+    // labels alone, which is how it worked before the store existed.
+    #[serde(rename = "storeFile")]
+    pub store_file: Option<String>,
 }
 
 pub struct Gz {
@@ -146,6 +152,7 @@ pub struct Dataset {
     pub plot_facets: Option<PathBuf>,
     /// The rail facets file More Like This ranks on (optional; never served).
     pub rail_facets: Option<PathBuf>,
+    pub store: Option<PathBuf>,
     /// DT-I compact facet blob (optional).
     pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
@@ -273,6 +280,14 @@ impl Dataset {
             .flatten()
             .filter_map(|name| safe_blob_path(dir, name).ok())
             .find(|path| path.is_file());
+        // No gz candidate: the store is mmap'd, and a compressed file cannot be. It is also the one blob
+        // whose absence is a capability change rather than a degradation of one feature, so it is left as
+        // a plain Option rather than folded into a fallback chain.
+        let store = meta
+            .store_file
+            .as_deref()
+            .and_then(|name| safe_blob_path(dir, name).ok())
+            .filter(|path| path.is_file());
         let last_modified = meta.last_modified_http.clone();
         // Writers withdraw the descriptor before replacing any blob and publish it last. A load
         // that overlaps that interval must not bind new files to a descriptor read before it.
@@ -291,6 +306,7 @@ impl Dataset {
             facts,
             plot_facets,
             rail_facets,
+            store,
             facets,
             last_modified,
         })

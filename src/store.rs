@@ -93,6 +93,30 @@ impl MappedStore {
     }
 }
 
+/// A mapped store together with the corpus-wide statistics derived from it.
+///
+/// The aggregates (prevalence, critique idf and means) are owned rather than borrowed, so this can hold
+/// both without a self-referential type: they are computed once, here, by scanning the store, because
+/// each is a property of the whole corpus and recomputing one per request would mean scanning per
+/// request.
+pub struct LoadedStore {
+    pub store: MappedStore,
+    pub aggregates: crate::rail::RailAggregates,
+}
+
+impl LoadedStore {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let store = MappedStore::open(path)?;
+        store.check().map_err(|e| format!("{}: {e}", path.display()))?;
+        let aggregates = crate::rail::RailAggregates::build(&store.view())?;
+        Ok(Self { store, aggregates })
+    }
+
+    pub fn view(&self) -> Store<'_> {
+        self.store.view()
+    }
+}
+
 /// Per-row `u32` columns without which the serving path cannot answer.
 const REQUIRED_COLUMNS_U32: &[&str] = &["card_title", "primary_genre", "imdb"];
 

@@ -193,7 +193,7 @@ const W_CRITIQUE: f64 = 1.40;
 const W_COVERAGE: f64 = 1.40;
 
 /// Idf-weighted coverage of the seed's defining arguments by a candidate.
-fn critique_coverage(defining: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
+fn critique_coverage(defining: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
     if defining.is_empty() || theirs.is_empty() {
         return None;
     }
@@ -209,7 +209,7 @@ fn critique_coverage(defining: &[(String, f64)], theirs: &[(String, f64)]) -> Op
 }
 
 /// Cosine between two titles' noul vectors, over the union of the dimensions either one carries.
-fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> {
+fn noul_cosine(seed: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
     if seed.is_empty() || theirs.is_empty() {
         return None;
     }
@@ -219,23 +219,37 @@ fn noul_cosine(seed: &[(String, f64)], theirs: &[(String, f64)]) -> Option<f64> 
             dot += p * q;
         }
     }
-    let norm = |v: &[(String, f64)]| v.iter().map(|(_, p)| p * p).sum::<f64>().sqrt();
+    let norm = |v: &[Weighted]| v.iter().map(|(_, p)| p * p).sum::<f64>().sqrt();
     let d = norm(seed) * norm(theirs);
     (d > 0.0).then(|| dot / d)
 }
 
+/// An axis, by its index in the fixed 12-axis order (den-spec store-v1 §Facets).
+pub type Axis = u8;
+/// A value, by its id in the store's one string table. Comparing ids compares strings, because the
+/// table interns: two titles share a facet value exactly when their ids are equal.
+pub type ValueId = u32;
+/// A named probability — a noul, a critique axis — as (name id, value).
+pub type Weighted = (ValueId, f64);
+
 /// One title's facet choices: axis -> (value, confidence). Supplied by the caller for the same reason as
 /// `Authorship` — `den-index` does not know where a facet comes from.
+///
+/// These were `String`s. On a single More Like This that meant cloning ~104 of them per candidate over a
+/// 400-candidate pool — measured at 2.4 µs per candidate, about a millisecond per uncached request spent
+/// entirely on the shape of this trait — plus two more allocations inside every `prevalence` call. Ids
+/// are `Copy`, compare by equality exactly as the strings did, and the caller resolves a name only when
+/// something is actually rendered.
 pub trait Facets {
-    fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)>;
+    fn facets(&self, tmdb_id: u32) -> Vec<(Axis, ValueId, f64)>;
     /// The seed's DEFINING arguments — axes it reads >= 0.8 on — each with its idf weight, and a
     /// candidate's raw probability on them. Coverage of these, not cosine over all seventeen.
-    fn critique_defining(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+    fn critique_defining(&self, tmdb_id: u32) -> Vec<Weighted> {
         let _ = tmdb_id;
         Vec::new()
     }
     /// A candidate's raw (uncentered) critique probabilities, for coverage.
-    fn critique_raw(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+    fn critique_raw(&self, tmdb_id: u32) -> Vec<Weighted> {
         let _ = tmdb_id;
         Vec::new()
     }
@@ -246,12 +260,12 @@ pub trait Facets {
     }
     /// The critique profile — what the work argues about — CENTERED on the corpus mean per axis, so the
     /// caller does the centering once rather than every comparison.
-    fn critique(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+    fn critique(&self, tmdb_id: u32) -> Vec<Weighted> {
         let _ = tmdb_id;
         Vec::new()
     }
     /// The 75 taxonomy nouls with their probabilities, for the cosine term.
-    fn nouls(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+    fn nouls(&self, tmdb_id: u32) -> Vec<Weighted> {
         let _ = tmdb_id;
         Vec::new()
     }
@@ -263,11 +277,11 @@ pub trait Facets {
     }
     /// Share of the corpus carrying this axis value, for rarity weighting. A shared `chronology = linear`
     /// is worth almost nothing (76% of titles) where a shared `conflict = person-vs-system` is worth a lot.
-    fn prevalence(&self, axis: &str, value: &str) -> f64;
+    fn prevalence(&self, axis: Axis, value: ValueId) -> f64;
 }
 
 /// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1.
-fn facet_agreement(f: &dyn Facets, seed: &[(String, String, f64)], other: u32) -> Option<f64> {
+fn facet_agreement(f: &dyn Facets, seed: &[(Axis, ValueId, f64)], other: u32) -> Option<f64> {
     let theirs = f.facets(other);
     if seed.is_empty() || theirs.is_empty() {
         return None; // Unknown is not none.
@@ -277,7 +291,7 @@ fn facet_agreement(f: &dyn Facets, seed: &[(String, String, f64)], other: u32) -
     for (axis, value, conf) in seed {
         let Some((_, their_value, their_conf)) = theirs.iter().find(|(a, _, _)| a == axis) else { continue };
         // ln(1/prevalence): a value the whole corpus shares carries almost no evidence.
-        let weight = conf * (1.0 / f.prevalence(axis, value).max(1e-6)).ln().max(0.0);
+        let weight = conf * (1.0 / f.prevalence(*axis, *value).max(1e-6)).ln().max(0.0);
         den += weight;
         if their_value == value {
             num += weight * their_conf;
@@ -362,11 +376,11 @@ pub fn more_like_this_pooled(
         return Vec::new();
     };
     let seed = seed_labels(&mine);
-    let seed_facets: Vec<(String, String, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
+    let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
     let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
-    let seed_nouls: Vec<(String, f64)> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
-    let seed_critique: Vec<(String, f64)> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
-    let seed_defining: Vec<(String, f64)> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
+    let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
+    let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
+    let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
 
     // One index's cosine between the seed and a candidate, when that index holds both.
     let sim = |index: Option<&Index>, other: u32| -> Option<f64> {

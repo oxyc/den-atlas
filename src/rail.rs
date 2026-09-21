@@ -1,185 +1,227 @@
-//! The per-title signals More Like This ranks on, and the traits `den_index` asks for them through.
+//! The per-title signals More Like This ranks on, read straight out of the store.
 //!
-//! `den-index` deliberately knows nothing about facts or the dataset — it holds vectors and labels. So the
-//! scorer takes `Authorship` and `Facets`, and this module is where den-atlas answers them: authorship out
-//! of the facts file it already loads, the rest out of `rail-facets-<version>.json`.
+//! `den-index` deliberately knows nothing about facts or the dataset — it holds vectors and labels. So
+//! the scorer takes `Authorship` and `Facets`, and this module answers them.
 //!
-//! What that blob carries, and why each part exists, is in `den-dataset/scripts/v2/build_rail_facets.py`.
-//! The short version: the vectors say what a title is ABOUT, the labels say what KIND it is, and these say
-//! how it is TOLD (the facet choices), which world it is set in (`__world`), what it is made of (the 75
-//! nouls, of which `labels-t02.json` ships only a thresholded top three) and what it ARGUES (the critique
-//! axes).
+//! What each signal is, and why it exists, is in `den-dataset/scripts/v2/build_rail_facets.py` and
+//! den-spec `wire/store-v1.md`. The short version: the vectors say what a title is ABOUT, the labels say
+//! what KIND it is, and these say how it is TOLD (the facet choices), which world it is set in (`world`),
+//! what it is made of (the taxonomy nouls) and what it ARGUES (the critique axes).
+//!
+//! # Nothing is parsed here
+//!
+//! This used to read a 50 MB JSON blob into `HashMap`s of owned `String`s — 47,529 titles × 12 axes × 2
+//! strings, about 1.1M allocations representing 188 distinct values, and most of the 552 MB atlas held.
+//! Now every per-title read is an index into a mapped column, and the only owned state is the three
+//! aggregates below, which cannot be columns because they are corpus-wide statistics.
 
-use den_index::MediaType;
+use den_index::{Axis, MediaType, ValueId, Weighted};
+use den_store::{Row, Store};
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::facts::Facts;
 
-/// A title, in the key both the blob and the indexes use.
-type Title = (MediaType, u32);
-/// One title's facet choices: `axis`, `value`, the model's confidence.
-type Choices = Vec<(String, String, f64)>;
-/// A named probability per axis — the nouls and the critique profile share this shape.
-type Weights = Vec<(String, f64)>;
+/// Above this, a title is judged to hold that critique axis, for the idf count.
+const DEFINING: f64 = 0.8;
+/// The share of a media type holding an axis, for `ln(N / holders)`.
+const HOLDS: f64 = 0.7;
 
-/// One media type's rail facets, read once at load.
+/// How the store encodes a media type in the high half of its packed key.
+fn media_code(media: MediaType) -> u8 {
+    match media {
+        MediaType::Movie => 0,
+        MediaType::Tv => 1,
+    }
+}
+
+/// The corpus-wide statistics the scorer needs, computed once at load.
+///
+/// These are the only things that cannot be read straight from a column: each is an aggregate over every
+/// row of a media type, and computing one per request would mean scanning the corpus per request.
 #[derive(Default)]
-pub struct RailFacets {
-    /// `axis -> (value, confidence)` per title.
-    choices: HashMap<Title, Choices>,
-    /// How far from a realist world, 0..=1.
-    world: HashMap<Title, f64>,
-    /// The 75 taxonomy nouls.
-    nouls: HashMap<Title, Weights>,
-    /// The 17 critique axes, raw.
-    critique_raw: HashMap<Title, Weights>,
-    /// The same, centered on the per-axis corpus mean within the title's own media type.
-    critique: HashMap<Title, Weights>,
-    /// Share of this media type carrying an axis value, for rarity weighting.
-    prevalence: HashMap<(MediaType, String, String), f64>,
-    /// `ln(N / titles >= 0.7 on this axis)`, per media type.
-    idf: HashMap<(MediaType, String), f64>,
+pub struct RailAggregates {
+    /// Share of a media type carrying an axis value, for rarity weighting. A shared `chronology = linear`
+    /// is worth almost nothing — 76% of titles — where a shared `conflict = person-vs-system` is worth a lot.
+    prevalence: HashMap<(u8, Axis, ValueId), f64>,
+    /// `ln(N / titles at or above 0.7 on this critique axis)`, per media type.
+    idf: HashMap<(u8, ValueId), f64>,
+    /// The per-axis mean of the critique profile within a media type.
+    ///
+    /// Raw cosine over seventeen mostly-low values is dominated by a shared baseline: it scored Oz 0.885
+    /// and Angel 0.792 against The Wire, ranking them correctly and separating them by almost nothing.
+    /// Centered, the same pair is +0.700 and +0.274.
+    critique_mean: HashMap<(u8, ValueId), f64>,
+    /// Rows of each media type, so `critique_top`'s scan knows what it is scanning.
+    rows_of_media: HashMap<u8, Vec<Row>>,
 }
 
-fn media_of(key: &str) -> Option<Title> {
-    let (kind, id) = key.split_once(':')?;
-    let media = match kind {
-        "tv" => MediaType::Tv,
-        "movie" => MediaType::Movie,
-        _ => return None,
-    };
-    Some((media, id.parse().ok()?))
-}
+impl RailAggregates {
+    /// One pass over the store per statistic. Called once, at load.
+    pub fn build(store: &Store<'_>) -> Result<Self, String> {
+        let keys = store.per_row::<u64>("keys").map_err(|e| e.to_string())?;
+        let facet_v = store.column::<u32>("facet_v").map_err(|e| e.to_string())?;
+        let facet_c = store.column::<u8>("facet_c").map_err(|e| e.to_string())?;
+        let critique = store.column::<u8>("critique").map_err(|e| e.to_string())?;
+        let critique_names = store.column::<u32>("critique_names").map_err(|e| e.to_string())?;
+        let axes = critique_names.len();
+        let rows = keys.len();
 
-impl RailFacets {
-    /// Read the blob. A malformed file degrades to no rail facets rather than failing the load: the rail
-    /// still works on vectors and labels, which is how it worked before this existed.
-    pub fn load(path: &Path) -> Option<RailFacets> {
-        let raw = std::fs::read(path).ok()?;
-        let parsed: HashMap<String, serde_json::Value> = serde_json::from_slice(&raw).ok()?;
-        let mut out = RailFacets::default();
-        let mut counts: HashMap<(MediaType, String, String), f64> = HashMap::new();
-        let mut totals: HashMap<MediaType, f64> = HashMap::new();
-        let mut critique_sum: HashMap<(MediaType, String), f64> = HashMap::new();
-        let mut above: HashMap<(MediaType, String), f64> = HashMap::new();
+        let mut out = RailAggregates::default();
+        let mut totals: HashMap<u8, f64> = HashMap::new();
+        let mut counts: HashMap<(u8, Axis, ValueId), f64> = HashMap::new();
+        let mut above: HashMap<(u8, ValueId), f64> = HashMap::new();
+        let mut sums: HashMap<(u8, ValueId), f64> = HashMap::new();
 
-        for (key, value) in &parsed {
-            let Some(id) = media_of(key) else { continue };
-            *totals.entry(id.0).or_insert(0.0) += 1.0;
-            let Some(object) = value.as_object() else { continue };
-            let mut choices = Vec::new();
-            for (axis, entry) in object {
-                match axis.as_str() {
-                    "__world" => {
-                        out.world.insert(id, entry.as_f64().unwrap_or(0.0));
-                    }
-                    "__nouls" => {
-                        out.nouls.insert(id, as_pairs(entry));
-                    }
-                    "__critique" => {
-                        let pairs = as_pairs(entry);
-                        for (name, p) in &pairs {
-                            *critique_sum.entry((id.0, name.clone())).or_insert(0.0) += p;
-                            if *p >= 0.7 {
-                                *above.entry((id.0, name.clone())).or_insert(0.0) += 1.0;
-                            }
-                        }
-                        out.critique_raw.insert(id, pairs);
-                    }
-                    _ => {
-                        let (Some(v), Some(c)) = (entry[0].as_str(), entry[1].as_f64()) else { continue };
-                        choices.push((axis.clone(), v.to_string(), c));
-                        *counts.entry((id.0, axis.clone(), v.to_string())).or_insert(0.0) += 1.0;
-                    }
+        for (row, &key) in keys.iter().enumerate() {
+            let media = (key >> 32) as u8;
+            *totals.entry(media).or_insert(0.0) += 1.0;
+            out.rows_of_media.entry(media).or_default().push(Row(row));
+
+            for axis in 0..den_store::FACET_AXES.len() {
+                let at = row * den_store::FACET_AXES.len() + axis;
+                let (Some(&value), Some(&conf)) = (facet_v.get(at), facet_c.get(at)) else { continue };
+                // A declined axis is stored absent, never as a value: a scorer counting "does-not-apply"
+                // as agreement would pair every declining title with every other.
+                if value == den_store::NONE_U32 || conf == 0 {
+                    continue;
+                }
+                *counts.entry((media, axis as Axis, value)).or_insert(0.0) += 1.0;
+            }
+
+            for (axis, &name) in critique_names.iter().enumerate() {
+                let p = f64::from(critique[row * axes + axis]) / 100.0;
+                *sums.entry((media, name)).or_insert(0.0) += p;
+                if p >= HOLDS {
+                    *above.entry((media, name)).or_insert(0.0) += 1.0;
                 }
             }
-            out.choices.insert(id, choices);
         }
 
         for ((media, axis, value), n) in counts {
             let total = totals.get(&media).copied().unwrap_or(1.0).max(1.0);
             out.prevalence.insert((media, axis, value), n / total);
         }
-        for ((media, axis), n) in &above {
+        for ((media, name), n) in &above {
             let total = totals.get(media).copied().unwrap_or(1.0).max(1.0);
-            out.idf.insert((*media, axis.clone()), (total / n.max(1.0)).ln().max(0.0));
+            out.idf.insert((*media, *name), (total / n.max(1.0)).ln().max(0.0));
         }
-        // Center the critique profile on the per-axis mean within its media type. Raw cosine over
-        // seventeen mostly-low values is dominated by a shared baseline — it scored Oz 0.885 and Angel
-        // 0.792 against The Wire, ranking them correctly and separating them by almost nothing. Centered,
-        // the same pair is +0.700 and +0.274. Every title gets every axis, so an unanswered one is
-        // centered to -mean rather than silently skipped by the cosine's name intersection.
-        let mut axes: Vec<(MediaType, String)> = critique_sum.keys().cloned().collect();
-        axes.sort();
-        axes.dedup();
-        let means: HashMap<(MediaType, String), f64> = axes
-            .iter()
-            .map(|k| {
-                let total = totals.get(&k.0).copied().unwrap_or(1.0).max(1.0);
-                (k.clone(), critique_sum.get(k).copied().unwrap_or(0.0) / total)
-            })
-            .collect();
-        for (id, raw) in &out.critique_raw {
-            let centered = axes
-                .iter()
-                .filter(|(media, _)| *media == id.0)
-                .map(|(_, axis)| {
-                    let mine = raw.iter().find(|(n, _)| n == axis).map(|(_, p)| *p).unwrap_or(0.0);
-                    (axis.clone(), mine - means.get(&(id.0, axis.clone())).copied().unwrap_or(0.0))
-                })
-                .collect();
-            out.critique.insert(*id, centered);
+        for ((media, name), sum) in sums {
+            let total = totals.get(&media).copied().unwrap_or(1.0).max(1.0);
+            out.critique_mean.insert((media, name), sum / total);
         }
-        Some(out)
+        let _ = rows;
+        Ok(out)
     }
 }
 
-fn as_pairs(value: &serde_json::Value) -> Weights {
-    value
-        .as_object()
-        .map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect())
-        .unwrap_or_default()
-}
-
-/// One seed's view of the rail facets — the shape `den_index::Facets` wants.
+/// One seed's view of the store — the shape `den_index::Facets` wants.
 pub struct SeedFacets<'a> {
-    pub rail: &'a RailFacets,
+    pub store: Store<'a>,
+    pub agg: &'a RailAggregates,
     pub media: MediaType,
 }
 
-impl den_index::Facets for SeedFacets<'_> {
-    fn facets(&self, tmdb_id: u32) -> Vec<(String, String, f64)> {
-        self.rail.choices.get(&(self.media, tmdb_id)).cloned().unwrap_or_default()
+impl SeedFacets<'_> {
+    fn media(&self) -> u8 {
+        media_code(self.media)
     }
 
-    fn prevalence(&self, axis: &str, value: &str) -> f64 {
-        self.rail.prevalence.get(&(self.media, axis.to_string(), value.to_string())).copied().unwrap_or(1.0)
+    fn row(&self, tmdb_id: u32) -> Option<Row> {
+        self.store.row_of(self.media(), tmdb_id).ok().flatten()
+    }
+
+    /// The raw critique profile of a row, as (name id, probability).
+    fn critique_at(&self, row: Row) -> Vec<Weighted> {
+        let (Ok(names), Ok(values)) =
+            (self.store.column::<u32>("critique_names"), self.store.column::<u8>("critique"))
+        else {
+            return Vec::new();
+        };
+        let axes = names.len();
+        names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &name)| {
+                values.get(row.0 * axes + i).map(|&v| (name, f64::from(v) / 100.0))
+            })
+            .collect()
+    }
+}
+
+impl den_index::Facets for SeedFacets<'_> {
+    fn facets(&self, tmdb_id: u32) -> Vec<(Axis, ValueId, f64)> {
+        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+        let (Ok(values), Ok(confs)) =
+            (self.store.column::<u32>("facet_v"), self.store.column::<u8>("facet_c"))
+        else {
+            return Vec::new();
+        };
+        let n = den_store::FACET_AXES.len();
+        (0..n)
+            .filter_map(|axis| {
+                let at = row.0 * n + axis;
+                let (&value, &conf) = (values.get(at)?, confs.get(at)?);
+                (value != den_store::NONE_U32 && conf > 0)
+                    .then_some((axis as Axis, value, f64::from(conf) / 100.0))
+            })
+            .collect()
+    }
+
+    fn prevalence(&self, axis: Axis, value: ValueId) -> f64 {
+        self.agg.prevalence.get(&(self.media(), axis, value)).copied().unwrap_or(1.0)
     }
 
     fn world(&self, tmdb_id: u32) -> f64 {
-        self.rail.world.get(&(self.media, tmdb_id)).copied().unwrap_or(0.0)
+        let Some(row) = self.row(tmdb_id) else { return 0.0 };
+        self.store
+            .per_row::<u8>("world")
+            .ok()
+            .and_then(|w| w.get(row.0).copied())
+            .map_or(0.0, |v| f64::from(v) / 100.0)
     }
 
-    fn nouls(&self, tmdb_id: u32) -> Vec<(String, f64)> {
-        self.rail.nouls.get(&(self.media, tmdb_id)).cloned().unwrap_or_default()
+    fn nouls(&self, tmdb_id: u32) -> Vec<Weighted> {
+        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+        let (Ok(names), Ok(keys), Ok(values)) = (
+            self.store.column::<u32>("noul_names"),
+            self.store.list::<u8>("noul_k_v", "noul_k_o"),
+            self.store.list::<u8>("noul_v_v", "noul_v_o"),
+        ) else {
+            return Vec::new();
+        };
+        let (ks, vs) = (keys.get(row), values.get(row));
+        ks.iter()
+            .zip(vs)
+            .filter_map(|(&k, &v)| names.get(k as usize).map(|&name| (name, f64::from(v) / 100.0)))
+            .collect()
     }
 
-    fn critique(&self, tmdb_id: u32) -> Vec<(String, f64)> {
-        self.rail.critique.get(&(self.media, tmdb_id)).cloned().unwrap_or_default()
+    fn critique(&self, tmdb_id: u32) -> Vec<Weighted> {
+        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+        let media = self.media();
+        // Centered here rather than stored centered, because the mean is a property of the corpus and the
+        // store is a property of a title. Every title carries every axis, so an unanswered one centers to
+        // -mean rather than being skipped by a cosine's name intersection.
+        self.critique_at(row)
+            .into_iter()
+            .map(|(name, p)| {
+                (name, p - self.agg.critique_mean.get(&(media, name)).copied().unwrap_or(0.0))
+            })
+            .collect()
     }
 
-    fn critique_raw(&self, tmdb_id: u32) -> Vec<(String, f64)> {
-        self.rail.critique_raw.get(&(self.media, tmdb_id)).cloned().unwrap_or_default()
+    fn critique_raw(&self, tmdb_id: u32) -> Vec<Weighted> {
+        self.row(tmdb_id).map(|row| self.critique_at(row)).unwrap_or_default()
     }
 
-    fn critique_defining(&self, tmdb_id: u32) -> Vec<(String, f64)> {
+    fn critique_defining(&self, tmdb_id: u32) -> Vec<Weighted> {
+        let media = self.media();
         self.critique_raw(tmdb_id)
             .into_iter()
-            .filter(|(_, p)| *p >= 0.8)
-            .filter_map(|(axis, _)| {
-                let w = self.rail.idf.get(&(self.media, axis.clone())).copied().unwrap_or(0.0);
-                (w > 0.0).then_some((axis, w))
+            .filter(|(_, p)| *p >= DEFINING)
+            .filter_map(|(name, _)| {
+                let w = self.agg.idf.get(&(media, name)).copied().unwrap_or(0.0);
+                (w > 0.0).then_some((name, w))
             })
             .collect()
     }
@@ -193,21 +235,24 @@ impl den_index::Facets for SeedFacets<'_> {
         if total <= 0.0 {
             return false;
         }
-        let score = |id: &Title| -> f64 {
-            let Some(theirs) = self.rail.critique_raw.get(id) else { return 0.0 };
+        let score = |row: Row| -> f64 {
+            let theirs = self.critique_at(row);
             defining
                 .iter()
                 .filter_map(|(a, w)| theirs.iter().find(|(name, _)| name == a).map(|(_, p)| w * p))
                 .sum::<f64>()
                 / total
         };
-        let mine = score(&(self.media, other));
+        let Some(other_row) = self.row(other) else { return false };
+        let mine = score(other_row);
+        let empty = Vec::new();
+        let rows = self.agg.rows_of_media.get(&self.media()).unwrap_or(&empty);
         // Only reached for a candidate the tone floor would otherwise cut, so the scan is rare.
-        self.rail.critique_raw.keys().filter(|k| k.0 == self.media && score(k) > mine).count() < n
+        rows.iter().filter(|&&row| score(row) > mine).count() < n
     }
 }
 
-/// One seed's authorship, out of the facts file: who made it, where it lived, and what shares either.
+/// One seed's authorship, out of the facts: who made it, where it lived, and what shares either.
 pub struct SeedAuthorship<'a> {
     pub facts: &'a Facts,
     pub media: MediaType,

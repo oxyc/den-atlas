@@ -142,6 +142,7 @@ mod tests {
     fn dataset(signature: Option<&str>) -> Dataset {
         Dataset {
             rail_facets: None,
+            store: None,
             meta: Meta {
                 dataset_version: "v1".into(),
                 taxonomy_version: "t02".into(),
@@ -183,6 +184,7 @@ mod tests {
                 plot_facets_gz_file: None,
                 rail_facets_file: None,
                 rail_facets_gz_file: None,
+                store_file: None,
             },
             labels: blob("labels-t02.json"),
             vectors: blob("vectors-bge-m3.bin"),
