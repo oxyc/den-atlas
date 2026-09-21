@@ -46,6 +46,38 @@ impl Released {
         }
     }
 
+    /// From the store: days since the epoch, plus the precision code stored beside them.
+    ///
+    /// The store keeps the DAY and a precision rather than a date string, so the span has to be rebuilt
+    /// here — and the span is what "released in 1999" means when a caller asks whether a title falls in a
+    /// window. Codes are den-spec `wire/store-v1.md`: 0 day, 1 month, 2 year, 3 decade, 4 century,
+    /// 0xFF none. Decade and century widen to their whole span rather than being read as a single year,
+    /// which would date a title precisely on the strength of a guess.
+    pub fn from_days(days: i32, precision: u8) -> Option<Released> {
+        const NONE: i32 = i32::MIN;
+        if days == NONE || precision == 0xFF {
+            return None;
+        }
+        let first_day = i64::from(days);
+        let year = civil_year(first_day);
+        let span = |years: i64| {
+            let start = days_from_civil(year, 1, 1);
+            Released { first_day: start, span_days: days_from_civil(year + years, 1, 1) - start }
+        };
+        Some(match precision {
+            0 => Released { first_day, span_days: 1 },
+            1 => {
+                let month = month_of(first_day);
+                let start = days_from_civil(year, month, 1);
+                Released { first_day: start, span_days: i64::from(days_in_month(year, month)) }
+            }
+            2 => span(1),
+            3 => span(10),
+            4 => span(100),
+            _ => return None,
+        })
+    }
+
     /// A title known only by its year.
     pub fn year(year: i64) -> Released {
         let first_day = days_from_civil(year, 1, 1);
@@ -77,6 +109,17 @@ fn civil_year(days: i64) -> i64 {
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     yoe + era * 400 + i64::from(mp >= 10)
+}
+
+/// The calendar month a day falls in (Hinnant's `civil_from_days`, month part).
+fn month_of(days: i64) -> u32 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    (if mp < 10 { mp + 3 } else { mp - 9 }) as u32
 }
 
 fn days_in_month(year: i64, month: u32) -> u32 {
@@ -323,6 +366,146 @@ impl Facts {
 
     /// Read a facts file, plain or gzipped. Parsed from memory rather than streamed: a stream parsed about three
     /// times slower, and the index load waits on it, while the file's ~24 MB are held only until it is parsed.
+    /// The facts, out of the store.
+    ///
+    /// Same shape, same API, different input — so `/recommend`, people search, the rail's authorship and
+    /// the display index all keep working untouched while `factsFile` stops being published. That blob is
+    /// 43 MB of the release and 1.04 s of a 1.6 s load, and it is read by atlas alone: nothing serves it
+    /// and no client fetches it.
+    ///
+    /// Still built into owned `HashMap`s rather than read from the mapping per call. That is deliberate
+    /// and temporary: it keeps this change to its input, where a zero-copy port would touch all six
+    /// consumers at once. The win here is the artifact and the parse, not the resident bytes.
+    pub fn from_store(store: &den_store::Store<'_>) -> Result<Facts, String> {
+        let err = |e: den_store::StoreError| e.to_string();
+        let keys = store.per_row::<u64>("keys").map_err(err)?;
+        let strings = store.strings().map_err(err)?;
+        let imdb = store.per_row::<u32>("imdb").map_err(err)?;
+        let released = store.per_row::<i32>("released").map_err(err)?;
+        let released_prec = store.per_row::<u8>("released_prec").map_err(err)?;
+        let runtime = store.per_row::<u16>("runtime").map_err(err)?;
+        let franchise = store.per_row::<u32>("franchise").map_err(err)?;
+        // u32 in the store, u16 here: a TMDB genre id fits in 16 bits and `Record` has always held them
+        // that way. The width check in den-store caught this being read as u16 directly — the section is
+        // aligned and whole either way, so it would have returned twice as many wrong numbers.
+        let genres = store.list::<u32>("genres_v", "genres_o").map_err(err)?;
+        let countries = store.list::<u32>("countries_v", "countries_o").map_err(err)?;
+        let languages = store.list::<u32>("languages_v", "languages_o").map_err(err)?;
+        let makers = store.list::<u32>("makers_v", "makers_o").map_err(err)?;
+        let cast = store.list::<u32>("cast_v", "cast_o").map_err(err)?;
+        let broadcasters = store.list::<u32>("broadcasters_v", "broadcasters_o").map_err(err)?;
+        let based_kind = store.list::<u32>("based_kind_v", "based_kind_o").map_err(err)?;
+        let alias_titles = store.list::<u32>("alias_titles_v", "alias_titles_o").map_err(err)?;
+        let ent_qid = store.column::<u32>("ent_qid").map_err(err)?;
+        let ent_name = store.column::<u32>("ent_name").map_err(err)?;
+        let ent_tmdb = store.column::<u32>("ent_tmdb").map_err(err)?;
+        let ent_alias = store.list_of::<u32>("ent_alias_v", "ent_alias_o", ent_qid.len()).map_err(err)?;
+
+        // A two-letter code out of the dictionary; anything else is not one and is skipped rather than
+        // truncated into a plausible wrong country. `fold` applies the case the JSON reader applied —
+        // countries upper, languages lower — because callers compare these to literals.
+        let code = |id: u32, fold: fn(&u8) -> u8| -> Option<[u8; 2]> {
+            let text = strings.get(id)?;
+            let bytes = text.as_bytes();
+            (bytes.len() == 2).then(|| [fold(&bytes[0]), fold(&bytes[1])])
+        };
+
+        // Entity lists hold INDICES into the entity table, not Q-ids — the store interns them so a
+        // 7-digit Q-id costs the same as a 5-digit one. Every consumer here expects Q-ids, so they are
+        // resolved on the way out. Reading the index as a Q-id is silent and catastrophic: it is a valid
+        // small number that names a different person.
+        let qid_of = |i: u32| -> Option<u32> { ent_qid.get(i as usize).copied() };
+        let qids = |ids: &[u32]| -> Vec<u32> { ids.iter().filter_map(|&i| qid_of(i)).collect() };
+
+        let mut records: HashMap<(MediaType, u32), Record> = HashMap::with_capacity(keys.len());
+        let mut titles: Titles = HashMap::new();
+        let mut credited: HashMap<u32, u32> = HashMap::new();
+        for (i, &packed) in keys.iter().enumerate() {
+            let row = den_store::Row(i);
+            let media_type = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
+            let key = (media_type, packed as u32);
+
+            let makers_row: Vec<u32> = qids(makers.get(row));
+            let cast_row: Vec<u32> = qids(cast.get(row));
+            for &qid in makers_row.iter().chain(cast_row.iter().filter(|q| !makers_row.contains(q))) {
+                *credited.entry(qid).or_default() += 1;
+            }
+
+            let names: Vec<Box<str>> = alias_titles
+                .get(row)
+                .iter()
+                .filter_map(|&id| strings.get(id))
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.to_owned().into_boxed_str())
+                .collect();
+            if !names.is_empty() {
+                titles.insert(key, names);
+            }
+
+            records.insert(
+                key,
+                Record {
+                    imdb_id: strings.get(imdb[i]).map(str::to_owned).filter(|id| id.starts_with("tt")),
+                    released: Released::from_days(released[i], released_prec[i]),
+                    genres: genres.get(row).iter().filter_map(|&g| u16::try_from(g).ok()).collect(),
+                    countries: countries
+                        .get(row)
+                        .iter()
+                        .filter_map(|&id| code(id, u8::to_ascii_uppercase))
+                        .collect(),
+                    languages: languages
+                        .get(row)
+                        .iter()
+                        .filter_map(|&id| code(id, u8::to_ascii_lowercase))
+                        .collect(),
+                    makers: makers_row,
+                    cast: cast_row,
+                    // A raw Q-id, not an entity index: the entity table holds almost no franchises.
+                    franchise: (franchise[i] != den_store::NONE_U32).then_some(franchise[i]),
+                    broadcasters: qids(broadcasters.get(row)),
+                    source_kinds: SourceKinds(
+                        based_kind
+                            .get(row)
+                            .iter()
+                            .filter_map(|&id| strings.get(id))
+                            .filter_map(SourceKinds::parse)
+                            .fold(0, |mask, kind| mask | kind),
+                    ),
+                    runtime_minutes: (runtime[i] > 0).then(|| u32::from(runtime[i])),
+                },
+            );
+        }
+
+        // Only the people a record credits: the entity table also names genres, franchises and places.
+        let mut people: Vec<(u32, Person)> = Vec::new();
+        let mut named: Vec<(u64, u32)> = Vec::new();
+        for (at, &qid) in ent_qid.iter().enumerate() {
+            if !credited.contains_key(&qid) {
+                continue;
+            }
+            let Some(name) = strings.get(ent_name[at]) else { continue };
+            let tmdb = (ent_tmdb[at] != den_store::NONE_U32).then_some(ent_tmdb[at]);
+            people.push((qid, Person { name: name.to_owned().into_boxed_str(), tmdb_id: tmdb }));
+            // The name AND every alias: 64,075 entities have them, and without them a search for
+            // "Michael James Vogel" finds nothing while "Mike Vogel" works.
+            for alias in std::iter::once(name)
+                .chain(ent_alias.get(den_store::Row(at)).iter().filter_map(|&id| strings.get(id)))
+            {
+                let key = name_key(alias);
+                if !key.is_empty() {
+                    named.push((fnv1a(&key), qid));
+                }
+            }
+        }
+        people.sort_unstable_by_key(|(qid, _)| *qid);
+        people.dedup_by_key(|(qid, _)| *qid);
+        people.shrink_to_fit();
+        named.sort_unstable_by_key(|&(hash, qid)| (hash, std::cmp::Reverse(credited[&qid]), qid));
+        named.dedup();
+        named.shrink_to_fit();
+        Ok(Facts { records, people, named, titles })
+    }
+
     pub fn read(path: &Path) -> Result<Facts, String> {
         let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         Facts::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
@@ -610,6 +793,53 @@ pub(crate) mod tests {
         {"mediaType": "movie", "tmdbId": 2}
       ]
     }"#;
+
+    /// The store path against the JSON path, on the REAL artifacts. Opt-in via `DEN_STORE` + `DEN_FACTS`.
+    ///
+    /// This is the test that matters for the migration: `Facts::from_store` has to answer the same
+    /// questions `Facts::read` did, for every title and every person, or `/recommend`, people search and
+    /// the rail's authorship all change without anything failing. The route tests above run on the JSON
+    /// fixture and cannot see a difference between the two readers.
+    #[test]
+    fn the_store_answers_what_the_json_did() {
+        let (Ok(store_path), Ok(facts_path)) = (std::env::var("DEN_STORE"), std::env::var("DEN_FACTS"))
+        else {
+            eprintln!("SKIP: set DEN_STORE and DEN_FACTS to compare the two readers");
+            return;
+        };
+        let mapped = crate::store::MappedStore::open(std::path::Path::new(&store_path)).expect("store");
+        let from_store = Facts::from_store(&mapped.view()).expect("facts from the store");
+        let from_json = Facts::read(std::path::Path::new(&facts_path)).expect("facts from json");
+
+        assert_eq!(from_store.len(), from_json.len(), "record count");
+
+        let mut differ = Vec::new();
+        for (media, id) in from_json.keys() {
+            let want = from_json.get(id, media).expect("json record");
+            let Some(got) = from_store.get(id, media) else {
+                differ.push(format!("{media:?}:{id} missing from the store"));
+                continue;
+            };
+            if got != want {
+                differ.push(format!("{media:?}:{id}\n  json  {want:?}\n  store {got:?}"));
+            }
+        }
+        eprintln!("records differing: {} of {}", differ.len(), from_json.len());
+        assert!(
+            differ.is_empty(),
+            "{} of {} records differ; first few:\n{}",
+            differ.len(),
+            from_json.len(),
+            differ.iter().take(3).cloned().collect::<Vec<_>>().join("\n")
+        );
+
+        // People search: the same names must find the same people.
+        for name in ["bong joon ho", "david simon", "mike vogel", "michael james vogel"] {
+            let a = from_store.people_named(name);
+            let b = from_json.people_named(name);
+            assert_eq!(a, b, "people_named({name:?})");
+        }
+    }
 
     /// `basedOn` was parsed away entirely, so "films based on a book" could not be answered from a file that
     /// carried the answer. The kinds come pre-folded by the producer; the Q-ids are NOT read — "adaptations

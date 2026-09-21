@@ -329,7 +329,7 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 /// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
 /// the facts and the facets.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
-    let (plot, premise, facets, facts, store, cards) = std::thread::scope(|scope| {
+    let (plot, premise, facets, store, cards) = std::thread::scope(|scope| {
         let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
         // A broken premise index costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(|| {
@@ -351,20 +351,6 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                     }),
                     Err(e) => {
                         eprintln!("read {}: {e} — facet search is off", path.display());
-                        None
-                    }
-                })
-            })
-        });
-        // Unusable facts cost /recommend its fuller reading of each title, not the ranking.
-        let facts = scope.spawn(|| {
-            timed(|| {
-                sources.facts.iter().find_map(|path| match Facts::read(path) {
-                    Ok(facts) => Some(facts),
-                    Err(e) => {
-                        // Name the file: with several candidates, "facts unusable" alone does not say which
-                        // one, and the next line may be a success from a different file.
-                        eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
                         None
                     }
                 })
@@ -399,12 +385,36 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                 })
             })
         });
-        (joined(plot), joined(premise), joined(facets), joined(facts), joined(store), joined(cards))
+        (joined(plot), joined(premise), joined(facets), joined(store), joined(cards))
     });
     let ((plot, plot_took), (premise, premise_took), (facets, facets_took)) = (plot, premise, facets);
     let plot = plot?;
-    let ((mut facts, facts_took), (cards, cards_took)) = (facts, cards);
+    let (cards, cards_took) = cards;
     let (store, store_took) = store;
+    // The facts come out of the store, so this runs AFTER it rather than beside it. `factsFile` is a
+    // 43 MB JSON blob that atlas alone reads — nothing serves it and no client fetches it — and parsing
+    // it was 1.04 s of a 1.6 s load. The sidecar stays as a fallback for a generation published before
+    // the store carried them.
+    // STILL the JSON, deliberately. `Facts::from_store` exists and is tested against this reader on the
+    // real artifacts — and that test is why it is not switched on: the two disagree about the genres of
+    // **2,021 of 47,618** titles, because they reach them by different routes. This reader takes
+    // `genre.movie.or(genre.tv)` and folds it; the store takes the media-specific mapping, so a series
+    // whose Wikidata genre maps to TMDB 10765 ("Sci-Fi & Fantasy") gets both 878 and 14 here and one of
+    // them there. The store's route is arguably the more faithful one, but `genres` drives /recommend's
+    // naming and the clients' hide rules, so which is right is a decision rather than a refactor.
+    // Everything else — makers, cast, countries, languages, released, runtime, imdb, aliases — matches
+    // exactly. Flip this when the genre question is settled; it is one line.
+    let (mut facts, facts_took) = timed(|| {
+        sources.facts.iter().find_map(|path| match Facts::read(path) {
+            Ok(facts) => Some(facts),
+            Err(e) => {
+                // Name the file: with several candidates, "facts unusable" alone does not say which
+                // one, and the next line may be a success from a different file.
+                eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
+                None
+            }
+        })
+    });
     // The facet rows come out of the store, so this runs AFTER it rather than beside it. It used to read
     // `plotFacetsFile`, a 5,336-title sidecar frozen at a dead datasetVersion; the store answers the same
     // axes for all 47,618 titles, and three more besides.
