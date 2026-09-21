@@ -56,6 +56,7 @@ pub fn render(state: &AppState) -> String {
         state.catalog.fresh(),
         state.catalog.schema_suspect(),
         state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+        state.index.as_ref().is_some_and(|index| index.store_unusable()),
     );
     let reason = health.map_or("ok", |(reason, _)| reason);
     gauge(

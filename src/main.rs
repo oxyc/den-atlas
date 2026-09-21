@@ -271,7 +271,7 @@ async fn main() {
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
     let health =
-        handler::health_state(dataset.is_some(), true, false, false).map_or("ok", |(reason, _)| reason);
+        handler::health_state(dataset.is_some(), true, false, false, false).map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
         public_base: env_opt("PUBLIC_BASE_URL"),

@@ -149,6 +149,8 @@ pub struct IndexQueries {
     loading: tokio::sync::Mutex<()>,
     /// Whether the dataset declares a facts file the last load couldn't read (`/health`).
     facts_unusable: AtomicBool,
+    /// Whether the dataset declares a store the last load could not read (`/health`).
+    store_unusable: AtomicBool,
 }
 
 impl IndexQueries {
@@ -171,11 +173,16 @@ impl IndexQueries {
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
+            store_unusable: AtomicBool::new(false),
         }
     }
 
     /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
     /// then run without facts, which only a log line said before.
+    pub fn store_unusable(&self) -> bool {
+        self.store_unusable.load(Ordering::Relaxed)
+    }
+
     pub fn facts_unusable(&self) -> bool {
         self.facts_unusable.load(Ordering::Relaxed)
     }
@@ -218,6 +225,9 @@ impl IndexQueries {
             took.as_secs_f64()
         );
         self.facts_unusable.store(!self.facts.is_empty() && indexes.facts.is_none(), Ordering::Relaxed);
+        // Declared and unread. A store that was never declared is not a fault; one that was and
+        // did not open is the rail quietly answering worse.
+        self.store_unusable.store(self.store.is_some() && indexes.store.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
