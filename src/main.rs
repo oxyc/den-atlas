@@ -186,7 +186,41 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
         eprintln!("check: the dataset declares facts that atlas cannot read — refusing");
         return 1;
     }
-    println!("check: ok ({} facts candidate(s), {} usable)", dataset.facts.len(), u8::from(reads));
+    // The store, for the same reason and more sharply: it is what More Like This ranks on, and an
+    // unreadable one degrades the row while every request keeps answering. This check is what
+    // `atlas-dataset-sync` runs against a STAGED generation, so a bad store is refused before it
+    // replaces a good one rather than after.
+    let store = match dataset.store.as_ref() {
+        None => None,
+        Some(path) => match store::LoadedStore::open(path) {
+            Ok(loaded) => Some(loaded),
+            Err(e) => {
+                eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
+                return 1;
+            }
+        },
+    };
+    if let Some(loaded) = &store {
+        // A store whose version does not match the manifest that named it is a mixed generation — the
+        // failure mode a moving release makes easy and nothing else here would notice.
+        if loaded.store.dataset_version() != dataset.meta.dataset_version {
+            eprintln!(
+                "check: store says datasetVersion {} but the manifest says {} — mixed generation",
+                loaded.store.dataset_version(),
+                dataset.meta.dataset_version
+            );
+            return 1;
+        }
+    }
+    println!(
+        "check: ok ({} facts candidate(s), {} usable; store: {})",
+        dataset.facts.len(),
+        u8::from(reads),
+        store.as_ref().map_or_else(
+            || "not declared".to_owned(),
+            |s| format!("{} rows, {} bytes", s.store.rows(), s.store.bytes())
+        )
+    );
     0
 }
 
