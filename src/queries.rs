@@ -70,10 +70,12 @@ impl Indexes {
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
+            // `LoadedStore::open` already proved this builds — `check` calls the same constructor — so
+            // the `else` below is the no-store case, which `store_unusable` reports.
             let facets = self
                 .store
                 .as_ref()
-                .and_then(|s| crate::rail::SeedFacets::new(&s.view(), &s.aggregates, media_type));
+                .and_then(|s| crate::rail::SeedFacets::new(&s.view(), &s.aggregates, media_type).ok());
             let Some(facets) = facets else {
                 return den_index::more_like_this(
                     Some(&self.plot),
@@ -152,7 +154,8 @@ pub struct IndexQueries {
     loading: tokio::sync::Mutex<()>,
     /// Whether the dataset declares a facts file the last load couldn't read (`/health`).
     facts_unusable: AtomicBool,
-    /// Whether the dataset declares a store the last load could not read (`/health`).
+    /// Whether the last load ended without a usable store — declared and unreadable, or not declared
+    /// at all. Both answer More Like This the same way, so `/health` reports them the same way.
     store_unusable: AtomicBool,
 }
 

@@ -152,7 +152,17 @@ pub const MAX_EMBED_INFLIGHT: usize = 4;
 pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `den-atlas check <dir>` — load a dataset directory exactly as serving would, and say whether it is fit to
-/// swap in. Exit 0 if it is, 1 if it is not.
+/// swap in.
+///
+/// Three outcomes, because "unfit" covers two situations a caller must treat differently:
+///
+///   0  fit to serve.
+///   1  BROKEN — a store that will not read, a mixed generation, a declared facts file atlas cannot
+///      parse. Never swap this in; whatever is running is better.
+///   2  DEGRADED — it loads and serves, but declares no store, so More Like This falls back to the
+///      pre-pooled scorer. Refuse a routine update, and take it anyway when the alternative is
+///      staying down: `atlas-dataset-sync` stops the unit to recover an interrupted swap, and a box
+///      that will not recover from an outage over a ranking downgrade has the trade backwards.
 ///
 /// This exists because a dataset can pass every check outside atlas and still be unusable by it. One entity
 /// carrying `"aliases": "…"` where `RawEntity.aliases` is `Vec<String>` made a 27 MB facts file unparseable
@@ -165,11 +175,13 @@ pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Checking here rather than in the publisher is deliberate — this uses atlas's OWN deserialiser, so it
 /// cannot drift from what serving actually requires the way a mirrored schema can.
 fn check_dataset(dir: &std::path::Path) -> i32 {
+    const BROKEN: i32 = 1;
+    const DEGRADED: i32 = 2;
     let dataset = match dataset::Dataset::load(dir) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("check: dataset at {} will not load: {e}", dir.display());
-            return 1;
+            return BROKEN;
         }
     };
     // A declared facts file that does not read is the case that bit us: serving continues, degraded, with a
@@ -184,29 +196,31 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
     });
     if declared && !reads {
         eprintln!("check: the dataset declares facts that atlas cannot read — refusing");
-        return 1;
+        return BROKEN;
     }
     // The store, for the same reason and more sharply: it is what More Like This ranks on, and an
     // unreadable one degrades the row while every request keeps answering. This check is what
     // `atlas-dataset-sync` runs against a STAGED generation, so a bad store is refused before it
     // replaces a good one rather than after.
     //
-    // A manifest that declares NO store fails here too. That is not pedantry about a field: without one
-    // the rail silently falls back to the pre-pooled scorer, which draws candidates from the premise
-    // index alone, and `/health` has nothing to go on at the moment the generation lands. Refusing it
-    // here is what keeps a store-less generation from replacing a good one.
+    // A manifest that declares NO store is DEGRADED, not broken, and the difference decides whether a
+    // box can recover from an interrupted swap. Such a dataset loads and serves; it just ranks More
+    // Like This with the pre-pooled scorer, which draws candidates from the premise index alone.
+    // `atlas-dataset-sync` stops the unit to recover an interrupted generation, so a refusal there
+    // means atlas stays DOWN — and staying down over a ranking downgrade has the trade backwards.
+    // It refuses a routine update and takes this one when the alternative is an outage.
     let Some(path) = dataset.store.as_ref() else {
         eprintln!(
-            "check: the dataset declares no storeFile — More Like This would fall back to the \
-             pre-pooled scorer, so this generation is refused"
+            "check: the dataset declares no storeFile — it will serve, but More Like This falls back \
+             to the pre-pooled scorer"
         );
-        return 1;
+        return DEGRADED;
     };
     let loaded = match store::LoadedStore::open(path) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
-            return 1;
+            return BROKEN;
         }
     };
     // A store whose version does not match the manifest that named it is a mixed generation — the
@@ -217,7 +231,7 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
             loaded.store.dataset_version(),
             dataset.meta.dataset_version
         );
-        return 1;
+        return BROKEN;
     }
     println!(
         "check: ok ({} facts candidate(s), {} usable; store: {} rows, {} bytes)",
@@ -608,8 +622,12 @@ mod tests {
     }
 
     /// A staged dataset directory: the two mandatory blobs, and whatever `extra` the meta adds.
+    ///
+    /// The directory name carries the process id. A fixed name under the shared temp dir, cleared with
+    /// `remove_dir_all` on entry, means two concurrent runs of this binary — two git worktrees, which is
+    /// how this project is usually laid out — delete each other's staging mid-test.
     fn staged(name: &str, extra: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("atlas-check-{name}"));
+        let dir = std::env::temp_dir().join(format!("atlas-check-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("labels.json"), b"{}").unwrap();
@@ -629,9 +647,24 @@ mod tests {
     /// which draws candidates from the premise index alone. `/health` cannot distinguish that from a
     /// working addon at the moment of the swap, so the refusal has to happen here.
     #[test]
-    fn check_refuses_a_dataset_that_declares_no_store() {
+    fn check_calls_a_dataset_with_no_store_degraded_rather_than_broken() {
         let dir = staged("no-store", "");
-        assert_eq!(check_dataset(&dir), 1, "a store-less generation must not be swappable in");
+        assert_eq!(
+            check_dataset(&dir),
+            2,
+            "no storeFile is DEGRADED (2), not BROKEN (1): it serves, it just ranks worse, and \
+             `atlas-dataset-sync` must be able to take it to recover an interrupted swap rather than \
+             leaving atlas stopped over a ranking downgrade"
+        );
+    }
+
+    /// The distinction the exit codes exist for. A store that will not read is BROKEN and must never
+    /// replace a working generation, however badly the box needs a dataset.
+    #[test]
+    fn check_calls_an_unreadable_store_broken() {
+        let dir = staged("bad-store", r#","storeFile":"den.store""#);
+        std::fs::write(dir.join("den.store"), vec![0u8; 256]).unwrap();
+        assert_eq!(check_dataset(&dir), 1, "a file that is not a store is BROKEN, not degraded");
     }
 
     /// And accepts one that declares a store it can read, whose `datasetVersion` matches the manifest.

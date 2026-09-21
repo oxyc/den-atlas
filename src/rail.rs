@@ -171,23 +171,30 @@ pub struct SeedFacets<'a> {
 impl<'a> SeedFacets<'a> {
     /// Resolve every column the rail reads, once.
     ///
-    /// `None` when any one of them is missing or the wrong width. All-or-nothing on purpose: a rail that
-    /// dropped only the absent signal would score some titles on fewer terms than others and still
-    /// return twenty confident-looking answers. `MappedStore::check` requires this same set at load, so
-    /// `None` here means a store got past that gate.
-    pub fn new(store: &Store<'a>, agg: &'a RailAggregates, media: MediaType) -> Option<Self> {
-        Some(SeedFacets {
+    /// All-or-nothing on purpose: a rail that dropped only the absent signal would score some titles on
+    /// fewer terms than others and still return twenty confident-looking answers.
+    ///
+    /// This is also the ONLY list of what the rail needs. `MappedStore::check` used to carry a second
+    /// copy, kept in step by a comment — so adding a column here and forgetting it there would leave a
+    /// store that passes the load gate, falls back to the pre-pooled scorer on every request, memoises
+    /// that, and reports healthy. `check` now calls this instead, and the error names the section.
+    pub fn new(
+        store: &Store<'a>,
+        agg: &'a RailAggregates,
+        media: MediaType,
+    ) -> Result<Self, den_store::StoreError> {
+        Ok(SeedFacets {
             agg,
             media: media_code(media),
-            keys: store.per_row::<u64>("keys").ok()?,
-            facet_v: store.column::<u32>("facet_v").ok()?,
-            facet_c: store.column::<u8>("facet_c").ok()?,
-            critique_names: store.column::<u32>("critique_names").ok()?,
-            critique: store.column::<u8>("critique").ok()?,
-            world: store.per_row::<u8>("world").ok()?,
-            noul_names: store.column::<u32>("noul_names").ok()?,
-            noul_k: store.list::<u8>("noul_k_v", "noul_k_o").ok()?,
-            noul_v: store.list::<u8>("noul_v_v", "noul_v_o").ok()?,
+            keys: store.per_row::<u64>("keys")?,
+            facet_v: store.column::<u32>("facet_v")?,
+            facet_c: store.column::<u8>("facet_c")?,
+            critique_names: store.column::<u32>("critique_names")?,
+            critique: store.column::<u8>("critique")?,
+            world: store.per_row::<u8>("world")?,
+            noul_names: store.column::<u32>("noul_names")?,
+            noul_k: store.list::<u8>("noul_k_v", "noul_k_o")?,
+            noul_v: store.list::<u8>("noul_v_v", "noul_v_o")?,
         })
     }
 
@@ -263,8 +270,14 @@ impl den_index::Facets for SeedFacets<'_> {
         let Some(row) = self.row(tmdb_id) else { return Vec::new() };
         let media = self.media;
         // Centered here rather than stored centered, because the mean is a property of the corpus and the
-        // store is a property of a title. Every title carries every axis, so an unanswered one centers to
-        // -mean rather than being skipped by a cosine's name intersection.
+        // store is a property of a title.
+        //
+        // Centering applies to the axes that survive CRITIQUE_FLOOR, not to all seventeen. An axis the
+        // title reads near zero on is dropped before this, so it is skipped by the cosine's name
+        // intersection rather than centered to -mean — and a row that is blank throughout contributes
+        // nothing instead of scoring a real negative against the mean, which is what
+        // `a_row_without_critique_returns_nothing` pins. "Unknown is not none" is the rule; a floored
+        // axis is unknown.
         self.critique_at(row)
             .into_iter()
             .map(|(name, p)| (name, p - self.agg.critique_mean.get(&(media, name)).copied().unwrap_or(0.0)))

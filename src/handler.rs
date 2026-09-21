@@ -417,12 +417,17 @@ pub(crate) fn health_state(
             "a JustWatch chart returned far fewer usable titles than it carried; rows may be short",
         ))
     } else if store_unusable {
-        // The store is what More Like This ranks on. Without it the rail silently falls back to vectors
-        // and labels — every request still answers, and answers worse, which is the shape of failure
-        // `den-update`'s probe exists to catch and cannot see unless it is named here.
+        // The store is what More Like This ranks on. Without it the rail silently falls back to the
+        // pre-pooled scorer — every request still answers, and answers worse, which is the shape of
+        // failure `den-update`'s probe exists to catch and cannot see unless it is named here.
+        //
+        // "no store" covers both ways it happens, deliberately: a manifest that declares one atlas
+        // cannot read, and a manifest that declares none. The detail line is the one sentence an
+        // operator gets, and naming only the first would misdescribe the case that actually fires when
+        // an atlas that wants a store meets a generation published before stores existed.
         Some((
             "store_unusable",
-            "the dataset declares a store that did not read; More Like This runs on vectors and labels",
+            "no usable store; More Like This falls back to the pre-pooled scorer (premise index only)",
         ))
     } else if facts_unusable {
         // Everything still answers, from labels and facets alone — which is why it is invisible without this:

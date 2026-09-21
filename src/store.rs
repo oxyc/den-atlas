@@ -76,24 +76,20 @@ impl MappedStore {
     /// Atlas's previous failure mode was the opposite: a facts file that would not parse was discovered
     /// per-feature, so `/recommend`, people search and `imdbId` went quiet one at a time while `/health`
     /// stayed green. A store either has what serving needs or it is not a store we can serve.
-    pub fn check(&self) -> Result<(), StoreError> {
+    /// `agg` so the rail's own constructor can be the thing that is checked — see below.
+    pub fn check(&self, agg: &crate::rail::RailAggregates) -> Result<(), StoreError> {
         let view = self.view();
-        view.per_row::<u64>("keys")?;
         view.strings()?;
-        // The facet arrays and the critique block: the rail's two heaviest terms.
-        view.column::<u32>("facet_v")?;
-        view.column::<u8>("facet_c")?;
-        view.column::<u8>("critique")?;
-        view.column::<u32>("critique_names")?;
-        view.per_row::<u8>("world")?;
-        // The nouls. These are why this function was rewritten: the first version required `makers`,
-        // `cast` and `genres` — none of which the rail reads from the store, since authorship still
-        // comes from the facts — and required none of these. `SeedFacets::nouls` swallows a read error
-        // and returns empty, so a store missing them silently dropped the W_NOUL = 1.60 term on every
-        // request, with no log line and no health signal. Exactly what this exists to prevent.
-        view.column::<u32>("noul_names")?;
-        view.list::<u8>("noul_k_v", "noul_k_o")?;
-        view.list::<u8>("noul_v_v", "noul_v_o")?;
+        // Everything the rail reads, checked by BUILDING the rail's view of the store rather than by a
+        // second list of section names. The first version of this function listed `makers`, `cast` and
+        // `genres` — none of which the rail reads, since authorship still comes from the facts — and
+        // listed none of the nouls; `SeedFacets::nouls` swallowed a read error and returned empty, so a
+        // store missing them dropped the W_NOUL = 1.60 term on every request with no log line and no
+        // health signal. Replacing the list with the constructor is what stops that recurring: there is
+        // now no way to add a column the rail needs and forget to require it here.
+        //
+        // The media type is immaterial — it only packs the search key — so movie stands for both.
+        crate::rail::SeedFacets::new(&view, agg, den_index::MediaType::Movie)?;
         Ok(())
     }
 }
@@ -112,8 +108,9 @@ pub struct LoadedStore {
 impl LoadedStore {
     pub fn open(path: &Path) -> Result<Self, String> {
         let store = MappedStore::open(path)?;
-        store.check().map_err(|e| format!("{}: {e}", path.display()))?;
+        // The aggregates first: `check` proves the rail can be built, and the rail borrows them.
         let aggregates = crate::rail::RailAggregates::build(&store.view())?;
+        store.check(&aggregates).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self { store, aggregates })
     }
 
@@ -141,8 +138,10 @@ pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
     if path.is_file() {
         return Some(path);
     }
-    if std::env::var("DEN_SPEC_OPTIONAL").is_ok() {
-        eprintln!("SKIP: den-spec absent and DEN_SPEC_OPTIONAL is set");
+    // `== "1"`, not `is_ok()`. Any-value-skips means `DEN_SPEC_OPTIONAL=0`, set by someone turning
+    // skipping OFF, silently turns it on — the exact failure this helper exists to stop.
+    if std::env::var("DEN_SPEC_OPTIONAL").as_deref() == Ok("1") {
+        eprintln!("SKIP: den-spec absent and DEN_SPEC_OPTIONAL=1");
         return None;
     }
     panic!(
@@ -169,7 +168,8 @@ mod tests {
         };
         let store = MappedStore::open(std::path::Path::new(&path)).expect("the store maps");
         assert!(store.rows() > 40_000, "a real store has the corpus in it, got {}", store.rows());
-        store.check().expect("every section serving needs");
+        let agg = crate::rail::RailAggregates::build(&store.view()).expect("aggregates");
+        store.check(&agg).expect("every section serving needs");
 
         // The mapping is lazy, so reading a column is what proves the offsets address real pages.
         let view = store.view();
@@ -190,7 +190,8 @@ mod tests {
         let store = MappedStore::open(&path).expect("the fixture maps");
         assert_eq!(store.dataset_version(), "fixture");
         assert_eq!(store.rows(), 3);
-        store.check().expect("the fixture has every section serving needs");
+        let agg = crate::rail::RailAggregates::build(&store.view()).expect("aggregates");
+        store.check(&agg).expect("the fixture has every section serving needs");
     }
 
     /// Both ways a file can fail to be a store, and each must say WHICH — "could not load the dataset"
