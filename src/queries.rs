@@ -227,8 +227,12 @@ impl IndexQueries {
         let facets = count(indexes.facets.as_ref().map(FacetIndex::len));
         let facts = count(indexes.facts.as_ref().map(Facts::len));
         let plot_facets = count(indexes.plot_facets.as_ref().map(PlotFacets::len));
+        // The store gets counted like everything else. It was the one part of the load that reported no
+        // number, in a log line whose whole job is to say what arrived — so the artifact More Like This
+        // ranks on was the one you could not confirm had loaded without reading /health.
+        let store = count(indexes.store.as_ref().map(|s| s.store.rows()));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, in {:.1}s ({phases})",
+            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, store {store}, in {:.1}s ({phases})",
             indexes.plot.len(),
             took.as_secs_f64()
         );
@@ -431,7 +435,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     });
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, rail facets {}, display {}",
+        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, store {}, display {}",
         seconds(plot_took),
         seconds(premise_took),
         seconds(facts_took),
