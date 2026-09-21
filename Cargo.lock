@@ -193,6 +193,7 @@ dependencies = [
  "bytes",
  "den-index",
  "den-store",
+ "den-sync",
  "den-titlesearch",
  "flate2",
  "httpdate",
@@ -218,6 +219,15 @@ version = "0.1.0"
 source = "git+https://github.com/oxyc/den-core.git?tag=den-store-v1.2#6fc658fb8f75747ec4ef364dfae9faa1119c9f24"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "den-sync"
+version = "0.1.0"
+source = "git+https://github.com/oxyc/den-core.git?tag=den-sync-v1#d59c9fd829ea292a6730b5f0175f12a21e3097b5"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -16,6 +16,12 @@ path = "src/main.rs"
 # owns the bytes. Pinned to a tag: this is a binary format contract, and Cargo.lock should say which
 # version of it this build reads.
 den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v1.2" }
+# The taste tilt's COMPOSITION — the weights, the squared dislike, the era curve — from the same repository.
+# A row ordered here and a page ordered on the tvOS app or in Den Web run the SAME arithmetic, which is the
+# only reason the three cannot drift. By TAG, like the store above: a policy contract wants one version per
+# build for the same reason a binary format does, and a revision says which commit where a tag says which
+# contract.
+den-sync = { git = "https://github.com/oxyc/den-core.git", tag = "den-sync-v1" }
 memmap2 = "0.9"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }

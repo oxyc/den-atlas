@@ -27,6 +27,7 @@
 
 use crate::queries::Indexes;
 use den_index::MediaType;
+use den_sync::{Era, Signals, Weights};
 /// Only the sidecar readers below parse JSON, and only tests call them.
 #[cfg(test)]
 use serde::Deserialize;
@@ -336,16 +337,207 @@ pub fn posters_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, B
         .collect())
 }
 
+/// The most titles one taste list may name. The same cap `POST /index/score` puts on a candidate list, for
+/// the same reason: a centroid over more than this is not a better centroid, and the list travels in a URL.
+const MAX_TASTE: usize = 500;
+
+/// The prefix every tilt parameter carries, so a household's taste can never be mistaken for a facet
+/// constraint — `tilt.liked` is not an axis called `tilt.liked` — whatever axes the store grows.
+pub(crate) const TILT_PREFIX: &str = "tilt.";
+
+/// A household's taste, as a row query asks for it.
+///
+/// # Why this is a request parameter and not a stored profile
+///
+/// atlas holds no household state: the same corpus answers everyone, and a row is a function of what the
+/// request said. That is also what keeps the answer cacheable — a page is a slice of an order that is fixed
+/// for (row, taste, weights), so page 3 is the same work as page 1 and neither can disagree with the other.
+///
+/// # The weights are parameters too
+///
+/// All four levers arrive per request (`tilt.w.*`), defaulting to den-core's. Baking them in is what takes
+/// them away from a tuner, and retrofitting that later is the expensive version.
+pub struct Tilt {
+    /// The liked and disliked titles, as `Index::centroid` takes them.
+    liked: Vec<(u32, MediaType)>,
+    disliked: Vec<(u32, MediaType)>,
+    /// The household's era curve, fitted by the CLIENT from its own library years (den-core's
+    /// `Era::from_samples`). Present means the era term is on: a row already fixed to an era — a decade row
+    /// — simply leaves it out, and atlas never invents a curve it was not given.
+    era: Option<Era>,
+    weights: Weights,
+    /// FNV-1a over the canonical taste: the liked and disliked sets, deduplicated and sorted, and the era
+    /// curve. Deduplicated and sorted because `liked=m2,m1` and `liked=m1,m2,m1` are the SAME taste and must
+    /// share one memo entry and one order — a fingerprint over the raw query string would fork both.
+    ///
+    /// It is the household's taste and nothing else, so it changes exactly when the liked/disliked sets do,
+    /// and it is sixteen hex digits: cheap to compute, cheap to send, cheap to log.
+    taste: String,
+    /// The four levers, fingerprinted apart from the taste, so a memo key says which of the two moved.
+    weights_key: String,
+}
+
+impl Tilt {
+    /// The tilt a row query asks for, or `None` when it asks for none.
+    ///
+    /// Never an error. An unparseable id, a malformed number or an axis this does not know is skipped, and a
+    /// query that leaves nothing to tilt WITH — no liked titles, no disliked titles, no era curve — is no
+    /// tilt at all, which orders the row byte-identically to a request that named no taste. Degrading to
+    /// today's row is always available; refusing the request is not.
+    pub fn parse(query: &str) -> Option<Tilt> {
+        let value = |key: &str| crate::handler::query_param(query, &format!("{TILT_PREFIX}{key}"));
+        let liked = titles(value("liked").as_deref());
+        let disliked = titles(value("disliked").as_deref());
+        let era = value("era").as_deref().and_then(pair).map(|(center, spread)| Era { center, spread });
+        if liked.is_empty() && disliked.is_empty() && era.is_none() {
+            return None;
+        }
+        let number = |key: &str| value(key).and_then(|v| v.parse::<f64>().ok());
+        let default = Weights::default();
+        let weights = Weights {
+            embedding: number("w.embedding").unwrap_or(default.embedding),
+            dislike: number("w.dislike").unwrap_or(default.dislike),
+            era: number("w.era").unwrap_or(default.era),
+            // Anything but an explicit `0` keeps the squaring, which is what makes the dislike weight safe.
+            square_dislike: value("w.square").map_or(default.square_dislike, |v| v != "0"),
+        };
+        let canonical = |titles: &[(u32, MediaType)]| {
+            let keys: std::collections::BTreeSet<(MediaType, u32)> =
+                titles.iter().map(|&(id, kind)| (kind, id)).collect();
+            keys.iter().map(|&(kind, id)| format!("{}{id}", media_letter(kind))).collect::<Vec<_>>().join(",")
+        };
+        let era_text = era.map_or_else(|| "-".to_owned(), |e| format!("{:.6},{:.6}", e.center, e.spread));
+        Some(Tilt {
+            taste: crate::util::fnv1a(&format!(
+                "l:{};d:{};e:{era_text}",
+                canonical(&liked),
+                canonical(&disliked)
+            )),
+            weights_key: crate::util::fnv1a(&format!(
+                "{:.6},{:.6},{:.6},{}",
+                weights.embedding,
+                weights.dislike,
+                weights.era,
+                u8::from(weights.square_dislike)
+            )),
+            liked,
+            disliked,
+            era,
+            weights,
+        })
+    }
+
+    /// `order`, reordered for this household — a PERMUTATION of it and nothing else.
+    ///
+    /// The whole row, not a page: the order is computed over every title the row holds, so a title on page 3
+    /// can be lifted onto page 1. That is the ceiling a client-side tilt cannot pass, since it only ever sees
+    /// the page it loaded.
+    ///
+    /// The composition is den-core's `tilt::order`, not a copy of it. atlas measures the cosines — they need
+    /// the vector space, which is why they are here — and den-core decides what they are worth.
+    fn applied(&self, indexes: &Indexes, order: &[Key], cards: &HashMap<Key, Card>) -> Vec<Key> {
+        let index = &indexes.plot;
+        let liked = index.centroid(&self.liked);
+        let disliked = index.centroid(&self.disliked);
+        // A household whose titles the corpus does not hold has no centroid, and with no era curve either
+        // there is nothing to tilt by. The row it gets is today's row.
+        if liked.is_none() && disliked.is_none() && self.era.is_none() {
+            return order.to_vec();
+        }
+        let signals: Vec<Signals> = order
+            .iter()
+            .map(|&key| {
+                let (media_type, id) = key;
+                let boost = |centroid: &Option<Vec<f64>>| {
+                    centroid.as_ref().map_or(0.0, |c| index.taste_boost(id, media_type, c))
+                };
+                Signals {
+                    taste: boost(&liked),
+                    dislike: boost(&disliked),
+                    // Off the card the row already draws, so the era term costs no lookup of its own.
+                    year: cards.get(&key).and_then(|c| c.year).and_then(|y| i32::try_from(y).ok()),
+                }
+            })
+            .collect();
+        let curve = self.era.unwrap_or(Era { center: 0.0, spread: 0.0 });
+        let permutation = den_sync::order(&signals, &self.weights, &curve, self.era.is_some());
+        // Reorder only. A tilt that returned anything but a permutation would drop or duplicate a title,
+        // which reads as a filter and invalidates every page already scrolled past — so an answer that is
+        // not one leaves the row exactly as it arrived.
+        let mut seen = vec![false; order.len()];
+        let mut tilted = Vec::with_capacity(order.len());
+        for &i in &permutation {
+            match order.get(i) {
+                Some(&key) if !std::mem::replace(&mut seen[i], true) => tilted.push(key),
+                _ => {
+                    eprintln!(
+                        "tilt: the policy returned {} indices for {} titles — keeping the incoming order",
+                        permutation.len(),
+                        order.len()
+                    );
+                    return order.to_vec();
+                }
+            }
+        }
+        if tilted.len() != order.len() {
+            eprintln!(
+                "tilt: {} titles ordered of {} — keeping the incoming order",
+                tilted.len(),
+                order.len()
+            );
+            return order.to_vec();
+        }
+        tilted
+    }
+}
+
+/// `m550,t1396` → the titles it names. An entry this cannot read is skipped, not fatal.
+fn titles(list: Option<&str>) -> Vec<(u32, MediaType)> {
+    let Some(list) = list.filter(|l| !l.is_empty()) else { return Vec::new() };
+    list.split(',')
+        .filter_map(|entry| {
+            let (letter, id) = entry.split_at_checked(1)?;
+            let media_type = match letter {
+                "m" => MediaType::Movie,
+                "t" => MediaType::Tv,
+                _ => return None,
+            };
+            Some((id.parse().ok()?, media_type))
+        })
+        .take(MAX_TASTE)
+        .collect()
+}
+
+/// `2004.5,12` → the pair it names, when both halves read as numbers.
+fn pair(text: &str) -> Option<(f64, f64)> {
+    let (a, b) = text.split_once(',')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// The letter a taste list spells a type with, and the canonical fingerprint sorts on.
+fn media_letter(media_type: MediaType) -> char {
+    match media_type {
+        MediaType::Movie => 'm',
+        MediaType::Tv => 't',
+    }
+}
+
 /// A row: the titles of `media_type` carrying every constraint, most confident first, then most voted — each as
 /// the card a client draws, with what its hide rules read — `skip` then `limit` of them, and how many there are.
 /// A constraint is a plot facet (`tone=bleak`) or one of the labels (`mood=Feel-good`, `subgenre=Heist`), and
 /// they combine. A title with no card is left out, since there is nothing to draw. "Most voted" reads TMDB's
 /// popularity in its daily `export` for a title facets.bin has no votes for.
+///
+/// `tilt` reorders the WHOLE row for a household before the page is cut, so a title the untilted order puts
+/// on page 3 can lead page 1 — the ceiling a client-side tilt over an already-loaded page cannot pass. It
+/// never filters and never changes `total`: the tilted order is a permutation of the untilted one, memoised
+/// beside it.
 pub fn row(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
     media_type: MediaType,
     constraints: &[(String, String)],
+    tilt: Option<&Tilt>,
     skip: usize,
     limit: usize,
 ) -> serde_json::Value {
@@ -357,7 +549,8 @@ pub fn row(
     let mut named: Vec<String> = constraints.iter().map(|(axis, value)| format!("{axis}={value}")).collect();
     named.sort_unstable();
     let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
-    let order = indexes.row_order(format!("{kind}?{}", named.join("&")), || {
+    let row_key = format!("{kind}?{}", named.join("&"));
+    let order = indexes.row_order(row_key.clone(), || {
         let (labels, plot): (Vec<_>, Vec<_>) =
             constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
         let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
@@ -395,6 +588,15 @@ pub fn row(
         matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
         matched.into_iter().map(|(key, _, _)| key).collect()
     });
+    // The household's order, memoised BESIDE the untilted one — per (row x taste fingerprint x weights), so
+    // every page of this row for this household is a slice of one order and the two cannot disagree. The
+    // untilted key is untouched, so a request that names no taste shares the entry every other one does.
+    let order = match tilt {
+        Some(tilt) => indexes.row_order(format!("{row_key}|t{}|w{}", tilt.taste, tilt.weights_key), || {
+            tilt.applied(indexes, &order, cards)
+        }),
+        None => order,
+    };
     let total = order.len();
     let titles: Vec<serde_json::Value> = order
         .iter()
@@ -427,7 +629,15 @@ pub fn row(
             title
         })
         .collect();
-    serde_json::json!({ "titles": titles, "total": total, "coverage": coverage })
+    let mut answer = serde_json::json!({ "titles": titles, "total": total, "coverage": coverage });
+    // Which order this page is a slice of, for a client that pages a row while the household's taste moves:
+    // a page whose `taste` differs from the one before it came from a different order, so the two must not
+    // be concatenated. Absent when no taste was sent, which keeps an untilted answer byte-identical to the
+    // one this route gave before rows could be tilted at all.
+    if let Some(tilt) = tilt {
+        answer["taste"] = serde_json::json!(tilt.taste);
+    }
+    answer
 }
 
 /// The confidence a label row needs (the label rows' own floor).
@@ -529,6 +739,69 @@ pub(crate) mod tests {
         "tv:4": {"ending": {"value": "bittersweet", "confidence": "high"}}
       }
     }"#;
+
+    /// The fingerprint is over the TASTE, not over the query string that carried it: the same liked and
+    /// disliked sets written differently must share one memo entry and one order, or two pages of a row
+    /// could come from two orders and a scroll would repeat or skip titles.
+    #[test]
+    fn the_taste_fingerprint_is_over_the_set_not_the_spelling() {
+        let fp = |query: &str| Tilt::parse(query).map(|t| t.taste);
+        assert_eq!(fp("tilt.liked=m1,t4"), fp("tilt.liked=t4,m1,m1"), "order and repeats don't fork it");
+        assert_ne!(fp("tilt.liked=m1"), fp("tilt.liked=m1,m2"), "a title added changes it");
+        assert_ne!(fp("tilt.liked=m1"), fp("tilt.disliked=m1"), "liked is not disliked");
+        assert_ne!(fp("tilt.liked=m1"), fp("tilt.liked=t1"), "a movie is not a series");
+        assert_ne!(fp("tilt.liked=m1&tilt.era=2010,10"), fp("tilt.liked=m1"), "the era curve is taste too");
+        // The levers are fingerprinted apart, so the memo key says which of the two moved.
+        let weights = |query: &str| Tilt::parse(query).map(|t| t.weights_key);
+        assert_eq!(fp("tilt.liked=m1&tilt.w.dislike=0.9"), fp("tilt.liked=m1"));
+        assert_ne!(weights("tilt.liked=m1&tilt.w.dislike=0.9"), weights("tilt.liked=m1"));
+    }
+
+    /// Nothing to tilt WITH is no tilt: the row is ordered, and answered, exactly as it was before rows
+    /// could be tilted at all. An unreadable taste degrades to the same place rather than to an error.
+    #[test]
+    fn a_taste_that_names_nothing_is_no_tilt() {
+        for query in [
+            "",
+            "tilt.liked=&tilt.disliked=",
+            // Weights with no taste change nothing, so they are not a tilt either.
+            "tilt.w.embedding=2&tilt.w.dislike=0.9",
+            // Unreadable ids: an entry with no type letter, an unknown one, and a non-number.
+            "tilt.liked=550&tilt.disliked=x9,mabc",
+            // An era that is not a pair of numbers.
+            "tilt.era=recent",
+        ] {
+            assert!(Tilt::parse(query).is_none(), "{query:?}");
+        }
+        // And the shape that IS a tilt, so the cases above are not passing by a typo in the parser.
+        assert!(Tilt::parse("tilt.liked=m1").is_some());
+        assert!(Tilt::parse("tilt.era=2004.5,12").is_some());
+    }
+
+    /// The era term is on exactly when the household sent a curve. atlas never fits one itself — it has no
+    /// library years — so an absent curve is a row with no era term, not a row tilted toward this year.
+    #[test]
+    fn the_era_term_is_on_only_when_a_curve_was_sent() {
+        assert_eq!(Tilt::parse("tilt.liked=m1").unwrap().era, None);
+        assert_eq!(
+            Tilt::parse("tilt.liked=m1&tilt.era=2004.5,12").unwrap().era,
+            Some(Era { center: 2004.5, spread: 12.0 })
+        );
+    }
+
+    /// Each lever is independently overridable, and an omitted one keeps den-core's default — so a tuner
+    /// can move one weight without restating the other three, and a client that sends none ships what
+    /// den-core ships.
+    #[test]
+    fn every_weight_is_a_request_parameter_defaulting_to_den_cores() {
+        assert_eq!(Tilt::parse("tilt.liked=m1").unwrap().weights, Weights::default());
+        let tuned = Tilt::parse("tilt.liked=m1&tilt.w.dislike=0.9&tilt.w.square=0").unwrap().weights;
+        assert_eq!(
+            tuned,
+            Weights { dislike: 0.9, square_dislike: false, ..Weights::default() },
+            "one lever moved, the rest left alone"
+        );
+    }
 
     #[test]
     fn matches_every_constraint_at_the_lowest_confidence_and_only_of_one_type() {
