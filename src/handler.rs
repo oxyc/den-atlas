@@ -2110,6 +2110,15 @@ mod tests {
         assert_eq!(bittersweet["titles"][0]["posterPath"], "/2.jpg");
         // Movie 1: primary genre Drama, and crime and drama from its facts.
         assert_eq!(bittersweet["titles"][2]["genreIds"], serde_json::json!([18, 80]));
+        // `primaryGenre` is the one name a client DISPLAYS, beside the ids its hide rules filter on. The
+        // key is always present, `null` for a title the corpus does not label, so a client can tell "atlas
+        // does not know this one" from "this atlas is too old to say".
+        assert_eq!(bittersweet["titles"][0]["primaryGenre"], "Drama");
+        assert_eq!(bittersweet["titles"][1]["primaryGenre"], "Comedy", "movie 3 is the Comedy one");
+        assert!(
+            bittersweet["titles"][0].as_object().unwrap().contains_key("primaryGenre"),
+            "the key is present even when its value is null"
+        );
         let paged = json(
             body_of(get(&state, "/index/plot/movie.json?ending=bittersweet&skip=1&limit=1").await).await,
         );

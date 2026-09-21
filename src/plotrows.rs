@@ -267,6 +267,7 @@ pub fn row(
                 "posterPath": card.poster_path,
                 "year": card.year,
                 "genreIds": genres(indexes, key),
+                "primaryGenre": primary_genre(indexes, key),
             });
             // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
             // for it, a request a card.
@@ -301,6 +302,18 @@ fn label_confidence(indexes: &Indexes, (media_type, id): Key, family: &str, labe
         c if c >= LABEL_FLOOR => Some(1),
         _ => None,
     }
+}
+
+/// The one genre the labels call a title's own, for a client to DISPLAY — "Crime", not a list of ids.
+///
+/// `None` for a title the corpus does not label, which is most of them: atlas knows 47,618 titles and TMDB
+/// has millions, so any row drawn from a TMDB list carries titles this cannot answer for. A client falls
+/// back to naming `genreIds` itself; that fallback is the normal case on a new release, not an error.
+///
+/// Display is not filtering. Hide rules read `genres` above — TMDB ids, which both clients already sync
+/// under `den.excludedGenreIDs` — and must not be rewired to this.
+pub(crate) fn primary_genre(indexes: &Indexes, (media_type, id): Key) -> Option<&str> {
+    indexes.plot.labels(id, media_type).map(|l| l.primary_genre).filter(|g| !g.is_empty())
 }
 
 /// Every genre anything names for a title, as TMDB genre ids: the labels' primary genre and animation, and the
