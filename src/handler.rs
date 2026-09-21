@@ -2,12 +2,11 @@
 //! so unknown paths 404 and non-GET/HEAD 405.
 
 use crate::config::Config;
-use crate::dataset::{Blob, Dataset};
 use crate::descriptor::build_descriptor;
-use crate::http::{serve, Payload, Servable};
+use crate::http::{serve, Servable};
 use crate::manifest::manifest_json;
 use crate::titles;
-use crate::util::{fnv1a, json_response, public_origin, unavailable_response, RELOAD_WAIT};
+use crate::util::{fnv1a, json_response, unavailable_response, RELOAD_WAIT};
 use crate::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -181,7 +180,6 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     }
     let headers = req.headers().clone();
     let query = req.uri().query().unwrap_or("").to_owned();
-    let origin = public_origin(&headers, state.public_base.as_deref());
     let ds = state.dataset.as_ref();
 
     if route == "/metrics" {
@@ -249,7 +247,6 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
                 "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
                 None,
-                false,
             )
             .await,
         );
@@ -257,20 +254,15 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if route == "/dataset.json" {
         return crate::tos::trusted(match ds {
             Some(ds) => {
-                // The descriptor embeds absolute blob URLs built from the request's own
-                // host/scheme, so those headers are part of what the body says.
-                //
-                // No Last-Modified. The dataset's date is not this body's date: the origin and the
-                // embed/index flags change the body under the same date, so a client revalidating with
-                // If-Modified-Since alone would be told a changed descriptor had not changed. The ETag
-                // covers every byte.
+                // No Last-Modified. The dataset's date is not this body's date: the embed/index flags
+                // change the body under the same date, so a client revalidating with If-Modified-Since
+                // alone would be told a changed descriptor had not changed. The ETag covers every byte.
                 serve_json(
                     &method,
                     &headers,
-                    build_descriptor(&origin, ds, state.embed.is_some(), state.index.is_some()),
+                    build_descriptor(ds, state.embed.is_some(), state.index.is_some()),
                     "public, max-age=300, stale-while-revalidate=3600, stale-if-error=86400",
                     None,
-                    true,
                 )
                 .await
             }
@@ -279,41 +271,6 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 RELOAD_WAIT,
             ),
         });
-    }
-    // Blob routes exist only when the dataset loaded (their names come from the meta).
-    if let Some(ds) = ds {
-        if let Some(labels) = &ds.labels {
-            if route == format!("/{}", labels.name) {
-                return serve_blob(&method, &headers, &query, ds, labels).await;
-            }
-        }
-        if let Some(vectors) = &ds.vectors {
-            if route == format!("/{}", vectors.name) {
-                return serve_blob(&method, &headers, &query, ds, vectors).await;
-            }
-        }
-        if let Some(md) = &ds.metadata {
-            if route == format!("/{}", md.name) {
-                return serve_blob(&method, &headers, &query, ds, md).await;
-            }
-        }
-        // DT-H premise index blobs.
-        if let Some(pl) = &ds.premise_labels {
-            if route == format!("/{}", pl.name) {
-                return serve_blob(&method, &headers, &query, ds, pl).await;
-            }
-        }
-        if let Some(pv) = &ds.premise_vectors {
-            if route == format!("/{}", pv.name) {
-                return serve_blob(&method, &headers, &query, ds, pv).await;
-            }
-        }
-        // DT-I facet blob.
-        if let Some(f) = &ds.facets {
-            if route == format!("/{}", f.name) {
-                return serve_blob(&method, &headers, &query, ds, f).await;
-            }
-        }
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
         return crate::tos::trusted(handle_catalog(&method, &headers, rest, &config, &state).await);
@@ -555,7 +512,7 @@ async fn handle_catalog(
                 timing.push_str(", cache;desc=stale");
             }
             let mut resp =
-                serve_json(method, headers, crate::catalog::page_of(&r.body, skip), cc, None, false).await;
+                serve_json(method, headers, crate::catalog::page_of(&r.body, skip), cc, None).await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
             // state /health calls `stale_catalog`, so the row carries the same slug.
             if !r.fresh {
@@ -1330,7 +1287,7 @@ async fn handle_index(
         }
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
-    let resp = serve_json(method, headers, body, cache_control, None, false).await;
+    let resp = serve_json(method, headers, body, cache_control, None).await;
     with_timing(resp, &format!("{load}{phases}total;dur={}", ms(started.elapsed())))
 }
 
@@ -1354,8 +1311,7 @@ async fn handle_title_search(
         return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
     };
     let Some(index) = search.index() else {
-        let mut resp =
-            serve_json(method, headers, r#"{"metas":[]}"#.to_owned(), "no-store", None, false).await;
+        let mut resp = serve_json(method, headers, r#"{"metas":[]}"#.to_owned(), "no-store", None).await;
         resp.headers_mut().insert(DEGRADED, header::HeaderValue::from_static("title_index_building"));
         return resp;
     };
@@ -1363,29 +1319,22 @@ async fn handle_title_search(
     let body = titles::metas_json(&index, &query, media_type);
     let searched = started.elapsed();
     let resp =
-        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=3600", None, false)
-            .await;
+        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=3600", None).await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
 /// The embedded landing/configure page — served through the conditional layer so it gets a strong ETag
 /// + `If-None-Match`/304 for free, plus a modest TTL (the page changes only on redeploy).
 async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'static str) -> Response {
-    let etag = fnv1a(html);
-    let bytes = Bytes::from_static(html.as_bytes());
-    let size = bytes.len() as u64;
     serve(
         method,
         headers,
         Servable {
-            etag_base: etag,
+            etag_base: fnv1a(html),
             content_type: "text/html; charset=utf-8".to_owned(),
             cache_control: "public, max-age=3600, stale-while-revalidate=600".to_owned(),
             last_modified: None,
-            size,
-            identity: Payload::Memory(bytes),
-            gzip: None,
-            vary_on_origin: false,
+            body: Bytes::from_static(html.as_bytes()),
         },
     )
     .await
@@ -1397,58 +1346,19 @@ async fn serve_json(
     body: String,
     cache_control: &str,
     last_modified: Option<String>,
-    vary_on_origin: bool,
 ) -> Response {
-    let etag = fnv1a(&body);
-    let bytes = Bytes::from(body.into_bytes());
-    let size = bytes.len() as u64;
     serve(
         method,
         headers,
         Servable {
-            etag_base: etag,
+            etag_base: fnv1a(&body),
             content_type: "application/json".to_owned(),
             cache_control: cache_control.to_owned(),
             last_modified,
-            size,
-            identity: Payload::Memory(bytes),
-            gzip: None,
-            vary_on_origin,
+            body: Bytes::from(body.into_bytes()),
         },
     )
     .await
-}
-
-async fn serve_blob(
-    method: &Method,
-    headers: &axum::http::HeaderMap,
-    query: &str,
-    ds: &Dataset,
-    blob: &Blob,
-) -> Response {
-    let started = Instant::now();
-    // `?v=<current datasetVersion>` ⇒ immutable for a year; a bare request revalidates.
-    let pinned = query_param(query, "v").as_deref() == Some(ds.meta.dataset_version.as_str());
-    let cache_control =
-        if pinned { "public, max-age=31536000, immutable" } else { "public, max-age=3600" }.to_owned();
-    let gzip = blob.gz.as_ref().map(|g| (Payload::VerifiedFile(g.path.clone(), g.identity.clone()), g.size));
-    let resp = serve(
-        method,
-        headers,
-        Servable {
-            etag_base: blob.sha256.clone(),
-            content_type: blob.content_type.to_owned(),
-            cache_control,
-            last_modified: ds.last_modified.clone(),
-            size: blob.size,
-            identity: Payload::VerifiedFile(blob.path.clone(), blob.identity.clone()),
-            gzip,
-            vary_on_origin: false, // a blob body carries no origin-derived URLs
-        },
-    )
-    .await;
-    // A blob has one phase — the body streams after this, so `total` is time to the response head.
-    crate::tos::trusted(with_timing(resp, &format!("total;dur={}", ms(started.elapsed()))))
 }
 
 /// First value of `key` in a `k=v&k2=v2` query string (the datasetVersion is hex, so no percent-decoding).
@@ -1645,11 +1555,12 @@ mod tests {
             .contains(r#""reason":"dataset_unavailable""#));
     }
 
-    /// The descriptor's Vary depends on ONE bool at its call site, and flipping it left the whole
-    /// suite green — the fix was in `http.rs` with nothing checking it was actually wired up. This
-    /// goes through `handle`, so the route, the flag and the header are all on the hook.
+    /// The descriptor used to embed absolute blob URLs built from the request's own forwarded
+    /// host/scheme, so it named those headers in `Vary` or a shared cache handed one requester's
+    /// chosen origin to everyone. It points at nothing now, so the body is the same for every
+    /// requester and a `Vary` on it would split a cache for no reason.
     #[tokio::test]
-    async fn the_descriptor_route_varies_on_the_origin_it_embeds() {
+    async fn the_descriptor_is_the_same_for_every_requester() {
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
 
@@ -1665,27 +1576,26 @@ mod tests {
         let ds = crate::dataset::Dataset::load(&dir).expect("fixture dataset must load");
 
         let state = Arc::new(AppState::for_test(Some(ds)));
-        let req = HttpRequest::builder()
-            .uri("/dataset.json")
-            .header("x-forwarded-host", "atlas.example")
-            .body(Body::empty())
-            .unwrap();
-        let resp = handle(State(state), req).await;
-
-        assert_eq!(resp.status(), 200);
-        let vary = resp
-            .headers()
-            .get("vary")
-            .expect("the descriptor embeds the request origin but did not vary on it")
-            .to_str()
-            .unwrap()
-            .to_ascii_lowercase();
-        assert!(vary.contains("x-forwarded-host"), "{vary}");
+        let ask = |host: &'static str| {
+            let req = HttpRequest::builder()
+                .uri("/dataset.json")
+                .header("x-forwarded-host", host)
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap();
+            handle(State(Arc::clone(&state)), req)
+        };
+        let mine = ask("atlas.example").await;
+        assert_eq!(mine.status(), 200);
+        assert!(mine.headers().get("vary").is_none(), "the descriptor still varies on the request");
+        let mine = body_of(mine).await;
+        assert!(!mine.contains("atlas.example"), "the descriptor still embeds the request origin: {mine}");
+        assert_eq!(body_of(ask("someone.else").await).await, mine);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A one-title store, so a `Dataset::load` in a route test has the mandatory blob. The tests it
-    /// serves are about the manifest and the served blobs, not about what is in the store.
+    /// A one-title store, so a `Dataset::load` in a route test has the artifact a dataset needs. The
+    /// tests it serves are about the manifest and the descriptor, not about what is in the store.
     fn store_in(dir: &std::path::Path) {
         std::fs::create_dir_all(dir).unwrap();
         let title = crate::store::fixture::Title {
@@ -1698,21 +1608,10 @@ mod tests {
         crate::store::fixture::write(&dir.join("s.store"), "v9", 2, &[title], &[]);
     }
 
-    /// A dataset fixture whose two blobs are distinguishable by content, so a route test can prove
-    /// WHICH blob it served rather than merely that it served something.
+    /// A loadable dataset for a route test. The old manifest shape, sidecar declarations and all:
+    /// those keys are no longer read, and a release that still carries them must still serve.
     fn fixture(dir: &std::path::Path) -> crate::dataset::Dataset {
         store_in(dir);
-        std::fs::write(dir.join("labels.json"), b"LABELS").unwrap();
-        std::fs::write(dir.join("vectors.bin"), b"VECTORS!").unwrap();
-        // Every OPTIONAL blob the production dataset ships, not just some of them. With only the two
-        // mandatory ones the "every advertised URL is versioned" loop saw two URLs, so dropping the
-        // stamp from any optional blob passed; declaring metadata + facets but not the two premise
-        // blobs left exactly that hole open for premise, and a premise route serving the wrong blob
-        // passed too. The loop's floor below is tied to what this writes.
-        std::fs::write(dir.join("meta.json"), b"[]").unwrap();
-        std::fs::write(dir.join("facets.bin"), b"FACETS").unwrap();
-        std::fs::write(dir.join("premise-labels.json"), b"PLABELS").unwrap();
-        std::fs::write(dir.join("premise-vectors.bin"), b"PVECTORS").unwrap();
         std::fs::write(
             dir.join("dataset.meta.json"),
             br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
@@ -2538,84 +2437,39 @@ mod tests {
         assert_eq!(percent_decode("100%zz%2"), "100%zz%2");
     }
 
-    /// What each route SERVES, not merely that it answers. Every test in this file anchored a
-    /// previously-found bug, so swapping the labels and vectors routes, or serving every blob as
-    /// `immutable` regardless of `?v=`, or returning 200 for a missing dataset, all passed.
+    /// The blob routes are GONE, and a manifest that still declares the sidecars must not bring them
+    /// back — not as a route, and not as a URL in the descriptor. A client that still asks gets the
+    /// same 404 as any unknown path, which is the honest answer once the files are not published.
     #[tokio::test]
-    async fn each_route_serves_what_it_advertises() {
+    async fn the_blob_routes_are_gone_and_the_descriptor_names_no_files() {
         let dir = std::env::temp_dir().join(format!("den-atlas-routes-{}", std::process::id()));
         let state = Arc::new(AppState::for_test(Some(fixture(&dir))));
 
-        let labels = get(&state, "/labels.json").await;
-        assert_eq!(labels.status(), 200);
-        assert_eq!(body_of(labels).await, "LABELS", "the labels route served another blob");
-
-        let vectors = get(&state, "/vectors.bin").await;
-        assert_eq!(vectors.status(), 200);
-        assert_eq!(body_of(vectors).await, "VECTORS!", "the vectors route served another blob");
-
-        // ...and the optional blobs, whose routes were entirely uncovered.
-        let facets = get(&state, "/facets.bin").await;
-        assert_eq!(facets.status(), 200);
-        assert_eq!(body_of(facets).await, "FACETS", "the facets route served another blob");
-        let meta = get(&state, "/meta.json").await;
-        assert_eq!(meta.status(), 200);
-        assert_eq!(body_of(meta).await, "[]", "the metadata route served another blob");
-        let pl = get(&state, "/premise-labels.json").await;
-        assert_eq!(pl.status(), 200);
-        assert_eq!(body_of(pl).await, "PLABELS", "the premise-labels route served another blob");
-        let pv = get(&state, "/premise-vectors.bin").await;
-        assert_eq!(pv.status(), 200);
-        assert_eq!(body_of(pv).await, "PVECTORS", "the premise-vectors route served another blob");
-
-        // `?v=<current version>` pins for a year; a bare request must revalidate instead.
-        let pinned = get(&state, "/labels.json?v=v9").await;
-        let cc = pinned.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
-        assert!(cc.contains("immutable"), "a version-pinned blob was not immutable: {cc}");
-        let bare = get(&state, "/labels.json").await;
-        let cc = bare.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
-        assert!(!cc.contains("immutable"), "an unpinned blob was served immutable for a year: {cc}");
-
-        // EVERY advertised URL carries the version stamp, or the pin above is unusable for that
-        // blob. `contains("?v=v9")` is not enough — one stamped URL hides an unstamped sibling.
-        let desc = body_of(get(&state, "/dataset.json").await).await;
-        let urls: Vec<&str> = desc
-            .match_indices("\"url\":\"")
-            .map(|(i, m)| {
-                let rest = &desc[i + m.len()..];
-                &rest[..rest.find('"').unwrap_or(0)]
-            })
-            .collect();
-        // Exact, not a floor: a floor of 4 was satisfied by the mandatory pair plus metadata and
-        // facets, so the two premise URLs the fixture did not declare were never looked at.
-        assert_eq!(urls.len(), 6, "the descriptor did not advertise every fixture blob: {desc}");
-        for u in &urls {
-            assert!(u.contains("?v=v9"), "an advertised URL is unversioned: {u} (all: {urls:?})");
-        }
-        // WHICH blob each FIELD points at. Collecting the six names and sorting them destroys the
-        // binding that matters: transposing the premise labels/vectors entries — two adjacent,
-        // near-identical literals, the likeliest bug in that block — left the sorted set identical
-        // and passed. The sha and byte count travel with the URL, so they are checked together;
-        // a transposition moves all three.
-        let d: serde_json::Value = serde_json::from_str(&desc).expect("descriptor must be JSON");
-        for (path, name, sha, bytes) in [
-            (&["labels"][..], "labels.json", "a", 6u64),
-            (&["vectors"][..], "vectors.bin", "b", 8),
-            (&["metadata"][..], "meta.json", "c", 2),
-            (&["facets"][..], "facets.bin", "d", 6),
-            (&["premise", "labels"][..], "premise-labels.json", "e", 7),
-            (&["premise", "vectors"][..], "premise-vectors.bin", "f", 8),
+        // The fixture's manifest declares all six. Every one of their paths is an unknown route.
+        for gone in [
+            "/labels.json",
+            "/labels.json?v=v9",
+            "/vectors.bin",
+            "/meta.json",
+            "/facets.bin",
+            "/premise-labels.json",
+            "/premise-vectors.bin",
         ] {
-            let mut node = &d;
-            for k in path {
-                node = node.get(k).unwrap_or_else(|| panic!("descriptor has no {path:?}: {desc}"));
-            }
-            let url = node["url"].as_str().unwrap_or_default();
-            assert_eq!(url, format!("http://localhost/{name}?v=v9"), "{path:?} advertises the wrong blob");
-            assert_eq!(node["sha256"].as_str().unwrap_or_default(), sha, "{path:?} carries the wrong sha");
-            assert_eq!(node["bytes"].as_u64().unwrap_or_default(), bytes, "{path:?} carries the wrong size");
+            let resp = get(&state, gone).await;
+            assert_eq!(resp.status(), 404, "{gone} is still served");
+            assert_eq!(body_of(resp).await, r#"{"error":"not_found"}"#, "{gone}");
         }
+
+        // ...and the descriptor points at nothing, so no client learns those paths in the first place.
+        let desc = body_of(get(&state, "/dataset.json").await).await;
+        assert!(!desc.contains("\"url\""), "the descriptor still advertises a blob URL: {desc}");
+        let d: serde_json::Value = serde_json::from_str(&desc).expect("descriptor must be JSON");
+        for gone in ["labels", "vectors", "metadata", "premise", "facets"] {
+            assert!(d.get(gone).is_none(), "the descriptor still carries {gone}: {desc}");
+        }
+        // What it does say: the store's own row count and the space its vectors live in.
         assert!(desc.contains("\"count\":1"), "{desc}");
+        assert!(desc.contains(r#""embeddingModel":"m""#) && desc.contains(r#""dims":2"#), "{desc}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2670,8 +2524,6 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(handle(State(Arc::clone(&state)), matching).await.status(), 304);
-        // A blob is the dataset's own bytes, so it keeps the date.
-        assert!(get(&state, "/labels.json").await.headers().get("last-modified").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2977,7 +2829,7 @@ mod tests {
             ("refused /metrics", get_metrics(&state, Some("Bearer wrong")).await, 404),
             ("unknown path", get(&state, "/nope").await, 404),
             ("/health", get(&state, "/health").await, 200),
-            ("blob", get(&state, "/labels.json").await, 200),
+            ("/dataset.json", get(&state, "/dataset.json").await, 200),
             ("304", send("GET", "/manifest.json", Some(("if-none-match", etag)), "").await, 304),
             ("unconfigured /embed", send("POST", "/embed", None, r#"{"text":"x"}"#).await, 503),
             ("wrong method", send("PUT", "/health", None, "").await, 405),

@@ -1,12 +1,16 @@
 //! Fail-closed guard at the HTTP serving boundary. Dataset publication already rejects expressive prose fields;
 //! this catches a future dynamic route (especially an MCP/TMDB hydration path) before the response leaves atlas.
+//!
+//! `verify_file` used to sit beside it, auditing the TMDB-derived metadata sidecar once at load because that
+//! file went out verbatim under `trusted` and so never reached `guard_response`. Nothing is served verbatim
+//! any more (#113): every TMDB-derived value atlas emits is built by a route and passes through
+//! `guard_response` below, so the boundary check is the whole guard.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::Path;
 
 const TRUSTED: HeaderName = HeaderName::from_static("x-den-internal-prose-source");
 const MAX_DYNAMIC_JSON: usize = 2 * 1024 * 1024;
@@ -51,21 +55,8 @@ pub fn prohibited(value: &Value) -> Vec<String> {
     found.into_iter().collect()
 }
 
-/// Verify a JSON artifact whose bytes will later be served verbatim. This is used for the TMDB-derived metadata
-/// sidecar; unlike the generated labels, it is not covered by the producer's ship guard.
-pub fn verify_file(path: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let value: Value = serde_json::from_reader(file).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    let keys = prohibited(&value);
-    if keys.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("{} carries prohibited prose field(s): {}", path.display(), keys.join(", ")))
-    }
-}
-
-/// Mark a response from a deliberately exempt source: the addon manifest/descriptor, provider catalog, or an
-/// already-audited immutable artifact. The marker is private and removed before the response leaves atlas.
+/// Mark a response from a deliberately exempt source: the addon manifest/descriptor, or the provider
+/// catalog. The marker is private and removed before the response leaves atlas.
 pub fn trusted(mut response: Response) -> Response {
     response.headers_mut().insert(TRUSTED, HeaderValue::from_static("1"));
     response

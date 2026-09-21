@@ -1,30 +1,19 @@
-//! HTTP caching + conditional-request layer — the port of `src/http.ts`, but the body layer STREAMS from
-//! disk (never loads a blob into RAM). One `serve` handles: strong ETag (+ distinct `-gzip` variant) with
-//! `If-None-Match`; `Last-Modified` + `If-Modified-Since` → 304; `HEAD`; `Range` → 206/416; gzip negotiation
-//! (`Vary` only when a gzip variant exists). Range is served on the identity representation only.
+//! HTTP caching + conditional-request layer — the port of `src/http.ts`. One `serve` handles: strong ETag
+//! with `If-None-Match`; `Last-Modified` + `If-Modified-Since` → 304; `HEAD`; `Range` → 206/416.
+//!
+//! Every body is now an in-memory one. The file-streaming path, its gzip variants and their `Vary` existed
+//! for the dataset blobs (`labels-*.json`, `vectors-*.bin`, the metadata sidecar, the premise pair,
+//! `facets.bin`), and those are no longer served (#113) — atlas answers questions about the store instead
+//! of handing out copies of it.
 
-use crate::util::log_due;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
-/// A body source: an in-memory buffer (small JSON) or a file streamed from disk (the big blobs).
-#[derive(Clone)]
-pub enum Payload {
-    Memory(Bytes),
-    #[cfg(test)]
-    File(PathBuf),
-    VerifiedFile(PathBuf, FileIdentity),
-}
-
-/// The file generation described by the startup metadata. A replacement must not inherit its
-/// predecessor's SHA, length or immutable URL. Writers stage on the same filesystem and rename,
-/// so an already-open response keeps its original inode while new requests refuse the replacement.
+/// The file generation described by the startup metadata, so a `Dataset::load` that overlaps a refresh
+/// cannot bind the new files to a descriptor read before it. Writers stage on the same filesystem and
+/// rename, so the two stats straddling the load see different inodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileIdentity {
     len: u64,
@@ -51,70 +40,24 @@ impl FileIdentity {
 }
 
 pub struct Servable {
-    /// Unquoted strong validator (sha256 for blobs, fnv for JSON).
+    /// Unquoted strong validator (the fnv of the body).
     pub etag_base: String,
     pub content_type: String,
     pub cache_control: String,
     pub last_modified: Option<String>,
-    /// Identity byte length.
-    pub size: u64,
-    pub identity: Payload,
-    /// Precomputed gzip body + its size (only where compression pays — the labels JSON).
-    pub gzip: Option<(Payload, u64)>,
-    /// The body embeds the request's forwarded host/scheme, so a shared cache must key on them.
-    pub vary_on_origin: bool,
+    pub body: Bytes,
 }
-
-/// How often a standing condition on the request path may be reported.
-const LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Response {
     let is_head = method == Method::HEAD;
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
-    // Range wins over gzip (byte offsets need the identity representation).
-    let wants_gzip = range_header.is_none() && s.gzip.is_some() && accepts_gzip(headers);
-    // The gzip variant is an OPTIMISATION, which is what `resolve_blob` says at load time: an
-    // unusable one drops the variant rather than taking the dataset down. Runtime has to agree, or a
-    // release that stops publishing a `.gz` — the sync deletes the undeclared file while the process
-    // is still serving the old meta — turns every `Accept-Encoding: gzip` request into a 503, which
-    // is every URLSession client, for a blob sitting readable on disk right beside it.
-    //
-    // Opened HERE, before the ETag, because the ETag names the representation being served: falling
-    // back after choosing `"<sha>-gzip"` would hand identity bytes to a cache under the gzip
-    // validator (RFC 9110 §8.8.3). The cost is one open on a request that turns out to be a 304.
-    let gz_open =
-        if wants_gzip { open_payload(&s.gzip.as_ref().unwrap().0, "the gzip variant").await } else { None };
-    let use_gzip = gz_open.is_some();
-    // Validate identity before a conditional 304 or HEAD too. Otherwise replacement bytes could
-    // still be blessed with the old validator without ever reaching the body-opening branch.
-    let mut identity_open = if !use_gzip {
-        let Some(open) = open_payload(&s.identity, "the blob").await else { return unavailable() };
-        Some(open)
-    } else {
-        None
-    };
-    // Distinct strong ETag per content-coding (RFC 9110 §8.8.3) — decided on the selected representation.
-    let etag = if use_gzip { format!("\"{}-gzip\"", s.etag_base) } else { format!("\"{}\"", s.etag_base) };
+    let size = s.body.len() as u64;
+    let etag = format!("\"{}\"", s.etag_base);
 
     let mut base: Vec<(&'static str, String)> = vec![
         ("etag", etag.clone()),
         ("cache-control", s.cache_control.clone()),
         ("accept-ranges", "bytes".to_owned()),
     ];
-    // `Vary` only when a gzip variant exists — else a CDN split-caches the identical identity blob per AE.
-    // The forwarded host/scheme are added by the caller for bodies that EMBED them (the descriptor's
-    // absolute blob URLs), because those are unkeyed request inputs a shared cache would otherwise
-    // ignore, handing one requester's chosen origin to everyone under the plain URL.
-    let mut vary: Vec<&str> = Vec::new();
-    if s.gzip.is_some() {
-        vary.push("Accept-Encoding");
-    }
-    if s.vary_on_origin {
-        vary.extend(["X-Forwarded-Host", "X-Forwarded-Proto", "Host"]);
-    }
-    if !vary.is_empty() {
-        base.push(("vary", vary.join(", ")));
-    }
     if let Some(lm) = &s.last_modified {
         base.push(("last-modified", lm.clone()));
     }
@@ -123,38 +66,34 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         return build(StatusCode::NOT_MODIFIED, &base, Body::empty());
     }
 
-    if let Some(rh) = &range_header {
+    if let Some(rh) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         // RFC 9110 §13.1.5: a Range with an If-Range that does not match the current representation
-        // must be answered with the WHOLE thing, not the requested slice. Ignoring it meant a client
-        // resuming a partial download across a dataset refresh spliced two datasets' bytes together
-        // under the new ETag — and since Range wins over gzip, a client that had received the gzip
-        // labels variant resumed with identity bytes spliced into a gzip stream. The sha256 check
-        // catches it, so the cost is a wasted download rather than corruption; this makes the resume
-        // work instead.
+        // must be answered with the WHOLE thing, not the requested slice.
         // A non-matching If-Range falls through to the full 200 below.
         if if_range_matches(headers, &etag, s.last_modified.as_deref()) {
-            match parse_range(rh, s.size) {
+            match parse_range(rh, size) {
                 RangeResult::Unsatisfiable => {
                     // NOT cacheable. This body depends entirely on the Range header, which is not in
-                    // any shared cache's key, so it inherited the blob's `immutable, max-age=1y` and
-                    // one client's bad Range could in principle pin a 416 on the blob for a year.
+                    // any shared cache's key, so it inherited the response's own `max-age` and one
+                    // client's bad Range could in principle pin a 416 on the URL for its whole TTL.
                     let mut h: Vec<(&'static str, String)> =
                         base.iter().filter(|(k, _)| *k != "cache-control").cloned().collect();
                     h.push(("cache-control", "no-store".to_owned()));
-                    h.push(("content-range", format!("bytes */{}", s.size)));
+                    h.push(("content-range", format!("bytes */{size}")));
                     h.push(("content-type", s.content_type.clone()));
                     return build(StatusCode::RANGE_NOT_SATISFIABLE, &h, Body::empty());
                 }
                 RangeResult::Range { start, end } => {
-                    // Opened before the 206 is built, and the handle carries the body, so the file
-                    // cannot vanish between the check and the read.
-                    let open = identity_open.take().expect("range selected identity");
                     let len = end - start + 1;
                     let mut h = base.clone();
                     h.push(("content-type", s.content_type.clone()));
-                    h.push(("content-range", format!("bytes {start}-{end}/{}", s.size)));
+                    h.push(("content-range", format!("bytes {start}-{end}/{size}")));
                     h.push(("content-length", len.to_string()));
-                    let body = if is_head { Body::empty() } else { range_body(open, start, len).await };
+                    let body = if is_head {
+                        Body::empty()
+                    } else {
+                        Body::from(s.body.slice(start as usize..(start + len) as usize))
+                    };
                     return build(StatusCode::PARTIAL_CONTENT, &h, body);
                 }
                 RangeResult::None => {} // malformed / multi-range → full 200
@@ -162,47 +101,10 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         }
     }
 
-    // The gzip variant is an OPTIMISATION, which is what `resolve_blob` says at load time: an
-    // unusable one drops the variant rather than taking the dataset down. Runtime has to agree, or a
-    // release that stops publishing a `.gz` — the sync deletes the undeclared file while the process
-    // still serves the old meta — turns every `Accept-Encoding: gzip` request into a 503, which is
-    // every URLSession client, for a blob sitting readable on disk right next to it.
-    let (open, size, encoding) = match gz_open {
-        Some(o) => (o, s.gzip.as_ref().unwrap().1, Some("gzip")),
-        None => {
-            // Only a missing IDENTITY blob is unserveable.
-            let o = identity_open.take().expect("identity was opened before validators");
-            (o, s.size, None)
-        }
-    };
-    if wants_gzip && encoding.is_none() {
-        // `resolve_blob` logs the same degradation at load time; this is its runtime twin, and
-        // without it every client silently drops to the full uncompressed blob.
-        //
-        // Reported HERE rather than where the fallback is decided, because that runs before the
-        // conditional check: a 304 serves nothing, and the line claimed it was serving identity.
-        // Throttled, because it describes a STATE that lasts the whole release-without-a-gz window,
-        // and one line per request is an amplifier.
-        static GZ_FALLBACK: AtomicU64 = AtomicU64::new(0);
-        if log_due(&GZ_FALLBACK, LOG_EVERY) {
-            eprintln!("serving {} as identity — its gzip variant is unusable", s.etag_base);
-        }
-    }
     let mut h = base;
-    // A FALLBACK is not a cacheable answer. The response is identity bytes under `Vary:
-    // Accept-Encoding`, so a shared cache would store it against the gzip key — and with `?v=` that
-    // is `immutable` for a year, long after the variant is back. Serving it is right; letting it
-    // outlive the condition is the mistake `unavailable()` already avoids for the same reason.
-    if wants_gzip && encoding.is_none() {
-        h.retain(|(k, _)| *k != "cache-control");
-        h.push(("cache-control", "no-store".to_owned()));
-    }
     h.push(("content-type", s.content_type.clone()));
     h.push(("content-length", size.to_string()));
-    if let Some(enc) = encoding {
-        h.push(("content-encoding", enc.to_owned()));
-    }
-    let body = if is_head { Body::empty() } else { full_body(open) };
+    let body = if is_head { Body::empty() } else { Body::from(s.body) };
     build(StatusCode::OK, &h, body)
 }
 
@@ -217,105 +119,6 @@ fn build(status: StatusCode, headers: &[(&'static str, String)], body: Body) -> 
         }
     }
     b.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-/// A payload with its file already OPEN, so the bytes a response promises are pinned before its
-/// status and `content-length` are chosen.
-///
-/// Checking readability and then reopening for the body is not enough: the file can vanish between
-/// the two opens, and the body helper's fallback then produces an empty body whose size hint hyper
-/// uses to rewrite `content-length` to 0. The result is a self-consistent 200 with the blob's real
-/// ETag and zero bytes — reproduced at 3 in 900 requests against an unlink-and-recreate loop —
-/// which under `?v=<version>` is `immutable, max-age=1y`, so a CDN pins a zero-length file as the
-/// blob's valid representation for a year. Holding the handle removes the window: an unlinked file
-/// stays readable through an open descriptor.
-enum Open {
-    Memory(Bytes),
-    File(tokio::fs::File),
-}
-
-async fn open_payload(p: &Payload, what: &str) -> Option<Open> {
-    match p {
-        Payload::Memory(b) => Some(Open::Memory(b.clone())),
-        #[cfg(test)]
-        Payload::File(path) => open_file(path, None, what).await,
-        Payload::VerifiedFile(path, identity) => open_file(path, Some(identity), what).await,
-    }
-}
-
-async fn open_file(path: &std::path::Path, expected: Option<&FileIdentity>, what: &str) -> Option<Open> {
-    match tokio::fs::File::open(path).await {
-        Ok(f) => {
-            if let Some(expected) = expected {
-                let actual = f.metadata().await.and_then(|m| FileIdentity::from_metadata(&m));
-                if actual.as_ref().ok() != Some(expected) {
-                    static CHANGED: AtomicU64 = AtomicU64::new(0);
-                    if log_due(&CHANGED, LOG_EVERY) {
-                        eprintln!(
-                            "dataset file changed since load ({}); reload the dataset before serving it",
-                            path.display()
-                        );
-                    }
-                    return None;
-                }
-            }
-            Some(Open::File(f))
-        }
-        Err(e) => {
-            // The real errno, not just "gone". EACCES and EMFILE both land here and neither is
-            // fixed by re-fetching the dataset, which is what the 503's detail text tells the
-            // operator to do. Swallowing it left the whole runtime blob path silent.
-            // Throttled: an unreadable blob is a standing condition, and a client can ask for
-            // it in a loop — measured at 28k lines and 4.8 MB of stderr per second on loopback,
-            // which fills a json-file log driver's disk and pushes everything else out of
-            // journald's rate limiter. One line a minute reports the same fact.
-            static OPEN_FAILED: AtomicU64 = AtomicU64::new(0);
-            if log_due(&OPEN_FAILED, LOG_EVERY) {
-                eprintln!("cannot open {what} ({}): {e}", path.display());
-            }
-            None
-        }
-    }
-}
-
-/// The blob is declared by the meta but could not be opened. `no-store`, because the whole problem
-/// with the old behaviour was a broken answer being cached; this one must never outlive the
-/// condition. `open_payload` has already logged the real errno — this text names the likeliest cause
-/// rather than the only one.
-fn unavailable() -> Response {
-    build(
-        StatusCode::SERVICE_UNAVAILABLE,
-        &[
-            ("content-type", "application/json".to_owned()),
-            ("cache-control", "no-store".to_owned()),
-            // A reload usually clears it; see util::RELOAD_WAIT.
-            ("retry-after", crate::util::RELOAD_WAIT.as_secs().to_string()),
-        ],
-        Body::from(
-            r#"{"error":"blob_unavailable","detail":"the dataset blob is missing, unreadable, or changed since load; see the server log and reload the dataset"}"#,
-        ),
-    )
-}
-
-fn full_body(p: Open) -> Body {
-    match p {
-        Open::Memory(b) => Body::from(b),
-        Open::File(f) => Body::from_stream(ReaderStream::new(f)),
-    }
-}
-
-async fn range_body(p: Open, start: u64, len: u64) -> Body {
-    match p {
-        Open::Memory(b) => {
-            let s = start as usize;
-            let e = (start + len) as usize;
-            Body::from(b.slice(s..e.min(b.len())))
-        }
-        Open::File(mut f) => {
-            let _ = f.seek(std::io::SeekFrom::Start(start)).await;
-            Body::from_stream(ReaderStream::new(f.take(len)))
-        }
-    }
 }
 
 /// Whether an `If-Range` precondition allows the range to be served.
@@ -353,21 +156,6 @@ pub fn is_not_modified(headers: &HeaderMap, etag_quoted: &str, last_modified: Op
         }
     }
     false
-}
-
-pub fn accepts_gzip(headers: &HeaderMap) -> bool {
-    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-    ae.split(',').any(|part| {
-        let mut it = part.trim().split(';');
-        let enc = it.next().unwrap_or("").trim();
-        if enc != "gzip" && enc != "*" {
-            return false; // `*` = any encoding (RFC 9110 §12.5.3)
-        }
-        match it.map(|p| p.trim()).find(|p| p.starts_with("q=")) {
-            None => true,
-            Some(qs) => qs[2..].parse::<f64>().map(|n| n > 0.0).unwrap_or(false), // honor q=0 / garbage
-        }
-    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -445,17 +233,13 @@ mod tests {
         h
     }
 
-    fn servable(gzip: bool) -> Servable {
-        let raw = Bytes::from(vec![b'x'; 1000]);
+    fn servable() -> Servable {
         Servable {
             etag_base: SHA.to_owned(),
             content_type: "application/octet-stream".to_owned(),
             cache_control: "public, max-age=3600".to_owned(),
             last_modified: Some(LAST_MODIFIED.to_owned()),
-            size: raw.len() as u64,
-            identity: Payload::Memory(raw.clone()),
-            gzip: if gzip { Some((Payload::Memory(Bytes::from(vec![b'z'; 40])), 40)) } else { None },
-            vary_on_origin: false,
+            body: Bytes::from(vec![b'x'; 1000]),
         }
     }
 
@@ -463,26 +247,23 @@ mod tests {
         axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
     }
 
-    #[tokio::test]
-    async fn a_replaced_file_cannot_inherit_the_loaded_generation() {
+    /// A replacement is a different generation even when it lands with the same length and mtime,
+    /// because it is a different inode. `Dataset::load` straddles its own read of dataset.meta.json
+    /// with this, so a load that overlaps a refresh refuses rather than binding new files to an old
+    /// descriptor.
+    #[test]
+    fn a_replaced_file_is_not_the_generation_that_was_loaded() {
         let dir = std::env::temp_dir().join(format!("atlas-generation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("blob");
         std::fs::write(&path, b"old-bytes!").unwrap();
         let stat = std::fs::metadata(&path).unwrap();
-        let identity = FileIdentity::from_metadata(&stat).unwrap();
-        let old = || {
-            let mut s = servable(false);
-            s.size = 10;
-            s.identity = Payload::VerifiedFile(path.clone(), identity.clone());
-            s.cache_control = "public, max-age=31536000, immutable".into();
-            s
-        };
-        let in_flight = serve(&Method::GET, &HeaderMap::new(), old()).await;
+        let loaded = FileIdentity::from_metadata(&stat).unwrap();
+        assert_eq!(FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap(), loaded);
+
         let next = dir.join("next");
         std::fs::write(&next, b"new-bytes!").unwrap();
-        // Even equal length and mtime cannot disguise a replacement inode on deployment targets.
-        #[cfg(unix)]
         std::fs::File::options()
             .write(true)
             .open(&next)
@@ -490,34 +271,15 @@ mod tests {
             .set_modified(stat.modified().unwrap())
             .unwrap();
         std::fs::rename(&next, &path).unwrap();
-        assert_eq!(body_bytes(in_flight).await, b"old-bytes!", "the open response retains its generation");
-        for (method, headers) in [
-            (Method::GET, HeaderMap::new()),
-            (Method::HEAD, HeaderMap::new()),
-            (Method::GET, hdrs(&[("if-none-match", "*")])),
-            (Method::GET, hdrs(&[("range", "bytes=0-2")])),
-        ] {
-            let resp = serve(&method, &headers, old()).await;
-            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{method}");
-            assert_eq!(resp.headers()["cache-control"], "no-store");
-            assert!(!resp.headers().contains_key("etag"));
-        }
-        let mut reloaded = old();
-        reloaded.identity = Payload::VerifiedFile(
-            path.clone(),
-            FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap(),
-        );
-        reloaded.etag_base = "new-sha".into();
-        let resp = serve(&Method::GET, &HeaderMap::new(), reloaded).await;
-        assert_eq!(resp.headers()["etag"], "\"new-sha\"");
-        assert_eq!(body_bytes(resp).await, b"new-bytes!");
+        let replaced = FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert_ne!(replaced, loaded, "a same-length, same-mtime replacement passed as the loaded file");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
     async fn t304_on_if_none_match() {
         let h = hdrs(&[("if-none-match", &format!("\"{SHA}\""))]);
-        let r = serve(&Method::GET, &h, servable(false)).await;
+        let r = serve(&Method::GET, &h, servable()).await;
         assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(r.headers().get("etag").unwrap(), &format!("\"{SHA}\""));
         assert!(body_bytes(r).await.is_empty());
@@ -526,24 +288,18 @@ mod tests {
     #[tokio::test]
     async fn t304_on_star_and_ims() {
         assert_eq!(
-            serve(&Method::GET, &hdrs(&[("if-none-match", "*")]), servable(false)).await.status(),
+            serve(&Method::GET, &hdrs(&[("if-none-match", "*")]), servable()).await.status(),
             StatusCode::NOT_MODIFIED
         );
         assert_eq!(
-            serve(&Method::GET, &hdrs(&[("if-modified-since", LAST_MODIFIED)]), servable(false))
-                .await
-                .status(),
+            serve(&Method::GET, &hdrs(&[("if-modified-since", LAST_MODIFIED)]), servable()).await.status(),
             StatusCode::NOT_MODIFIED
         );
         // Before the build time → 200.
         assert_eq!(
-            serve(
-                &Method::GET,
-                &hdrs(&[("if-modified-since", "Tue, 30 Jun 2026 00:00:00 GMT")]),
-                servable(false)
-            )
-            .await
-            .status(),
+            serve(&Method::GET, &hdrs(&[("if-modified-since", "Tue, 30 Jun 2026 00:00:00 GMT")]), servable())
+                .await
+                .status(),
             StatusCode::OK
         );
     }
@@ -551,70 +307,28 @@ mod tests {
     #[tokio::test]
     async fn t_inm_precedence_over_ims() {
         let h = hdrs(&[("if-none-match", "\"nope\""), ("if-modified-since", LAST_MODIFIED)]);
-        assert_eq!(serve(&Method::GET, &h, servable(false)).await.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn t_gzip_distinct_etag_and_vary() {
-        let h = hdrs(&[("accept-encoding", "gzip, deflate")]);
-        let r = serve(&Method::GET, &h, servable(true)).await;
-        assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
-        assert_eq!(r.headers().get("vary").unwrap(), "Accept-Encoding");
-        assert_eq!(r.headers().get("etag").unwrap(), &format!("\"{SHA}-gzip\""));
-        assert_eq!(body_bytes(r).await.len(), 40);
-    }
-
-    #[tokio::test]
-    async fn t_gzip_star_and_q0_and_absent() {
-        assert_eq!(
-            serve(&Method::GET, &hdrs(&[("accept-encoding", "*")]), servable(true))
-                .await
-                .headers()
-                .get("content-encoding")
-                .map(|v| v.to_str().unwrap().to_owned()),
-            Some("gzip".to_owned())
-        );
-        assert!(serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip;q=0")]), servable(true))
-            .await
-            .headers()
-            .get("content-encoding")
-            .is_none());
-        // Identity servable → no Vary.
-        assert!(serve(&Method::GET, &hdrs(&[]), servable(false)).await.headers().get("vary").is_none());
-        // Gzip servable → Vary present.
-        assert_eq!(
-            serve(&Method::GET, &hdrs(&[]), servable(true)).await.headers().get("vary").unwrap(),
-            "Accept-Encoding"
-        );
+        assert_eq!(serve(&Method::GET, &h, servable()).await.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn t_range_206_416() {
-        let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-9")]), servable(false)).await;
+        let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-9")]), servable()).await;
         assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(r.headers().get("content-range").unwrap(), "bytes 0-9/1000");
         assert_eq!(r.headers().get("content-length").unwrap(), "10");
         assert_eq!(body_bytes(r).await.len(), 10);
 
-        let sfx = serve(&Method::GET, &hdrs(&[("range", "bytes=-7")]), servable(false)).await;
+        let sfx = serve(&Method::GET, &hdrs(&[("range", "bytes=-7")]), servable()).await;
         assert_eq!(sfx.headers().get("content-range").unwrap(), "bytes 993-999/1000");
 
-        let un = serve(&Method::GET, &hdrs(&[("range", "bytes=2000-")]), servable(false)).await;
+        let un = serve(&Method::GET, &hdrs(&[("range", "bytes=2000-")]), servable()).await;
         assert_eq!(un.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(un.headers().get("content-range").unwrap(), "bytes */1000");
     }
 
     #[tokio::test]
-    async fn t_range_wins_over_gzip() {
-        let h = hdrs(&[("range", "bytes=0-9"), ("accept-encoding", "gzip")]);
-        let r = serve(&Method::GET, &h, servable(true)).await;
-        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
-        assert!(r.headers().get("content-encoding").is_none());
-    }
-
-    #[tokio::test]
     async fn t_head_no_body() {
-        let r = serve(&Method::HEAD, &hdrs(&[]), servable(false)).await;
+        let r = serve(&Method::HEAD, &hdrs(&[]), servable()).await;
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.headers().get("content-length").unwrap(), "1000");
         assert!(body_bytes(r).await.is_empty());
@@ -631,198 +345,25 @@ mod tests {
         assert_eq!(parse_range("nonsense", 100), RangeResult::None);
     }
 
-    /// A body that embeds the request's own host/scheme must name them in Vary, or a shared cache
-    /// serves one requester's chosen origin to everyone under the plain URL. The descriptor's blob
-    /// URLs are built from those headers and it goes out `public, max-age=300`.
-    /// A blob the meta declares but disk does not have used to go out as a 200 with the real ETag,
-    /// the declared content-length and NO bytes. Under `?v=<version>` that carries
-    /// `immutable, max-age=1y`, so a CDN pins a zero-length file as the valid representation for a
-    /// year and every client behind it fails its sha256 check with no way to recover.
-    #[tokio::test]
-    async fn a_declared_but_missing_blob_is_unavailable_not_an_empty_200() {
-        let missing = std::env::temp_dir().join(format!("den-atlas-gone-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
-        let mut s = servable(false);
-        s.identity = Payload::File(missing.clone());
-
-        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as success");
-        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
-        assert!(cc.contains("no-store"), "a broken answer was made cacheable: {cc}");
-        assert!(resp.headers().get("etag").is_none(), "the blob's ETag was attached to a failure");
-
-        // The range path too — it built its own 206 with the same empty body.
-        let mut s = servable(false);
-        s.identity = Payload::File(missing);
-        let r = serve(&Method::GET, &hdrs(&[("range", "bytes=0-99")]), s).await;
-        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "a missing blob was served as a 206");
-    }
-
-    /// The same fixture, but FILE-backed — which is what production always is (`handler.rs` builds
-    /// every blob from `Payload::File`). Every `serve` test used `Payload::Memory` for both
-    /// representations, so the `Open::File` arms were exercised once and never for byte correctness:
-    /// deleting the `seek` in `range_body`, taking the gzip content-length from the identity size,
-    /// and dropping `range_header.is_none()` from the gzip decision all passed 104 tests.
-    ///
-    /// Identity is 1000 bytes of ascending values so an offset is visible in the bytes themselves;
-    /// the "gzip" variant is 40 distinct bytes (not real gzip — nothing here decompresses).
-    fn file_servable(dir: &std::path::Path, gzip: bool) -> Servable {
-        std::fs::create_dir_all(dir).unwrap();
-        let raw: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let id = dir.join("blob.bin");
-        std::fs::write(&id, &raw).unwrap();
-        let gz = dir.join("blob.bin.gz");
-        std::fs::write(&gz, vec![b'z'; 40]).unwrap();
-        Servable {
-            etag_base: SHA.to_owned(),
-            content_type: "application/octet-stream".to_owned(),
-            cache_control: "public, max-age=31536000, immutable".to_owned(),
-            last_modified: Some(LAST_MODIFIED.to_owned()),
-            size: raw.len() as u64,
-            identity: Payload::File(id),
-            gzip: if gzip { Some((Payload::File(gz), 40)) } else { None },
-            vary_on_origin: false,
-        }
-    }
-
-    /// A Range forces the identity representation, so it must also carry the IDENTITY validator.
-    /// Serving identity bytes under `"<sha>-gzip"` is the RFC 9110 §8.8.3 hazard the ordering above
-    /// exists to prevent, and it is what a shared cache would then hand every later gzip request.
-    #[tokio::test]
-    async fn a_range_from_a_gzip_client_is_identity_bytes_under_the_identity_etag() {
-        let dir = std::env::temp_dir().join(format!("den-atlas-rgz-{}", std::process::id()));
-        let resp = serve(
-            &Method::GET,
-            &hdrs(&[("range", "bytes=100-109"), ("accept-encoding", "gzip")]),
-            file_servable(&dir, true),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(
-            resp.headers().get("etag").unwrap(),
-            &format!("\"{SHA}\""),
-            "a 206 carried the gzip validator"
-        );
-        assert!(resp.headers().get("content-encoding").is_none());
-        // ...and the bytes come from the right OFFSET. Dropping the seek returns byte 0 onwards.
-        let want: Vec<u8> = (100..110u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(body_bytes(resp).await, want, "the 206 served the wrong offset");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The gzip response must describe the GZIP file: its length, its bytes, its validator. Taking
-    /// the length from the identity size makes a streamed body hang or truncate.
-    #[tokio::test]
-    async fn a_gzip_response_describes_the_gzip_file_not_the_identity_one() {
-        let dir = std::env::temp_dir().join(format!("den-atlas-gzf-{}", std::process::id()));
-        let resp =
-            serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), file_servable(&dir, true)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
-        assert_eq!(resp.headers().get("etag").unwrap(), &format!("\"{SHA}-gzip\""));
-        assert_eq!(resp.headers().get("content-length").unwrap(), "40", "the identity length was declared");
-        assert_eq!(body_bytes(resp).await, vec![b'z'; 40], "the identity bytes were served as gzip");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// A 416 keeps every validator the 200 would have carried — a cache and a client both need them
     /// to revalidate afterwards. Only `cache-control` is replaced.
     #[tokio::test]
     async fn an_unsatisfiable_range_keeps_its_validators() {
-        let dir = std::env::temp_dir().join(format!("den-atlas-416v-{}", std::process::id()));
-        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), file_servable(&dir, true)).await;
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), servable()).await;
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         let h = resp.headers();
         assert_eq!(h.get("etag").unwrap(), &format!("\"{SHA}\""));
         assert_eq!(h.get("last-modified").unwrap(), LAST_MODIFIED);
         assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
-        assert_eq!(h.get("vary").unwrap(), "Accept-Encoding");
         assert_eq!(h.get_all("cache-control").iter().count(), 1, "cache-control was duplicated");
         assert_eq!(h.get("cache-control").unwrap(), "no-store");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The gz→identity fallback must not be stored: it is identity bytes under `Vary:
-    /// Accept-Encoding`, so a cache would serve them for the gzip key long after the variant is back.
-    #[tokio::test]
-    async fn the_gzip_fallback_is_not_cacheable() {
-        let dir = std::env::temp_dir().join(format!("den-atlas-gzfb-{}", std::process::id()));
-        let mut sv = file_servable(&dir, true);
-        sv.gzip = Some((Payload::File(dir.join("not-there.gz")), 40));
-        let resp = serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), sv).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get("content-encoding").is_none());
-        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
-        assert!(cc.contains("no-store"), "a fallback was made cacheable: {cc}");
-        assert!(!cc.contains("immutable"), "{cc}");
-
-        // ...while an ordinary identity request, which is not a fallback, keeps its long TTL.
-        let plain = serve(&Method::GET, &HeaderMap::new(), file_servable(&dir, true)).await;
-        let cc = plain.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
-        assert!(cc.contains("immutable"), "a normal identity response lost its caching: {cc}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A gzip variant that has gone missing must fall back to the identity blob, not 503 a request
-    /// the file on disk answers perfectly. The sync deletes a `.gz` the new meta no longer declares
-    /// while the process still serves the old one, so this window is a normal part of a release.
-    #[tokio::test]
-    async fn a_missing_gzip_variant_falls_back_to_identity() {
-        let gone = std::env::temp_dir().join(format!("den-atlas-nogz-{}.gz", std::process::id()));
-        let _ = std::fs::remove_file(&gone);
-        let mut s = servable(true);
-        s.gzip = Some((Payload::File(gone), 40));
-
-        let resp = serve(&Method::GET, &hdrs(&[("accept-encoding", "gzip")]), s).await;
-        assert_eq!(resp.status(), StatusCode::OK, "a readable identity blob was refused");
-        assert!(resp.headers().get("content-encoding").is_none(), "identity bytes were labelled gzip");
-        // ...and under the IDENTITY validator. Serving identity under `"<sha>-gzip"` would hand a
-        // shared cache the wrong bytes for every later gzip request.
-        assert_eq!(resp.headers().get("etag").unwrap(), &format!("\"{SHA}\""));
-        assert_eq!(resp.headers().get("content-length").unwrap(), "1000");
-        assert_eq!(body_bytes(resp).await.len(), 1000);
-    }
-
-    /// ...but a missing IDENTITY blob is still unserveable.
-    #[tokio::test]
-    async fn a_missing_identity_blob_is_still_unavailable_even_with_a_gzip_variant() {
-        let gone = std::env::temp_dir().join(format!("den-atlas-noid-{}.bin", std::process::id()));
-        let _ = std::fs::remove_file(&gone);
-        let mut s = servable(true);
-        s.identity = Payload::File(gone);
-        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    /// The blob is opened ONCE and the handle carries the body. Checking readability and then
-    /// reopening leaves a window in which the file vanishes: the body helper's empty fallback has a
-    /// size hint of 0, so hyper rewrites content-length and the response goes out as a complete,
-    /// self-consistent 200 with the blob's real ETag and no bytes — measured at 3 in 900 requests
-    /// against an unlink-and-recreate loop. An open descriptor keeps reading an unlinked file, so
-    /// holding it removes the window entirely.
-    #[tokio::test]
-    async fn a_blob_unlinked_after_the_response_starts_is_still_served_whole() {
-        let path = std::env::temp_dir().join(format!("den-atlas-unlink-{}.bin", std::process::id()));
-        std::fs::write(&path, vec![b'x'; 1000]).unwrap();
-        let mut s = servable(false);
-        s.identity = Payload::File(path.clone());
-
-        let resp = serve(&Method::GET, &HeaderMap::new(), s).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        // Gone before a single byte of the body is read.
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            body_bytes(resp).await.len(),
-            1000,
-            "the body came back short after the file was unlinked mid-response"
-        );
     }
 
     /// A 416 must not be cacheable: it is determined by the Range header, which no shared cache keys
     /// on, and it inherited the blob's year-long `immutable`.
     #[tokio::test]
     async fn an_unsatisfiable_range_is_not_cacheable() {
-        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), servable(false)).await;
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=9999-")]), servable()).await;
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_owned();
         assert!(cc.contains("no-store"), "a 416 was made cacheable: {cc}");
@@ -836,23 +377,22 @@ mod tests {
     #[tokio::test]
     async fn a_zero_length_suffix_range_is_unsatisfiable_not_an_underflow() {
         assert!(matches!(parse_range("bytes=-0", 1000), RangeResult::Unsatisfiable));
-        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=-0")]), servable(false)).await;
+        let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=-0")]), servable()).await;
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
-    /// A zero-byte blob is reachable — `resolve_blob` takes the on-disk length, whatever the meta
-    /// declares — and every range against it must be unsatisfiable rather than underflowing `size - 1`.
+    /// An empty body is reachable (an empty catalog page is a real answer), and every range against
+    /// it must be unsatisfiable rather than underflowing `size - 1`.
     #[tokio::test]
     async fn every_range_against_an_empty_representation_is_unsatisfiable() {
         for r in ["bytes=0-0", "bytes=0-", "bytes=-1", "bytes=-0", "bytes=5-9"] {
             assert!(
                 matches!(parse_range(r, 0), RangeResult::Unsatisfiable),
-                "{r} was satisfiable on an empty blob"
+                "{r} was satisfiable on an empty body"
             );
         }
-        let mut s = servable(false);
-        s.identity = Payload::Memory(Bytes::new());
-        s.size = 0;
+        let mut s = servable();
+        s.body = Bytes::new();
         let resp = serve(&Method::GET, &hdrs(&[("range", "bytes=0-0")]), s).await;
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(resp.headers().get("content-range").unwrap(), "bytes */0");
@@ -863,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_range_serves_the_whole_representation() {
         for r in ["bytes=0-10,20-30", "items=0-10", "bytes=abc-def", "garbage"] {
-            let resp = serve(&Method::GET, &hdrs(&[("range", r)]), servable(false)).await;
+            let resp = serve(&Method::GET, &hdrs(&[("range", r)]), servable()).await;
             assert_eq!(resp.status(), StatusCode::OK, "{r} was answered with {}", resp.status());
             assert_eq!(body_bytes(resp).await.len(), 1000, "{r}");
         }
@@ -890,75 +430,47 @@ mod tests {
     }
 
     /// RFC 9110 §13.1.5: a Range whose If-Range does not match must get the whole representation.
-    /// Ignoring it spliced two datasets' bytes together when a client resumed across a refresh —
-    /// and because Range wins over gzip, a client resuming a gzip download got identity bytes
-    /// spliced into a gzip stream.
+    /// Ignoring it spliced two generations' bytes together when a client resumed across a refresh.
     #[tokio::test]
     async fn a_stale_if_range_gets_the_whole_thing_not_a_slice() {
         let etag = format!("\"{SHA}\"");
         let range = ("range", "bytes=0-9");
 
         let stale =
-            serve(&Method::GET, &hdrs(&[range, ("if-range", "\"an-older-dataset\"")]), servable(false)).await;
+            serve(&Method::GET, &hdrs(&[range, ("if-range", "\"an-older-dataset\"")]), servable()).await;
         assert_eq!(stale.status(), StatusCode::OK, "a stale If-Range still got a partial response");
         assert_eq!(body_bytes(stale).await.len(), 1000);
 
-        let current = serve(&Method::GET, &hdrs(&[range, ("if-range", &etag)]), servable(false)).await;
+        let current = serve(&Method::GET, &hdrs(&[range, ("if-range", &etag)]), servable()).await;
         assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT, "a matching If-Range was ignored");
         assert_eq!(body_bytes(current).await.len(), 10);
 
         // The date form, against Last-Modified.
-        let by_date =
-            serve(&Method::GET, &hdrs(&[range, ("if-range", LAST_MODIFIED)]), servable(false)).await;
+        let by_date = serve(&Method::GET, &hdrs(&[range, ("if-range", LAST_MODIFIED)]), servable()).await;
         assert_eq!(by_date.status(), StatusCode::PARTIAL_CONTENT);
-        let wrong_date = serve(
-            &Method::GET,
-            &hdrs(&[range, ("if-range", "Tue, 01 Jul 2025 00:00:00 GMT")]),
-            servable(false),
-        )
-        .await;
+        let wrong_date =
+            serve(&Method::GET, &hdrs(&[range, ("if-range", "Tue, 01 Jul 2025 00:00:00 GMT")]), servable())
+                .await;
         assert_eq!(wrong_date.status(), StatusCode::OK);
 
         // A weak tag never satisfies If-Range — strong comparison only.
-        let weak =
-            serve(&Method::GET, &hdrs(&[range, ("if-range", &format!("W/{etag}"))]), servable(false)).await;
+        let weak = serve(&Method::GET, &hdrs(&[range, ("if-range", &format!("W/{etag}"))]), servable()).await;
         assert_eq!(weak.status(), StatusCode::OK, "a weak validator satisfied If-Range");
 
         // No If-Range at all is still an ordinary range request.
-        let plain = serve(&Method::GET, &hdrs(&[range]), servable(false)).await;
+        let plain = serve(&Method::GET, &hdrs(&[range]), servable()).await;
         assert_eq!(plain.status(), StatusCode::PARTIAL_CONTENT);
     }
 
+    /// Nothing here varies on a request header any more: no gzip variant to negotiate, and no body
+    /// built from the request's own origin. A `Vary` naming a header the body does not depend on
+    /// splits a shared cache for nothing.
     #[tokio::test]
-    async fn a_body_built_from_the_request_origin_varies_on_it() {
-        let mut s = servable(false);
-        s.vary_on_origin = true;
-        let r = serve(&Method::GET, &hdrs(&[]), s).await;
-        let vary = r.headers().get("vary").expect("no Vary at all").to_str().unwrap().to_ascii_lowercase();
-        assert!(vary.contains("x-forwarded-host"), "{vary}");
-        assert!(vary.contains("x-forwarded-proto"), "{vary}");
-        assert!(vary.contains("host"), "{vary}");
-
-        // ...and it still composes with the gzip variant rather than replacing it.
-        let mut s = servable(true);
-        s.vary_on_origin = true;
-        let r = serve(&Method::GET, &hdrs(&[]), s).await;
-        let vary = r.headers().get("vary").unwrap().to_str().unwrap().to_ascii_lowercase();
-        assert!(vary.contains("accept-encoding") && vary.contains("x-forwarded-host"), "{vary}");
-    }
-
-    /// The 304 must carry the same Vary as the 200 it stands in for. Assembling it after the
-    /// conditional early-return silently drops it, which is the shape that bit the sibling service:
-    /// a revalidating cache then keeps a body built for another origin.
-    #[tokio::test]
-    async fn a_304_carries_the_origin_vary_too() {
-        let mut s = servable(false);
-        s.vary_on_origin = true;
-        let etag = format!("\"{}\"", s.etag_base);
-        let r = serve(&Method::GET, &hdrs(&[("if-none-match", &etag)]), s).await;
-        assert_eq!(r.status(), StatusCode::NOT_MODIFIED, "the probe did not take the 304 path");
-        let vary = r.headers().get("vary").expect("the 304 dropped Vary entirely");
-        let vary = vary.to_str().unwrap().to_ascii_lowercase();
-        assert!(vary.contains("x-forwarded-host"), "{vary}");
+    async fn no_response_varies_on_a_request_header() {
+        for headers in [hdrs(&[]), hdrs(&[("accept-encoding", "gzip")]), hdrs(&[("host", "atlas.test")])] {
+            let r = serve(&Method::GET, &headers, servable()).await;
+            assert!(r.headers().get("vary").is_none(), "{:?}", r.headers());
+            assert!(r.headers().get("content-encoding").is_none(), "{:?}", r.headers());
+        }
     }
 }

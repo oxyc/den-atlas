@@ -33,8 +33,6 @@ pub struct AppState {
     /// `None` when the dataset couldn't be loaded (old/missing meta) — the addon still serves manifest +
     /// catalog and returns 503 on the dataset routes.
     pub dataset: Option<dataset::Dataset>,
-    /// Override the origin used in descriptor blob URLs (else derived from X-Forwarded-* / Host).
-    pub public_base: Option<String>,
     /// JustWatch "most popular" catalog rows (public, isolated from the dataset resource).
     pub catalog: catalog::CatalogState,
     /// The operator-default country (env `JW_COUNTRY`) — used when an `auto` install forwards no
@@ -97,12 +95,10 @@ impl justwatch::TrendingSource for OfflineSource {
 
 #[cfg(test)]
 impl AppState {
-    /// Minimal state for a route test: no embed proxy, no origin override, so the descriptor's URLs
-    /// come from the request headers — which is the case the origin `Vary` exists for.
+    /// Minimal state for a route test: no embed proxy, no index queries, an offline catalog source.
     pub fn for_test(dataset: Option<dataset::Dataset>) -> Self {
         AppState {
             dataset,
-            public_base: None,
             // An OFFLINE source, not a real client. `JustWatchClient::new()` here pointed every
             // route test at apis.justwatch.com: any test that touched /catalog would have made
             // live requests without naming the host anywhere, which is plausibly how an audit
@@ -326,7 +322,6 @@ async fn main() {
         .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
-        public_base: env_opt("PUBLIC_BASE_URL"),
         catalog,
         default_country,
         embed,
@@ -386,7 +381,7 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} public_base={} embed={} title_search={} index_queries={} motn={}",
+         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} motn={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -394,7 +389,6 @@ async fn main() {
         providers.join(","),
         ttl.as_secs(),
         cache_dir.as_deref().unwrap_or("memory"),
-        state.public_base.as_deref().unwrap_or("derived"),
         on(state.embed.is_some()),
         on(state.titles.is_some()),
         on(state.index.is_some()),
@@ -439,7 +433,7 @@ async fn replay(dir: &str, path: &str) -> i32 {
 }
 
 /// An env var's value, with unset and empty both meaning "not configured" — the rule every den addon
-/// uses. `PUBLIC_BASE_URL=` read as set produced an empty origin, and `EMBED_URL=` a proxy to "".
+/// uses. `EMBED_URL=` read as set produced a proxy to "".
 fn env_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }

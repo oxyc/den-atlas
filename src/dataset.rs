@@ -1,19 +1,17 @@
-//! Loads the dataset from `data/` — the `dataset.meta.json` sidecar (which the producer/import writes with
-//! per-blob sha256 + size + gzip + the HTTP-date), so the server compresses nothing at startup and reads no
-//! blob body into memory; those are streamed from disk per request (see `http.rs`).
+//! Loads the dataset from `data/` — the `dataset.meta.json` sidecar the producer/import writes.
 //!
-//! It DOES hash the store once, at load. `store-v1` puts a content hash in the header and den-spec's rule
+//! It hashes the store once, at load. `store-v1` puts a content hash in the header and den-spec's rule
 //! is to verify it before any cast, so taking the row count off an unverified header would be precisely
 //! the silent misread the format was designed to make impossible. ~130 ms on a 131 MB store, once per
-//! process. This comment used to claim zero startup hashing, which stopped being true when the store
-//! became the only artifact and its row count became the number served as `count`.
+//! process.
 //!
 //! # One artifact
 //!
-//! `storeFile` is the dataset. Everything the serving path reads — labels, both vector matrices, facts,
-//! cards, facet rows, votes — is a section of it, so it is the MANDATORY blob and a dataset without a
-//! readable one does not load. The blobs that used to be mandatory (`labelsFile`, `vectorsFile`) are now
-//! optional and are only SERVED, never read; a manifest that no longer declares them simply serves none.
+//! `storeFile` is the dataset — the only file this reads and the only one it describes. Everything the
+//! serving path needs — labels, both vector matrices, facts, cards, facet rows, votes — is a section of
+//! it, so a dataset without a readable store does not load. The sidecar blobs it replaced (`labelsFile`,
+//! `vectorsFile`, `metadataFile`, the premise pair, `facetsFile`) were served to an app that no longer
+//! fetches them and are gone: no field describes them and no route streams them (#113).
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -37,113 +35,20 @@ pub struct Meta {
     /// the app against a key the user pinned — an addon that could mint its own signature would prove nothing.
     #[serde(default)]
     pub signature: Option<String>,
-    // The labels and vectors blobs. OPTIONAL since the store carries both: nothing reads them, and a
-    // manifest that no longer declares them (the pruned one) must still load. They are kept only so a
-    // generation that still publishes them keeps serving them to a client that still fetches them.
-    #[serde(rename = "labelsFile")]
-    pub labels_file: Option<String>,
-    #[serde(rename = "vectorsFile")]
-    pub vectors_file: Option<String>,
-    #[serde(rename = "labelsGzFile")]
-    pub labels_gz_file: Option<String>,
-    /// The metadata sidecar's precompressed variant. The sidecar is the only other JSON blob, so it
-    /// is the only other one compression pays for — vectors, premise vectors and facets are packed
-    /// binary and gzip buys nothing on them. Absent unless the producer publishes it, in which case
-    /// this serves it exactly like the labels variant; the server never compresses anything itself.
-    #[serde(rename = "metadataGzFile")]
-    pub metadata_gz_file: Option<String>,
-    #[serde(rename = "labelsSha256")]
-    pub labels_sha256: Option<String>,
-    #[serde(rename = "labelsBytes")]
-    pub labels_bytes: Option<u64>,
-    #[serde(rename = "vectorsSha256")]
-    pub vectors_sha256: Option<String>,
-    #[serde(rename = "vectorsBytes")]
-    pub vectors_bytes: Option<u64>,
     #[serde(rename = "lastModifiedHttp")]
     pub last_modified_http: Option<String>,
-    // Metadata sidecar (optional) — a ≤6-month synced cache of tmdbId→{title,poster_path,year} so the app
-    // renders semantic/ANN neighbour cards without a per-result TMDB call. Absent ⇒ served labels+vectors only.
-    #[serde(rename = "metadataFile")]
-    pub metadata_file: Option<String>,
-    #[serde(rename = "metadataSha256")]
-    pub metadata_sha256: Option<String>,
-    #[serde(rename = "metadataBytes")]
-    pub metadata_bytes: Option<u64>,
-    // DT-H premise index (optional) — a SECOND labels+vectors index in a DIFFERENT embedding space (tag-string
-    // embeddings) served alongside the plot index, so the app clusters "More Like This" by premise. Absent ⇒
-    // omitted from the descriptor; the app runs plot-only.
-    #[serde(rename = "premiseEmbeddingModel")]
-    pub premise_embedding_model: Option<String>,
-    #[serde(rename = "premiseDims")]
-    pub premise_dims: Option<u32>,
-    #[serde(rename = "premiseCount")]
-    pub premise_count: Option<u64>,
-    #[serde(rename = "premiseLabelsFile")]
-    pub premise_labels_file: Option<String>,
-    #[serde(rename = "premiseLabelsSha256")]
-    pub premise_labels_sha256: Option<String>,
-    #[serde(rename = "premiseLabelsBytes")]
-    pub premise_labels_bytes: Option<u64>,
-    /// The premise labels' precompressed variant — the other large JSON blob, served exactly like the
-    /// labels one when the producer publishes it.
-    #[serde(rename = "premiseLabelsGzFile")]
-    pub premise_labels_gz_file: Option<String>,
-    #[serde(rename = "premiseVectorsFile")]
-    pub premise_vectors_file: Option<String>,
-    #[serde(rename = "premiseVectorsSha256")]
-    pub premise_vectors_sha256: Option<String>,
-    #[serde(rename = "premiseVectorsBytes")]
-    pub premise_vectors_bytes: Option<u64>,
-    // DT-I facet blob (optional) — compact per-film country/language/year/media-type/popularity for on-device
-    // attribute search ("spanish series"). Absent ⇒ omitted from the descriptor.
-    #[serde(rename = "facetsFile")]
-    pub facets_file: Option<String>,
-    #[serde(rename = "facetsSha256")]
-    pub facets_sha256: Option<String>,
-    #[serde(rename = "facetsBytes")]
-    pub facets_bytes: Option<u64>,
     // The store (den-spec wire/store-v1) — every per-title signal the serving path reads, plus both
     // vector matrices, in one mmap'd file. Read from disk, NEVER served: it is an implementation detail
     // of this server, not an artifact a client fetches.
     //
-    // MANDATORY. It used to be optional, so that a generation published before stores existed would still
-    // serve; there is no such generation left to serve, because the labels, vectors, facts, metadata and
-    // facet sidecars this fell back to are no longer read at all. A dataset with no readable store has
-    // nothing behind any of its query routes, so it does not load — the same treatment `labelsFile` and
-    // `vectorsFile` used to get.
+    // MANDATORY, and the only file the meta names. A dataset with no readable store has nothing behind
+    // any of its query routes, so it does not load.
     #[serde(rename = "storeFile")]
     pub store_file: String,
 }
 
-pub struct Gz {
-    pub path: PathBuf,
-    pub size: u64,
-    pub identity: crate::http::FileIdentity,
-}
-
-pub struct Blob {
-    /// Served path + descriptor filename, e.g. `labels-t01.json`.
-    pub name: String,
-    pub path: PathBuf,
-    pub size: u64,
-    pub identity: crate::http::FileIdentity,
-    pub sha256: String,
-    pub content_type: &'static str,
-    pub gz: Option<Gz>,
-}
-
 pub struct Dataset {
     pub meta: Meta,
-    /// The labels and vectors blobs, when the release still publishes them. Served, never read.
-    pub labels: Option<Blob>,
-    pub vectors: Option<Blob>,
-    /// Optional metadata sidecar blob (poster/title cache); None when the meta declares no sidecar.
-    pub metadata: Option<Blob>,
-    /// DT-H premise index blobs (optional): a second labels+vectors pair in the tag-embedding space. Both
-    /// present or both None (the meta must declare the pair fully).
-    pub premise_labels: Option<Blob>,
-    pub premise_vectors: Option<Blob>,
     /// The one artifact the serving path reads (`den-spec wire/store-v1`; never served).
     pub store: PathBuf,
     /// Titles in that store, from its verified header.
@@ -152,19 +57,15 @@ pub struct Dataset {
     /// where the store holds 47,618), nothing validated it, and it was served to the app as the corpus
     /// size — so it is gone and this is what `/dataset.json` and the query routes count with.
     pub store_rows: usize,
-    /// DT-I compact facet blob (optional).
-    pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
     pub last_modified: Option<String>,
 }
 
 impl Dataset {
-    /// Read `dir/dataset.meta.json` and resolve the blobs it declares.
+    /// Read `dir/dataset.meta.json` and open the store it declares.
     ///
-    /// Fails loudly on the meta or the STORE — it is the only artifact the serving path reads, so a
-    /// dataset without a readable one has nothing behind any query route. Every other blob degrades
-    /// instead: a missing premise index costs premise-based More Like This, not the whole addon (see the
-    /// call site below).
+    /// Fails loudly on either: the store is the only artifact this reads, so a dataset without a
+    /// readable one has nothing behind any query route.
     pub fn load(dir: &Path) -> Result<Dataset, String> {
         use std::io::Read;
         let meta_path = dir.join("dataset.meta.json");
@@ -178,120 +79,33 @@ impl Dataset {
         file.read_to_end(&mut raw).map_err(|e| e.to_string())?;
         let meta: Meta = serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
 
-        let labels = optional_blob(
-            dir,
-            "labels",
-            &meta.labels_file,
-            &meta.labels_sha256,
-            meta.labels_bytes,
-            "application/json",
-            meta.labels_gz_file.as_deref(),
-        );
-        let vectors = optional_blob(
-            dir,
-            "vectors",
-            &meta.vectors_file,
-            &meta.vectors_sha256,
-            meta.vectors_bytes,
-            "application/octet-stream",
-            None,
-        );
-        // The OPTIONAL blobs degrade; they do not take the dataset with them.
-        //
-        // These used to propagate with `?`, so one missing or unreadable sidecar failed the whole
-        // load: the addon then served no labels, no vectors, 503 on /dataset.json and 404 on every
-        // blob route, because a secondary index was absent. The mandatory pair above still fails
-        // hard — without those there is no dataset — but the difference between "no premise index"
-        // and "no dataset at all" is the difference between plot-only More Like This and an addon
-        // that does nothing. Each is reported so an absent feature is never silent.
-        let metadata = optional_blob(
-            dir,
-            "metadata",
-            &meta.metadata_file,
-            &meta.metadata_sha256,
-            meta.metadata_bytes,
-            "application/json",
-            meta.metadata_gz_file.as_deref(),
-        )
-        .and_then(|blob| match crate::tos::verify_file(&blob.path) {
-            Ok(()) => Some(blob),
-            Err(error) => {
-                eprintln!("metadata refused by serving guard ({error}) — serving without it");
-                None
-            }
-        });
-        // DT-H premise index — both halves or neither; one without the other is not a usable index.
-        let premise_labels = optional_blob(
-            dir,
-            "premiseLabels",
-            &meta.premise_labels_file,
-            &meta.premise_labels_sha256,
-            meta.premise_labels_bytes,
-            "application/json",
-            meta.premise_labels_gz_file.as_deref(),
-        );
-        let premise_vectors = optional_blob(
-            dir,
-            "premiseVectors",
-            &meta.premise_vectors_file,
-            &meta.premise_vectors_sha256,
-            meta.premise_vectors_bytes,
-            "application/octet-stream",
-            None,
-        );
-        let (premise_labels, premise_vectors) = match (premise_labels, premise_vectors) {
-            (Some(l), Some(v)) => (Some(l), Some(v)),
-            (l, v) => {
-                if l.is_some() || v.is_some() {
-                    eprintln!(
-                        "premise index incomplete (one of its two blobs is unusable) — serving without it"
-                    );
-                }
-                (None, None)
-            }
-        };
-        // DT-I facet blob.
-        let facets = optional_blob(
-            dir,
-            "facets",
-            &meta.facets_file,
-            &meta.facets_sha256,
-            meta.facets_bytes,
-            "application/octet-stream",
-            None,
-        );
-        // No gz candidate: the store is mmap'd, and a compressed file cannot be. Verified here and the
-        // mapping dropped, so the row count below is the store's OWN — the one number about this dataset
-        // that has been checked against the bytes rather than claimed by the manifest.
+        // Verified here and the mapping dropped, so the row count below is the store's OWN — the one
+        // number about this dataset that has been checked against the bytes rather than claimed by the
+        // manifest.
         let store = safe_blob_path(dir, &meta.store_file)?;
         let store_rows = crate::store::MappedStore::open(&store)
             .map_err(|e| format!("store {} is unusable: {e}", meta.store_file))?
             .rows();
         let last_modified = meta.last_modified_http.clone();
-        // Writers withdraw the descriptor before replacing any blob and publish it last. A load
-        // that overlaps that interval must not bind new files to a descriptor read before it.
+        // Writers withdraw the descriptor before replacing the store and publish it last. A load
+        // that overlaps that interval must not bind a new store to a descriptor read before it.
         let current_meta =
             std::fs::metadata(&meta_path).and_then(|m| crate::http::FileIdentity::from_metadata(&m));
         if current_meta.as_ref().ok() != Some(&meta_identity) {
             return Err("dataset changed while loading; retry after the refresh completes".into());
         }
-        Ok(Dataset {
-            meta,
-            labels,
-            vectors,
-            metadata,
-            premise_labels,
-            premise_vectors,
-            store,
-            store_rows,
-            facets,
-            last_modified,
-        })
+        Ok(Dataset { meta, store, store_rows, last_modified })
     }
 }
 
 /// `dir/name` where `name` must be a plain file name. Rejects anything with a separator, a parent
 /// component, or a root — the three ways `Path::join` stops meaning "inside dir".
+///
+/// The name comes from dataset.meta.json, which scripts/fetch-dataset.sh pulls from a GitHub release
+/// over the network. `dir.join` on "../secret" walks out, and on an absolute path discards `dir`
+/// entirely. FP-3's own rationale names a compromised dataset host as the adversary, and den-atlas
+/// loads that meta without checking the signature it passes through, so this was arbitrary file read
+/// over HTTP.
 fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(name);
     let mut parts = candidate.components();
@@ -302,97 +116,12 @@ fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dir.join(name))
 }
 
-/// An optional blob: resolved only when the meta fully declares it (file + sha + bytes), and
-/// reported-then-dropped when it is declared but unusable. Never fatal — see the call site.
-fn optional_blob(
-    dir: &Path,
-    label: &str,
-    file: &Option<String>,
-    sha256: &Option<String>,
-    bytes: Option<u64>,
-    content_type: &'static str,
-    gz_file: Option<&str>,
-) -> Option<Blob> {
-    let (file, sha256, bytes) = match (file, sha256, bytes) {
-        (Some(f), Some(s), Some(b)) => (f, s, b),
-        // Not declared, or declared incompletely. Absent by design, so nothing to report.
-        _ => return None,
-    };
-    match resolve_blob(dir, file, bytes, sha256, content_type, gz_file) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("optional blob {label} ({file}) is unusable ({e}) — serving without it");
-            None
-        }
-    }
-}
-
-fn resolve_blob(
-    dir: &Path,
-    name: &str,
-    size: u64,
-    sha256: &str,
-    content_type: &'static str,
-    gz_file: Option<&str>,
-) -> Result<Blob, String> {
-    // A blob name is a FILE NAME, not a path. `dir.join` on "../secret" walks out, and on an
-    // absolute path discards `dir` entirely — and these names come from dataset.meta.json, which
-    // scripts/fetch-dataset.sh pulls from a GitHub release over the network. FP-3's own rationale
-    // names a compromised dataset host as the adversary, and den-atlas loads that meta without
-    // checking the signature it passes through, so this was arbitrary file read over HTTP.
-    let path = safe_blob_path(dir, name)?;
-    // Use the on-disk length, not the meta's declared size: if a refreshed/stale meta disagrees with the
-    // actual file, trusting the meta makes Content-Length/Range framing hang or desync the connection.
-    let stat = std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
-    let actual = stat.len();
-    let identity = crate::http::FileIdentity::from_metadata(&stat).map_err(|e| e.to_string())?;
-    if actual != size {
-        eprintln!("{} is {actual} bytes but meta declares {size} — using the on-disk size", path.display());
-    }
-    // The gz variant is an OPTIMISATION, so an unusable one drops the variant — it does not take the
-    // dataset down. Propagating here made a single bad optional name fatal for labels, vectors,
-    // premise and facets alike: `"labelsGzFile": ""` served 503 on /dataset.json and 404 on every
-    // blob, where before it merely produced a junk variant nobody could select. The sync script
-    // treats an empty *File value as an ordinary shape (`[ -n "$f" ] || continue`), so this is a
-    // release away, and main.rs's stated posture is to degrade rather than refuse.
-    let gz = match gz_file {
-        Some(gzname) => match safe_blob_path(dir, gzname).and_then(|p| {
-            std::fs::metadata(&p)
-                .and_then(|m| {
-                    Ok(Gz {
-                        path: p.clone(),
-                        size: m.len(),
-                        identity: crate::http::FileIdentity::from_metadata(&m)?,
-                    })
-                })
-                .map_err(|e| format!("stat {}: {e}", p.display()))
-        }) {
-            Ok(gz) => Some(gz),
-            Err(why) => {
-                eprintln!("no gzip variant for {name} ({why}) — serving identity only");
-                None
-            }
-        },
-        None => None,
-    };
-    Ok(Blob {
-        name: name.to_owned(),
-        path,
-        size: actual,
-        identity,
-        sha256: sha256.to_owned(),
-        content_type,
-        gz,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A one-title store in `dir`, named as the manifests below declare it. Every `Dataset::load` test
-    /// needs one, because the store is the mandatory blob: these tests are about the OPTIONAL ones, and
-    /// without a store each would fail for the wrong reason.
+    /// that is meant to succeed needs one, because the store is the only artifact a dataset has.
     fn store_in(dir: &Path) {
         let title = crate::store::fixture::Title {
             media: 0,
@@ -408,7 +137,7 @@ mod tests {
     const HEAD: &str = r#""datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
                           "quantization":"int8","storeFile":"s.store","#;
 
-    /// Blob names come from dataset.meta.json, which the refresh script pulls from a GitHub release
+    /// File names come from dataset.meta.json, which the refresh script pulls from a GitHub release
     /// over the network — and FP-3's rationale names a compromised dataset host as the adversary.
     /// `dir.join` walks out on "../x" and discards `dir` outright on an absolute path, so this was
     /// arbitrary file read over HTTP, bounded only by what the container process can read.
@@ -418,259 +147,41 @@ mod tests {
         for bad in ["../secret.txt", "/etc/passwd", "a/b.json", "..", "./x.json", ""] {
             assert!(safe_blob_path(dir, bad).is_err(), "{bad:?} was accepted as a blob name");
         }
-        assert_eq!(safe_blob_path(dir, "labels-t02.json").unwrap(), dir.join("labels-t02.json"));
+        assert_eq!(safe_blob_path(dir, "den-v1.store").unwrap(), dir.join("den-v1.store"));
     }
 
-    /// ...and through the CALL SITE, because a helper's own test cannot see `resolve_blob` going
-    /// back to `dir.join`. A real secret outside the dataset dir, reachable by the traversal.
+    /// ...and through the CALL SITE, because a helper's own test cannot see `load` going back to
+    /// `dir.join`. `storeFile` is now the only name the meta hands to a path, so it is the only
+    /// place the traversal can come back. A real secret outside the dataset dir, reachable by it.
     #[test]
-    fn resolve_blob_refuses_to_read_outside_the_dataset_directory() {
+    fn the_store_name_cannot_escape_the_dataset_directory() {
         let root = std::env::temp_dir().join(format!("den-atlas-trav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let data = root.join("data");
         std::fs::create_dir_all(&data).unwrap();
-        let secret = root.join("secret.txt");
+        let secret = root.join("secret.store");
         std::fs::write(&secret, b"a credential the dataset dir must not reach").unwrap();
-        let len = std::fs::metadata(&secret).unwrap().len();
 
-        for escape in ["../secret.txt", secret.to_string_lossy().as_ref()] {
-            let r = resolve_blob(&data, escape, len, "sha", "application/json", None);
-            assert!(r.is_err(), "{escape:?} resolved to a readable blob outside the dataset dir");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The gz variant is the SECOND call site, and the first version of this test passed `None` for
-    /// it — so reverting that one line to `dir.join` left the suite green while
-    /// `"labelsGzFile": "../../../etc/shadow"` was served to anyone sending `Accept-Encoding: gzip`.
-    #[test]
-    fn a_gz_blob_name_cannot_escape_either() {
-        let root = std::env::temp_dir().join(format!("den-atlas-gz-{}", std::process::id()));
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("labels.json"), b"{}").unwrap();
-        let secret = root.join("secret.gz");
-        std::fs::write(&secret, b"not for the wire").unwrap();
-
-        // An escaping gz name must not resolve to the file outside the data dir...
-        let blob = resolve_blob(&data, "labels.json", 2, "sha", "application/json", Some("../secret.gz"))
-            .expect("a bad OPTIONAL name must not take the whole dataset down");
-        assert!(blob.gz.is_none(), "a gz variant resolved outside the dataset directory");
-
-        // ...and neither must an absolute one.
-        let blob = resolve_blob(
-            &data,
-            "labels.json",
-            2,
-            "sha",
-            "application/json",
-            Some(secret.to_string_lossy().as_ref()),
-        )
-        .expect("still not fatal");
-        assert!(blob.gz.is_none());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// An unusable OPTIONAL blob drops the variant; it does not refuse the dataset. Propagating the
-    /// error made `"labelsGzFile": ""` serve 503 on /dataset.json and 404 on every blob — and the
-    /// sync script treats an empty *File value as an ordinary shape, so that is one release away.
-    #[test]
-    fn an_unusable_gzip_variant_does_not_take_the_dataset_down() {
-        let root = std::env::temp_dir().join(format!("den-atlas-optgz-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("labels.json"), b"{}").unwrap();
-
-        for bad in ["", "missing.json.gz", "../x.gz"] {
-            let blob = resolve_blob(&root, "labels.json", 2, "sha", "application/json", Some(bad))
-                .unwrap_or_else(|e| panic!("{bad:?} took the whole dataset down: {e}"));
-            assert!(blob.gz.is_none(), "{bad:?} produced a gz variant");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// An optional blob that is declared but unusable must cost that ONE feature, not the dataset.
-    /// These propagated with `?`, so a missing premise index — a secondary "More Like This" signal —
-    /// meant no labels, no vectors, 503 on /dataset.json and 404 on every blob route.
-    #[test]
-    fn an_unusable_optional_blob_does_not_take_the_dataset_down() {
-        let root = std::env::temp_dir().join(format!("den-atlas-optblob-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
-        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
-        std::fs::write(root.join("facets.bin"), b"FACETS").unwrap();
-        store_in(&root);
-        // metadata, and both premise blobs, are DECLARED but never written.
-        std::fs::write(
-            root.join("dataset.meta.json"),
-            format!(
-                r#"{{{HEAD}
-                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "metadataFile":"gone.json","metadataBytes":8,"metadataSha256":"c",
-                 "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d",
-                 "premiseLabelsFile":"gone-pl.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
-                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
-            ),
-        )
-        .unwrap();
-
-        let ds = Dataset::load(&root).expect("a missing optional blob took the whole dataset down");
-        assert_eq!(ds.store_rows, 1, "the mandatory blob must still be there");
-        assert_eq!(ds.labels.as_ref().map(|b| b.name.as_str()), Some("labels.json"));
-        assert_eq!(ds.vectors.as_ref().map(|b| b.size), Some(8));
-        assert!(ds.metadata.is_none(), "an unreadable metadata sidecar was resolved anyway");
-        assert!(ds.premise_labels.is_none() && ds.premise_vectors.is_none());
-        // ...and a usable optional blob is still served.
-        assert!(ds.facets.is_some(), "a perfectly good facets blob was dropped with the broken ones");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The gz variants are wired to the right blobs. Every gz test called `resolve_blob` directly, so
-    /// crossing the wires in `load` — serving the metadata sidecar's gz as the labels variant —
-    /// passed, and so did dropping `metadataGzFile` entirely.
-    #[test]
-    fn each_gz_variant_is_wired_to_its_own_blob() {
-        let root = std::env::temp_dir().join(format!("den-atlas-gzwire-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
-        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
-        std::fs::write(root.join("meta.json"), b"[]").unwrap();
-        std::fs::write(root.join("labels.json.gz"), b"LGZ").unwrap();
-        std::fs::write(root.join("meta.json.gz"), b"MGZ").unwrap();
-        store_in(&root);
-        std::fs::write(
-            root.join("dataset.meta.json"),
-            format!(
-                r#"{{{HEAD}
-                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                 "labelsGzFile":"labels.json.gz",
-                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c",
-                 "metadataGzFile":"meta.json.gz"}}"#
-            ),
-        )
-        .unwrap();
-
-        let ds = Dataset::load(&root).expect("fixture must load");
-        let gz_name =
-            |b: &Blob| b.gz.as_ref().map(|g| g.path.file_name().unwrap().to_string_lossy().into_owned());
-        let labels = ds.labels.as_ref().expect("the labels must resolve");
-        assert_eq!(gz_name(labels).as_deref(), Some("labels.json.gz"), "labels got the wrong gz variant");
-        let md = ds.metadata.as_ref().expect("the sidecar must resolve");
-        assert_eq!(gz_name(md).as_deref(), Some("meta.json.gz"), "the sidecar's gz variant is not wired up");
-        assert!(ds.vectors.as_ref().unwrap().gz.is_none(), "a binary blob was given a gz variant");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Metadata is the one served artifact derived directly from TMDB. Even if a future producer adds an
-    /// overview under a renamed/cased key, it is dropped before a route can expose it.
-    #[test]
-    fn metadata_with_expressive_prose_is_not_served() {
-        let root = std::env::temp_dir().join(format!("den-atlas-prose-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
-        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
-        let metadata = br#"[{"tmdbId":1,"mediaType":"movie","title":"X","plot_summary":"prose"}]"#;
-        std::fs::write(root.join("meta.json"), metadata).unwrap();
-        store_in(&root);
-        std::fs::write(
-            root.join("dataset.meta.json"),
-            format!(
-                r#"{{{HEAD}"labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                     "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                     "metadataFile":"meta.json","metadataBytes":{},"metadataSha256":"c"}}"#,
-                metadata.len()
-            ),
-        )
-        .unwrap();
-        let ds = Dataset::load(&root).expect("the optional violation must not take down the dataset");
-        assert!(ds.metadata.is_none(), "prose-bearing metadata reached the serving table");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The premise labels' gz variant is wired to the premise labels, and an escaping name for it is
-    /// refused the same way — dropping the variant, not the index.
-    #[test]
-    fn the_premise_labels_gz_variant_is_wired_and_guarded() {
-        let root = std::env::temp_dir().join(format!("den-atlas-premisegz-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        for (name, body) in [
-            ("labels.json", &b"LABELS"[..]),
-            ("vectors.bin", b"VECTORS!"),
-            ("premise-labels.json", b"PLABELS"),
-            ("premise-vectors.bin", b"PVECTORS"),
-            ("premise-labels.json.gz", b"PGZ"),
-        ] {
-            std::fs::write(data.join(name), body).unwrap();
-        }
-        std::fs::write(root.join("secret.gz"), b"not for the wire").unwrap();
-        store_in(&data);
-        let meta = |gz: &str| {
-            format!(
-                r#"{{{HEAD}
-                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
-                 "premiseLabelsGzFile":"{gz}",
-                 "premiseVectorsFile":"premise-vectors.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
+        for escape in ["../secret.store", secret.to_string_lossy().as_ref()] {
+            std::fs::write(
+                data.join("dataset.meta.json"),
+                format!(
+                    r#"{{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
+                         "quantization":"int8","storeFile":"{escape}"}}"#
+                ),
             )
-        };
-
-        std::fs::write(data.join("dataset.meta.json"), meta("premise-labels.json.gz")).unwrap();
-        let ds = Dataset::load(&data).expect("fixture must load");
-        let pl = ds.premise_labels.as_ref().expect("the premise labels must resolve");
-        let gz = pl.gz.as_ref().expect("the premise labels' gz variant is not wired up");
-        assert_eq!(gz.path, data.join("premise-labels.json.gz"));
-        assert!(
-            ds.labels.as_ref().unwrap().gz.is_none(),
-            "the premise variant was handed to the plot labels"
-        );
-        assert!(ds.premise_vectors.as_ref().unwrap().gz.is_none(), "a binary blob was given a gz variant");
-
-        std::fs::write(data.join("dataset.meta.json"), meta("../secret.gz")).unwrap();
-        let ds = Dataset::load(&data).expect("a bad optional gz name must not take the dataset down");
-        let pl = ds.premise_labels.as_ref().expect("an escaping gz name dropped the whole premise index");
-        assert!(pl.gz.is_none(), "a premise gz variant resolved outside the dataset directory");
+            .unwrap();
+            match Dataset::load(&data) {
+                Err(err) => assert!(err.contains("plain file name"), "refused for the wrong reason: {err}"),
+                Ok(ds) => panic!("{escape:?} resolved to {}", ds.store.display()),
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Half a premise index is not an index: the app needs both blobs to cluster by premise, and
-    /// advertising one of them would have it fetch a pair it cannot use.
-    #[test]
-    fn half_a_premise_index_is_dropped_whole() {
-        let root = std::env::temp_dir().join(format!("den-atlas-halfpremise-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
-        std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
-        std::fs::write(root.join("premise-labels.json"), b"PLABELS").unwrap();
-        store_in(&root);
-        std::fs::write(
-            root.join("dataset.meta.json"),
-            format!(
-                r#"{{{HEAD}
-                 "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
-                 "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
-                 "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
-                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
-            ),
-        )
-        .unwrap();
-
-        let ds = Dataset::load(&root).expect("dataset must still load");
-        assert!(ds.premise_labels.is_none(), "the premise labels were kept without their vectors");
-        assert!(ds.premise_vectors.is_none());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The PRUNED manifest — a store and the five facts about it that are not in it — must load, and a
-    /// manifest that no longer declares labels or vectors must not be refused for it. That shape is what
-    /// the publisher now writes, so a required `labelsFile` would take the dataset down on the next
-    /// release rather than at any point anyone could see.
+    /// The PRUNED manifest — a store and the five facts about it that are not in it — is the only shape
+    /// the publisher writes, and the only one this has to load. A manifest that still declares the
+    /// retired sidecars loads the same way: the extra keys are simply not read.
     #[test]
     fn a_manifest_that_declares_only_a_store_loads() {
         let root = std::env::temp_dir().join(format!("den-atlas-pruned-{}", std::process::id()));
@@ -682,7 +193,19 @@ mod tests {
         let ds = Dataset::load(&root).expect("the pruned manifest must load");
         assert_eq!(ds.store, root.join("s.store"));
         assert_eq!(ds.store_rows, 1, "the row count comes from the store's verified header");
-        assert!(ds.labels.is_none() && ds.vectors.is_none() && ds.facets.is_none());
+
+        // ...and so does a manifest from the generation that still declares the retired sidecars,
+        // whether or not their files are on disk. They are unknown keys now, not a contract.
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            format!(
+                r#"{{{HEAD}"labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                     "vectorsFile":"gone.bin","vectorsBytes":8,"vectorsSha256":"b",
+                     "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(Dataset::load(&root).expect("an old manifest must still load").store_rows, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
