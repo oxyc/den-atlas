@@ -39,8 +39,14 @@ members = ["crates/den-index", "crates/den-titlesearch"]
 
 # `start_paused` — the cold-burst test simulates ~45s of queued upstream work, which has to cost no
 # wall clock to be worth running. Tests only; the shipped binary's tokio features are unchanged.
+#
+# `blake2` is the store fixture's content hash (`store::fixture`). den-store VERIFIES that digest and does
+# not expose the function, and a store is now the only thing the serving path reads, so every test with a
+# dataset in it needs one written. A real implementation, not a second copy of den-store's vendored one:
+# the fixture must fail when the writer is wrong, not agree with it.
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+blake2 = "0.10"
 
 # Speed over size, everywhere: every More Like This, search and row walks tens of thousands of records, the
 # index load parses tens of megabytes of JSON, and a size-optimised build ("z", with a per-crate override that

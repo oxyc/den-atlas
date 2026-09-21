@@ -6,12 +6,16 @@
 //! these may treat "not known" as "none".
 
 use den_index::MediaType;
+/// The JSON facts reader is test-only — the facts are sections of the store — and it is the only thing
+/// here that deserialises or gunzips.
+#[cfg(test)]
 use serde::Deserialize;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Read;
-use std::path::Path;
 
-/// The file layout this reader understands (`"schema"` in the file).
+/// The file layout the JSON reader understands (`"schema"` in the file).
+#[cfg(test)]
 const SCHEMA: u32 = 1;
 
 /// When a title came out, as its first day (days since 1970-01-01) and how many days the statement covers:
@@ -526,11 +530,14 @@ impl Facts {
         Ok(Facts { records, people, named, titles })
     }
 
-    pub fn read(path: &Path) -> Result<Facts, String> {
-        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        Facts::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
-    }
-
+    /// The `factsSlimFile`/`factsFile` sidecar.
+    ///
+    /// **Tests only.** The facts are sections of the store and the sidecar is not published; `Facts::read`,
+    /// which took a path and picked between four candidate files, is gone with it. This reader stays
+    /// behind `#[cfg(test)]` so the parity test below still has something to hold `from_store` to — and so
+    /// the unit tests of Wikidata's open-world shapes (an `imdbId` that is a list, a `titles` object, a
+    /// year-precision date) keep a small file to state them on.
+    #[cfg(test)]
     pub fn from_bytes(raw: &[u8]) -> Result<Facts, String> {
         if !raw.starts_with(&[0x1f, 0x8b]) {
             return Facts::from_json(raw);
@@ -540,6 +547,7 @@ impl Facts {
         Facts::from_json(&plain)
     }
 
+    #[cfg(test)]
     fn from_json(json: &[u8]) -> Result<Facts, String> {
         let file: RawFile = serde_json::from_slice(json).map_err(|e| format!("parse: {e}"))?;
         if file.schema != SCHEMA {
@@ -651,12 +659,14 @@ fn fnv1a(text: &str) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// `Q42` → 42.
+/// `Q42` → 42. The store interns entities, so only the JSON reader parses a Q-id.
+#[cfg(test)]
 fn qid(id: &str) -> Option<u32> {
     id.strip_prefix('Q')?.parse().ok()
 }
 
 /// Two-letter codes, cased by `case`; anything else dropped.
+#[cfg(test)]
 fn codes(values: Option<Vec<String>>, case: fn(&u8) -> u8) -> Vec<[u8; 2]> {
     let mut out: Vec<[u8; 2]> = Vec::new();
     for value in values.unwrap_or_default() {
@@ -670,6 +680,7 @@ fn codes(values: Option<Vec<String>>, case: fn(&u8) -> u8) -> Vec<[u8; 2]> {
     out
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawFile {
     schema: u32,
@@ -684,12 +695,14 @@ struct RawFile {
 
 /// The file's `entities`, read straight into what atlas keeps of them — each one's name and TMDB person id, and a
 /// hash of every name and alias — so a map of 100k-odd string keys never exists.
+#[cfg(test)]
 #[derive(Default)]
 struct RawEntities {
     people: Vec<(u32, Person)>,
     named: Vec<(u64, u32)>,
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for RawEntities {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Entities;
@@ -722,6 +735,7 @@ impl<'de> Deserialize<'de> for RawEntities {
     }
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawEntity {
@@ -730,6 +744,7 @@ struct RawEntity {
     aliases: Option<Vec<String>>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawTitles {
     en: Option<String>,
@@ -737,12 +752,14 @@ struct RawTitles {
     aliases: Option<Vec<String>>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawGenre {
     movie: Option<u16>,
     tv: Option<u16>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRecord {
@@ -767,6 +784,7 @@ struct RawRecord {
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
 /// list of them. The first is read.
+#[cfg(test)]
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum OneOrMany {
@@ -774,6 +792,7 @@ enum OneOrMany {
     Many(Vec<String>),
 }
 
+#[cfg(test)]
 impl OneOrMany {
     fn first(self) -> Option<String> {
         match self {
@@ -783,6 +802,7 @@ impl OneOrMany {
     }
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawReleased {
     date: String,
@@ -829,7 +849,8 @@ pub(crate) mod tests {
         };
         let mapped = crate::store::MappedStore::open(std::path::Path::new(&store_path)).expect("store");
         let mut from_store = Facts::from_store(&mapped.view()).expect("facts from the store");
-        let mut from_json = Facts::read(std::path::Path::new(&facts_path)).expect("facts from json");
+        let raw = std::fs::read(&facts_path).expect("read the facts sidecar");
+        let mut from_json = Facts::from_bytes(&raw).expect("facts from json");
 
         assert_eq!(from_store.len(), from_json.len(), "record count");
 

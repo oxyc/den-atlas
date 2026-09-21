@@ -128,9 +128,8 @@ fn title(index: &Index, id: u32, media: MediaType) -> String {
 /// An independently constructed copy printed a different row than the one being measured, which is worse
 /// than no print at all.
 fn pooled(indexes: &Indexes, facts: &Facts, id: u32, media: MediaType) -> Option<Vec<u32>> {
-    let loaded = indexes.store.as_ref()?;
-    let view = loaded.view();
-    let facets = SeedFacets::new(&view, &loaded.aggregates, media).ok()?;
+    let view = indexes.store.view();
+    let facets = SeedFacets::new(&view, &indexes.store.aggregates, media).ok()?;
     let authorship = SeedAuthorship::of(facts, media, id);
     Some(more_like_this_pooled(
         Some(&indexes.plot),
@@ -161,14 +160,11 @@ pub fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
+    // No store-less arm to guard against any more: `load_for_tools` fails without one.
     let Some(facts) = indexes.facts.as_ref() else {
         eprintln!("rail-ab: this dataset has no readable facts — authorship cannot be scored");
         return 1;
     };
-    if indexes.store.is_none() {
-        eprintln!("rail-ab: this dataset has no readable store — there is no pooled arm to compare");
-        return 1;
-    }
 
     println!(
         "{:<24} {:>9} {:>9}   {:>9} {:>9}   {:>4} {:>4}",

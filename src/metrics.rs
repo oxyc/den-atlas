@@ -98,7 +98,10 @@ pub fn render(state: &AppState) -> String {
             ),
             1,
         );
-        gauge(&mut b, "atlas_dataset_titles", "Titles in the served dataset.", "", m.count);
+        // The store's own row count, not the manifest's claim: it is the number the bytes were checked
+        // against, and the only one that cannot silently mean a different population than it says.
+        let titles = u64::try_from(ds.store_rows).unwrap_or(u64::MAX);
+        gauge(&mut b, "atlas_dataset_titles", "Titles in the served dataset.", "", titles);
     }
     gauge(
         &mut b,

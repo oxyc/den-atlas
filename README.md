@@ -124,7 +124,7 @@ origin.
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
 | `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total}`. The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
-| `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the dataset's plot facets (`plotFacetsFile`: ending, era, structure, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
+| `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the store's facet axes (ending, era, chronology, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
@@ -162,7 +162,8 @@ so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries"
 Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`). Unified
 query search scans both plot and premise vectors when the latter exist, normalises each scan against its own
 distribution, and lets the stronger one spend the single semantic weight; a missing premise index preserves
-plot-only behaviour. The facet lane reads the dataset's `facets.bin`. Taste weights stay with the client:
+plot-only behaviour. The facet lane reads the store's country, language, year and vote columns — it used to
+read a `facets.bin` sidecar, which covered 9,086 fewer titles. Taste weights stay with the client:
 `score` returns the raw boosts.
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
@@ -176,8 +177,8 @@ re-serving an overview, synopsis, description, tagline, or equivalent prose.
 ranks. It is the web app's `billboard.ts` ported: what is new in the world and new to this library, with
 attention (a place in Trending Everywhere, the household's "new on" lists, and the client's own lists) and
 quality, multiplied by the library's taste and discounted where the library's own More Like This already
-reaches. It describes each title from what atlas holds: the labels, `facets.bin`, and the dataset's Wikidata
-facts file (`factsSlimFile`, else `factsFile`) when the release carries one; a candidate's `hint` (release
+reaches. It describes each title from what atlas holds, all of it out of the one store: the labels, the
+country/language/year/vote columns, and the Wikidata facts; a candidate's `hint` (release
 date, genres, countries, popularity, rating and votes) fills only what those leave unknown. Rating hints affect only
 that response: Atlas never writes them to catalogs, its dataset or replay fixtures. Existing upstream scores,
 including JustWatch's IMDb scores, remain in Atlas's own catalog output. `unjudged` names the 20
@@ -252,9 +253,9 @@ reported the box was already at the previous digest — a failure that reads as 
 than as a broken build. Checking line widths by hand does not substitute: rustfmt also JOINS short wrapped
 lines and SPLITS long array literals, neither of which a width check can predict.
 `fetch-dataset.sh` is anonymous (needs curl, python3 and shasum). It downloads every blob
-`dataset.meta.json` declares — the labels (and their `.gz`), the vectors, the poster sidecar, the premise
-index and `facets.bin` — verifies each against the meta's sha256, and only then moves them into `./data`.
-The server reads all of that at startup; it never hashes or compresses. To pick up a new release, re-run it
+`dataset.meta.json` declares and verifies each against the meta's sha256 before moving them into `./data`.
+`storeFile` is the one it REFUSES a release without: the store is the only artifact the server reads, and
+anything else declared beside it is served rather than read. To pick up a new release, re-run it
 and restart the server.
 
 Refreshes stage on the destination filesystem and replace files by rename. An open response keeps

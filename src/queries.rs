@@ -2,11 +2,21 @@
 //! and More Like This — and the Wikidata facts `/recommend` reads beside them. The indexes load on the first
 //! query and are released after a few idle minutes, so an atlas nobody is asking holds none of their ~80 MB
 //! of vectors; the first query after an idle spell pays the load from disk.
+//!
+//! # One artifact
+//!
+//! Everything below is read out of the mmap'd store (den-spec `wire/store-v1.md`) and nothing else. There
+//! used to be seven inputs — `labels-t02.json`, `vectors-bge-m3.bin`, `labels-premise.json`,
+//! `vectors-premise.bin`, `metadata-*.json`, `facets.bin`, a facts sidecar and a plot-facets sidecar —
+//! each with its own reader, its own parse and its own idea of how many titles the corpus has. They
+//! disagreed: `facets.bin` covered 9,086 fewer titles than the store, the plot-facets sidecar 42,282
+//! fewer, and a title missing from one of them lost its row order or its attribute search with nothing
+//! failing. One artifact cannot disagree with itself, which is the whole point of the cut.
 
 use crate::dataset::Dataset;
 use crate::facts::Facts;
 use crate::fit::Corpus;
-use crate::plotrows::{read_cards, Card, PlotFacets};
+use crate::plotrows::{cards_from_store, Card, PlotFacets};
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
 use den_titlesearch::{TitleIndex, TitleRecord};
@@ -22,28 +32,24 @@ const IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 pub struct Indexes {
-    /// Every title in the published corpus. The indexes below may be partial; this is their denominator.
+    /// Every title in the corpus — the store's own row count. The indexes below may be partial (the plot
+    /// index covers the rows that have a plot vector); this is their denominator.
     pub population: usize,
     pub dataset_version: String,
     pub plot: Index,
-    /// The premise index, when the dataset ships one that loads; without it More Like This is plot-only.
+    /// The premise index, when the store's premise vector sections read; without it More Like This is
+    /// plot-only.
     pub premise: Option<Index>,
-    /// The facet index — country, original language, year, votes — built from the store's own columns
-    /// where there is one, else from `facets.bin`. Without either the facet lane answers nothing.
+    /// The facet index — country, original language, year, votes — filled from the store's own columns.
+    /// Without it the facet lane answers nothing.
     pub facets: Option<FacetIndex>,
-    /// Which of the two built it. Reported on the load line, because the two differ by 9,086 titles and a
-    /// silent fall back to the blob is a narrower attribute search that nothing else would show.
-    pub facets_from_store: bool,
-    /// The Wikidata facts, when the dataset ships a file that reads; without them `/recommend` reads labels and
-    /// facets alone.
+    /// The Wikidata facts; without them `/recommend` reads labels and facets alone.
     pub facts: Option<Facts>,
     /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
     pub plot_facets: Option<PlotFacets>,
-    /// The per-title signals More Like This ranks on; without them the rail falls back to vectors and
-    /// labels, which is how it worked before they existed.
-    /// The mapped store and its corpus-wide aggregates. Absent ⇒ the rail falls back to vectors
-    /// and labels alone, which is how it worked before the store existed.
-    pub store: Option<crate::store::LoadedStore>,
+    /// The mapped store and its corpus-wide aggregates: the artifact everything above was read out of,
+    /// kept because the rail addresses its columns per candidate rather than copying them.
+    pub store: crate::store::LoadedStore,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
@@ -74,21 +80,10 @@ impl Indexes {
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
-            // `LoadedStore::open` already proved this builds — `check` calls the same constructor — so
-            // the `else` below is the no-store case, which `store_unusable` reports.
-            let facets = self
-                .store
-                .as_ref()
-                .and_then(|s| crate::rail::SeedFacets::new(&s.view(), &s.aggregates, media_type).ok());
-            let Some(facets) = facets else {
-                return den_index::more_like_this(
-                    Some(&self.plot),
-                    self.premise.as_ref(),
-                    tmdb_id,
-                    media_type,
-                )
-                .into();
-            };
+            // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
+            // the load fails without a store, so there is no arm here that answers without one.
+            let facets = crate::rail::SeedFacets::new(&self.store.view(), &self.store.aggregates, media_type)
+                .expect("MappedStore::check builds this at load, so it cannot fail per request");
             let authorship =
                 self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
             den_index::more_like_this_pooled(
@@ -111,23 +106,12 @@ impl Indexes {
 
     /// A title's TMDB vote count — what every browse row is ORDERED by.
     ///
-    /// From the STORE first. It used to come only from `facets.bin`, which fell 9,007 titles behind the
-    /// corpus because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how
-    /// *La Job* (tv:5) came to sit next to *Game of Thrones*. The store carries one for 47,551 of 47,618
-    /// rows, 9,019 more than the blob.
-    ///
-    /// `facets.bin` remains the fallback while it is still shipped, so a dataset published before the
-    /// `votes` section existed keeps ordering its rows the way it always did.
+    /// From the store's `votes` column. It used to come from `facets.bin`, which fell 9,007 titles behind
+    /// the corpus because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how
+    /// *La Job* (tv:5) came to sit next to *Game of Thrones*. 0 for a row the store has no count for, which
+    /// is what the blob answered for a title it did not describe.
     pub fn votes(&self, media_type: den_index::MediaType, tmdb_id: u32) -> u32 {
-        let from_store = self.store.as_ref().and_then(|loaded| {
-            let view = loaded.view();
-            let media = u8::from(media_type == den_index::MediaType::Tv);
-            let row = view.row_of(media, tmdb_id).ok().flatten()?;
-            view.per_row::<u32>("votes").ok()?.get(row.0).copied()
-        });
-        from_store.unwrap_or_else(|| {
-            self.facets.as_ref().and_then(|f| f.title(tmdb_id, media_type)).map_or(0, |t| t.votes)
-        })
+        votes_of(&self.store, media_type, tmdb_id)
     }
 
     /// A browse row's order (`plotrows::row`), worked out once per type and constraints: every page of a row, and
@@ -141,15 +125,24 @@ impl Indexes {
     }
 }
 
+/// A title's vote count, out of the store. Shared by `Indexes::votes` and the display index's ranking,
+/// which used to read the column with two copies of the same four lines.
+fn votes_of(loaded: &crate::store::LoadedStore, media_type: den_index::MediaType, tmdb_id: u32) -> u32 {
+    let view = loaded.view();
+    let media = u8::from(media_type == den_index::MediaType::Tv);
+    let row = view.row_of(media, tmdb_id).ok().flatten();
+    row.and_then(|row| view.per_row::<u32>("votes").ok()?.get(row.0).copied()).unwrap_or(0)
+}
+
 /// The facet index from the store's own columns, so attribute search covers the whole corpus.
 ///
-/// `facets.bin` is a separate producer that fell 9,086 titles behind the corpus because nothing rebuilt it,
-/// and the four facts it holds — country, original language, year, vote count — are all in the store. This
-/// reads them from there instead. `den-index` cannot depend on `den-store` (it must keep building for
+/// `facets.bin` was a separate producer that fell 9,086 titles behind the corpus because nothing rebuilt
+/// it, and the four facts it held — country, original language, year, vote count — are all in the store.
+/// This reads them from there instead. `den-index` cannot depend on `den-store` (it must keep building for
 /// wasm32 and aarch64-apple-tvos), so the index is FILLED here rather than read there.
 ///
 /// The country and language taken are the FIRST each title lists, which is what the blob held: one code per
-/// title. A title with several origins is findable by the one Wikidata lists first, exactly as before.
+/// title. A title with several origins is findable by the one Wikidata lists first, exactly as it was.
 fn facet_index_from(
     facts: &Facts,
     store: &den_store::Store<'_>,
@@ -197,26 +190,21 @@ fn memoised<K: Eq + std::hash::Hash, V: ?Sized>(
     value
 }
 
-/// A labels blob and its vectors blob.
-type BlobPair = (PathBuf, PathBuf);
-
 pub struct IndexQueries {
-    population: usize,
     dataset_version: String,
-    plot: BlobPair,
-    premise: Option<BlobPair>,
-    facets: Option<PathBuf>,
-    facts: Vec<PathBuf>,
-    plot_facets: Option<PathBuf>,
-    store: Option<PathBuf>,
-    metadata: Option<PathBuf>,
+    taxonomy_version: String,
+    store: PathBuf,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
-    /// Whether the dataset declares a facts file the last load couldn't read (`/health`).
+    /// Whether the last load couldn't read the store's facts sections (`/health`).
     facts_unusable: AtomicBool,
-    /// Whether the last load ended without a usable store — declared and unreadable, or not declared
-    /// at all. Both answer More Like This the same way, so `/health` reports them the same way.
+    /// Whether the last load failed outright: the store would not open, so every index route answers 503.
+    ///
+    /// It used to mean something softer — "no store, so More Like This falls back to the pre-pooled
+    /// scorer" — because the store was one input among several and the rest could carry a degraded
+    /// service. It is now the only input, so there is no degraded service behind it: this is an outage of
+    /// every query route, and `/health` says so.
     store_unusable: AtomicBool,
     /// Whether the last load ended with no facet rows. Its own flag because it is its own feature: the
     /// store can be perfectly readable and its twelve `facet_*` sections missing or mis-typed, and then
@@ -227,21 +215,10 @@ pub struct IndexQueries {
 
 impl IndexQueries {
     pub fn new(ds: &Dataset) -> Self {
-        let premise = ds
-            .premise_labels
-            .as_ref()
-            .zip(ds.premise_vectors.as_ref())
-            .map(|(labels, vectors)| (labels.path.clone(), vectors.path.clone()));
         IndexQueries {
-            population: usize::try_from(ds.meta.count).unwrap_or(usize::MAX),
             dataset_version: ds.meta.dataset_version.clone(),
-            plot: (ds.labels.path.clone(), ds.vectors.path.clone()),
-            premise,
-            facets: ds.facets.as_ref().map(|f| f.path.clone()),
-            facts: ds.facts.clone(),
-            plot_facets: ds.plot_facets.clone(),
+            taxonomy_version: ds.meta.taxonomy_version.clone(),
             store: ds.store.clone(),
-            metadata: ds.metadata.as_ref().map(|m| m.path.clone()),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
@@ -250,13 +227,12 @@ impl IndexQueries {
         }
     }
 
-    /// Whether the last index load ended without a store: More Like This then falls back to the
-    /// pre-pooled scorer, which draws candidates from the premise index alone.
+    /// Whether the last index load failed on the store: every `/index/…` route then answers 503.
     pub fn store_unusable(&self) -> bool {
         self.store_unusable.load(Ordering::Relaxed)
     }
 
-    /// Whether the dataset declares a facts file that the last index load couldn't read: `/recommend` and search
+    /// Whether the last index load couldn't read the store's facts sections: `/recommend` and search
     /// then run without facts, which only a log line said before.
     pub fn facts_unusable(&self) -> bool {
         self.facts_unusable.load(Ordering::Relaxed)
@@ -280,56 +256,38 @@ impl IndexQueries {
         on_load();
         let started = Instant::now();
         let sources = Sources {
-            population: self.population,
             dataset_version: self.dataset_version.clone(),
-            plot: self.plot.clone(),
-            premise: self.premise.clone(),
-            facets: self.facets.clone(),
-            facts: self.facts.clone(),
-            plot_facets: self.plot_facets.clone(),
+            taxonomy_version: self.taxonomy_version.clone(),
             store: self.store.clone(),
-            metadata: self.metadata.clone(),
         };
-        let (indexes, phases) = tokio::task::spawn_blocking(move || load(&sources))
+        let loaded = tokio::task::spawn_blocking(move || load(&sources))
             .await
-            .map_err(|e| format!("load task: {e}"))??;
+            .map_err(|e| format!("load task: {e}"))?;
+        // A failed load is now an OUTAGE of the query routes, not a degradation of one of them, because
+        // the store is the only input left. Recorded before the `?` so `/health` reports it rather than
+        // only the request that happened to trigger the load.
+        self.store_unusable.store(loaded.is_err(), Ordering::Relaxed);
+        let (indexes, phases) = loaded?;
         let took = started.elapsed();
         let count = |n: Option<usize>| n.map_or("none".to_owned(), |n| format!("{n} titles"));
         let premise = count(indexes.premise.as_ref().map(Index::len));
-        let facets = format!(
-            "{} ({})",
-            count(indexes.facets.as_ref().map(FacetIndex::len)),
-            if indexes.facets_from_store { "store" } else { "facets.bin" }
-        );
+        let facets = count(indexes.facets.as_ref().map(FacetIndex::len));
         let facts = count(indexes.facts.as_ref().map(Facts::len));
         let plot_facets = count(indexes.plot_facets.as_ref().map(PlotFacets::len));
-        // The store gets counted like everything else. It was the one part of the load that reported no
-        // number, in a log line whose whole job is to say what arrived — so the artifact More Like This
-        // ranks on was the one you could not confirm had loaded without reading /health.
-        let store = count(indexes.store.as_ref().map(|s| s.store.rows()));
         eprintln!(
-            "index loaded: {} titles, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, store {store}, in {:.1}s ({phases})",
+            "index loaded: {} of {} store rows, premise {premise}, facets {facets}, facts {facts}, plot facets {plot_facets}, in {:.1}s ({phases})",
             indexes.plot.len(),
+            indexes.population,
             took.as_secs_f64()
         );
-        // The facts come from the STORE now, so a declared store counts as a promise of them just as a
-        // declared `factsFile` did. This used to be `!self.facts.is_empty() && …`, which was true while the
-        // JSON was published and became permanently FALSE the moment it stopped: a store whose facts
-        // sections are missing or the wrong width would fall through to a fallback chain with nothing in
-        // it, leave `/recommend`, `imdbId` and people search off, and answer `/health` with `ok`. That is
-        // the nineteen-minute silent degradation this flag exists to make impossible.
-        let promised_facts = !self.facts.is_empty() || self.store.is_some();
-        self.facts_unusable.store(promised_facts && indexes.facts.is_none(), Ordering::Relaxed);
-        // Absent for ANY reason, including never declared. This used to require `self.store.is_some()`,
-        // on the reasoning that a dataset which never promised a store cannot have broken one — but the
-        // rail ranks on the store now, and the two cases are indistinguishable from the outside: both
-        // answer More Like This with the pre-pooled scorer. A manifest published without `storeFile`
-        // would have degraded every row silently, with `/health` green. `check` refuses such a manifest
-        // outright; this is the second half, for a generation that got past it.
-        self.store_unusable.store(indexes.store.is_none(), Ordering::Relaxed);
-        // A store or a sidecar is a promise of facet rows, the same way either is a promise of facts.
-        let promised_rows = self.store.is_some() || self.plot_facets.is_some();
-        self.rows_unusable.store(promised_rows && indexes.plot_facets.is_none(), Ordering::Relaxed);
+        // The facts are sections of the store, so a store that opened is a promise of them: there is no
+        // longer a "the dataset declares no facts file" case in which their absence is by design. A store
+        // whose facts sections are missing or the wrong width leaves `/recommend`, `imdbId` and people
+        // search off while every request answers 200 — the nineteen-minute silent degradation this flag
+        // exists to make impossible.
+        self.facts_unusable.store(indexes.facts.is_none(), Ordering::Relaxed);
+        // Same reasoning for the twelve `facet_*` sections and the browse rows they fill.
+        self.rows_unusable.store(indexes.plot_facets.is_none(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
         *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
         Ok((indexes, Some(took)))
@@ -365,17 +323,16 @@ pub async fn release_when_idle(queries: Arc<IndexQueries>) {
     }
 }
 
-/// Where each part of the indexes is read from.
+/// Where the indexes are read from: one file, and the manifest field that is not in it.
 struct Sources {
-    population: usize,
+    /// The generation, as the manifest names it. Not read from the store even though the store stamps its
+    /// own — `den-atlas check` compares the two to catch a mixed generation, and a value that agreed with
+    /// itself by construction could not.
     dataset_version: String,
-    plot: BlobPair,
-    premise: Option<BlobPair>,
-    facets: Option<PathBuf>,
-    facts: Vec<PathBuf>,
-    plot_facets: Option<PathBuf>,
-    store: Option<PathBuf>,
-    metadata: Option<PathBuf>,
+    /// The labelling pass's version. It is NOT in the store — the store is the corpus, and the taxonomy
+    /// is a property of the pass that labelled it — so both indexes are stamped with it here.
+    taxonomy_version: String,
+    store: PathBuf,
 }
 
 /// Load the indexes ONCE, synchronously, for a command-line tool.
@@ -385,17 +342,10 @@ struct Sources {
 /// and its own facet sidecar out of files serving does not open, and every number it produced was about
 /// that parse. Nothing here is cached or released; the process exits when it is done.
 pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
-    let queries = IndexQueries::new(ds);
     let sources = Sources {
-        population: queries.population,
-        dataset_version: queries.dataset_version.clone(),
-        plot: queries.plot.clone(),
-        premise: queries.premise.clone(),
-        facets: queries.facets.clone(),
-        facts: queries.facts.clone(),
-        plot_facets: queries.plot_facets.clone(),
-        store: queries.store.clone(),
-        metadata: queries.metadata.clone(),
+        dataset_version: ds.meta.dataset_version.clone(),
+        taxonomy_version: ds.meta.taxonomy_version.clone(),
+        store: ds.store.clone(),
     };
     load(&sources).map(|(indexes, _phases)| indexes)
 }
@@ -412,155 +362,88 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
     handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// The indexes, and how long each part took. Every part is its own file and parse, so they load side by side —
-/// the first query after an idle spell waits on this — and then the display title index, which needs the cards,
-/// the facts and the facets.
+/// The indexes, and how long each part took.
+///
+/// The store is opened FIRST and a failure ends the load: it is the only input, so there is nothing to
+/// build the other parts out of and nothing to serve if it will not open. Everything after it is a read
+/// of a section of that one mapping, so the parallel phase is what can genuinely run side by side — both
+/// vector indexes and the cards — while the facts, the facet rows, the facet index and the display index
+/// follow in the order they depend on each other.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
-    let (plot, premise, facets, store, cards) = std::thread::scope(|scope| {
-        let plot = scope.spawn(|| timed(|| read_index(&sources.plot)));
-        // A broken premise index costs premise-led More Like This, not the whole feature.
-        let premise = scope.spawn(|| {
-            timed(|| {
-                sources.premise.as_ref().and_then(|pair| {
-                    read_index(pair)
-                        .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
-                        .ok()
-                })
-            })
-        });
-        // Like the premise index, an unusable facet blob costs only its own feature.
-        let facets = scope.spawn(|| {
-            timed(|| {
-                sources.facets.as_ref().and_then(|path| match std::fs::read(path) {
-                    Ok(blob) => FacetIndex::from_blob(&blob).or_else(|| {
-                        eprintln!("facet index {} is not a DFI2 blob — facet search is off", path.display());
-                        None
-                    }),
-                    Err(e) => {
-                        eprintln!("read {}: {e} — facet search is off", path.display());
-                        None
-                    }
-                })
-            })
-        });
-        // The store: every per-title signal the rail ranks on, mapped rather than parsed. Read on the
-        // load threads beside everything else; without it the pooled scorer is unavailable and More Like
-        // This falls back to vectors and labels, which is how it worked before the store existed.
-        let store = scope.spawn(|| {
-            timed(|| {
-                sources.store.as_ref().and_then(|path| match crate::store::LoadedStore::open(path) {
-                    Ok(loaded) => Some(loaded),
-                    Err(e) => {
-                        // Name the file and the reason. "could not load the dataset" is the message that
-                        // cost nineteen minutes of quiet degradation the last time a blob went bad.
-                        eprintln!("store unusable ({e}) — More Like This falls back to vectors and labels");
-                        None
-                    }
-                })
-            })
-        });
-        let cards = scope.spawn(|| {
-            timed(|| {
-                sources.metadata.as_ref().and_then(|path| {
-                    read_cards(path)
-                        .map_err(|e| {
-                            eprintln!(
-                                "metadata unusable ({e}) — plot rows are empty, search has no display titles"
-                            )
-                        })
-                        .ok()
-                })
-            })
-        });
-        (joined(plot), joined(premise), joined(facets), joined(store), joined(cards))
+    // Name the file and the reason. "could not load the dataset" is the message that cost nineteen
+    // minutes of quiet degradation the last time a blob went bad.
+    let (store, store_took) = timed(|| {
+        crate::store::LoadedStore::open(&sources.store)
+            .map_err(|e| format!("store {} is unusable: {e}", sources.store.display()))
     });
-    let ((plot, plot_took), (premise, premise_took), (facets, facets_took)) = (plot, premise, facets);
-    let plot = plot?;
-    let (cards, cards_took) = cards;
-    let (store, store_took) = store;
-    // The facts come out of the store, so this runs AFTER it rather than beside it. `factsFile` is a
-    // 43 MB JSON blob that atlas alone reads — nothing serves it and no client fetches it — and parsing
-    // it was 1.04 s of a 1.6 s load, now 0.38 s off the store.
+    let store = store?;
+    let population = store.store.rows();
+
+    let (plot, premise, cards) = std::thread::scope(|scope| {
+        let view = || store.view();
+        let plot = scope.spawn(move || timed(|| Index::from_store_plot(&view())));
+        // A premise index that will not read costs premise-led More Like This, not the whole feature.
+        let premise = scope.spawn(move || {
+            timed(|| {
+                Index::from_store_premise(&view())
+                    .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
+                    .ok()
+            })
+        });
+        let cards = scope.spawn(move || {
+            timed(|| {
+                cards_from_store(&view())
+                    .map_err(|e| {
+                        eprintln!("cards unusable ({e}) — plot rows are empty, search has no display titles")
+                    })
+                    .ok()
+            })
+        });
+        (joined(plot), joined(premise), joined(cards))
+    });
+    let ((plot, plot_took), (premise, premise_took), (cards, cards_took)) = (plot, premise, cards);
+    // The taxonomy version is a property of the LABELLING PASS, not of the corpus, so the store does not
+    // carry it and both indexes are stamped from the manifest. Miss this and `/index/schema.json`,
+    // `/index/taxonomy.json` and the `atlas_dataset_info` metric all report an empty version.
+    let plot = plot.map_err(|e| e.to_string())?.with_taxonomy_version(&sources.taxonomy_version);
+    let premise = premise.map(|index| index.with_taxonomy_version(&sources.taxonomy_version));
+    // `factsFile` was a 43 MB JSON blob that atlas alone read — nothing served it and no client fetched
+    // it — and parsing it was 1.04 s of a 1.6 s load, against 0.38 s off the store.
     //
-    // Switched on only once `Facts::from_store` answered IDENTICALLY to the JSON reader on the real
+    // Switched over only once `Facts::from_store` answered IDENTICALLY to the JSON reader on the real
     // corpus: 0 of 47,618 records differ. Getting there found four real losses in the store, three of
     // which would have changed what people see — series genres kept as TMDB composites (which dropped
     // Horror from Chilling Adventures of Sabrina), genres sorted out of the genreMap's order, the
     // franchise interned against a table that holds almost no franchises, and 1,236 entity references
     // the table did not describe being dropped. The test that found them is `facts::tests::
     // the_store_answers_what_the_json_did`, and it is opt-in because it needs the real artifacts.
-    //
-    // The sidecar stays as a fallback for a generation published before the store carried them.
     let (mut facts, facts_took) = timed(|| {
-        let from_store = store.as_ref().and_then(|s| {
-            Facts::from_store(&s.view())
-                .map_err(|e| eprintln!("facts unusable from the store ({e}) — trying factsFile"))
-                .ok()
-        });
-        from_store.or_else(|| {
-            sources.facts.iter().find_map(|path| match Facts::read(path) {
-                Ok(facts) => Some(facts),
-                Err(e) => {
-                    // Name the file: with several candidates, "facts unusable" alone does not say which
-                    // one, and the next line may be a success from a different file.
-                    eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
-                    None
-                }
-            })
-        })
+        Facts::from_store(&store.view())
+            .map_err(|e| eprintln!("facts unusable ({e}) — /recommend and search run without them"))
+            .ok()
     });
-    // The facet rows come out of the store, so this runs AFTER it rather than beside it. It used to read
-    // `plotFacetsFile`, a 5,336-title sidecar frozen at a dead datasetVersion; the store answers the same
-    // axes for all 47,618 titles, and three more besides.
+    // The facet rows used to come from `plotFacetsFile`, a 5,336-title sidecar frozen at a dead
+    // datasetVersion; the store answers the same axes for all 47,618 titles, and three more besides.
     let (plot_facets, plot_facets_took) = timed(|| {
-        let from_store = store.as_ref().and_then(|s| {
-            PlotFacets::from_store(&s.view())
-                .map_err(|e| eprintln!("facet rows unusable ({e}) — falling back to plotFacetsFile"))
-                .ok()
-        });
-        // The sidecar only when there is no store to read them from: a dataset published before the
-        // `facet_v` sections existed still gets its rows, at the 5,336 titles it described.
-        from_store.or_else(|| {
-            sources.plot_facets.as_ref().and_then(|path| {
-                PlotFacets::read(path)
-                    .map_err(|e| eprintln!("plot facets unusable ({e}) — plot rows are empty"))
-                    .ok()
-            })
-        })
+        PlotFacets::from_store(&store.view())
+            .map_err(|e| eprintln!("facet rows unusable ({e}) — every browse row is empty"))
+            .ok()
     });
-    // The facet index comes out of the store too, for the same reason: `facets.bin` covers 38,532 titles
-    // and the store covers 47,618, so attribute search ("spanish series", "80s korean horror") was asking
-    // a table 9,086 titles behind the corpus it is searching. The blob stays as the fallback for a dataset
-    // published before the store carried these columns.
-    let (facets, facets_from_store) = match (store.as_ref(), facts.as_ref()) {
-        (Some(loaded), Some(facts)) => match facet_index_from(facts, &loaded.view()) {
-            Ok(built) => (Some(built), true),
-            Err(e) => {
-                eprintln!("facet index unusable from the store ({e}) — falling back to facets.bin");
-                (facets, false)
-            }
-        },
-        _ => (facets, false),
-    };
+    // The facet index needs the facts, so it follows them: `facets.bin` covered 38,532 titles where the
+    // store covers 47,618, so attribute search ("spanish series", "80s korean horror") was asking a table
+    // 9,086 titles behind the corpus it was searching.
+    let (facets, facets_took) = timed(|| {
+        let facts = facts.as_ref()?;
+        facet_index_from(facts, &store.view())
+            .map_err(|e| eprintln!("facet index unusable ({e}) — attribute search is off"))
+            .ok()
+    });
 
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
         cards.as_ref().map(|cards| {
-            let votes = |kind, id| {
-                store
-                    .as_ref()
-                    .and_then(|loaded| {
-                        let view = loaded.view();
-                        let media = u8::from(kind == den_index::MediaType::Tv);
-                        let row = view.row_of(media, id).ok().flatten()?;
-                        view.per_row::<u32>("votes").ok()?.get(row.0).copied()
-                    })
-                    .map(f64::from)
-                    .unwrap_or_else(|| {
-                        facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0.0, |t| f64::from(t.votes))
-                    })
-            };
+            let votes = |kind, id| f64::from(votes_of(&store, kind, id));
             // Each title under its display name, and every other name the facts give it: its original title and
             // aliases ("기생충", "Gisaengchung").
             TitleIndex::build(
@@ -586,23 +469,22 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     });
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "plot {}, premise {}, facts {}, metadata {}, facets {}, plot facets {}, store {}, display {}",
+        "store {}, plot {}, premise {}, cards {}, facts {}, facet rows {}, facets {}, display {}",
+        seconds(store_took),
         seconds(plot_took),
         seconds(premise_took),
-        seconds(facts_took),
         seconds(cards_took),
-        seconds(facets_took),
+        seconds(facts_took),
         seconds(plot_facets_took),
-        seconds(store_took),
+        seconds(facets_took),
         seconds(display_took)
     );
     let indexes = Indexes {
-        population: sources.population,
+        population,
         dataset_version: sources.dataset_version.clone(),
         plot,
         premise,
         facets,
-        facets_from_store,
         facts,
         plot_facets,
         store,
@@ -618,113 +500,135 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     Ok((indexes, format!("{phases}, fit {}", seconds(fit_took))))
 }
 
-fn read_index((labels, vectors): &BlobPair) -> Result<Index, String> {
-    let labels = std::fs::read(labels).map_err(|e| format!("read {}: {e}", labels.display()))?;
-    let vector_bytes = std::fs::read(vectors).map_err(|e| format!("read {}: {e}", vectors.display()))?;
-    Index::from_blobs(&labels, vector_bytes).map_err(|e| e.to_string())
-}
-
-/// A small, real dataset — plot and premise indexes over three movies and a series — written to `dir` and
-/// loaded, for route tests. Heist is the biggest subgenre; "Campy/Cult" has a slash to encode.
+/// A small, real dataset — twelve titles in one store — written to `dir` and loaded, for route tests.
+/// Heist is the biggest subgenre; "Campy/Cult" has a slash to encode.
+///
+/// It used to be seven files: two labels blobs, two vector blobs, `facets.bin`, a facts sidecar, a
+/// plot-facets sidecar and a metadata sidecar, each covering a different subset of the same twelve titles.
+/// The corpus is unchanged — same ids, labels, vectors, cards, votes, facets and credits — but it is now
+/// one artifact, which is why the facts describe every title the facet index needs rather than four of
+/// them living in a separate blob.
 #[cfg(test)]
 pub fn write_fixture(dir: &std::path::Path) -> Dataset {
-    type Row<'a> = (u32, &'a str, &'a str, &'a [(&'a str, f64)], &'a [(&'a str, f64)], [i8; 3]);
-    fn blobs(rows: &[Row<'_>]) -> (String, Vec<u8>) {
-        let records: Vec<serde_json::Value> = rows
-            .iter()
-            .map(|(id, kind, genre, subs, moods, _)| {
-                let labels = |ls: &[(&str, f64)]| -> Vec<serde_json::Value> {
-                    ls.iter().map(|(l, c)| serde_json::json!({"label": l, "confidence": c})).collect()
-                };
-                serde_json::json!({"tmdbId": id, "mediaType": kind, "primaryGenre": genre, "animated": false,
-                                   "source": "llm", "subgenres": labels(subs), "moods": labels(moods)})
-            })
-            .collect();
-        let labels = serde_json::json!({"taxonomyVersion": "t02", "count": rows.len(), "records": records});
-        let mut vectors = (rows.len() as i32).to_le_bytes().to_vec();
-        vectors.extend_from_slice(&3i32.to_le_bytes());
-        for row in rows {
-            vectors.extend(row.5.iter().map(|&v| v as u8));
-        }
-        (labels.to_string(), vectors)
-    }
-    // Eight zero-vector series make the fixture's semantic-score distribution large enough for one clear
-    // movie match to cross search.rs's z=2.5 floor. They deliberately have no cards: route tests can prove
-    // which of the four drawable titles each semantic index proposes without expanding every other fixture.
-    let plot = blobs(&[
-        (1, "movie", "Drama", &[("Heist", 0.9)], &[("Tense", 0.8)], [100, 0, 0]),
-        (2, "movie", "Drama", &[("Heist", 0.8)], &[], [90, 10, 0]),
-        (3, "movie", "Comedy", &[("Heist", 0.6), ("Campy/Cult", 0.9)], &[], [0, 100, 0]),
-        (4, "tv", "Drama", &[("Heist", 0.95)], &[], [100, 0, 0]),
-        (101, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (102, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (103, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (104, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (105, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (106, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (107, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (108, "tv", "Drama", &[], &[], [0, 0, 0]),
-    ]);
-    let premise = blobs(&[
-        (1, "movie", "Drama", &[("Heist", 0.9)], &[("Tense", 0.8)], [100, 0, 0]),
-        (2, "movie", "Drama", &[("Heist", 0.8)], &[], [0, 100, 0]),
-        (3, "movie", "Comedy", &[("Heist", 0.6), ("Campy/Cult", 0.9)], &[], [95, 0, 0]),
-        (4, "tv", "Drama", &[("Heist", 0.95)], &[], [100, 0, 0]),
-        (101, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (102, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (103, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (104, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (105, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (106, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (107, "tv", "Drama", &[], &[], [0, 0, 0]),
-        (108, "tv", "Drama", &[], &[], [0, 0, 0]),
-    ]);
+    write_fixture_as(dir, "One", true)
+}
+
+/// The same fixture with a different display title for movie 1, for the tests about a word that is both a
+/// facet and a title ("brazil").
+#[cfg(test)]
+pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
+    write_fixture_as(dir, movie_one, true)
+}
+
+/// The same fixture with no premise vectors, for the tests about a dataset whose store carries only the
+/// plot space. Setting `premise_labels = None` on the dataset used to do this; the premise index is a
+/// section of the store now, so the store is what has to lack it.
+#[cfg(test)]
+pub fn write_fixture_plot_only(dir: &std::path::Path) -> Dataset {
+    write_fixture_as(dir, "One", false)
+}
+
+#[cfg(test)]
+fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool) -> Dataset {
+    use crate::store::fixture::{Entity, Title};
+    // Days since 1970-01-01, the store's unit for a release date.
+    const D1985: i32 = 5479;
+    const D1995: i32 = 9131;
+    const D2010: i32 = 14610;
+    const D2026_09_01: i32 = 20697;
+
+    let vector = |v: [i8; 3], on: bool| if on { v.to_vec() } else { Vec::new() };
+    // Movies 1-3 and series 4 are the drawable titles. Eight zero-vector series make the fixture's
+    // semantic-score distribution large enough for one clear movie match to cross search.rs's z=2.5 floor;
+    // they deliberately have no card, so a route test can prove which of the four drawable titles each
+    // semantic index proposes without expanding every other fixture.
+    let mut titles = vec![
+        Title {
+            media: 0,
+            tmdb_id: 1,
+            primary_genre: "Drama",
+            subgenres: vec![("Heist", 90)],
+            moods: vec![("Tense", 80)],
+            plot: vector([100, 0, 0], true),
+            premise: vector([100, 0, 0], premise),
+            facets: vec![("ending", "bittersweet", 70), ("tone", "bleak", 90), ("pacing", "slow-burn", 90)],
+            card: Some((movie_one, Some("/1.jpg"), Some(1985))),
+            votes: 100,
+            imdb: Some("tt0000001"),
+            released: Some((D2026_09_01, 0)),
+            genres: vec![80, 18],
+            countries: vec!["KR", "DK"],
+            makers: vec![1, 9],
+            cast: vec![2, 3],
+            franchise: Some(50),
+            based_kind: vec!["book", "play"],
+            alias_titles: vec!["One", "하나", "Uno"],
+            ..Title::default()
+        },
+        Title {
+            media: 0,
+            tmdb_id: 2,
+            primary_genre: "Drama",
+            subgenres: vec![("Heist", 80)],
+            plot: vector([90, 10, 0], true),
+            premise: vector([0, 100, 0], premise),
+            facets: vec![("ending", "bittersweet", 90), ("tone", "bleak", 60)],
+            card: Some(("Two", Some("/2.jpg"), Some(1995))),
+            votes: 500,
+            released: Some((D1995, 0)),
+            countries: vec!["KR"],
+            ..Title::default()
+        },
+        Title {
+            media: 0,
+            tmdb_id: 3,
+            primary_genre: "Comedy",
+            subgenres: vec![("Heist", 60), ("Campy/Cult", 90)],
+            plot: vector([0, 100, 0], true),
+            premise: vector([95, 0, 0], premise),
+            facets: vec![("ending", "bittersweet", 90), ("tone", "comic", 90)],
+            card: Some(("Three", None, Some(1985))),
+            votes: 50,
+            released: Some((D1985, 0)),
+            countries: vec!["ES"],
+            ..Title::default()
+        },
+        Title {
+            media: 1,
+            tmdb_id: 4,
+            primary_genre: "Drama",
+            subgenres: vec![("Heist", 95)],
+            plot: vector([100, 0, 0], true),
+            premise: vector([100, 0, 0], premise),
+            facets: vec![("ending", "bittersweet", 90)],
+            card: Some(("Four", Some("/4.jpg"), Some(2010))),
+            votes: 300,
+            released: Some((D2010, 0)),
+            countries: vec!["KR"],
+            ..Title::default()
+        },
+    ];
+    titles.extend((101..=108).map(|tmdb_id| Title {
+        media: 1,
+        tmdb_id,
+        primary_genre: "Drama",
+        plot: vector([0, 0, 0], true),
+        premise: vector([0, 0, 0], premise),
+        ..Title::default()
+    }));
+    let entities = [
+        Entity { qid: 1, name: "A Director", tmdb: Some(11), aliases: Vec::new() },
+        // People search indexes the aliases as well as the name.
+        Entity { qid: 2, name: "Lead Actor", tmdb: None, aliases: vec!["Bong Joon-ho", "기생충 배우"] },
+        Entity { qid: 50, name: "A Franchise", tmdb: None, aliases: Vec::new() },
+    ];
+
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("labels.json"), &plot.0).unwrap();
-    std::fs::write(dir.join("vectors.bin"), &plot.1).unwrap();
-    std::fs::write(dir.join("premise-labels.json"), &premise.0).unwrap();
-    std::fs::write(dir.join("premise-vectors.bin"), &premise.1).unwrap();
-    // Korean movies 1 (1985, 100 votes) and 2 (1995, 500), Spanish movie 3 (1985), Korean series 4 (2010, 300).
-    let mut facets = b"DFI2".to_vec();
-    facets.extend_from_slice(&4u32.to_le_bytes());
-    for (id, tv, country, year, votes) in [
-        (1i32, 0u8, b"KR", 1985u16, 100u32),
-        (2, 0, b"KR", 1995, 500),
-        (3, 0, b"ES", 1985, 50),
-        (4, 1, b"KR", 2010, 300),
-    ] {
-        facets.extend_from_slice(&id.to_le_bytes());
-        facets.push(tv);
-        facets.extend_from_slice(b"xx");
-        facets.extend_from_slice(country);
-        facets.extend_from_slice(&year.to_le_bytes());
-        facets.extend_from_slice(&votes.to_le_bytes());
-    }
-    std::fs::write(dir.join("facets.bin"), &facets).unwrap();
-    std::fs::write(dir.join("facts-slim.json"), crate::facts::tests::SAMPLE).unwrap();
-    std::fs::write(dir.join("plot-facets.json"), crate::plotrows::tests::SAMPLE).unwrap();
-    let metadata = serde_json::json!([
-        {"tmdbId": 1, "mediaType": "movie", "title": "One", "posterPath": "/1.jpg", "year": 1985},
-        {"tmdbId": 2, "mediaType": "movie", "title": "Two", "posterPath": "/2.jpg", "year": 1995},
-        {"tmdbId": 3, "mediaType": "movie", "title": "Three", "posterPath": null, "year": 1985},
-        {"tmdbId": 4, "mediaType": "tv", "title": "Four", "posterPath": "/4.jpg", "year": 2010},
-    ])
-    .to_string();
-    std::fs::write(dir.join("metadata.json"), &metadata).unwrap();
+    crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &entities);
+    // The pruned manifest: the store, and the few facts about it that are not in it.
     let meta = serde_json::json!({
-        "factsSlimFile": "facts-slim.json",
-        "plotFacetsFile": "plot-facets.json",
-        "metadataFile": "metadata.json", "metadataBytes": metadata.len(), "metadataSha256": "f",
-        "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3, "count": 12,
-        "quantization": "int8",
-        "labelsFile": "labels.json", "labelsBytes": plot.0.len(), "labelsSha256": "a",
-        "vectorsFile": "vectors.bin", "vectorsBytes": plot.1.len(), "vectorsSha256": "b",
-        "premiseEmbeddingModel": "pm", "premiseDims": 3, "premiseCount": 12,
-        "premiseLabelsFile": "premise-labels.json", "premiseLabelsBytes": premise.0.len(),
-        "premiseLabelsSha256": "c",
-        "premiseVectorsFile": "premise-vectors.bin", "premiseVectorsBytes": premise.1.len(),
-        "premiseVectorsSha256": "d",
-        "facetsFile": "facets.bin", "facetsBytes": facets.len(), "facetsSha256": "e",
+        "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+        "quantization": "int8", "storeFile": "den-v1.store",
     });
     std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
     Dataset::load(dir).expect("fixture dataset must load")
@@ -744,7 +648,11 @@ mod tests {
         let (indexes, first) = queries.get(counted).await.unwrap();
         assert!(first.is_some(), "the first query loads");
         assert!(indexes.premise.is_some());
-        assert_eq!(indexes.facts.as_ref().map(|f| f.len()), Some(3), "the facts load with the indexes");
+        // One facts record per store row: the facts are sections of the corpus now, not a sidecar that
+        // happened to describe some of it.
+        assert_eq!(indexes.facts.as_ref().map(|f| f.len()), Some(12), "the facts load with the indexes");
+        assert_eq!(indexes.plot.taxonomy_version(), "t02", "stamped from the manifest, not the store");
+        assert_eq!(indexes.premise.as_ref().map(Index::taxonomy_version), Some("t02"));
         let (_, again) = queries.get(counted).await.unwrap();
         assert!(again.is_none(), "a warm query doesn't");
         assert_eq!(loads.get(), 1, "on_load runs for the load alone");
@@ -761,11 +669,16 @@ mod tests {
         assert_eq!(loads.get(), 2);
     }
 
+    /// A store swapped for something that is not one fails the load and SAYS SO through `/health`, rather
+    /// than panicking or answering a degraded row. It is the only input, so there is nothing else to serve
+    /// from — which is the difference from every optional blob this used to fall back through.
     #[tokio::test]
-    async fn a_dataset_that_does_not_parse_is_an_error_not_a_panic() {
+    async fn a_store_that_does_not_read_is_an_error_not_a_panic() {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-bad-{}", std::process::id()));
         let ds = write_fixture(&dir);
-        std::fs::write(&ds.labels.path, b"not json").unwrap();
-        assert!(IndexQueries::new(&ds).get(|| ()).await.is_err());
+        std::fs::write(&ds.store, b"not a store").unwrap();
+        let queries = IndexQueries::new(&ds);
+        assert!(queries.get(|| ()).await.is_err());
+        assert!(queries.store_unusable(), "a failed load must reach /health");
     }
 }

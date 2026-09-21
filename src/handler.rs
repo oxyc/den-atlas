@@ -282,11 +282,15 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     }
     // Blob routes exist only when the dataset loaded (their names come from the meta).
     if let Some(ds) = ds {
-        if route == format!("/{}", ds.labels.name) {
-            return serve_blob(&method, &headers, &query, ds, &ds.labels).await;
+        if let Some(labels) = &ds.labels {
+            if route == format!("/{}", labels.name) {
+                return serve_blob(&method, &headers, &query, ds, labels).await;
+            }
         }
-        if route == format!("/{}", ds.vectors.name) {
-            return serve_blob(&method, &headers, &query, ds, &ds.vectors).await;
+        if let Some(vectors) = &ds.vectors {
+            if route == format!("/{}", vectors.name) {
+                return serve_blob(&method, &headers, &query, ds, vectors).await;
+            }
         }
         if let Some(md) = &ds.metadata {
             if route == format!("/{}", md.name) {
@@ -1651,14 +1655,11 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("den-atlas-desc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("labels.json"), b"{}").unwrap();
-        std::fs::write(dir.join("vectors.bin"), b"\0\0").unwrap();
+        store_in(&dir);
         std::fs::write(
             dir.join("dataset.meta.json"),
-            br#"{"datasetVersion":"t","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
-                 "labelsFile":"labels.json","labelsBytes":2,"labelsSha256":"a",
-                 "vectorsFile":"vectors.bin","vectorsBytes":2,"vectorsSha256":"b"}"#,
+            br#"{"datasetVersion":"t","taxonomyVersion":"t","embeddingModel":"m","dims":2,
+                 "quantization":"int8","storeFile":"s.store"}"#,
         )
         .unwrap();
         let ds = crate::dataset::Dataset::load(&dir).expect("fixture dataset must load");
@@ -1683,10 +1684,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A one-title store, so a `Dataset::load` in a route test has the mandatory blob. The tests it
+    /// serves are about the manifest and the served blobs, not about what is in the store.
+    fn store_in(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let title = crate::store::fixture::Title {
+            media: 0,
+            tmdb_id: 1,
+            plot: vec![0, 0],
+            premise: vec![0, 0],
+            ..crate::store::fixture::Title::default()
+        };
+        crate::store::fixture::write(&dir.join("s.store"), "v9", 2, &[title], &[]);
+    }
+
     /// A dataset fixture whose two blobs are distinguishable by content, so a route test can prove
     /// WHICH blob it served rather than merely that it served something.
     fn fixture(dir: &std::path::Path) -> crate::dataset::Dataset {
-        std::fs::create_dir_all(dir).unwrap();
+        store_in(dir);
         std::fs::write(dir.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(dir.join("vectors.bin"), b"VECTORS!").unwrap();
         // Every OPTIONAL blob the production dataset ships, not just some of them. With only the two
@@ -1700,8 +1715,8 @@ mod tests {
         std::fs::write(dir.join("premise-vectors.bin"), b"PVECTORS").unwrap();
         std::fs::write(
             dir.join("dataset.meta.json"),
-            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
+                 "quantization":"int8","storeFile":"s.store",
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c",
@@ -1792,7 +1807,11 @@ mod tests {
         let taxonomy = json(body_of(taxonomy).await);
         assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
         assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
+        // The labelling pass's version is NOT in the store; both routes that name it read it off the
+        // index, which the load stamps from the manifest. Miss that and these answer "".
+        assert_eq!(taxonomy["taxonomyVersion"], "t02", "{taxonomy}");
         let schema = json(body_of(get(&state, "/index/schema.json").await).await);
+        assert_eq!(schema["taxonomyVersion"], "t02", "{schema}");
         // 12 titles, 8 of them unlabelled: `count` and `denominator` must differ, or a client reports a
         // fraction of the corpus as though it were the whole of it.
         assert_eq!(schema["population"]["count"], 12);
@@ -1810,13 +1829,17 @@ mod tests {
             ("/index/rows/series/subgenre/Heist.json", serde_json::json!([4])),
             ("/index/rows/movie/subgenre/Campy%2FCult.json", serde_json::json!([3])),
             ("/index/rows/movie/mood/Tense.json", serde_json::json!([1])),
-            // Premise leads: 3 (its premise score, +¼ as the plot agrees, −¼ for another genre) beats 2.
-            ("/index/similar/movie/1.json", serde_json::json!([3, 2])),
+            // The POOLED scorer, which is the only one now: the store is the dataset, so there is no
+            // store-less arm left for a fixture to fall into. Movie 2 leads — it is a strong PLOT
+            // neighbour (90,10,0 against 100,0,0) and shares movie 1's Drama, where movie 3 is a premise
+            // neighbour in another genre. Drawing candidates from both spaces is the whole point of
+            // pooling; the pre-pooled scorer drew them from the premise index alone and answered 3, 2.
+            ("/index/similar/movie/1.json", serde_json::json!([2, 3])),
             // The rail is scrolled, so it pages. Absent both params it answers the first screenful, which
             // is what every existing caller expects.
-            ("/index/similar/movie/1.json?skip=1", serde_json::json!([2])),
-            ("/index/similar/movie/1.json?limit=1", serde_json::json!([3])),
-            ("/index/similar/movie/1.json?skip=1&limit=1", serde_json::json!([2])),
+            ("/index/similar/movie/1.json?skip=1", serde_json::json!([3])),
+            ("/index/similar/movie/1.json?limit=1", serde_json::json!([2])),
+            ("/index/similar/movie/1.json?skip=1&limit=1", serde_json::json!([3])),
             ("/index/similar/movie/1.json?skip=99", serde_json::json!([])),
         ] {
             let answer = json(body_of(get(&state, path).await).await);
@@ -1826,7 +1849,10 @@ mod tests {
                 assert_eq!(answer["total"], 2, "{path}");
             }
             if path.starts_with("/index/rows/") {
-                let denominator = if path.contains("/series/") { 1 } else { 3 };
+                // Titles of that type in the CORPUS: three movies, nine series. It used to read 1 for
+                // series, because the denominator came from `facets.bin` and that blob described four of
+                // the twelve titles — so "1 of 1 series is a heist" where the honest answer is 1 of 9.
+                let denominator = if path.contains("/series/") { 9 } else { 3 };
                 assert_eq!(answer["coverage"]["denominator"], denominator, "{path}");
             }
         }
@@ -2078,9 +2104,9 @@ mod tests {
         assert!(first["f"]["semPremise"].as_f64().unwrap() > 0.0, "{with_premise}");
 
         let dir = std::env::temp_dir().join(format!("den-atlas-query-plot-only-{}", std::process::id()));
-        let mut ds = crate::queries::write_fixture(&dir);
-        ds.premise_labels = None;
-        ds.premise_vectors = None;
+        // A store with no premise vectors. Dropping the premise BLOBS from the dataset used to do this;
+        // the premise index is a section of the store now, so the store is what has to lack it.
+        let ds = crate::queries::write_fixture_plot_only(&dir);
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         let state = Arc::new(AppState {
             index: Some(index),
@@ -2099,13 +2125,7 @@ mod tests {
     #[tokio::test]
     async fn query_search_keeps_the_exact_title_floor_across_an_inferred_facet_collision() {
         let dir = std::env::temp_dir().join(format!("den-atlas-query-brazil-{}", std::process::id()));
-        let ds = crate::queries::write_fixture(&dir);
-        let metadata_path = dir.join("metadata.json");
-        let mut metadata: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
-        metadata[0]["title"] = serde_json::json!("Brazil");
-        std::fs::write(&metadata_path, metadata.to_string()).unwrap();
-
+        let ds = crate::queries::write_fixture_titled(&dir, "Brazil");
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         let state = Arc::new(AppState {
             index: Some(index),

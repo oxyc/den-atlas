@@ -7,5 +7,13 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# The store reader — den-spec wire/store-v1. Pure and dependency-light (`zerocopy` alone) and it owns no
+# mapping, so it compiles for wasm32 like the rest of this crate. Same tag as den-atlas reads with: a
+# binary format contract wants one version per build, not two.
+den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v1.2" }
+
+# The index is built from the store; the only JSON left in this crate is the labels-blob reader the
+# store-vs-blob parity tests compare against, so serde is not linked into the serving build at all.
+[dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

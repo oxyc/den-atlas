@@ -27,9 +27,13 @@
 
 use crate::queries::Indexes;
 use den_index::MediaType;
+/// Only the sidecar readers below parse JSON, and only tests call them.
+#[cfg(test)]
 use serde::Deserialize;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Read;
+#[cfg(test)]
 use std::path::Path;
 
 type Key = (MediaType, u32);
@@ -41,7 +45,8 @@ type Key = (MediaType, u32);
 /// reader's job, and this is where it happens.
 const FACET_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 
-/// The sidecar layout the fallback reader understands (`"schema"` in the file).
+/// The sidecar layout the test-only reader understands (`"schema"` in the file).
+#[cfg(test)]
 const SCHEMA: u32 = 1;
 
 /// `structure=<value>` → the axis in the store that answers it.
@@ -130,14 +135,10 @@ impl PlotFacets {
 
     /// The old `plotFacetsFile` sidecar.
     ///
-    /// Kept as a FALLBACK for a dataset published before the store carried facets — the same
-    /// degrade-rather-than-fail rule every other optional blob here follows. Production no longer ships
-    /// one; `from_store` is the path that runs.
-    pub fn read(path: &Path) -> Result<PlotFacets, String> {
-        let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        PlotFacets::from_bytes(&raw).map_err(|e| format!("{}: {e}", path.display()))
-    }
-
+    /// **Tests only.** Nothing reads the sidecar: it is not published and `from_store` is the only path
+    /// that runs. It stays behind `#[cfg(test)]` so the unit test below still has a second description of
+    /// the same four titles to hold `matching` to.
+    #[cfg(test)]
     pub fn from_bytes(raw: &[u8]) -> Result<PlotFacets, String> {
         let file: RawFile = serde_json::from_slice(&gunzipped(raw)?).map_err(|e| format!("parse: {e}"))?;
         if file.schema != SCHEMA {
@@ -238,7 +239,53 @@ pub struct Card {
     pub year: Option<i64>,
 }
 
+/// The cards, out of the store.
+///
+/// Same map, same shape, different input — so plot rows and the search display titles keep working while
+/// `metadataFile` stops being read. The store carries `card_title`, `card_poster` and `card_year` for
+/// every row it holds, which is MORE rows than the sidecar has records: the writer falls back to the
+/// facts' `titles.en`/`titles.orig` for a title the sidecar does not name, so a row can have a card here
+/// and none there. Those rows are kept — a title the sidecar never described is not a reason to answer
+/// with nothing for it.
+///
+/// A row with no resolvable title is skipped, exactly as `read_cards` skips a record whose `title` is
+/// null: a card is a thing to draw, and there is nothing to draw without a name. The empty string is
+/// treated the same way for the same reason — the writer's `title or titles.en or titles.orig` chain
+/// cannot emit one, so this is a guard rather than a behaviour, and a blank label is not a card.
+/// `posterPath` keeps whatever string the store holds, empty included, because `read_cards` did: only
+/// the ABSENT id (`u32::MAX`) is `None`.
+pub fn cards_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Card>, String> {
+    let err = |e: den_store::StoreError| e.to_string();
+    let keys = store.per_row::<u64>("keys").map_err(err)?;
+    let titles = store.per_row::<u32>("card_title").map_err(err)?;
+    let posters = store.per_row::<u32>("card_poster").map_err(err)?;
+    let years = store.per_row::<i16>("card_year").map_err(err)?;
+    let strings = store.strings().map_err(err)?;
+
+    let mut cards: HashMap<Key, Card> = HashMap::with_capacity(keys.len());
+    for (i, &packed) in keys.iter().enumerate() {
+        let media_type = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
+        // `Strings::get` answers `None` for `NONE_U32` and for an id it cannot resolve, so the sentinel
+        // never becomes the string "4294967295" — and `NONE_I16` is absent, not the year -32768.
+        let Some(title) = strings.get(titles[i]).filter(|title| !title.is_empty()) else { continue };
+        cards.insert(
+            (media_type, packed as u32),
+            Card {
+                title: title.to_owned(),
+                poster_path: strings.get(posters[i]).map(str::to_owned),
+                year: (years[i] != den_store::NONE_I16).then(|| i64::from(years[i])),
+            },
+        );
+    }
+    Ok(cards)
+}
+
 /// The metadata sidecar (`metadataFile`) as cards by title.
+///
+/// **Tests only.** The cards come out of the store; the sidecar is not read and no longer published.
+/// It stays behind `#[cfg(test)]` so `the_store_answers_what_the_metadata_sidecar_did` still has the
+/// reader it compares against — a deleted reader cannot disagree with anything.
+#[cfg(test)]
 pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -268,31 +315,23 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
         .collect())
 }
 
-/// The sidecar's poster paths alone, as `(media type, tmdb id) -> "/abc.jpg"`.
+/// The store's poster paths alone, as `(media type, tmdb id) -> "/abc.jpg"`.
 ///
-/// Separate from `read_cards` because the catalog rows want the path and nothing else, and there are 38.5k
-/// of them: keeping each title and year too would hold a `String` per title for no reader. Serde drops what
-/// this struct does not name, so those are never allocated.
-pub fn read_posters(path: &Path) -> Result<HashMap<Key, Box<str>>, String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawPoster {
-        tmdb_id: u32,
-        media_type: String,
-        poster_path: Option<String>,
-    }
-    let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let cards: Vec<RawPoster> =
-        serde_json::from_slice(&gunzipped(&raw)?).map_err(|e| format!("{}: parse: {e}", path.display()))?;
-    Ok(cards
-        .into_iter()
-        .filter_map(|c| {
-            let media_type = match c.media_type.as_str() {
-                "movie" => MediaType::Movie,
-                "tv" => MediaType::Tv,
-                _ => return None,
-            };
-            Some(((media_type, c.tmdb_id), c.poster_path?.into_boxed_str()))
+/// Separate from `cards_from_store` because the catalog rows want the path and nothing else, and there are
+/// tens of thousands of them: keeping each title and year too would hold a `String` per title for no
+/// reader. This read the metadata sidecar until the store carried `card_poster`.
+pub fn posters_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Box<str>>, String> {
+    let err = |e: den_store::StoreError| e.to_string();
+    let keys = store.per_row::<u64>("keys").map_err(err)?;
+    let posters = store.per_row::<u32>("card_poster").map_err(err)?;
+    let strings = store.strings().map_err(err)?;
+    Ok(keys
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &packed)| {
+            let media_type = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
+            let poster = strings.get(posters[i]).filter(|path| !path.is_empty())?;
+            Some(((media_type, packed as u32), poster.to_owned().into_boxed_str()))
         })
         .collect())
 }
@@ -436,6 +475,7 @@ pub(crate) fn genres(indexes: &Indexes, (media_type, id): Key) -> Vec<u16> {
     genres
 }
 
+#[cfg(test)]
 fn title_key(key: &str) -> Option<Key> {
     let (media_type, id) = key.split_once(':')?;
     let media_type = match media_type {
@@ -446,6 +486,7 @@ fn title_key(key: &str) -> Option<Key> {
     Some((media_type, id.parse().ok()?))
 }
 
+#[cfg(test)]
 fn gunzipped(raw: &[u8]) -> Result<Vec<u8>, String> {
     if !raw.starts_with(&[0x1f, 0x8b]) {
         return Ok(raw.to_vec());
@@ -455,6 +496,7 @@ fn gunzipped(raw: &[u8]) -> Result<Vec<u8>, String> {
     Ok(plain)
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawFile {
     schema: u32,
@@ -462,6 +504,7 @@ struct RawFile {
     facets: HashMap<String, HashMap<String, Option<RawFacet>>>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawFacet {
     value: Option<String>,
@@ -514,5 +557,122 @@ pub(crate) mod tests {
         assert!(facets.matching(MediaType::Movie, &[pair("ending", "sad")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[pair("colour", "blue")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[]).is_empty());
+    }
+
+    /// The store's cards against the sidecar's, on the REAL artifacts. Opt-in via `DEN_STORE` +
+    /// `DEN_METADATA`.
+    ///
+    /// The cards are the title, poster path and year every `/index/row` answer carries, and a row is
+    /// built only for keys that HAVE one — so a reader that silently loses a card drops the title from
+    /// the row rather than drawing it wrong, and the fixture tests above cannot see it. Every key the
+    /// sidecar describes must come back identical from the store.
+    ///
+    /// The store legitimately holds cards the sidecar does not: the writer falls back to the facts'
+    /// `titles.en`/`titles.orig` when the sidecar has no record for a row, so the extras are classified
+    /// here rather than waved through — a store card for a key the sidecar DOES describe with a
+    /// different title would be a loss, not an extra.
+    #[test]
+    fn the_store_answers_what_the_metadata_sidecar_did() {
+        let (Ok(store_path), Ok(metadata_path)) = (std::env::var("DEN_STORE"), std::env::var("DEN_METADATA"))
+        else {
+            eprintln!("SKIP: set DEN_STORE and DEN_METADATA to compare the two card readers");
+            return;
+        };
+        let mapped = crate::store::MappedStore::open(std::path::Path::new(&store_path)).expect("store");
+        let from_store = cards_from_store(&mapped.view()).expect("cards from the store");
+        let from_json = read_cards(std::path::Path::new(&metadata_path)).expect("cards from the sidecar");
+        eprintln!("cards: store {} · sidecar {}", from_store.len(), from_json.len());
+
+        let mut differ = Vec::new();
+        for (key, want) in &from_json {
+            let Some(got) = from_store.get(key) else {
+                differ.push(format!("{key:?} missing from the store"));
+                continue;
+            };
+            // Name the FIELD that differs: three values, and a whole-Card dump says which record but not
+            // which of them moved.
+            let mut fields = Vec::new();
+            if got.title != want.title {
+                fields.push(format!("title {:?} vs {:?}", got.title, want.title));
+            }
+            if got.poster_path != want.poster_path {
+                fields.push(format!("posterPath {:?} vs {:?}", got.poster_path, want.poster_path));
+            }
+            if got.year != want.year {
+                fields.push(format!("year {:?} vs {:?}", got.year, want.year));
+            }
+            if !fields.is_empty() {
+                differ.push(format!("{key:?} differs in {}", fields.join(", ")));
+            }
+        }
+        eprintln!("cards differing: {} of {}", differ.len(), from_json.len());
+        for line in differ.iter().take(20) {
+            eprintln!("  {line}");
+        }
+
+        // What the store has and the sidecar does not. Split by whether the sidecar has a RECORD for the
+        // key at all: a record the sidecar carries but `read_cards` drops (a null title) is a different
+        // story from a row the sidecar never mentions, and lumping them together would hide either one.
+        let raw = std::fs::read(&metadata_path).expect("metadata");
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&gunzipped(&raw).expect("gunzip")).expect("metadata parses");
+        let described: std::collections::HashSet<Key> = records
+            .iter()
+            .filter_map(|r| {
+                let media_type = match r.get("mediaType")?.as_str()? {
+                    "movie" => MediaType::Movie,
+                    "tv" => MediaType::Tv,
+                    _ => return None,
+                };
+                Some((media_type, u32::try_from(r.get("tmdbId")?.as_u64()?).ok()?))
+            })
+            .collect();
+        let (mut untitled, mut absent) = (Vec::new(), Vec::new());
+        for key in from_store.keys() {
+            if from_json.contains_key(key) {
+                continue;
+            }
+            if described.contains(key) {
+                untitled.push(*key);
+            } else {
+                absent.push(*key);
+            }
+        }
+        eprintln!(
+            "sidecar records {} · store-only cards {}: {} the sidecar describes without a title, {} it \
+             has no record for",
+            records.len(),
+            untitled.len() + absent.len(),
+            untitled.len(),
+            absent.len()
+        );
+        for key in absent.iter().take(20) {
+            eprintln!("  store-only {key:?}: {:?}", from_store[key].title);
+        }
+
+        // And the other direction: store rows this can draw no card for at all. They are dropped, as the
+        // sidecar reader drops a titleless record — but a count that grows is a writer losing titles, and
+        // a silently shrinking card map is exactly the failure this comparison exists to catch.
+        let view = mapped.view();
+        let keys = view.per_row::<u64>("keys").expect("keys");
+        let titles = view.per_row::<u32>("card_title").expect("card_title");
+        let strings = view.strings().expect("strings");
+        let untitled_rows: Vec<Key> = keys
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| strings.get(titles[i]).is_none_or(str::is_empty))
+            .map(|(_, &packed)| {
+                (if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie }, packed as u32)
+            })
+            .collect();
+        eprintln!("store rows with no title: {} of {} — {untitled_rows:?}", untitled_rows.len(), keys.len());
+
+        assert!(
+            differ.is_empty(),
+            "{} of {} cards differ; first few:\n{}",
+            differ.len(),
+            from_json.len(),
+            differ.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+        );
     }
 }

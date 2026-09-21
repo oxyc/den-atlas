@@ -1,6 +1,19 @@
 //! Loads the dataset from `data/` — the `dataset.meta.json` sidecar (which the producer/import writes with
-//! per-blob sha256 + size + gzip + the HTTP-date), so the server does ZERO startup hashing or compression.
-//! Blob bodies are never read into memory here; they're streamed from disk per request (see `http.rs`).
+//! per-blob sha256 + size + gzip + the HTTP-date), so the server compresses nothing at startup and reads no
+//! blob body into memory; those are streamed from disk per request (see `http.rs`).
+//!
+//! It DOES hash the store once, at load. `store-v1` puts a content hash in the header and den-spec's rule
+//! is to verify it before any cast, so taking the row count off an unverified header would be precisely
+//! the silent misread the format was designed to make impossible. ~130 ms on a 131 MB store, once per
+//! process. This comment used to claim zero startup hashing, which stopped being true when the store
+//! became the only artifact and its row count became the number served as `count`.
+//!
+//! # One artifact
+//!
+//! `storeFile` is the dataset. Everything the serving path reads — labels, both vector matrices, facts,
+//! cards, facet rows, votes — is a section of it, so it is the MANDATORY blob and a dataset without a
+//! readable one does not load. The blobs that used to be mandatory (`labelsFile`, `vectorsFile`) are now
+//! optional and are only SERVED, never read; a manifest that no longer declares them simply serves none.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -11,10 +24,12 @@ pub struct Meta {
     pub dataset_version: String,
     #[serde(rename = "taxonomyVersion")]
     pub taxonomy_version: String,
+    /// The embedding model, its width and its quantisation: properties of the store's vector sections,
+    /// and what `POST /embed` must produce a query vector in. Read by `handler`'s embed route (the memo
+    /// key and the expected dimension) and served to the app, so they stay required.
     #[serde(rename = "embeddingModel")]
     pub embedding_model: String,
     pub dims: u32,
-    pub count: u64,
     pub quantization: String,
     /// FP-3 — the producer's Ed25519 signature over the canonical descriptor payload ("ed25519:<base64>").
     /// Passed through verbatim to `/dataset.json`; den-atlas neither creates nor validates it. Signing
@@ -22,10 +37,13 @@ pub struct Meta {
     /// the app against a key the user pinned — an addon that could mint its own signature would prove nothing.
     #[serde(default)]
     pub signature: Option<String>,
+    // The labels and vectors blobs. OPTIONAL since the store carries both: nothing reads them, and a
+    // manifest that no longer declares them (the pruned one) must still load. They are kept only so a
+    // generation that still publishes them keeps serving them to a client that still fetches them.
     #[serde(rename = "labelsFile")]
-    pub labels_file: String,
+    pub labels_file: Option<String>,
     #[serde(rename = "vectorsFile")]
-    pub vectors_file: String,
+    pub vectors_file: Option<String>,
     #[serde(rename = "labelsGzFile")]
     pub labels_gz_file: Option<String>,
     /// The metadata sidecar's precompressed variant. The sidecar is the only other JSON blob, so it
@@ -35,13 +53,13 @@ pub struct Meta {
     #[serde(rename = "metadataGzFile")]
     pub metadata_gz_file: Option<String>,
     #[serde(rename = "labelsSha256")]
-    pub labels_sha256: String,
+    pub labels_sha256: Option<String>,
     #[serde(rename = "labelsBytes")]
-    pub labels_bytes: u64,
+    pub labels_bytes: Option<u64>,
     #[serde(rename = "vectorsSha256")]
-    pub vectors_sha256: String,
+    pub vectors_sha256: Option<String>,
     #[serde(rename = "vectorsBytes")]
-    pub vectors_bytes: u64,
+    pub vectors_bytes: Option<u64>,
     #[serde(rename = "lastModifiedHttp")]
     pub last_modified_http: Option<String>,
     // Metadata sidecar (optional) — a ≤6-month synced cache of tmdbId→{title,poster_path,year} so the app
@@ -85,30 +103,17 @@ pub struct Meta {
     pub facets_sha256: Option<String>,
     #[serde(rename = "facetsBytes")]
     pub facets_bytes: Option<u64>,
-    // Wikidata facts (optional) — per-title release dates, genres, makers, cast, countries and languages, for
-    // /recommend; the slim file carries only what ranking reads. Read from disk, never served. Absent ⇒
-    // /recommend reads the labels and facets alone.
-    #[serde(rename = "factsFile")]
-    pub facts_file: Option<String>,
-    #[serde(rename = "factsGzFile")]
-    pub facts_gz_file: Option<String>,
-    #[serde(rename = "factsSlimFile")]
-    pub facts_slim_file: Option<String>,
-    #[serde(rename = "factsSlimGzFile")]
-    pub facts_slim_gz_file: Option<String>,
-    // Plot facets (optional) — closed browse axes read from Wikipedia plots (ending, era, structure, …) for
-    // `/index/plot` rows. Read from disk, never served. Absent ⇒ those rows are empty.
-    #[serde(rename = "plotFacetsFile")]
-    pub plot_facets_file: Option<String>,
-    #[serde(rename = "plotFacetsGzFile")]
-    pub plot_facets_gz_file: Option<String>,
     // The store (den-spec wire/store-v1) — every per-title signal the serving path reads, plus both
     // vector matrices, in one mmap'd file. Read from disk, NEVER served: it is an implementation detail
-    // of this server, not an artifact a client fetches. Optional only so a store-less generation still
-    // SERVES rather than crash-looping: `den-atlas check` refuses one, so it cannot be swapped in, and
-    // `/health` reports `store_unusable` if one somehow is.
+    // of this server, not an artifact a client fetches.
+    //
+    // MANDATORY. It used to be optional, so that a generation published before stores existed would still
+    // serve; there is no such generation left to serve, because the labels, vectors, facts, metadata and
+    // facet sidecars this fell back to are no longer read at all. A dataset with no readable store has
+    // nothing behind any of its query routes, so it does not load — the same treatment `labelsFile` and
+    // `vectorsFile` used to get.
     #[serde(rename = "storeFile")]
-    pub store_file: Option<String>,
+    pub store_file: String,
 }
 
 pub struct Gz {
@@ -130,23 +135,23 @@ pub struct Blob {
 
 pub struct Dataset {
     pub meta: Meta,
-    pub labels: Blob,
-    pub vectors: Blob,
+    /// The labels and vectors blobs, when the release still publishes them. Served, never read.
+    pub labels: Option<Blob>,
+    pub vectors: Option<Blob>,
     /// Optional metadata sidecar blob (poster/title cache); None when the meta declares no sidecar.
     pub metadata: Option<Blob>,
     /// DT-H premise index blobs (optional): a second labels+vectors pair in the tag-embedding space. Both
     /// present or both None (the meta must declare the pair fully).
     pub premise_labels: Option<Blob>,
     pub premise_vectors: Option<Blob>,
-    /// The Wikidata facts file `/recommend` reads (optional; never served).
-    /// Every facts file the release ships, best first. The loader tries them in turn: a file that is
-    /// present but unparseable must not end the search while good alternatives sit beside it.
-    pub facts: Vec<PathBuf>,
-    /// The plot facets file `/index/plot` rows read (optional; never served).
-    pub plot_facets: Option<PathBuf>,
-    /// The store the rail ranks on (`den-spec wire/store-v1`; never served). This replaced a
-    /// `railFacetsFile` JSON sidecar, whose per-title signals are now sections of the store.
-    pub store: Option<PathBuf>,
+    /// The one artifact the serving path reads (`den-spec wire/store-v1`; never served).
+    pub store: PathBuf,
+    /// Titles in that store, from its verified header.
+    ///
+    /// The only title count anything can check. The manifest's `count` was the LABELLED subset (47,539
+    /// where the store holds 47,618), nothing validated it, and it was served to the app as the corpus
+    /// size — so it is gone and this is what `/dataset.json` and the query routes count with.
+    pub store_rows: usize,
     /// DT-I compact facet blob (optional).
     pub facets: Option<Blob>,
     /// HTTP-date for `Last-Modified` (verbatim from the meta sidecar).
@@ -156,9 +161,10 @@ pub struct Dataset {
 impl Dataset {
     /// Read `dir/dataset.meta.json` and resolve the blobs it declares.
     ///
-    /// Fails loudly on the meta or either MANDATORY blob — without labels and vectors there is no
-    /// dataset to serve. Every optional blob degrades instead: a missing premise index costs
-    /// premise-based More Like This, not the whole addon (see the call site below).
+    /// Fails loudly on the meta or the STORE — it is the only artifact the serving path reads, so a
+    /// dataset without a readable one has nothing behind any query route. Every other blob degrades
+    /// instead: a missing premise index costs premise-based More Like This, not the whole addon (see the
+    /// call site below).
     pub fn load(dir: &Path) -> Result<Dataset, String> {
         use std::io::Read;
         let meta_path = dir.join("dataset.meta.json");
@@ -172,22 +178,24 @@ impl Dataset {
         file.read_to_end(&mut raw).map_err(|e| e.to_string())?;
         let meta: Meta = serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
 
-        let labels = resolve_blob(
+        let labels = optional_blob(
             dir,
+            "labels",
             &meta.labels_file,
-            meta.labels_bytes,
             &meta.labels_sha256,
+            meta.labels_bytes,
             "application/json",
             meta.labels_gz_file.as_deref(),
-        )?;
-        let vectors = resolve_blob(
+        );
+        let vectors = optional_blob(
             dir,
+            "vectors",
             &meta.vectors_file,
-            meta.vectors_bytes,
             &meta.vectors_sha256,
+            meta.vectors_bytes,
             "application/octet-stream",
             None,
-        )?;
+        );
         // The OPTIONAL blobs degrade; they do not take the dataset with them.
         //
         // These used to propagate with `?`, so one missing or unreadable sidecar failed the whole
@@ -252,31 +260,13 @@ impl Dataset {
             "application/octet-stream",
             None,
         );
-        // The Wikidata facts: the slim file when the release has one, and the plain file before its gzip.
-        // EVERY candidate, not the first that exists. This list used to `find` the first file present, so a
-        // file that was present and unparseable ended the search — one entity with a string where a list
-        // belonged discarded a 27 MB file and left /recommend, people search, imdbId and countries off, with
-        // three perfectly good alternatives sitting beside it. The loader tries them in turn.
-        let facts: Vec<PathBuf> =
-            [&meta.facts_slim_file, &meta.facts_slim_gz_file, &meta.facts_file, &meta.facts_gz_file]
-                .into_iter()
-                .flatten()
-                .filter_map(|name| safe_blob_path(dir, name).ok())
-                .filter(|path| path.is_file())
-                .collect();
-        let plot_facets = [&meta.plot_facets_file, &meta.plot_facets_gz_file]
-            .into_iter()
-            .flatten()
-            .filter_map(|name| safe_blob_path(dir, name).ok())
-            .find(|path| path.is_file());
-        // No gz candidate: the store is mmap'd, and a compressed file cannot be. It is also the one blob
-        // whose absence is a capability change rather than a degradation of one feature, so it is left as
-        // a plain Option rather than folded into a fallback chain.
-        let store = meta
-            .store_file
-            .as_deref()
-            .and_then(|name| safe_blob_path(dir, name).ok())
-            .filter(|path| path.is_file());
+        // No gz candidate: the store is mmap'd, and a compressed file cannot be. Verified here and the
+        // mapping dropped, so the row count below is the store's OWN — the one number about this dataset
+        // that has been checked against the bytes rather than claimed by the manifest.
+        let store = safe_blob_path(dir, &meta.store_file)?;
+        let store_rows = crate::store::MappedStore::open(&store)
+            .map_err(|e| format!("store {} is unusable: {e}", meta.store_file))?
+            .rows();
         let last_modified = meta.last_modified_http.clone();
         // Writers withdraw the descriptor before replacing any blob and publish it last. A load
         // that overlaps that interval must not bind new files to a descriptor read before it.
@@ -292,9 +282,8 @@ impl Dataset {
             metadata,
             premise_labels,
             premise_vectors,
-            facts,
-            plot_facets,
             store,
+            store_rows,
             facets,
             last_modified,
         })
@@ -401,6 +390,24 @@ fn resolve_blob(
 mod tests {
     use super::*;
 
+    /// A one-title store in `dir`, named as the manifests below declare it. Every `Dataset::load` test
+    /// needs one, because the store is the mandatory blob: these tests are about the OPTIONAL ones, and
+    /// without a store each would fail for the wrong reason.
+    fn store_in(dir: &Path) {
+        let title = crate::store::fixture::Title {
+            media: 0,
+            tmdb_id: 1,
+            plot: vec![0, 0],
+            premise: vec![0, 0],
+            ..crate::store::fixture::Title::default()
+        };
+        crate::store::fixture::write(&dir.join("s.store"), "v9", 2, &[title], &[]);
+    }
+
+    /// The manifest fields every test below shares, the store included.
+    const HEAD: &str = r#""datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
+                          "quantization":"int8","storeFile":"s.store","#;
+
     /// Blob names come from dataset.meta.json, which the refresh script pulls from a GitHub release
     /// over the network — and FP-3's rationale names a compromised dataset host as the adversary.
     /// `dir.join` walks out on "../x" and discards `dir` outright on an absolute path, so this was
@@ -491,23 +498,26 @@ mod tests {
         std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
         std::fs::write(root.join("facets.bin"), b"FACETS").unwrap();
+        store_in(&root);
         // metadata, and both premise blobs, are DECLARED but never written.
         std::fs::write(
             root.join("dataset.meta.json"),
-            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
+            format!(
+                r#"{{{HEAD}
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "metadataFile":"gone.json","metadataBytes":8,"metadataSha256":"c",
                  "facetsFile":"facets.bin","facetsBytes":6,"facetsSha256":"d",
                  "premiseLabelsFile":"gone-pl.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
-                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}"#,
+                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
+            ),
         )
         .unwrap();
 
         let ds = Dataset::load(&root).expect("a missing optional blob took the whole dataset down");
-        assert_eq!(ds.labels.name, "labels.json", "the mandatory blobs must still be there");
-        assert_eq!(ds.vectors.size, 8);
+        assert_eq!(ds.store_rows, 1, "the mandatory blob must still be there");
+        assert_eq!(ds.labels.as_ref().map(|b| b.name.as_str()), Some("labels.json"));
+        assert_eq!(ds.vectors.as_ref().map(|b| b.size), Some(8));
         assert!(ds.metadata.is_none(), "an unreadable metadata sidecar was resolved anyway");
         assert!(ds.premise_labels.is_none() && ds.premise_vectors.is_none());
         // ...and a usable optional blob is still served.
@@ -528,25 +538,28 @@ mod tests {
         std::fs::write(root.join("meta.json"), b"[]").unwrap();
         std::fs::write(root.join("labels.json.gz"), b"LGZ").unwrap();
         std::fs::write(root.join("meta.json.gz"), b"MGZ").unwrap();
+        store_in(&root);
         std::fs::write(
             root.join("dataset.meta.json"),
-            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
+            format!(
+                r#"{{{HEAD}
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "labelsGzFile":"labels.json.gz",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "metadataFile":"meta.json","metadataBytes":2,"metadataSha256":"c",
-                 "metadataGzFile":"meta.json.gz"}"#,
+                 "metadataGzFile":"meta.json.gz"}}"#
+            ),
         )
         .unwrap();
 
         let ds = Dataset::load(&root).expect("fixture must load");
         let gz_name =
             |b: &Blob| b.gz.as_ref().map(|g| g.path.file_name().unwrap().to_string_lossy().into_owned());
-        assert_eq!(gz_name(&ds.labels).as_deref(), Some("labels.json.gz"), "labels got the wrong gz variant");
+        let labels = ds.labels.as_ref().expect("the labels must resolve");
+        assert_eq!(gz_name(labels).as_deref(), Some("labels.json.gz"), "labels got the wrong gz variant");
         let md = ds.metadata.as_ref().expect("the sidecar must resolve");
         assert_eq!(gz_name(md).as_deref(), Some("meta.json.gz"), "the sidecar's gz variant is not wired up");
-        assert!(ds.vectors.gz.is_none(), "a binary blob was given a gz variant");
+        assert!(ds.vectors.as_ref().unwrap().gz.is_none(), "a binary blob was given a gz variant");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -561,11 +574,11 @@ mod tests {
         std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
         let metadata = br#"[{"tmdbId":1,"mediaType":"movie","title":"X","plot_summary":"prose"}]"#;
         std::fs::write(root.join("meta.json"), metadata).unwrap();
+        store_in(&root);
         std::fs::write(
             root.join("dataset.meta.json"),
             format!(
-                r#"{{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                     "quantization":"int8","labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
+                r#"{{{HEAD}"labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                      "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                      "metadataFile":"meta.json","metadataBytes":{},"metadataSha256":"c"}}"#,
                 metadata.len()
@@ -595,10 +608,10 @@ mod tests {
             std::fs::write(data.join(name), body).unwrap();
         }
         std::fs::write(root.join("secret.gz"), b"not for the wire").unwrap();
+        store_in(&data);
         let meta = |gz: &str| {
             format!(
-                r#"{{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
+                r#"{{{HEAD}
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
@@ -612,7 +625,10 @@ mod tests {
         let pl = ds.premise_labels.as_ref().expect("the premise labels must resolve");
         let gz = pl.gz.as_ref().expect("the premise labels' gz variant is not wired up");
         assert_eq!(gz.path, data.join("premise-labels.json.gz"));
-        assert!(ds.labels.gz.is_none(), "the premise variant was handed to the plot labels");
+        assert!(
+            ds.labels.as_ref().unwrap().gz.is_none(),
+            "the premise variant was handed to the plot labels"
+        );
         assert!(ds.premise_vectors.as_ref().unwrap().gz.is_none(), "a binary blob was given a gz variant");
 
         std::fs::write(data.join("dataset.meta.json"), meta("../secret.gz")).unwrap();
@@ -632,20 +648,70 @@ mod tests {
         std::fs::write(root.join("labels.json"), b"LABELS").unwrap();
         std::fs::write(root.join("vectors.bin"), b"VECTORS!").unwrap();
         std::fs::write(root.join("premise-labels.json"), b"PLABELS").unwrap();
+        store_in(&root);
         std::fs::write(
             root.join("dataset.meta.json"),
-            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,"count":1,
-                 "quantization":"int8",
+            format!(
+                r#"{{{HEAD}
                  "labelsFile":"labels.json","labelsBytes":6,"labelsSha256":"a",
                  "vectorsFile":"vectors.bin","vectorsBytes":8,"vectorsSha256":"b",
                  "premiseLabelsFile":"premise-labels.json","premiseLabelsBytes":7,"premiseLabelsSha256":"e",
-                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}"#,
+                 "premiseVectorsFile":"gone-pv.bin","premiseVectorsBytes":8,"premiseVectorsSha256":"f"}}"#
+            ),
         )
         .unwrap();
 
         let ds = Dataset::load(&root).expect("dataset must still load");
         assert!(ds.premise_labels.is_none(), "the premise labels were kept without their vectors");
         assert!(ds.premise_vectors.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The PRUNED manifest — a store and the five facts about it that are not in it — must load, and a
+    /// manifest that no longer declares labels or vectors must not be refused for it. That shape is what
+    /// the publisher now writes, so a required `labelsFile` would take the dataset down on the next
+    /// release rather than at any point anyone could see.
+    #[test]
+    fn a_manifest_that_declares_only_a_store_loads() {
+        let root = std::env::temp_dir().join(format!("den-atlas-pruned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        store_in(&root);
+        std::fs::write(root.join("dataset.meta.json"), format!("{{{HEAD}\"builtAt\":\"now\"}}")).unwrap();
+
+        let ds = Dataset::load(&root).expect("the pruned manifest must load");
+        assert_eq!(ds.store, root.join("s.store"));
+        assert_eq!(ds.store_rows, 1, "the row count comes from the store's verified header");
+        assert!(ds.labels.is_none() && ds.vectors.is_none() && ds.facets.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ...and the store is the one blob whose absence IS fatal, because nothing else is read. A dataset
+    /// that will not produce one has nothing behind `/index/…`, `/recommend` or search, so it must fail
+    /// where an operator sees it rather than serve every route empty.
+    #[test]
+    fn a_dataset_without_a_readable_store_does_not_load() {
+        let root = std::env::temp_dir().join(format!("den-atlas-nostore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Declared, never written.
+        std::fs::write(root.join("dataset.meta.json"), format!("{{{HEAD}\"builtAt\":\"now\"}}")).unwrap();
+        assert!(Dataset::load(&root).is_err(), "a missing store was served anyway");
+
+        // Present, but not a store.
+        std::fs::write(root.join("s.store"), b"not a store").unwrap();
+        let Err(err) = Dataset::load(&root) else { panic!("a file that is not a store was accepted") };
+        assert!(err.contains("s.store"), "the error must name the file: {err}");
+
+        // Not declared at all.
+        std::fs::write(
+            root.join("dataset.meta.json"),
+            br#"{"datasetVersion":"v9","taxonomyVersion":"t","embeddingModel":"m","dims":2,
+                 "quantization":"int8"}"#,
+        )
+        .unwrap();
+        assert!(Dataset::load(&root).is_err(), "a manifest with no storeFile was accepted");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

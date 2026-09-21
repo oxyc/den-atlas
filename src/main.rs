@@ -155,15 +155,17 @@ pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// `den-atlas check <dir>` — load a dataset directory exactly as serving would, and say whether it is fit to
 /// swap in.
 ///
-/// Three outcomes, because "unfit" covers two situations a caller must treat differently:
+/// Two outcomes:
 ///
 ///   0  fit to serve.
-///   1  BROKEN — a store that will not read, a mixed generation, a declared facts file atlas cannot
-///      parse. Never swap this in; whatever is running is better.
-///   2  DEGRADED — it loads and serves, but declares no store, so More Like This falls back to the
-///      pre-pooled scorer. Refuse a routine update, and take it anyway when the alternative is
-///      staying down: `atlas-dataset-sync` stops the unit to recover an interrupted swap, and a box
-///      that will not recover from an outage over a ranking downgrade has the trade backwards.
+///   1  BROKEN — no store, a store that will not read, a mixed generation, a store whose facts or facet
+///      rows do not read. Never swap this in; whatever is running is better.
+///
+/// There used to be a third, DEGRADED (2), for a dataset that declared no store: it served, and merely
+/// ranked More Like This with the pre-pooled scorer, so `atlas-dataset-sync` could take it rather than
+/// stay down through an interrupted swap. That halfway state is gone — the store is the only artifact
+/// read, so a dataset without one serves nothing — and 2 is now unreachable. `atlas-dataset-sync` still
+/// distinguishes the codes; this simply never returns that one.
 ///
 /// This exists because a dataset can pass every check outside atlas and still be unusable by it. One entity
 /// carrying `"aliases": "…"` where `RawEntity.aliases` is `Vec<String>` made a 27 MB facts file unparseable
@@ -177,7 +179,6 @@ pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// cannot drift from what serving actually requires the way a mirrored schema can.
 fn check_dataset(dir: &std::path::Path) -> i32 {
     const BROKEN: i32 = 1;
-    const DEGRADED: i32 = 2;
     let dataset = match dataset::Dataset::load(dir) {
         Ok(d) => d,
         Err(e) => {
@@ -185,39 +186,17 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
             return BROKEN;
         }
     };
-    // A declared facts file that does not read is the case that bit us: serving continues, degraded, with a
-    // whole feature class silently off. Treat it as fatal HERE so it never reaches serving.
-    let declared = !dataset.facts.is_empty();
-    let reads = dataset.facts.iter().any(|path| match facts::Facts::read(path) {
-        Ok(_) => true,
-        Err(e) => {
-            eprintln!("check: {} does not read: {e}", path.display());
-            false
-        }
-    });
-    if declared && !reads {
-        eprintln!("check: the dataset declares facts that atlas cannot read — refusing");
-        return BROKEN;
-    }
-    // The store, for the same reason and more sharply: it is what More Like This ranks on, and an
-    // unreadable one degrades the row while every request keeps answering. This check is what
-    // `atlas-dataset-sync` runs against a STAGED generation, so a bad store is refused before it
-    // replaces a good one rather than after.
+    // The store. This check is what `atlas-dataset-sync` runs against a STAGED generation, so a bad one
+    // is refused before it replaces a good one rather than after. `Dataset::load` above already mapped
+    // and verified it; this opens it the way SERVING does, which additionally builds the rail's
+    // aggregates and proves every column the scorer reads.
     //
-    // A manifest that declares NO store is DEGRADED, not broken, and the difference decides whether a
-    // box can recover from an interrupted swap. Such a dataset loads and serves; it just ranks More
-    // Like This with the pre-pooled scorer, which draws candidates from the premise index alone.
-    // `atlas-dataset-sync` stops the unit to recover an interrupted generation, so a refusal there
-    // means atlas stays DOWN — and staying down over a ranking downgrade has the trade backwards.
-    // It refuses a routine update and takes this one when the alternative is an outage.
-    let Some(path) = dataset.store.as_ref() else {
-        eprintln!(
-            "check: the dataset declares no storeFile — it will serve, but More Like This falls back \
-             to the pre-pooled scorer"
-        );
-        return DEGRADED;
-    };
-    let loaded = match store::LoadedStore::open(path) {
+    // A dataset that declares no store used to be DEGRADED — it served, and merely ranked More Like This
+    // with the pre-pooled scorer. There is no such halfway state left: the store is the only artifact
+    // read, so a dataset without one has nothing behind any query route and `Dataset::load` refuses it
+    // above. DEGRADED now has no way to fire; it is kept only so the exit codes `atlas-dataset-sync`
+    // switches on keep their meanings.
+    let loaded = match store::LoadedStore::open(&dataset.store) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
@@ -249,9 +228,7 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
         return BROKEN;
     }
     println!(
-        "check: ok ({} facts candidate(s), {} usable; store: {} rows, {} bytes, facts and rows read)",
-        dataset.facts.len(),
-        u8::from(reads),
+        "check: ok (store: {} rows, {} bytes, facts and rows read)",
         loaded.store.rows(),
         loaded.store.bytes()
     );
@@ -297,10 +274,14 @@ async fn main() {
     // A catalog row names TMDB's poster path beside JustWatch's metahub URL for every title the dataset
     // knows, so a client draws first-party art where there is any and keeps metahub for the rest. Read once
     // here rather than through the query indexes, which are released when idle (see `CatalogState::posters`).
-    if let Some(blob) = dataset.as_ref().and_then(|d| d.metadata.as_ref()) {
-        match plotrows::read_posters(&blob.path) {
+    if let Some(ds) = dataset.as_ref() {
+        // Mapped, read and dropped: the map is held for the life of the query indexes, not of the
+        // process, and these are an owned map either way. It used to read the metadata sidecar.
+        match store::MappedStore::open(&ds.store)
+            .and_then(|store| plotrows::posters_from_store(&store.view()))
+        {
             Ok(posters) => {
-                eprintln!("catalog posters: {} titles from {}", posters.len(), blob.name);
+                eprintln!("catalog posters: {} titles from the store", posters.len());
                 catalog = catalog.with_posters(Arc::new(posters));
             }
             Err(e) => eprintln!("catalog posters unavailable ({e}) — rows carry metahub art alone"),
@@ -399,7 +380,7 @@ async fn main() {
     let providers: Vec<&str> = catalog::selected_providers().iter().map(|p| p.code).collect();
     let dataset = match &state.dataset {
         Some(ds) => {
-            format!("titles={} index={}/{}", ds.meta.count, ds.meta.embedding_model, ds.meta.taxonomy_version)
+            format!("titles={} index={}/{}", ds.store_rows, ds.meta.embedding_model, ds.meta.taxonomy_version)
         }
         None => "dataset=unavailable".to_owned(),
     };
@@ -639,7 +620,7 @@ mod tests {
         axum::Router::new().fallback(handler::handle).with_state(Arc::new(AppState::for_test(None)))
     }
 
-    /// A staged dataset directory: the two mandatory blobs, and whatever `extra` the meta adds.
+    /// A staged dataset directory: the manifest, and whatever `extra` it adds.
     ///
     /// The directory name carries the process id. A fixed name under the shared temp dir, cleared with
     /// `remove_dir_all` on entry, means two concurrent runs of this binary — two git worktrees, which is
@@ -648,32 +629,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atlas-check-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("labels.json"), b"{}").unwrap();
-        std::fs::write(dir.join("vectors.bin"), b"\0\0\0\0").unwrap();
         let meta = format!(
             r#"{{"datasetVersion":"fixture","taxonomyVersion":"t02","embeddingModel":"bge-m3",
-                 "dims":1024,"count":3,"quantization":"int8-symmetric-x127",
-                 "labelsFile":"labels.json","labelsSha256":"l","labelsBytes":2,
-                 "vectorsFile":"vectors.bin","vectorsSha256":"v","vectorsBytes":4{extra}}}"#
+                 "dims":1024,"quantization":"int8-symmetric-x127"{extra}}}"#
         );
         std::fs::write(dir.join("dataset.meta.json"), meta).unwrap();
         dir
     }
 
     /// The gate that decides whether a generation replaces the running one. A manifest with no
-    /// `storeFile` parses, resolves and serves — and answers More Like This with the pre-pooled scorer,
-    /// which draws candidates from the premise index alone. `/health` cannot distinguish that from a
-    /// working addon at the moment of the swap, so the refusal has to happen here.
+    /// `storeFile` names no artifact at all now that nothing else is read, so it is BROKEN — where it
+    /// used to be DEGRADED (2), on the reasoning that it still served and merely ranked More Like This
+    /// with the pre-pooled scorer. There is nothing left behind such a manifest to serve.
     #[test]
-    fn check_calls_a_dataset_with_no_store_degraded_rather_than_broken() {
+    fn check_calls_a_dataset_with_no_store_broken() {
         let dir = staged("no-store", "");
-        assert_eq!(
-            check_dataset(&dir),
-            2,
-            "no storeFile is DEGRADED (2), not BROKEN (1): it serves, it just ranks worse, and \
-             `atlas-dataset-sync` must be able to take it to recover an interrupted swap rather than \
-             leaving atlas stopped over a ranking downgrade"
-        );
+        assert_eq!(check_dataset(&dir), 1, "a manifest naming no store has no artifact to serve");
     }
 
     /// The distinction the exit codes exist for. A store that will not read is BROKEN and must never

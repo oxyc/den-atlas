@@ -16,7 +16,8 @@ pub use similar::{
     more_like_this, more_like_this_pooled, Authorship, Axis, Facets, ValueId, Weighted, MAX_ROW,
 };
 
-/// The two kinds of title in the index (`"movie"` / `"tv"` in the labels blob).
+/// The two kinds of title in the index. The store packs the distinction into a key's high word; this
+/// spelling is the labels blob's, which only the test-only reader still parses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MediaType {
     Movie,
@@ -24,6 +25,7 @@ pub enum MediaType {
 }
 
 impl MediaType {
+    #[cfg(test)]
     fn parse(s: &str) -> Option<Self> {
         match s {
             "movie" => Some(MediaType::Movie),

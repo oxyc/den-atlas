@@ -1,8 +1,16 @@
-//! One index: the labels blob (`labels-tNN.json`) and the vectors blob (`vectors-*.bin`: a little-endian
-//! `[i32 count][i32 dim]` header, then `count × dim` int8 rows in label order). The dataset has two — plot
-//! and premise — in different embedding spaces; each is an `Index`, and nothing here mixes them.
+//! One index: the labels and the int8 vectors of one embedding space, read out of the store
+//! (den-spec `wire/store-v1.md`). The dataset has two spaces — plot and premise — and each is an `Index`;
+//! nothing here mixes them.
+//!
+//! Vectors are held in the layout the old `vectors-*.bin` blob had — a little-endian `[i32 count][i32 dim]`
+//! header, then `count × dim` int8 rows in record order — because every scorer below addresses them that
+//! way. The blob itself is no longer read: [`Index::from_blobs`] is kept only for the tests that hold the
+//! store reader to what the blobs answered.
 
 use crate::MediaType;
+/// Only the blob reader below parses JSON, and only tests call it — so serde is a dev-dependency here
+/// and this crate's serving path has no deserialiser in it at all.
+#[cfg(test)]
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -32,6 +40,7 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct LabelsArtifact {
     #[serde(rename = "taxonomyVersion")]
@@ -39,6 +48,7 @@ struct LabelsArtifact {
     records: Vec<RawRecord>,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawRecord {
     #[serde(rename = "tmdbId")]
@@ -55,6 +65,7 @@ struct RawRecord {
     animated: bool,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct RawLabel {
     label: String,
@@ -77,6 +88,28 @@ struct Record {
 struct Entry {
     row: u32,
     confidence: f64,
+}
+
+/// Which of the store's two vector matrices an index is built over.
+///
+/// Private on purpose: the public way in is [`Index::from_store_plot`] or [`Index::from_store_premise`],
+/// so no call site has an argument to get the wrong way round. Its one job is to name the values section
+/// and its `_has` column TOGETHER — pairing `vec_premise` with `vec_plot_has` would index the right
+/// vectors for the wrong rows and nothing downstream could tell.
+#[derive(Clone, Copy)]
+enum Space {
+    Plot,
+    Premise,
+}
+
+impl Space {
+    /// (values, `_has`) — always as a pair, never separately.
+    fn sections(self) -> (&'static str, &'static str) {
+        match self {
+            Space::Plot => ("vec_plot", "vec_plot_has"),
+            Space::Premise => ("vec_premise", "vec_premise_has"),
+        }
+    }
 }
 
 /// A neighbour: the title and its int8 dot-product similarity (the vectors were L2-normalised before
@@ -114,6 +147,14 @@ pub struct Index {
 
 impl Index {
     /// Build from the two blobs. Fails when either doesn't parse or the vector count disagrees with the labels.
+    ///
+    /// **Tests only.** Serving reads the store; `labels-tNN.json` and `vectors-*.bin` are no longer
+    /// opened by anything that runs in the binary. It stays behind `#[cfg(test)]` rather than being
+    /// deleted because two tests need a second implementation to be worth anything: `tests::fixture`,
+    /// which builds the tiny in-memory indexes every unit test here and in `similar.rs` runs on, and
+    /// `the_store_answers_what_the_blobs_did`, which is the evidence that the store reader answers what
+    /// the blob reader did on the real corpus. A deleted reader cannot disagree with anything.
+    #[cfg(test)]
     pub fn from_blobs(labels_json: &[u8], vectors: Vec<u8>) -> Result<Index, LoadError> {
         let artifact: LabelsArtifact =
             serde_json::from_slice(labels_json).map_err(|e| LoadError::Labels(e.to_string()))?;
@@ -139,24 +180,166 @@ impl Index {
                 moods,
             });
         }
-        let mut rows = HashMap::with_capacity(records.len());
-        for (row, record) in records.iter().enumerate() {
-            if let Some(media_type) = record.media_type {
-                rows.entry((media_type, record.tmdb_id)).or_insert(row as u32);
-            }
+        Ok(assemble(artifact.taxonomy_version, dim, records, names, vectors))
+    }
+
+    /// The plot index, out of the store — den-spec `wire/store-v1.md` — instead of the two blobs. Same
+    /// `Index`, same answers; the labels and the plot vectors are already in there, columnar and mmap'd,
+    /// so reading them again out of `labels-tNN.json` + `vectors-bge-m3.bin` is 60 MB of artifact and a
+    /// JSON parse for signals the process has already mapped.
+    ///
+    /// See [`from_store_space`](Index::from_store_space) for what the move has to reconcile.
+    pub fn from_store_plot(store: &den_store::Store<'_>) -> Result<Index, LoadError> {
+        Index::from_store_space(store, Space::Plot)
+    }
+
+    /// The premise index, out of the store: `labels-premise.json` + `vectors-premise.bin`, which cover the
+    /// 44,531 titles that got a premise embedding rather than the plot index's 47,539.
+    ///
+    /// A SEPARATE constructor rather than a `Space` argument, and the enum that picks the sections is
+    /// private, so there is no argument at a call site to get the wrong way round. The two indexes are
+    /// **different embedding spaces** — a cosine between them is meaningless, not merely inaccurate — and
+    /// a wrong argument here would build a thing that answers confidently and wrongly forever. The one
+    /// value inside also names BOTH sections together, so `vec_premise` can never be paired with
+    /// `vec_plot_has`, which is the mistake that would silently index the right vectors for the wrong rows.
+    ///
+    /// The taxonomy version is shared: both blobs declare the same `taxonomyVersion` (`t02` in the
+    /// generation this was written against), because the premise labels are the same labelling pass,
+    /// restricted to the titles that have a premise vector. So the caller stamps both indexes from the
+    /// same manifest field.
+    pub fn from_store_premise(store: &den_store::Store<'_>) -> Result<Index, LoadError> {
+        Index::from_store_space(store, Space::Premise)
+    }
+
+    /// One body for both spaces, so the plot and premise paths cannot drift.
+    ///
+    /// Four things the move has to reconcile, each of which is a way to be quietly wrong:
+    ///
+    /// **Which rows.** The store is the whole corpus; this is a VECTOR index. A row whose `_has` column is
+    /// 0 has no vector in this space, and a zero vector is not a missing one — it dots to 0 against every
+    /// query, so it would rank ahead of every genuinely dissimilar title in More Like This. Such a row is
+    /// left out. On the corpus this was written against, `vec_plot_has` selects exactly the 47,539 titles
+    /// of `labels-t02.json` and `vec_premise_has` exactly the 44,531 of `labels-premise.json` — the key
+    /// sets match both ways, and `vec_premise`'s all-zero rows agree with `vec_premise_has` exactly.
+    ///
+    /// **Confidence.** The blob carries `f64`, the store `u8` hundredths, and `57u8 as f64 / 100.0` is
+    /// bit-identical to parsing `"0.57"` — which is why the writer refuses a probability with more than
+    /// two decimals. The blob is not held to that: 799 of its confidence values, over 793 titles, are a
+    /// float-arithmetic residue such as `0.7999999999999999`, one ULP below the 0.80 the store keeps —
+    /// the same 799 in both label blobs. The store is the one telling the truth about what the model said,
+    /// and this is a visible change, not a rounding detail: `plotrows::label_confidence` tiers a label at
+    /// `>= 0.8`, and that tier is the primary sort key of every subgenre and mood browse row, so the 791
+    /// labels written `0.7999999999999999` move from tier 2 to tier 3 and rise within their row.
+    ///
+    /// **Row order.** `keys` is sorted ascending — every movie by tmdb id, then every series — where the
+    /// blob kept the producer's record order. Nothing reads row numbers from outside, but order is the tie
+    /// break in two places: `buckets` is stable, so labels of equal confidence come out in row order, and
+    /// `best` gives an equal score to the earlier row. Both orders are arbitrary; this one is at least a
+    /// property of the data rather than of whichever pass wrote the file.
+    ///
+    /// **Names.** The store's string table has its own ids, over the whole corpus. They are re-interned
+    /// here in row order, so `names` stays this index's own dense id space — the one the bucket keys and
+    /// `primary_genre` index.
+    ///
+    /// The store carries no `taxonomyVersion` (it is a property of the labelling pass, not of the corpus),
+    /// so it starts empty; the caller stamps it from the manifest with [`with_taxonomy_version`].
+    ///
+    /// # A known loss, on the premise side only
+    ///
+    /// The store has ONE set of label sections and the writer fills them from the plot labels pass alone.
+    /// Three titles in the current generation have a premise vector and premise labels but no plot labels
+    /// — movie 51870, movie 121329, tv 42680 — so the premise index built here answers no primary genre,
+    /// no subgenres and no moods for them where the blob answered all three. It is three of 44,531 and the
+    /// fix belongs in den-dataset's `build_store.py` (fill the label sections from the UNION of both
+    /// passes); the parity test below bounds it so it cannot grow unnoticed.
+    ///
+    /// [`with_taxonomy_version`]: Index::with_taxonomy_version
+    fn from_store_space(store: &den_store::Store<'_>, space: Space) -> Result<Index, LoadError> {
+        let (vector_section, has_section) = space.sections();
+        let labelled = |e: den_store::StoreError| LoadError::Labels(e.to_string());
+        let vectored = |e: den_store::StoreError| LoadError::Vectors(e.to_string());
+        let keys = store.per_row::<u64>("keys").map_err(labelled)?;
+        let strings = store.strings().map_err(labelled)?;
+        let primary_genre = store.per_row::<u32>("primary_genre").map_err(labelled)?;
+        let animated = store.per_row::<u8>("animated").map_err(labelled)?;
+        // Values and confidences share one offsets array, so row i owns the same span in both.
+        let subgenre_v = store.list::<u32>("subgenre_v", "subgenre_o").map_err(labelled)?;
+        let subgenre_c = store.list::<u8>("subgenre_c", "subgenre_o").map_err(labelled)?;
+        let mood_v = store.list::<u32>("mood_v", "mood_o").map_err(labelled)?;
+        let mood_c = store.list::<u8>("mood_c", "mood_o").map_err(labelled)?;
+        let has_vector = store.per_row::<u8>(has_section).map_err(vectored)?;
+        let space_vectors = store.column::<i8>(vector_section).map_err(vectored)?;
+
+        // Read off the section rather than assumed to be 1024: a dimension is a property of the embedding
+        // model, and a build that hardcodes one silently misreads the first store written by another.
+        let dim = if keys.is_empty() { 0 } else { space_vectors.len() / keys.len() };
+        if dim == 0 || space_vectors.len() != keys.len() * dim {
+            return Err(LoadError::Vectors(format!(
+                "{vector_section} holds {} bytes for {} rows",
+                space_vectors.len(),
+                keys.len()
+            )));
         }
-        let subgenres = buckets(&records, |r| &r.subgenres);
-        let moods = buckets(&records, |r| &r.moods);
-        Ok(Index {
-            taxonomy_version: artifact.taxonomy_version,
-            dim,
-            records,
-            names,
-            rows,
-            vectors,
-            subgenres,
-            moods,
-        })
+
+        let mut names: Vec<Box<str>> = Vec::new();
+        let mut name_ids: HashMap<String, u32> = HashMap::new();
+        let mut intern = |name: String| -> u32 {
+            *name_ids.entry(name).or_insert_with_key(|name| {
+                names.push(name.as_str().into());
+                (names.len() - 1) as u32
+            })
+        };
+        let kept = has_vector.iter().filter(|&&has| has != 0).count();
+        let mut records = Vec::with_capacity(kept);
+        let mut vectors = Vec::with_capacity(HEADER_BYTES + kept * dim);
+        // The header the blob carries and every reader of `self.vectors` assumes; the count is written once
+        // the rows are known, and `vector_dimension` below re-reads it rather than trusting this.
+        vectors.extend_from_slice(&0i32.to_le_bytes());
+        vectors.extend_from_slice(&0i32.to_le_bytes());
+        for (i, &packed) in keys.iter().enumerate() {
+            if has_vector[i] == 0 {
+                continue;
+            }
+            let row = den_store::Row(i);
+            // An id the dictionary cannot resolve is dropped, never interned as "": a nameless label would
+            // collide with the absent primary genre and become a bucket nothing can ask for.
+            let mut scored = |values: &[u32], confidences: &[u8]| -> Box<[(u32, f64)]> {
+                values
+                    .iter()
+                    .zip(confidences)
+                    .filter_map(|(&value, &confidence)| {
+                        Some((intern(strings.get(value)?.to_owned()), f64::from(confidence) / 100.0))
+                    })
+                    .collect()
+            };
+            let subgenres = scored(subgenre_v.get(row), subgenre_c.get(row));
+            let moods = scored(mood_v.get(row), mood_c.get(row));
+            records.push(Record {
+                tmdb_id: packed as u32,
+                media_type: Some(if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie }),
+                // Absent is "", as it is in the blob, where `primaryGenre` defaults to the empty string.
+                primary_genre: intern(strings.get(primary_genre[i]).unwrap_or_default().to_owned()),
+                animated: animated[i] != 0,
+                subgenres,
+                moods,
+            });
+            vectors.extend(space_vectors[i * dim..(i + 1) * dim].iter().map(|&v| v as u8));
+        }
+        let count = i32::try_from(records.len())
+            .map_err(|_| LoadError::Vectors(format!("{} rows do not fit a blob header", records.len())))?;
+        let width = i32::try_from(dim)
+            .map_err(|_| LoadError::Vectors(format!("{dim} dimensions do not fit a blob header")))?;
+        vectors[..4].copy_from_slice(&count.to_le_bytes());
+        vectors[4..8].copy_from_slice(&width.to_le_bytes());
+        let dim = vector_dimension(&vectors, records.len())?;
+        Ok(assemble(String::new(), dim, records, names, vectors))
+    }
+
+    /// Stamp the taxonomy version an index built from the store has no way to know — it is the labelling
+    /// pass's version, and it lives in the dataset manifest, not in the corpus.
+    pub fn with_taxonomy_version(mut self, version: impl Into<String>) -> Index {
+        self.taxonomy_version = version.into();
+        self
     }
 
     pub fn taxonomy_version(&self) -> &str {
@@ -635,6 +818,26 @@ unsafe fn dot_avx2(a: &[u8], b: &[u8]) -> i32 {
     lanes.iter().fold(0i32, |total, &lane| total.wrapping_add(lane)) + dot_scalar(&a[at..n], &b[at..n])
 }
 
+/// The parts every constructor ends the same way: the (type, id) → row map and the two label buckets.
+/// Shared, so the store path and the blob path cannot come to index the same records differently.
+fn assemble(
+    taxonomy_version: String,
+    dim: usize,
+    records: Vec<Record>,
+    names: Vec<Box<str>>,
+    vectors: Vec<u8>,
+) -> Index {
+    let mut rows = HashMap::with_capacity(records.len());
+    for (row, record) in records.iter().enumerate() {
+        if let Some(media_type) = record.media_type {
+            rows.entry((media_type, record.tmdb_id)).or_insert(row as u32);
+        }
+    }
+    let subgenres = buckets(&records, |r| &r.subgenres);
+    let moods = buckets(&records, |r| &r.moods);
+    Index { taxonomy_version, dim, records, names, rows, vectors, subgenres, moods }
+}
+
 /// The label → titles buckets for one label family. A record joins each label once, with the confidence of
 /// its first occurrence; each bucket is stable-sorted by confidence, so ties keep record order.
 fn buckets(records: &[Record], family: impl Fn(&Record) -> &[(u32, f64)]) -> HashMap<u32, Vec<Entry>> {
@@ -814,6 +1017,247 @@ pub(crate) mod tests {
         );
         assert_eq!(idx.taste_boost(1, MediaType::Tv, &centroid), 0.0);
         assert!(idx.centroid(&[(99, MediaType::Movie)]).is_none());
+    }
+
+    /// Two label lists are the same when they name the same labels in the same order at the same
+    /// confidence — **to the hundredth**, which is the precision the store keeps and the only precision
+    /// the producer is held to. The blob is not held to it: 799 of its confidence values, over 793 titles,
+    /// are written a ULP below the hundredth the model gave — `0.7999999999999999` 791 times, and
+    /// `0.6799999999999999` and `0.9199999999999999` four times each, in BOTH label blobs. Comparing those
+    /// as `f64` would report a difference that exists in the JSON's float formatting, not in the data.
+    fn same_labels(got: &[(&str, f64)], want: &[(&str, f64)]) -> bool {
+        got.len() == want.len()
+            && got.iter().zip(want).all(|(a, b)| a.0 == b.0 && (a.1 * 100.0).round() == (b.1 * 100.0).round())
+    }
+
+    /// Does the store hold no label at all for this title? The three known losses below are all of this
+    /// shape — the store's label sections are written from the plot pass alone, so a title labelled only
+    /// by the premise pass arrives blank rather than wrong.
+    fn unlabelled(got: &Labels<'_>) -> bool {
+        got.primary_genre.is_empty() && got.subgenres.is_empty() && got.moods.is_empty() && !got.animated
+    }
+
+    /// One space compared both ways. Returns the titles that differ for a reason other than the known,
+    /// bounded loss, and the ones that hit that loss.
+    fn compare(
+        space: &str,
+        from_store: &Index,
+        from_blobs: &Index,
+    ) -> (Vec<String>, Vec<(MediaType, u32)>, usize, usize) {
+        let mut differ = Vec::new();
+        let mut blank = Vec::new();
+        let (mut quantised, mut compared) = (0usize, 0usize);
+        for (media, id) in from_blobs.titles() {
+            compared += 1;
+            let want = from_blobs.labels(id, media).expect("blob labels");
+            let (Some(got), Some(store_row), Some(blob_row)) =
+                (from_store.labels(id, media), from_store.row_of(id, media), from_blobs.row_of(id, media))
+            else {
+                differ.push(format!("[{space}] {media:?}:{id} missing from the store"));
+                continue;
+            };
+            // Name the FIELD that differs, not two Debug dumps to eyeball.
+            let mut fields = Vec::new();
+            if got.primary_genre != want.primary_genre {
+                fields.push("primary_genre");
+            }
+            if got.animated != want.animated {
+                fields.push("animated");
+            }
+            if !same_labels(&got.subgenres, &want.subgenres) {
+                fields.push("subgenres");
+            }
+            if !same_labels(&got.moods, &want.moods) {
+                fields.push("moods");
+            }
+            if got.subgenres != want.subgenres || got.moods != want.moods {
+                quantised += 1;
+            }
+            // The vector is compared regardless: a blank-labelled title must still carry the right bytes.
+            if from_store.row_vector(store_row as usize) != from_blobs.row_vector(blob_row as usize) {
+                fields.push("vector");
+            }
+            if fields.is_empty() {
+                continue;
+            }
+            if fields == ["vector"] || !unlabelled(&got) {
+                differ.push(format!("[{space}] {media:?}:{id} differs in {}", fields.join(", ")));
+            } else {
+                blank.push((media, id));
+            }
+        }
+        // A title the store indexes and the blobs do not would not show up above, and would mean the two
+        // are describing different corpora however well the shared titles agree.
+        for (media, id) in from_store.titles() {
+            if from_blobs.labels(id, media).is_none() {
+                differ.push(format!("[{space}] {media:?}:{id} is in the store index and not the blobs"));
+            }
+        }
+        (differ, blank, quantised, compared)
+    }
+
+    /// The taxonomy itself, not just the per-title answers: the bucket keys are a different id space on
+    /// each side, and a mis-interned name would still answer every title correctly while leaving the label
+    /// rows pointing at the wrong buckets.
+    ///
+    /// `allowance` is how many titles the store is known to hold no labels for (the premise-only loss).
+    /// The vocabulary is compared as a SET rather than in population order, because a bucket one title
+    /// smaller can reorder equally-sized labels — which says nothing — while a label disappearing
+    /// altogether says a great deal.
+    fn same_taxonomy(space: &str, from_store: &Index, from_blobs: &Index, allowance: usize) {
+        for (family, mut a, mut b) in [
+            ("subgenre", from_store.subgenre_labels(), from_blobs.subgenre_labels()),
+            ("mood", from_store.mood_labels(), from_blobs.mood_labels()),
+        ] {
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "{space} {family} vocabulary");
+        }
+        // Unaffected by the loss: a blank-labelled title is still an indexed title of its own type.
+        assert_eq!(from_store.media_type_counts(), from_blobs.media_type_counts(), "{space} type counts");
+        let floor = DISPLAY_CONFIDENCE_FLOOR;
+        for (what, a, b) in [
+            ("subgenre coverage", from_store.subgenre_coverage(floor), from_blobs.subgenre_coverage(floor)),
+            ("mood coverage", from_store.mood_coverage(floor), from_blobs.mood_coverage(floor)),
+        ] {
+            assert!(
+                a.abs_diff(b) <= allowance,
+                "{space} {what}: store {a} vs blobs {b}, more than the {allowance} titles the store \
+                 cannot label"
+            );
+        }
+    }
+
+    /// The store path against the blob path, on the REAL artifacts, for BOTH spaces. Opt-in via
+    /// `DEN_STORE` + `DEN_LABELS` + `DEN_VECTORS` + `DEN_PREMISE_LABELS` + `DEN_PREMISE_VECTORS`.
+    ///
+    /// This is the test that matters for the migration: the fixture tests above cannot see a difference
+    /// between the two readers, because they only ever run the blob one. Each `from_store_*` has to answer
+    /// the same for every title — primary genre, animated, both label families with their confidences, and
+    /// the vector byte for byte — or label rows, More Like This and the taste tilt all change with nothing
+    /// failing. Both spaces, because the premise index is the half a plot-only test would have let
+    /// through.
+    ///
+    /// It is the reason `from_blobs` still exists at all: serving no longer opens a blob, so this is the
+    /// only thing left that can disagree with the store reader. It needs the real artifacts, which is why
+    /// it is opt-in — and why it skips rather than fails when they are not to hand.
+    #[test]
+    fn the_store_answers_what_the_blobs_did() {
+        let (
+            Ok(store_path),
+            Ok(labels_path),
+            Ok(vectors_path),
+            Ok(premise_labels_path),
+            Ok(premise_vectors_path),
+        ) = (
+            std::env::var("DEN_STORE"),
+            std::env::var("DEN_LABELS"),
+            std::env::var("DEN_VECTORS"),
+            std::env::var("DEN_PREMISE_LABELS"),
+            std::env::var("DEN_PREMISE_VECTORS"),
+        )
+        else {
+            eprintln!(
+                "SKIP: set DEN_STORE, DEN_LABELS, DEN_VECTORS, DEN_PREMISE_LABELS and \
+                 DEN_PREMISE_VECTORS to compare the two readers"
+            );
+            return;
+        };
+        // `read`, not mmap: `memmap2` compiles for neither wasm32 nor tvOS, and this crate has to.
+        let bytes = std::fs::read(&store_path).expect("read the store");
+        let store = den_store::Store::open(&bytes).expect("open the store");
+        let blobs = |labels: &str, vectors: &str| {
+            Index::from_blobs(
+                &std::fs::read(labels).expect("read the labels"),
+                std::fs::read(vectors).expect("read the vectors"),
+            )
+            .expect("index from the blobs")
+        };
+        let plot = (
+            Index::from_store_plot(&store).expect("plot from the store"),
+            blobs(&labels_path, &vectors_path),
+        );
+        let premise = (
+            Index::from_store_premise(&store).expect("premise from the store"),
+            blobs(&premise_labels_path, &premise_vectors_path),
+        );
+
+        // The premise index is a DIFFERENT embedding space over a subset of the corpus. If the two store
+        // constructors ever came to read the same section, every number below would still agree while More
+        // Like This quietly answered plot neighbours for a premise query.
+        assert_ne!(plot.0.len(), premise.0.len(), "the two spaces cover different title counts");
+        let first = plot.0.titles().next().expect("a title");
+        let (a, b) = (plot.0.row_of(first.1, first.0).unwrap(), premise.0.row_of(first.1, first.0).unwrap());
+        assert_ne!(
+            plot.0.row_vector(a as usize),
+            premise.0.row_vector(b as usize),
+            "premise must not be built off vec_plot"
+        );
+
+        let mut all_blank = Vec::new();
+        for (space, (from_store, from_blobs)) in [("plot", &plot), ("premise", &premise)] {
+            let dropped = store.rows() - from_store.len();
+            eprintln!(
+                "[{space}] store rows: {}, indexed: {}, dropped for want of a vector: {dropped}",
+                store.rows(),
+                from_store.len()
+            );
+            assert_eq!(from_store.len(), from_blobs.len(), "{space} record count");
+            assert_eq!(from_store.dimension(), from_blobs.dimension(), "{space} dimension");
+            assert_eq!(from_store.taxonomy_version(), "", "the store carries no taxonomy version");
+
+            let (differ, blank, quantised, compared) = compare(space, from_store, from_blobs);
+            eprintln!(
+                "[{space}] titles compared: {compared}; differing: {}; blank in the store: {}; \
+                 agreeing to the hundredth but not to the bit: {quantised}",
+                differ.len(),
+                blank.len()
+            );
+            for line in differ.iter().take(20) {
+                eprintln!("  {line}");
+            }
+            assert!(
+                differ.is_empty(),
+                "[{space}] {} of {compared} titles differ; first few:\n{}",
+                differ.len(),
+                differ.iter().take(3).cloned().collect::<Vec<_>>().join("\n")
+            );
+            same_taxonomy(space, from_store, from_blobs, blank.len());
+            all_blank.extend(blank.into_iter().map(|key| (space, key)));
+        }
+
+        // The plot side is held to IDENTICAL, not to "within an allowance": nothing is known to be lost
+        // there, so the full ordered taxonomy and every count must match.
+        let (store_plot, blob_plot) = (&plot.0, &plot.1);
+        assert_eq!(store_plot.subgenre_labels(), blob_plot.subgenre_labels(), "plot subgenre taxonomy");
+        assert_eq!(store_plot.mood_labels(), blob_plot.mood_labels(), "plot mood taxonomy");
+        assert_eq!(store_plot.primary_genre_counts(), blob_plot.primary_genre_counts(), "plot genre counts");
+        let floor = DISPLAY_CONFIDENCE_FLOOR;
+        assert_eq!(store_plot.subgenre_counts(floor), blob_plot.subgenre_counts(floor), "plot subgenres");
+        assert_eq!(store_plot.mood_counts(floor), blob_plot.mood_counts(floor), "plot moods");
+
+        // The known loss, bounded rather than waved through: the store's label sections are filled from
+        // the PLOT labels pass alone, so a title the premise pass labelled and the plot pass did not
+        // arrives with no labels. Every such title must be exactly that — `vec_plot_has = 0` — and there
+        // must be none at all on the plot side, where those rows are not indexed in the first place.
+        let has_plot = store.per_row::<u8>("vec_plot_has").expect("vec_plot_has");
+        for &(space, (media, id)) in &all_blank {
+            assert_eq!(space, "premise", "a blank-labelled title on the plot side: {media:?}:{id}");
+            let row = store.row_of(u8::from(media == MediaType::Tv), id).expect("row").expect("indexed");
+            assert_eq!(
+                has_plot[row.0], 0,
+                "{media:?}:{id} has plot labels in the store yet came back blank — not the known loss"
+            );
+        }
+        eprintln!(
+            "titles the store cannot label (premise-only labels, den-dataset build_store.py): {:?}",
+            all_blank.iter().map(|&(_, key)| key).collect::<Vec<_>>()
+        );
+        assert!(
+            all_blank.len() <= 3,
+            "the premise-only label loss grew to {} titles; fix build_store.py rather than this bound",
+            all_blank.len()
+        );
     }
 
     #[test]
