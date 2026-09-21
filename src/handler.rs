@@ -699,6 +699,9 @@ impl IndexQuestion {
                     .split('&')
                     .filter_map(|pair| pair.split_once('='))
                     .filter(|(key, _)| !matches!(*key, "skip" | "limit"))
+                    // The taste is not an axis. Every tilt parameter carries one prefix so a household's
+                    // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
+                    .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
                     // Form-encoded, as a browser's URLSearchParams writes it: a space is a `+`.
                     .map(|(key, value)| (percent_decode(key), percent_decode(&value.replace('+', " "))))
                     .collect();
@@ -707,6 +710,7 @@ impl IndexQuestion {
                     export,
                     *media_type,
                     &constraints,
+                    crate::plotrows::Tilt::parse(query).as_ref(),
                     number("skip", 0),
                     number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
                 )
@@ -1283,7 +1287,16 @@ async fn handle_index(
     // den-embed and wasn't is the exception: it stays short, so the ranked answer replaces it once den-embed
     // is back.
     let long = "public, max-age=3600, stale-while-revalidate=86400";
-    let mut cache_control = long;
+    // A tilted row is as cacheable as any other — it is a slice of an order fixed for (row, taste, weights),
+    // so every page of it revalidates the same way — but its URL carries the household's liked and disliked
+    // titles, and that does not belong in a shared cache's key store or a proxy's log. `private` keeps the
+    // TTL and the ETag and moves the copy to the client that asked. A row with no taste in its URL keeps
+    // `public` exactly as before.
+    let mut cache_control = if query.contains(crate::plotrows::TILT_PREFIX) {
+        "private, max-age=3600, stale-while-revalidate=86400"
+    } else {
+        long
+    };
     let mut unembedded = |missed: bool| {
         if missed {
             cache_control = "public, max-age=300";
@@ -1452,7 +1465,7 @@ async fn serve_blob(
 }
 
 /// First value of `key` in a `k=v&k2=v2` query string (the datasetVersion is hex, so no percent-decoding).
-fn query_param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let mut it = kv.splitn(2, '=');
         (it.next()? == key).then(|| it.next().unwrap_or("").to_owned())
@@ -2214,6 +2227,60 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a
+    /// different order — and a different set of weights, a different order again.
+    #[tokio::test]
+    async fn a_tilted_row_is_the_same_row_in_another_order() {
+        let state = index_state("den-atlas-tilted-rows");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        let row = "/index/row/movie.json?subgenre=Heist";
+        let plain = json(body_of(get(&state, row).await).await);
+        assert_eq!(ids(&plain), vec![2, 1, 3], "{plain}");
+
+        // Movie 2 rejected. It leads the untilted row and the squared dislike drops it — but only by the
+        // slots the weight is worth, not to the back: burying a title is a hide rule's job. Movie 1 sits
+        // almost on top of movie 2 in the vector space (cos 0.99), so it is pushed down nearly as far and
+        // ends up behind movie 3, which is barely related (cos 0.11) and barely touched.
+        let disliked = json(body_of(get(&state, &format!("{row}&tilt.disliked=m2")).await).await);
+        assert_eq!(ids(&disliked), vec![2, 3, 1], "{disliked}");
+        assert_eq!(disliked["total"], plain["total"], "a tilt never changes a row's total");
+        let (mut before, mut after) = (ids(&plain), ids(&disliked));
+        before.sort_unstable();
+        after.sort_unstable();
+        assert_eq!(after, before, "and nothing entered or left the row");
+
+        // The weights are request parameters, so a tuner can move them: a loud enough embedding weight puts
+        // the liked title in front, where the shipped 0.15 leaves it where the row's own order had it.
+        let liked = format!("{row}&tilt.liked=m3");
+        let gentle = json(body_of(get(&state, &liked).await).await);
+        assert_eq!(ids(&gentle), vec![2, 1, 3], "the shipped weight is a nudge: {gentle}");
+        let loud = json(body_of(get(&state, &format!("{liked}&tilt.w.embedding=2")).await).await);
+        assert_eq!(ids(&loud)[0], 3, "a big enough weight does take the lead: {loud}");
+        assert_ne!(gentle["taste"], serde_json::Value::Null, "the page says which order it is a slice of");
+        assert_eq!(gentle["taste"], loud["taste"], "same taste, different levers");
+
+        // Every page of one row is a slice of ONE order, so paging state stays valid under infinite scroll.
+        let page = json(body_of(get(&state, &format!("{row}&tilt.disliked=m2&skip=1&limit=1")).await).await);
+        assert_eq!(page["total"], plain["total"]);
+        assert_eq!(ids(&page), vec![ids(&disliked)[1]], "{page}");
+
+        // A taste that names nothing is no taste at all: byte-identical to the row with no taste in its URL.
+        let empty = body_of(get(&state, &format!("{row}&tilt.liked=&tilt.disliked=")).await).await;
+        assert_eq!(empty, body_of(get(&state, row).await).await);
+
+        // The taste travels in the URL, so a tilted page is cacheable to the client that asked and to
+        // nobody else; a row with no taste in it keeps the shared TTL it has always had.
+        let tilted = get(&state, &format!("{row}&tilt.disliked=m2")).await;
+        assert_eq!(tilted.headers()["cache-control"], "private, max-age=3600, stale-while-revalidate=86400");
+        assert_eq!(
+            get(&state, row).await.headers()["cache-control"],
+            "public, max-age=3600, stale-while-revalidate=86400"
+        );
     }
 
     /// A ranked answer from a real fixture index and facts: never what the library owns, another type, or a
