@@ -59,7 +59,13 @@ safe_name() {
 # What the server cannot start without. `"$FILES" is non-empty` only says SOMETHING was declared,
 # so `"labelsFile": ""`, or a meta declaring just labelsGzFile, fetched happily and reported success
 # with a ./data den-atlas cannot load.
-REQUIRED="labels vectors"
+#
+# `store`, not `labels vectors`: the store carries the labels, both vector matrices, the cards and the
+# facets, and the blobs are retired (#113 §1.2). This is the SECOND copy of this guard — the first is the
+# pre-flight in oxyc/den's deploy/atlas-dataset-sync.sh, and that one was changed without this one, which
+# is what a duplicated guard does. They move together or they fail in opposite directions: one refusing
+# every good release, the other accepting one it cannot serve.
+REQUIRED="store"
 for r in $REQUIRED; do
   STAGE="$STAGE" python3 - "${r}File" <<'PY' || { echo "release meta declares no ${r}File — refusing" >&2; exit 1; }
 import json, os, sys
