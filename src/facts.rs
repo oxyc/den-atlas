@@ -447,7 +447,19 @@ impl Facts {
                 Record {
                     imdb_id: strings.get(imdb[i]).map(str::to_owned).filter(|id| id.starts_with("tt")),
                     released: Released::from_days(released[i], released_prec[i]),
-                    genres: genres.get(row).iter().filter_map(|&g| u16::try_from(g).ok()).collect(),
+                    // Folded HERE, not in the writer: `fold_genre` expands TMDB's series composites
+                    // (10765 "Sci-Fi & Fantasy" → Sci-Fi and Fantasy) and lives in one language.
+                    genres: {
+                        let mut out: Vec<u16> = Vec::new();
+                        for id in genres.get(row).iter().filter_map(|&g| u16::try_from(g).ok()) {
+                            for &genre in crate::recommend::fold_genre(id) {
+                                if !out.contains(&genre) {
+                                    out.push(genre);
+                                }
+                            }
+                        }
+                        out
+                    },
                     countries: countries
                         .get(row)
                         .iter()
@@ -821,10 +833,60 @@ pub(crate) mod tests {
                 continue;
             };
             if got != want {
-                differ.push(format!("{media:?}:{id}\n  json  {want:?}\n  store {got:?}"));
+                // Name the FIELD that differs, not two 400-character Debug dumps to eyeball.
+                let mut fields = Vec::new();
+                if got.imdb_id != want.imdb_id {
+                    fields.push("imdb_id");
+                }
+                if got.released != want.released {
+                    fields.push("released");
+                }
+                if got.genres != want.genres {
+                    fields.push("genres");
+                }
+                if got.countries != want.countries {
+                    fields.push("countries");
+                }
+                if got.languages != want.languages {
+                    fields.push("languages");
+                }
+                if got.makers != want.makers {
+                    fields.push("makers");
+                }
+                if got.cast != want.cast {
+                    fields.push("cast");
+                }
+                if got.franchise != want.franchise {
+                    fields.push("franchise");
+                }
+                if got.broadcasters != want.broadcasters {
+                    fields.push("broadcasters");
+                }
+                if got.source_kinds != want.source_kinds {
+                    fields.push("source_kinds");
+                }
+                if got.runtime_minutes != want.runtime_minutes {
+                    fields.push("runtime_minutes");
+                }
+                differ.push(format!("{media:?}:{id} differs in {}", fields.join(", ")));
             }
         }
         eprintln!("records differing: {} of {}", differ.len(), from_json.len());
+        for line in &differ {
+            eprintln!("  {line}");
+        }
+        // With DEN_GENRE_REPORT set, dump the genre disagreements with their titles so the two routes
+        // can be judged on real shows rather than on the schema.
+        if std::env::var("DEN_GENRE_REPORT").is_ok() {
+            for (media, id) in from_json.keys() {
+                let (Some(a), Some(b)) = (from_json.get(id, media), from_store.get(id, media)) else {
+                    continue;
+                };
+                if a.genres != b.genres {
+                    println!("GENRE\t{media:?}\t{id}\t{:?}\t{:?}", a.genres, b.genres);
+                }
+            }
+        }
         assert!(
             differ.is_empty(),
             "{} of {} records differ; first few:\n{}",

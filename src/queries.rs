@@ -395,24 +395,34 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // 43 MB JSON blob that atlas alone reads — nothing serves it and no client fetches it — and parsing
     // it was 1.04 s of a 1.6 s load. The sidecar stays as a fallback for a generation published before
     // the store carried them.
-    // STILL the JSON, deliberately. `Facts::from_store` exists and is tested against this reader on the
-    // real artifacts — and that test is why it is not switched on: the two disagree about the genres of
-    // **2,021 of 47,618** titles, because they reach them by different routes. This reader takes
-    // `genre.movie.or(genre.tv)` and folds it; the store takes the media-specific mapping, so a series
-    // whose Wikidata genre maps to TMDB 10765 ("Sci-Fi & Fantasy") gets both 878 and 14 here and one of
-    // them there. The store's route is arguably the more faithful one, but `genres` drives /recommend's
-    // naming and the clients' hide rules, so which is right is a decision rather than a refactor.
-    // Everything else — makers, cast, countries, languages, released, runtime, imdb, aliases — matches
-    // exactly. Flip this when the genre question is settled; it is one line.
+    // The facts, out of the store. `factsFile` is 43 MB of the release and was 1.04 s of a 1.6 s load,
+    // read by atlas alone — nothing serves it and no client fetches it.
+    //
+    // Switched on only once `Facts::from_store` answered IDENTICALLY to the JSON reader on the real
+    // corpus: 0 of 47,618 records differ. Getting there found four real losses in the store, three of
+    // which would have changed what people see — series genres kept as TMDB composites (which dropped
+    // Horror from Chilling Adventures of Sabrina), genres sorted out of the genreMap's order, the
+    // franchise interned against a table that holds almost no franchises, and 1,236 entity references
+    // the table did not describe being dropped. The test that found them is `facts::tests::
+    // the_store_answers_what_the_json_did`, and it is opt-in because it needs the real artifacts.
+    //
+    // The sidecar stays as a fallback for a generation published before the store carried them.
     let (mut facts, facts_took) = timed(|| {
-        sources.facts.iter().find_map(|path| match Facts::read(path) {
-            Ok(facts) => Some(facts),
-            Err(e) => {
-                // Name the file: with several candidates, "facts unusable" alone does not say which
-                // one, and the next line may be a success from a different file.
-                eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
-                None
-            }
+        let from_store = store.as_ref().and_then(|s| {
+            Facts::from_store(&s.view())
+                .map_err(|e| eprintln!("facts unusable from the store ({e}) — trying factsFile"))
+                .ok()
+        });
+        from_store.or_else(|| {
+            sources.facts.iter().find_map(|path| match Facts::read(path) {
+                Ok(facts) => Some(facts),
+                Err(e) => {
+                    // Name the file: with several candidates, "facts unusable" alone does not say which
+                    // one, and the next line may be a success from a different file.
+                    eprintln!("facts unusable ({}: {e}) — trying the next candidate", path.display());
+                    None
+                }
+            })
         })
     });
     // The facet rows come out of the store, so this runs AFTER it rather than beside it. It used to read
