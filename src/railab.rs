@@ -177,6 +177,26 @@ pub fn run(dir: &std::path::Path) -> i32 {
     println!("{}", "-".repeat(90));
     let (mut ag, mut asg, mut bg, mut bsg, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0);
     let mut notes: Vec<String> = Vec::new();
+    // The scalar a weight sweep is judged on. Genre share is a SHAPE, and the pooled scorer lowers it on
+    // purpose, so "higher is better" is false for it — sweeping against it would tune the rail back into
+    // the genre shelf it exists to stop being. Where the titles a viewer would actually expect END UP is
+    // the thing a weight is for: Once is supposed to pull in the other three John Carney films, The Wire
+    // the rest of David Simon's Baltimore. A miss counts as one past the end of the row, so dropping a
+    // wanted title always costs more than ranking it last.
+    let (mut want_rank_a, mut want_rank_b, mut want_n) = (0.0, 0.0, 0.0);
+    let (mut bad_rank_a, mut bad_rank_b, mut bad_n) = (0.0, 0.0, 0.0);
+    let miss = (den_index::MAX_ROW + 1) as f64;
+    // The COUNTERWEIGHT, and the reason `want mean rank` cannot be swept on alone.
+    //
+    // Every title in `WANTED` is there because a viewer would expect it, and most of them are expected
+    // BECAUSE they share a maker: four John Carney films, six David Simon shows. So raising `W_MAKER`
+    // improves that number by construction, and a sweep against it alone recommends raising the weight
+    // for ever — measured, monotonically, from 0.0 to 2.6 without turning.
+    //
+    // This is what raising it costs: the share of the visible twenty that shares a maker with the seed.
+    // Past some point the row stops being "more like this" and becomes "more by this person", which is a
+    // different row the detail screen already has.
+    let (mut auth_share_a, mut auth_share_b) = (0.0, 0.0);
 
     for &(name, id, media) in ANCHORS {
         let Some(seed) = indexes
@@ -214,19 +234,43 @@ pub fn run(dir: &std::path::Path) -> i32 {
         bsg += b_s;
         n += 1.0;
 
-        let at = |row: &[u32], want: u32| {
-            row.iter().position(|x| *x == want).map_or("-".to_owned(), |p| (p + 1).to_string())
+        // Share of the visible twenty crediting one of the seed's own makers.
+        let by_same_maker = |row: &[u32]| -> f64 {
+            let mine = &SeedAuthorship::of(facts, media, id).makers;
+            if mine.is_empty() || row.is_empty() {
+                return 0.0;
+            }
+            let hits = row
+                .iter()
+                .take(20)
+                .filter(|&&other| {
+                    facts.get(other, media).is_some_and(|r| r.makers.iter().any(|m| mine.contains(m)))
+                })
+                .count();
+            hits as f64 / row.len().min(20) as f64
         };
+        auth_share_a += by_same_maker(&a);
+        auth_share_b += by_same_maker(&b);
+
+        let rank = |row: &[u32], want: u32| row.iter().position(|x| *x == want).map(|p| (p + 1) as f64);
+        let shown = |r: Option<f64>| r.map_or("-".to_owned(), |p| (p as usize).to_string());
         for &(label, want) in listed(WANTED, id) {
-            let (pa, pb) = (at(&a, want), at(&b_full, want));
-            if pa != pb {
-                notes.push(format!("  want {label:<24} {name:<24} A={pa:<4} B={pb}"));
+            let (ra, rb) = (rank(&a, want), rank(&b_full, want));
+            want_rank_a += ra.unwrap_or(miss);
+            want_rank_b += rb.unwrap_or(miss);
+            want_n += 1.0;
+            if shown(ra) != shown(rb) {
+                notes.push(format!("  want {label:<24} {name:<24} A={:<4} B={}", shown(ra), shown(rb)));
             }
         }
         for &(label, bad) in listed(UNWANTED, id) {
-            let (pa, pb) = (at(&a, bad), at(&b_full, bad));
-            if pa != pb {
-                notes.push(format!("  DROP {label:<24} {name:<24} A={pa:<4} B={pb}"));
+            let (ra, rb) = (rank(&a, bad), rank(&b_full, bad));
+            // Inverted: for a title that should NOT be there, further down is better and absent is best.
+            bad_rank_a += ra.unwrap_or(miss);
+            bad_rank_b += rb.unwrap_or(miss);
+            bad_n += 1.0;
+            if shown(ra) != shown(rb) {
+                notes.push(format!("  DROP {label:<24} {name:<24} A={:<4} B={}", shown(ra), shown(rb)));
             }
         }
     }
@@ -240,6 +284,28 @@ pub fn run(dir: &std::path::Path) -> i32 {
             asg / n * 100.0,
             bg / n * 100.0,
             bsg / n * 100.0
+        );
+    }
+    // One line a sweep can be read off. Lower is better on `want`, higher on `drop`.
+    if want_n > 0.0 {
+        println!(
+            "\nwant mean rank  A={:>6.1}  B={:>6.1}   (of {want_n:.0}, a miss counts {miss:.0})",
+            want_rank_a / want_n,
+            want_rank_b / want_n
+        );
+    }
+    if bad_n > 0.0 {
+        println!(
+            "drop mean rank  A={:>6.1}  B={:>6.1}   (of {bad_n:.0}, higher is better, {miss:.0} = absent)",
+            bad_rank_a / bad_n,
+            bad_rank_b / bad_n
+        );
+    }
+    if n > 0.0 {
+        println!(
+            "same-maker share  A={:>5.0}%  B={:>5.0}%   (of the visible 20 — the cost of W_MAKER)",
+            auth_share_a / n * 100.0,
+            auth_share_b / n * 100.0
         );
     }
     println!("\nmoves:");
