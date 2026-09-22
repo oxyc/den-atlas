@@ -306,23 +306,6 @@ pub fn name_key(name: &str) -> String {
 }
 
 impl Facts {
-    /// Every title of this type crediting one of these makers — the seed's own siblings, whatever the
-    /// vectors think of them. A weight can only re-order candidates the vectors proposed, and the vectors
-    /// do not propose a seed's siblings: The Wire and The Deuce share a creator and The Deuce is premise
-    /// rank 764, plot 628, outside any sane pool.
-    pub fn titles_sharing_makers(&self, media_type: MediaType, makers: &[u32]) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .records
-            .iter()
-            .filter(|((media, _), record)| {
-                *media == media_type && record.makers.iter().any(|m| makers.contains(m))
-            })
-            .map(|((_, id), _)| *id)
-            .collect();
-        out.sort_unstable();
-        out
-    }
-
     pub fn get(&self, tmdb_id: u32, media_type: MediaType) -> Option<&Record> {
         self.records.get(&(media_type, tmdb_id))
     }

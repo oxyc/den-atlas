@@ -118,10 +118,13 @@ impl Indexes {
     ) -> Vec<den_index::Scored> {
         // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
         // the load fails without a store, so there is no arm here that answers without one.
-        let facets = crate::rail::SeedFacets::new(&self.store.view(), &self.store.aggregates, media_type)
+        let view = self.store.view();
+        let facets = den_index::SeedFacets::new(&view, &self.store.aggregates, media_type)
             .expect("MappedStore::check builds this at load, so it cannot fail per request")
             .tuned(params);
-        let authorship = self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
+        // Without the credit lists the rail ranks without authorship. The facts read the same lists, so a
+        // store missing them also reaches `/health` as `facts_unusable`.
+        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id).ok();
         den_index::more_like_this_scored(
             Some(&self.plot),
             self.premise.as_ref(),
@@ -1005,6 +1008,65 @@ mod tests {
 
         let (bare, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
         assert!(bare.character_links(Movie, 1).is_empty(), "no list, no links");
+    }
+
+    /// The rail's authorship is read from the store's credit lists (`den_index::SeedAuthorship`); it used
+    /// to be read from the facts, which are built from the same lists. This holds the two to one answer on
+    /// the real corpus: for every 100th title, the siblings it nominates are exactly the titles whose facts
+    /// credit one of its makers, and every share it gives a sibling or one of its plot neighbours is the
+    /// share the facts give.
+    ///
+    /// Opt-in, like every test that needs the real corpus: `DEN_STORE` names a store whose directory holds
+    /// its `dataset.meta.json`.
+    #[test]
+    fn authorship_from_the_credit_lists_answers_what_the_facts_did() {
+        use den_index::Authorship as _;
+        let Ok(store) = std::env::var("DEN_STORE") else {
+            eprintln!("SKIP: set DEN_STORE to a real den-<ver>.store to exercise this");
+            return;
+        };
+        let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
+        let indexes = load_for_tools(&Dataset::load(dir).expect("the dataset loads")).expect("indexes");
+        let facts = indexes.facts.as_ref().expect("the real store carries facts");
+        let view = indexes.store.view();
+        let share = |mine: &[u32], theirs: &[u32]| -> f64 {
+            if mine.is_empty() || theirs.is_empty() {
+                return 0.0;
+            }
+            mine.iter().filter(|m| theirs.contains(m)).count() as f64 / mine.len() as f64
+        };
+        let mut records: Vec<(den_index::MediaType, u32, &crate::facts::Record)> =
+            facts.keys().map(|(m, id)| (m, id, facts.get(id, m).expect("a key the facts listed"))).collect();
+        records.sort_unstable_by_key(|&(m, id, _)| (m, id));
+        let (mut seeds, mut shares, mut nominated) = (0, 0, 0);
+        for &(media, id, seed) in records.iter().step_by(100) {
+            let columns = den_index::SeedAuthorship::of(&view, media, id).expect("the credit lists read");
+            let siblings: Vec<u32> = records
+                .iter()
+                .filter(|&&(m, _, r)| m == media && r.makers.iter().any(|q| seed.makers.contains(q)))
+                .map(|&(_, other, _)| other)
+                .collect();
+            assert_eq!(columns.nominate(), siblings, "{media:?} {id}: nominations");
+            let neighbours = indexes.plot.nearest(id, media, 50).into_iter().map(|n| n.tmdb_id);
+            for other in siblings.iter().copied().chain(neighbours) {
+                let theirs = facts.get(other, media).cloned().unwrap_or_default();
+                assert_eq!(
+                    columns.makers(other),
+                    share(&seed.makers, &theirs.makers),
+                    "{id} -> {other}: makers"
+                );
+                assert_eq!(
+                    columns.home(other),
+                    share(&seed.broadcasters, &theirs.broadcasters),
+                    "{id} -> {other}: home"
+                );
+                shares += 2;
+            }
+            nominated += siblings.len();
+            seeds += 1;
+        }
+        eprintln!("{seeds} seeds, {nominated} nominations and {shares} shares agree with the facts");
+        assert!(seeds > 400, "a real corpus, got {seeds} seeds");
     }
 
     /// A one-line `title.ratings` dump naming the fixture's movie 1, joined onto its store.

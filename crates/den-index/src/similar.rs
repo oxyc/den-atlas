@@ -82,7 +82,7 @@ const SUBGENRE_CAP: usize = 3;
 const MIN_CONFIDENCE: f64 = 0.55;
 
 /// A noul below this is noise, not a signal: ~75 dimensions per row become ~15. Applied by the `Facets`
-/// implementation (den-atlas `rail.rs`), which reads it from `SimilarParams`.
+/// implementation (`rail.rs`), which reads it from `SimilarParams`.
 pub const NOUL_FLOOR: f64 = 0.20;
 /// Below this a title is simply realist; the distance is not meaningful. Applied like `NOUL_FLOOR`.
 pub const WORLD_FLOOR: f64 = 0.05;
@@ -97,7 +97,7 @@ pub const DEFINING: f64 = 0.8;
 /// production. The tuning playground and any offline scorer take the same type and override fields.
 ///
 /// Not here, because a request cannot move them cheaply: the critique floor and the idf "holds" share are
-/// baked into corpus-wide aggregates computed once at load (den-atlas `RailAggregates`).
+/// baked into corpus-wide aggregates computed once at load (`RailAggregates`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimilarParams {
     pub pool_k: usize,
@@ -462,11 +462,6 @@ pub trait Facets {
         let _ = tmdb_id;
         Vec::new()
     }
-    /// Whether this candidate is among the seed's `n` best by critique coverage, corpus-wide.
-    fn critique_top(&self, tmdb_id: u32, other: u32, n: usize) -> bool {
-        let _ = (tmdb_id, other, n);
-        false
-    }
     /// The critique profile — what the work argues about — CENTERED on the corpus mean per axis, so the
     /// caller does the centering once rather than every comparison.
     fn critique(&self, tmdb_id: u32) -> Vec<Weighted> {
@@ -499,8 +494,9 @@ fn facet_agreement(f: &dyn Facets, seed: &[(Axis, ValueId, f64)], other: u32) ->
     let mut den = 0.0;
     for (axis, value, conf) in seed {
         let Some((_, their_value, their_conf)) = theirs.iter().find(|(a, _, _)| a == axis) else { continue };
-        // ln(1/prevalence): a value the whole corpus shares carries almost no evidence.
-        let weight = conf * (1.0 / f.prevalence(*axis, *value).max(1e-6)).ln().max(0.0);
+        // ln(1/prevalence): a value the whole corpus shares carries almost no evidence. `libm::log`, not
+        // `f64::ln`, so every target rounds it the same way (see den-index's Cargo.toml).
+        let weight = conf * libm::log(1.0 / f.prevalence(*axis, *value).max(1e-6)).max(0.0);
         den += weight;
         if their_value == value {
             num += weight * their_conf;
@@ -624,11 +620,49 @@ pub fn more_like_this_scored(
         return Vec::new();
     }
 
-    // Labels come from whichever index holds the seed; both carry the same label set.
-    let Some(mine) = premise
-        .and_then(|p| p.labels(tmdb_id, media_type))
-        .or_else(|| plot.and_then(|p| p.labels(tmdb_id, media_type)))
-    else {
+    // One index's cosine between the seed and a candidate, when that index holds both.
+    let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
+        let index = index?;
+        let a = index.row_of(tmdb_id, media_type)?;
+        let b = index.row_of(other, media_type)?;
+        Some(index.similarity(a, b))
+    };
+    let pool: Vec<Candidate> = pool
+        .iter()
+        .map(|&id| Candidate { tmdb_id: id, premise: sim(premise, id), plot: sim(plot, id) })
+        .collect();
+    // Labels come from whichever index holds the title; both carry the same label set.
+    let labels = |id: u32| {
+        premise.and_then(|x| x.labels(id, media_type)).or_else(|| plot.and_then(|x| x.labels(id, media_type)))
+    };
+    rank_pool(&pool, tmdb_id, &labels, authorship, facets, p)
+}
+
+/// One member of a seed's candidate pool, with its cosine to the seed in each space (`None` where that
+/// space does not hold both titles).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candidate {
+    pub tmdb_id: u32,
+    pub premise: Option<f64>,
+    pub plot: Option<f64>,
+}
+
+/// Everything More Like This does after retrieval: gate, score and order a pool that is already drawn.
+///
+/// Pure over its inputs — the pool with its cosines, the labels, and the two traits — so a caller holding
+/// no vectors can rank a pool someone else retrieved, and rank it exactly as serving does. The pool's
+/// ORDER matters as well as its membership: it is the candidates' order for every tie below.
+/// `more_like_this_scored` is retrieval (both indexes' nearest `pool_k`, then authorship's nominations,
+/// deduplicated in that order) followed by this.
+pub fn rank_pool<'l>(
+    pool: &[Candidate],
+    tmdb_id: u32,
+    labels: &dyn Fn(u32) -> Option<crate::Labels<'l>>,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    p: &SimilarParams,
+) -> Vec<Scored> {
+    let Some(mine) = labels(tmdb_id) else {
         return Vec::new();
     };
     let seed = seed_labels(&mine, p.min_confidence);
@@ -638,16 +672,8 @@ pub fn more_like_this_scored(
     let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
 
-    // One index's cosine between the seed and a candidate, when that index holds both.
-    let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
-        let index = index?;
-        let a = index.row_of(tmdb_id, media_type)?;
-        let b = index.row_of(other, media_type)?;
-        Some(index.similarity(a, b))
-    };
-
     let raw: Vec<(u32, Option<f64>, Option<f64>)> =
-        pool.iter().map(|&id| (id, sim(premise, id), sim(plot, id))).collect();
+        pool.iter().map(|c| (c.tmdb_id, c.premise, c.plot)).collect();
     // A candidate one index has never seen is scored at that index's pool floor rather than zero, so a
     // missing vector costs it a little and does not disqualify it.
     let floor = |values: Vec<f64>| -> f64 {
@@ -665,10 +691,7 @@ pub fn more_like_this_scored(
     type Gated = (u32, f64, String, Option<f64>, Option<f64>);
     let mut scored: Vec<Gated> = Vec::new();
     for &(id, pc, l) in &raw {
-        let Some(theirs) = premise
-            .and_then(|x| x.labels(id, media_type))
-            .or_else(|| plot.and_then(|x| x.labels(id, media_type)))
-        else {
+        let Some(theirs) = labels(id) else {
             continue;
         };
         if p.same_animation && theirs.animated != mine.animated {
@@ -705,9 +728,7 @@ pub fn more_like_this_scored(
     let mut final_scored: Vec<Scored> = scored
         .into_iter()
         .map(|(id, base, dominant, pc, l)| {
-            let theirs = premise
-                .and_then(|x| x.labels(id, media_type))
-                .or_else(|| plot.and_then(|x| x.labels(id, media_type)));
+            let theirs = labels(id);
             let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th, p.min_confidence));
             let maker = authorship.map_or(0.0, |a| a.makers(id));
             let home = authorship.map_or(0.0, |a| a.home(id));
@@ -1043,6 +1064,56 @@ mod tests {
         assert_eq!(rank(&off)[0].tmdb_id, 2, "without the maker weight the closest vector leads");
         off.set("max_row", 2.0).unwrap();
         assert_eq!(rank(&off).len(), 2);
+    }
+
+    /// `rank_pool` is everything after retrieval: handed the pool `more_like_this_scored` draws, with its
+    /// cosines and in its order, it ranks it identically — so a caller holding no vectors can reproduce a
+    /// served row from a pool retrieved elsewhere.
+    #[test]
+    fn a_retrieved_pool_ranks_as_serving_ranks_it() {
+        let seed_subs: &[(&str, f64)] = &[("Romantic Drama", 0.75)];
+        let seed_moods: &[(&str, f64)] = &[("Feel-good", 0.6)];
+        let premise = fixture(&[
+            (1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0]),
+            (2, "movie", "Romance", false, seed_subs, seed_moods, [95, 0, 0]),
+            (3, "movie", "Drama", false, &[], &[("Feel-good", 0.7)], [60, 0, 0]),
+            (4, "movie", "Romance", false, seed_subs, seed_moods, [88, 0, 0]),
+            (5, "movie", "Romance", false, seed_subs, seed_moods, [40, 0, 0]),
+            (6, "movie", "Romance", false, seed_subs, seed_moods, [0, 100, 0]),
+        ]);
+        struct SameHand;
+        impl Authorship for SameHand {
+            fn nominate(&self) -> Vec<u32> {
+                vec![1, 6]
+            }
+            fn makers(&self, id: u32) -> f64 {
+                f64::from(u8::from(id == 6))
+            }
+        }
+        let mut p = SimilarParams::default();
+        p.set("pool_k", 3.0).unwrap();
+        let served =
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, Some(&SameHand), None, &p);
+
+        // Retrieval by hand: the premise index's nearest `pool_k`, then the nominations the pool lacks.
+        let mut ids: Vec<u32> =
+            premise.nearest(1, MediaType::Movie, 3).into_iter().map(|n| n.tmdb_id).collect();
+        ids.extend(SameHand.nominate().into_iter().filter(|&id| id != 1));
+        let seed_row = premise.row_of(1, MediaType::Movie).unwrap();
+        let pool: Vec<Candidate> = ids
+            .iter()
+            .map(|&id| Candidate {
+                tmdb_id: id,
+                premise: premise.row_of(id, MediaType::Movie).map(|row| premise.similarity(seed_row, row)),
+                plot: None,
+            })
+            .collect();
+        let labels = |id: u32| premise.labels(id, MediaType::Movie);
+        let ranked = rank_pool(&pool, 1, &labels, Some(&SameHand), None, &p);
+
+        assert_eq!(ranked, served);
+        assert_eq!(served.len(), 4, "three retrieved and one nominated: {served:?}");
+        assert!(served.iter().any(|s| s.tmdb_id == 6), "the nomination the vectors missed is ranked");
     }
 
     #[test]

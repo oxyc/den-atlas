@@ -77,19 +77,21 @@ impl MappedStore {
     /// per-feature, so `/recommend`, people search and `imdbId` went quiet one at a time while `/health`
     /// stayed green. A store either has what serving needs or it is not a store we can serve.
     /// `agg` so the rail's own constructor can be the thing that is checked — see below.
-    pub fn check(&self, agg: &crate::rail::RailAggregates) -> Result<(), StoreError> {
+    pub fn check(&self, agg: &den_index::RailAggregates) -> Result<(), StoreError> {
         let view = self.view();
         view.strings()?;
-        // Everything the rail reads, checked by BUILDING the rail's view of the store rather than by a
-        // second list of section names. The first version of this function listed `makers`, `cast` and
-        // `genres` — none of which the rail reads, since authorship still comes from the facts — and
-        // listed none of the nouls; `SeedFacets::nouls` swallowed a read error and returned empty, so a
+        // Everything the rail's facets read, checked by BUILDING the rail's view of the store rather than
+        // by a second list of section names. The first version of this function listed `makers`, `cast`
+        // and `genres` and none of the nouls; `SeedFacets::nouls` swallowed a read error and returned empty, so a
         // store missing them dropped the W_NOUL = 1.60 term on every request with no log line and no
         // health signal. Replacing the list with the constructor is what stops that recurring: there is
         // now no way to add a column the rail needs and forget to require it here.
         //
+        // Authorship (`SeedAuthorship`, the credit lists) is not required: the rail ranks without it, as it
+        // always has when the credits would not read, and the facts' own load reports their absence.
+        //
         // The media type is immaterial — it only packs the search key — so movie stands for both.
-        crate::rail::SeedFacets::new(&view, agg, den_index::MediaType::Movie)?;
+        den_index::SeedFacets::new(&view, agg, den_index::MediaType::Movie)?;
         Ok(())
     }
 }
@@ -102,14 +104,14 @@ impl MappedStore {
 /// request.
 pub struct LoadedStore {
     pub store: MappedStore,
-    pub aggregates: crate::rail::RailAggregates,
+    pub aggregates: den_index::RailAggregates,
 }
 
 impl LoadedStore {
     pub fn open(path: &Path) -> Result<Self, String> {
         let store = MappedStore::open(path)?;
         // The aggregates first: `check` proves the rail can be built, and the rail borrows them.
-        let aggregates = crate::rail::RailAggregates::build(&store.view())?;
+        let aggregates = den_index::RailAggregates::build(&store.view())?;
         store.check(&aggregates).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self { store, aggregates })
     }
@@ -575,7 +577,7 @@ mod tests {
         };
         let store = MappedStore::open(std::path::Path::new(&path)).expect("the store maps");
         assert!(store.rows() > 40_000, "a real store has the corpus in it, got {}", store.rows());
-        let agg = crate::rail::RailAggregates::build(&store.view()).expect("aggregates");
+        let agg = den_index::RailAggregates::build(&store.view()).expect("aggregates");
         store.check(&agg).expect("every section serving needs");
 
         // The mapping is lazy, so reading a column is what proves the offsets address real pages.
@@ -597,8 +599,102 @@ mod tests {
         let store = MappedStore::open(&path).expect("the fixture maps");
         assert_eq!(store.dataset_version(), "fixture");
         assert_eq!(store.rows(), 3);
-        let agg = crate::rail::RailAggregates::build(&store.view()).expect("aggregates");
+        let agg = den_index::RailAggregates::build(&store.view()).expect("aggregates");
         store.check(&agg).expect("the fixture has every section serving needs");
+    }
+
+    // The rail's column reads (`den_index::SeedFacets`), against den-spec's three-title fixture. These
+    // exist because the first version of the rail had none, and that is exactly what let three thresholds
+    // quietly change the ranking: the store still loaded, every row still returned twelve facets, and the
+    // numbers were simply different. They sit here, beside the loader, because this is where the fixture
+    // is found; `spec_fixture` fails rather than returns `None` when den-spec is absent, so they cannot go
+    // back to reporting a pass over a store they never opened.
+
+    fn rail_fixture() -> Option<LoadedStore> {
+        fixture().map(|path| LoadedStore::open(&path).expect("the fixture loads"))
+    }
+
+    fn seed(loaded: &LoadedStore, media: den_index::MediaType) -> den_index::SeedFacets<'_> {
+        den_index::SeedFacets::new(&loaded.view(), &loaded.aggregates, media)
+            .expect("the fixture carries every column the rail reads")
+    }
+
+    fn axis(name: &str) -> den_index::Axis {
+        den_store::FACET_AXES.iter().position(|a| *a == name).unwrap() as den_index::Axis
+    }
+
+    /// The fixture's `movie:1` answers `era` and `tone`, and DECLINES `pacing`. A declined axis must be
+    /// absent, not a value: a scorer that counted `does-not-apply` as agreement would pair every
+    /// declining title with every other.
+    #[test]
+    fn facets_carry_confidence_and_declines_are_absent() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let facets = seed(&loaded, den_index::MediaType::Movie).facets(1);
+        let (_, _, conf) = facets.iter().find(|(a, _, _)| *a == axis("era")).expect("era is answered");
+        assert!((conf - 0.96).abs() < 1e-9, "confidence is hundredths, got {conf}");
+        assert!(!facets.iter().any(|(a, _, _)| *a == axis("pacing")), "a declined axis must not appear");
+    }
+
+    /// Prevalence is per media type and per axis. With one movie answering `era`, that value's
+    /// prevalence among movies is 1 of 2 movie rows.
+    #[test]
+    fn prevalence_is_scoped_to_one_media_type() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let movies = seed(&loaded, den_index::MediaType::Movie);
+        let era = axis("era");
+        let (_, value, _) = movies.facets(1).into_iter().find(|(a, _, _)| *a == era).unwrap();
+
+        assert!((movies.prevalence(era, value) - 0.5).abs() < 1e-9, "1 of 2 movie rows");
+        // The same value id, asked of the other media type, must not read the movie statistic.
+        assert!((seed(&loaded, den_index::MediaType::Tv).prevalence(era, value) - 1.0).abs() < 1e-9);
+    }
+
+    /// The floors the rail re-applies. `movie:1` holds `theme__vampire` at 0.25 (kept) and the fixture
+    /// gives it a `world` of 0.25 from that; a value below the world floor must read as 0.
+    #[test]
+    fn nouls_and_world_are_floored() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let movies = seed(&loaded, den_index::MediaType::Movie);
+
+        let floors = den_index::SimilarParams::default();
+        assert!(movies.nouls(1).iter().all(|(_, p)| *p >= floors.noul_floor), "every noul clears the floor");
+        let world = movies.world(1);
+        assert!(world == 0.0 || world >= floors.world_floor, "world is floored, got {world}");
+        // A row with nothing at all reads as zero distance, not as a missing value.
+        assert_eq!(movies.world(2), 0.0);
+    }
+
+    /// "Unknown is not none." A row with no critique must return NOTHING, so the cosine term is skipped
+    /// — not a negated mean vector that scores a real, usually negative, similarity.
+    #[test]
+    fn a_row_without_critique_returns_nothing() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let movies = seed(&loaded, den_index::MediaType::Movie);
+
+        assert!(!movies.critique(1).is_empty(), "movie:1 argues about something");
+        assert!(movies.critique_raw(2).is_empty(), "movie:2 has no critique at all");
+        assert!(movies.critique(2).is_empty(), "and centering must not manufacture seventeen values for it");
+    }
+
+    /// Centering subtracts the per-media mean, so a title above the corpus on an axis reads positive.
+    #[test]
+    fn critique_is_centered_on_its_own_media_type() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let movies = seed(&loaded, den_index::MediaType::Movie);
+        let raw = movies.critique_raw(1);
+        let centered = movies.critique(1);
+
+        assert_eq!(raw.len(), centered.len());
+        for ((name, r), (name2, c)) in raw.iter().zip(&centered) {
+            assert_eq!(name, name2, "centering preserves order");
+            assert!(c <= r, "centering subtracts a non-negative mean: {r} -> {c}");
+        }
+        assert!(centered.iter().any(|(_, c)| *c > 0.0), "something must be above its own mean");
     }
 
     /// Both ways a file can fail to be a store, and each must say WHICH — "could not load the dataset"
