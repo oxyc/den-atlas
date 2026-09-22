@@ -24,6 +24,99 @@ const DEFAULT_LIMIT: usize = 20;
 /// shown is what a response's size scales with.
 const MAX_LIMIT: usize = 200;
 
+/// The seeds the page opens with when its URL names none: a spread of kinds and sizes of catalogue, each
+/// a row someone has looked at closely.
+pub const DEFAULT_SEEDS: &[(MediaType, u32)] = &[
+    (MediaType::Tv, 1399),      // Game of Thrones
+    (MediaType::Tv, 1438),      // The Wire
+    (MediaType::Movie, 5723),   // Once
+    (MediaType::Movie, 614945), // Voicemails for Isabelle
+    (MediaType::Tv, 38148),     // Beck (1997)
+    (MediaType::Movie, 278),    // The Shawshank Redemption
+];
+
+/// Seeds one `/playground/rows.json` request may rank. Each is a whole tuned row, so this times the
+/// clamped cost of one row bounds the request.
+pub const MAX_SEEDS: usize = 12;
+
+/// Titles shown per seed in one `/playground/rows.json` answer. Lower than `MAX_LIMIT` because the answer
+/// is up to twelve rows, and every title shown carries its signals: at 200 per seed the worst request was
+/// 1.76 MB.
+pub const MAX_ROWS_LIMIT: usize = 50;
+
+/// `limit` checked against `MAX_ROWS_LIMIT`, after `parse` has held it to `MAX_LIMIT`.
+pub fn rows_limit(limit: usize) -> Result<usize, String> {
+    if limit > MAX_ROWS_LIMIT {
+        return Err(format!("limit must be at most {MAX_ROWS_LIMIT} per seed here, got {limit}"));
+    }
+    Ok(limit)
+}
+
+/// `movie:5723` / `series:1438`: a seed as the page's URL and `rows.json` name it, in the type names
+/// atlas's routes use.
+pub fn seed_key(media: MediaType, id: u32) -> String {
+    match media {
+        MediaType::Movie => format!("movie:{id}"),
+        MediaType::Tv => format!("series:{id}"),
+    }
+}
+
+/// The `seeds` value of a query string, percent-decoded, and the query without it — so the rest goes
+/// through `parse`, which refuses any key it does not know.
+pub fn take_seeds(query: &str) -> (Option<String>, String) {
+    let mut seeds = None;
+    let mut rest: Vec<&str> = Vec::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        match pair.split_once('=').unwrap_or((pair, "")) {
+            ("seeds", value) => seeds = Some(crate::handler::percent_decode(value)),
+            _ => rest.push(pair),
+        }
+    }
+    (seeds, rest.join("&"))
+}
+
+/// A seed list: absent is `DEFAULT_SEEDS`, empty is none, otherwise comma-separated `seed_key`s. A seed
+/// named twice is ranked once, in its first place; more than `MAX_SEEDS` is refused.
+pub fn parse_seeds(value: Option<&str>) -> Result<Vec<(MediaType, u32)>, String> {
+    let Some(value) = value else { return Ok(DEFAULT_SEEDS.to_vec()) };
+    let mut seeds: Vec<(MediaType, u32)> = Vec::new();
+    for key in value.split(',').filter(|key| !key.is_empty()) {
+        let seed = key
+            .split_once(':')
+            .and_then(|(kind, id)| {
+                let media = match kind {
+                    "movie" => MediaType::Movie,
+                    "series" => MediaType::Tv,
+                    _ => return None,
+                };
+                Some((media, id.parse().ok()?))
+            })
+            .ok_or_else(|| format!("seeds: {key:?} is not movie:<tmdbId> or series:<tmdbId>"))?;
+        if !seeds.contains(&seed) {
+            seeds.push(seed);
+        }
+    }
+    if seeds.len() > MAX_SEEDS {
+        return Err(format!("seeds: at most {MAX_SEEDS}, got {}", seeds.len()));
+    }
+    Ok(seeds)
+}
+
+/// `GET /playground/rows.json?seeds=…&<knob>=…&limit=` — every seed's tuned row in one answer, each the
+/// shape `/playground/similar` gives one seed, with its `key`. One request per change of the page's
+/// knobs, however many seeds it shows.
+pub fn rows(indexes: &Indexes, seeds: &[(MediaType, u32)], params: &SimilarParams, limit: usize) -> Value {
+    let rows: Vec<Value> = seeds
+        .iter()
+        .map(|&(media, id)| {
+            let mut row = answer(indexes, media, id, params, limit);
+            row["key"] = json!(seed_key(media, id));
+            row
+        })
+        .collect();
+    json!({ "changed": changed(params), "rows": rows })
+}
+
 /// `GET /playground/params.json` — every knob, its range, and production's value for it.
 pub fn params_json() -> String {
     let production = SimilarParams::default();
@@ -40,7 +133,16 @@ pub fn params_json() -> String {
             })
         })
         .collect();
-    json!({ "knobs": knobs, "defaultLimit": DEFAULT_LIMIT, "maxLimit": MAX_LIMIT }).to_string()
+    let default_seeds: Vec<String> = DEFAULT_SEEDS.iter().map(|&(media, id)| seed_key(media, id)).collect();
+    json!({
+        "knobs": knobs,
+        "defaultLimit": DEFAULT_LIMIT,
+        "maxLimit": MAX_LIMIT,
+        "defaultSeeds": default_seeds,
+        "maxSeeds": MAX_SEEDS,
+        "maxRowsLimit": MAX_ROWS_LIMIT,
+    })
+    .to_string()
 }
 
 /// The query string as parameters and a count. Every key must be `limit` or a knob: a misspelt knob is a
@@ -218,6 +320,47 @@ mod tests {
         let (params, limit) = parse("").unwrap();
         assert_eq!(params, SimilarParams::default());
         assert_eq!(limit, DEFAULT_LIMIT);
+    }
+
+    /// No `seeds` in the URL is the default set; an empty one is no seeds at all — the page's "clear".
+    #[test]
+    fn an_absent_seed_list_is_the_default_set_and_an_empty_one_is_none() {
+        assert_eq!(parse_seeds(None).unwrap(), DEFAULT_SEEDS);
+        assert_eq!(DEFAULT_SEEDS.len(), 6);
+        assert!(DEFAULT_SEEDS.contains(&(MediaType::Tv, 38148)), "Beck, the 1997 series");
+        assert_eq!(parse_seeds(Some("")).unwrap(), []);
+        let (seeds, rest) = take_seeds("w_maker=1&limit=5");
+        assert_eq!((seeds, rest.as_str()), (None, "w_maker=1&limit=5"));
+
+        let p: Value = serde_json::from_str(&params_json()).unwrap();
+        let keys: Vec<String> = DEFAULT_SEEDS.iter().map(|&(m, id)| seed_key(m, id)).collect();
+        assert_eq!(p["defaultSeeds"], json!(keys), "the page is told the same defaults");
+        assert_eq!(p["maxSeeds"], MAX_SEEDS);
+    }
+
+    /// The page writes its seeds into its URL as `seed_key`s, and reads them back as the same list — also
+    /// when the browser has percent-encoded the separators.
+    #[test]
+    fn a_seed_list_round_trips_through_the_url() {
+        let seeds = vec![(MediaType::Movie, 5723), (MediaType::Tv, 1438), (MediaType::Movie, 278)];
+        let value = seeds.iter().map(|&(m, id)| seed_key(m, id)).collect::<Vec<_>>().join(",");
+        assert_eq!(value, "movie:5723,series:1438,movie:278");
+        let query = format!("w_maker=0.5&seeds={value}&limit=10");
+        let (read, rest) = take_seeds(&query);
+        assert_eq!(parse_seeds(read.as_deref()).unwrap(), seeds);
+        assert_eq!(rest, "w_maker=0.5&limit=10", "the rest still goes through `parse`");
+        let (encoded, _) = take_seeds("seeds=movie%3A5723%2Cseries%3A1438%2Cmovie%3A278");
+        assert_eq!(parse_seeds(encoded.as_deref()).unwrap(), seeds);
+    }
+
+    #[test]
+    fn a_bad_or_oversized_seed_list_is_refused_and_a_repeat_ranked_once() {
+        for bad in ["tv:1399", "movie:x", "movie", "movie:1,,series:"] {
+            assert!(parse_seeds(Some(bad)).unwrap_err().contains("seeds"), "{bad}");
+        }
+        assert_eq!(parse_seeds(Some("movie:1,movie:1,series:1")).unwrap().len(), 2);
+        let many = (1..=MAX_SEEDS as u32 + 1).map(|id| format!("movie:{id}")).collect::<Vec<_>>().join(",");
+        assert!(parse_seeds(Some(&many)).unwrap_err().contains("at most"));
     }
 
     #[test]
