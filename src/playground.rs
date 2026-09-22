@@ -7,7 +7,8 @@
 //! client is served, and a tuned row is never memoised or cached where a production row would be.
 //!
 //! Every answer here is computed per request, so an enabled playground is a cost anyone who can reach
-//! atlas can spend. Enable it where that is acceptable.
+//! atlas can spend. The knob ranges (`SimilarParams::KNOBS`) and `MAX_LIMIT` bound what one request can
+//! cost; how many requests an address may make is the relay's to limit.
 
 use crate::queries::Indexes;
 use den_index::{MediaType, Scored, SimilarParams};
@@ -19,7 +20,9 @@ pub const PAGE: &str = include_str!("playground.html");
 
 /// Titles shown when the request names no `limit`: the rail's first screenful.
 const DEFAULT_LIMIT: usize = 20;
-const MAX_LIMIT: usize = 1000;
+/// Production's whole row (`den_index::MAX_ROW`): every title shown carries its signals, so the count
+/// shown is what a response's size scales with.
+const MAX_LIMIT: usize = 200;
 
 /// `GET /playground/params.json` — every knob, its range, and production's value for it.
 pub fn params_json() -> String {
@@ -167,7 +170,9 @@ mod tests {
             ("w_maker=99", "w_maker"),
             ("w_makr=1", "w_makr"),
             ("limit=0", "limit"),
-            ("limit=5000", "limit"),
+            ("limit=201", "limit"),
+            ("pool_k=1001", "pool_k"),
+            ("max_row=401", "max_row"),
             ("watched=1438", "watched"),
         ] {
             let err = parse(query).unwrap_err();
