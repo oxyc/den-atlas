@@ -113,19 +113,22 @@ impl FacetIndex {
     /// Titles for which a filterable field is known. `mediaType` is intrinsic to every row; country,
     /// language and year may be absent.
     pub fn coverage(&self, field: &str) -> usize {
-        match field {
-            "mediaType" => self.rows.len(),
-            "country" => {
-                self.rows.iter().filter(|row| row.country.iter().all(u8::is_ascii_alphabetic)).count()
-            }
-            "language" => self
-                .rows
-                .iter()
-                .filter(|row| row.language.iter().all(u8::is_ascii_alphabetic) && &row.language != b"xx")
-                .count(),
-            "year" | "decade" => self.rows.iter().filter(|row| row.year >= 1870).count(),
-            _ => 0,
-        }
+        self.coverage_for(field, None)
+    }
+
+    /// As `coverage`, among the titles of one type when `media_type` is given.
+    pub fn coverage_for(&self, field: &str, media_type: Option<MediaType>) -> usize {
+        let known: fn(&Row) -> bool = match field {
+            "mediaType" => |_| true,
+            "country" => |row| row.country.iter().all(u8::is_ascii_alphabetic),
+            "language" => |row| row.language.iter().all(u8::is_ascii_alphabetic) && &row.language != b"xx",
+            "year" | "decade" => |row| row.year >= 1870,
+            _ => return 0,
+        };
+        self.rows
+            .iter()
+            .filter(|row| media_type.is_none_or(|want| row.media_type == want) && known(row))
+            .count()
     }
 
     /// Distinct values and their title counts for the finite-valued facet fields. Year is intentionally exposed
