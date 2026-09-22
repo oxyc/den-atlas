@@ -751,7 +751,7 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             countries: vec!["KR", "DK"],
             makers: vec![1, 9],
             cast: vec![2, 3],
-            franchise: Some(50),
+            franchise: vec![50, 51],
             based_kind: vec!["book", "play"],
             alias_titles: vec!["One", "하나", "Uno"],
             ..Title::default()
@@ -954,6 +954,22 @@ mod tests {
             crate::recommend::Listed { key: (Movie, 1), imdb_id: None, rating: Some(7.0), year: None };
         let title = known.title(listed.key, None, Some(&listed));
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(7.0), Some(9000.0), false));
+    }
+
+    /// A title in two series ranks on the first, the most specific, exactly as it did when the store held only
+    /// that one. The rest are read — the facts carry them — but nothing ranks on them until oxyc/den-atlas#43
+    /// part D.
+    #[tokio::test]
+    async fn recommend_ranks_on_the_first_of_several_series() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-franchise-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let (indexes, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
+        let record = indexes.facts.as_ref().and_then(|facts| facts.get(1, Movie)).expect("movie 1's facts");
+        assert_eq!(record.franchise, vec![50, 51], "the store's list, in order");
+        let known = crate::recommend::Knowledge { indexes: &indexes };
+        assert_eq!(known.title((Movie, 1), None, None).franchise, Some(50));
+        assert_eq!(known.title((Movie, 2), None, None).franchise, None, "no series is none");
     }
 
     /// `/recommend` read popularity from client hints alone, so every title from atlas's own lists scored no buzz.

@@ -1,6 +1,6 @@
 //! The store on disk: the one impure step, and the shapes the serving path reads out of it.
 //!
-//! The format and its decoder are not here. `den-spec wire/store-v1.md` is the contract and
+//! The format and its decoder are not here. `den-spec wire/store-v2.md` is the contract and
 //! `den_store` is the reader, in den-core, because that crate must also compile for the browser and for
 //! tvOS where `memmap2` does not. What belongs here is the part that touches the filesystem: map the
 //! file, verify it once, and keep the mapping alive for the life of the process.
@@ -133,10 +133,18 @@ impl LoadedStore {
 /// way a test can say so is to fail.
 #[cfg(test)]
 pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
+    spec_vectors("store-v2.store")
+}
+
+/// A file under den-spec's `vectors/`, with `spec_fixture`'s rule for when it is absent. `store-v1.store`
+/// is the frozen last store-v1 output, for the tests that an old store is still read.
+#[cfg(test)]
+pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var("DEN_SPEC_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../den-spec"))
-        .join("vectors/store-v1.store");
+        .join("vectors")
+        .join(name);
     if path.is_file() {
         return Some(path);
     }
@@ -147,18 +155,18 @@ pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
         return None;
     }
     panic!(
-        "{} not found — these tests check den-atlas against the store-v1 contract and cannot do so \
+        "{} not found — these tests check den-atlas against the store contract and cannot do so \
          without it. Check out den-spec beside this repo, set DEN_SPEC_DIR, or set DEN_SPEC_OPTIONAL=1 \
          to skip deliberately.",
         path.display()
     )
 }
 
-/// Writes a store-v1 file from test data.
+/// Writes a store-v2 file from test data.
 ///
 /// The store is the only artifact the serving path reads, so every test that needs a dataset needs one
 /// written — the route fixture's twelve titles, and the one-row stores `dataset.rs` hangs its manifest
-/// tests on. den-spec's `vectors/store-v1.store` cannot stand in: it describes three titles of its own,
+/// tests on. den-spec's `vectors/store-v2.store` cannot stand in: it describes three titles of its own,
 /// and rewriting the route tests around them would throw away a fixture built to exercise this server
 /// (twelve rows so search's z-score floor has a distribution, four drawable cards, a label with a slash).
 ///
@@ -167,7 +175,7 @@ pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
 /// copy agrees with itself. What keeps it honest is that it is checked by the reader we ship: every store
 /// it writes goes through `den_store::Store::open`, which verifies the magic, the version, the endianness
 /// marker, the content hash over every byte and each section's extent, and then through `MappedStore::check`.
-/// A layout mistake here fails the tests rather than passing them. The store-v1 CONTRACT is still tested
+/// A layout mistake here fails the tests rather than passing them. The store-v2 CONTRACT is still tested
 /// against the real writer's output, by `maps_and_checks_the_spec_fixture` below.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -214,7 +222,8 @@ pub(crate) mod fixture {
         pub broadcasters: Vec<u32>,
         pub based_kind: Vec<&'a str>,
         pub alias_titles: Vec<&'a str>,
-        pub franchise: Option<u32>,
+        /// Series Q-ids, most specific first — raw, not interned, as the real writer holds them.
+        pub franchise: Vec<u32>,
     }
 
     /// One row of the entity table: a person, a franchise, a place.
@@ -290,7 +299,7 @@ pub(crate) mod fixture {
         }
     }
 
-    /// Write `titles` (and the entities they credit) to `path` as a store-v1 file.
+    /// Write `titles` (and the entities they credit) to `path` as a store-v2 file.
     ///
     /// Panics on anything a fixture can simply get right — a vector of the wrong width, a title count that
     /// does not fit a `u32`. A test fixture that limped on would be describing something other than the
@@ -437,10 +446,8 @@ pub(crate) mod fixture {
         );
         b.u8s("released_prec", &titles.iter().map(|t| t.released.map_or(0, |(_, p)| p)).collect::<Vec<u8>>());
         b.section("runtime", 2, titles.iter().flat_map(|t| t.runtime.to_le_bytes()).collect());
-        b.u32s(
-            "franchise",
-            &titles.iter().map(|t| t.franchise.unwrap_or(den_store::NONE_U32)).collect::<Vec<u32>>(),
-        );
+        let franchise_rows: Vec<Vec<u32>> = titles.iter().map(|t| t.franchise.clone()).collect();
+        b.list("franchise_v", "franchise_o", &franchise_rows);
         let genre_rows: Vec<Vec<u32>> = titles.iter().map(|t| t.genres.clone()).collect();
         b.list("genres_v", "genres_o", &genre_rows);
         for (values, offsets, pick) in [
@@ -539,7 +546,7 @@ pub(crate) mod fixture {
         out[HEADER..table_end].copy_from_slice(&table);
 
         out[..8].copy_from_slice(b"DENSTOR1");
-        out[8..12].copy_from_slice(&1u32.to_le_bytes());
+        out[8..12].copy_from_slice(&den_store::FORMAT_VERSION.to_le_bytes());
         out[12..16].copy_from_slice(&0x0102_0304u32.to_le_bytes());
         out[24..28].copy_from_slice(&(sections.len() as u32).to_le_bytes());
         out[28..32].copy_from_slice(&(rows as u32).to_le_bytes());
@@ -593,7 +600,7 @@ mod tests {
     #[test]
     fn maps_and_checks_the_spec_fixture() {
         let Some(path) = fixture() else {
-            eprintln!("SKIP: den-spec/vectors/store-v1.store not found");
+            eprintln!("SKIP: den-spec/vectors/store-v2.store not found");
             return;
         };
         let store = MappedStore::open(&path).expect("the fixture maps");

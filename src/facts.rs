@@ -150,8 +150,8 @@ pub struct Record {
     pub makers: Vec<u32>,
     /// Its cast, unordered: Wikidata rarely says who is billed first.
     pub cast: Vec<u32>,
-    /// The series of works it belongs to (P179).
-    pub franchise: Option<u32>,
+    /// Every series of works it belongs to (P179), most specific first. Empty when it is in none.
+    pub franchise: Vec<u32>,
     /// Where a series first aired (P449): its network or service.
     pub broadcasters: Vec<u32>,
     /// What it was adapted from, as kinds rather than ids — the fact "based on a book" needs.
@@ -371,7 +371,8 @@ impl Facts {
         let released = store.per_row::<i32>("released").map_err(err)?;
         let released_prec = store.per_row::<u8>("released_prec").map_err(err)?;
         let runtime = store.per_row::<u16>("runtime").map_err(err)?;
-        let franchise = store.per_row::<u32>("franchise").map_err(err)?;
+        // A list in store-v2, one value in store-v1: `franchises` reads either as a list.
+        let franchises = store.franchises().map_err(err)?;
         // u32 in the store, u16 here: a TMDB genre id fits in 16 bits and `Record` has always held them
         // that way. The width check in den-store caught this being read as u16 directly — the section is
         // aligned and whole either way, so it would have returned twice as many wrong numbers.
@@ -463,8 +464,8 @@ impl Facts {
                     languages: codes_of(languages.get(row), u8::to_ascii_lowercase),
                     makers: makers_row,
                     cast: cast_row,
-                    // A raw Q-id, not an entity index: the entity table holds almost no franchises.
-                    franchise: (franchise[i] != den_store::NONE_U32).then_some(franchise[i]),
+                    // Raw Q-ids, not entity indices: the entity table holds almost no franchises.
+                    franchise: franchises.get(row).to_vec(),
                     broadcasters: qids(broadcasters.get(row)),
                     source_kinds: SourceKinds(
                         based_kind
@@ -601,7 +602,7 @@ impl Facts {
                 languages: codes(raw.languages, u8::to_ascii_lowercase),
                 makers,
                 cast: entities(raw.cast),
-                franchise: raw.franchise.and_then(OneOrMany::first).as_deref().and_then(qid),
+                franchise: entities(raw.franchise.map(OneOrMany::all)),
                 broadcasters: entities(raw.broadcaster),
                 runtime_minutes: raw.runtime_minutes,
                 source_kinds: SourceKinds(
@@ -766,7 +767,7 @@ struct RawRecord {
 }
 
 /// A statement Wikidata may make once or several times — an IMDb id, a franchise — written as a string or a
-/// list of them. The first is read.
+/// list of them. An IMDb id reads the first; a franchise reads them all.
 #[cfg(test)]
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -781,6 +782,13 @@ impl OneOrMany {
         match self {
             OneOrMany::One(value) => Some(value),
             OneOrMany::Many(values) => values.into_iter().next(),
+        }
+    }
+
+    fn all(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(value) => vec![value],
+            OneOrMany::Many(values) => values,
         }
     }
 }
@@ -809,7 +817,7 @@ pub(crate) mod tests {
          "released": {"date": "2026-09-01", "precision": "day"},
          "genres": ["Q100", "Q101", "Q999"], "directors": ["Q1"], "screenwriters": ["Q1", "Q9"],
          "cast": ["Q2", "Q3", "Q2"],
-         "countries": ["us", "DK"], "languages": ["SV"], "franchise": ["Q50"],
+         "countries": ["us", "DK"], "languages": ["SV"], "franchise": ["Q50", "Q51"],
          "basedOn": ["Q60", "Q61"], "basedOnKind": ["book", "play"]},
         {"mediaType": "tv", "tmdbId": 1, "started": {"date": "2010-00-00", "precision": "year"},
          "genres": ["Q102"], "creators": ["Q7"], "countries": ["KR"], "broadcaster": ["Q80"], "hasVector": false},
@@ -960,6 +968,33 @@ pub(crate) mod tests {
         assert!(series.source_kinds.is_empty());
     }
 
+    /// store-v2, as the real writer wrote den-spec's fixture: movie:1 is in two series, Q114 then Q105, and
+    /// both reach the record in that order. store-v1 kept the first alone, and some titles meet their siblings
+    /// only through the second (oxyc/den-atlas#43).
+    #[test]
+    fn the_store_gives_every_series_in_order() {
+        let Some(path) = crate::store::spec_fixture() else { return };
+        let mapped = crate::store::MappedStore::open(&path).expect("the fixture maps");
+        let facts = Facts::from_store(&mapped.view()).expect("facts from the store");
+        assert_eq!(facts.get(1, MediaType::Movie).unwrap().franchise, vec![114, 105]);
+        assert!(facts.get(2, MediaType::Movie).unwrap().franchise.is_empty());
+        assert!(facts.get(10, MediaType::Tv).unwrap().franchise.is_empty());
+    }
+
+    /// A store published before store-v2 still loads, whole — `LoadedStore::open` runs every check serving
+    /// does — and its single series reads as a list of one. That is what lets this ship before the dataset
+    /// that writes v2, and keeps it serving if the dataset is rolled back.
+    #[test]
+    fn a_store_v1_file_still_loads_with_its_series_as_a_list_of_one() {
+        let Some(path) = crate::store::spec_vectors("store-v1.store") else { return };
+        let loaded = crate::store::LoadedStore::open(&path).expect("a store-v1 file still loads");
+        assert_eq!(loaded.view().format_version(), 1);
+        let facts = Facts::from_store(&loaded.view()).expect("facts from a v1 store");
+        assert_eq!(facts.get(1, MediaType::Movie).unwrap().franchise, vec![105]);
+        assert!(facts.get(2, MediaType::Movie).unwrap().franchise.is_empty(), "u32::MAX is none");
+        assert!(facts.get(10, MediaType::Tv).unwrap().franchise.is_empty());
+    }
+
     /// A kind the producer grows later must not be silently folded into `other`.
     #[test]
     fn an_unknown_source_kind_is_ignored_not_guessed() {
@@ -980,7 +1015,7 @@ pub(crate) mod tests {
         assert_eq!(film.cast, vec![2, 3], "a repeated statement counts once");
         assert_eq!(film.countries, vec![*b"US", *b"DK"], "countries are upper-cased, in the order given");
         assert_eq!(film.languages, vec![*b"sv"]);
-        assert_eq!(film.franchise, Some(50));
+        assert_eq!(film.franchise, vec![50, 51], "every series, in the file's order");
         assert_eq!(film.released, Some(Released { first_day: days_from_civil(2026, 9, 1), span_days: 1 }));
 
         // Movie 1 and series 1 are different titles.

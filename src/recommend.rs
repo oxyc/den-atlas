@@ -519,7 +519,9 @@ impl<'a> Knowledge<'a> {
             title.people = r.makers.iter().map(|&id| (id, 1.0)).collect();
             let each = if r.cast.is_empty() { 0.0 } else { (CAST_BILLED / r.cast.len() as f64).min(1.0) };
             title.people.extend(r.cast.iter().filter(|id| !r.makers.contains(*id)).map(|&id| (id, each)));
-            title.franchise = r.franchise;
+            // The FIRST (most specific) series only, which is all the store held before it carried the list:
+            // the franchise lift in `fit.rs` reads this. oxyc/den-atlas#43 part D is what reads every series.
+            title.franchise = r.franchise.first().copied();
             title.broadcasters = r.broadcasters.clone();
         }
         title.released = hint
