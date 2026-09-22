@@ -58,6 +58,42 @@ const SCHEMA: u32 = 1;
 /// Anything not listed here is a chronology value, which is what `structure` mostly meant.
 const STRUCTURE_ALIAS: &[(&str, &str)] = &[("single-day", "timespan"), ("anthology", "continuity")];
 
+/// A display row that stands for several values of one axis, asked for as `<axis>=<value>` like any other.
+///
+/// Some values are too thin to fill a row alone and make a good one together. This is display only: the
+/// store keeps the raw values and similarity reads those, rarity included — `linear` is ~90% of known
+/// `chronology` (30,808 of 34,121 in store 5b1c3213b6a1), so a shared `nonlinear` says far more about two
+/// titles than a shared `linear`, and merging there would flatten exactly that signal. A merged value names
+/// no value of its axis, so it never shadows one.
+pub struct MergedRow {
+    pub axis: &'static str,
+    pub value: &'static str,
+    /// What a client may call the row. Clients name their own rows; this is the suggestion.
+    pub title: &'static str,
+    pub members: &'static [&'static str],
+}
+
+pub const MERGED_ROWS: &[MergedRow] = &[
+    MergedRow {
+        axis: "ending",
+        value: "unresolved",
+        title: "Endings that don't tie up",
+        members: &["open", "ambiguous", "cyclical"],
+    },
+    MergedRow {
+        axis: "ending",
+        value: "unhappy",
+        title: "Not a happy ending",
+        members: &["tragic", "bittersweet"],
+    },
+    MergedRow {
+        axis: "chronology",
+        value: "out-of-order",
+        title: "Told out of order",
+        members: &["nonlinear", "framed", "parallel-strands"],
+    },
+];
+
 /// The axis a constraint really names, after the alias above.
 fn resolve_axis(axis: &str, value: &str) -> String {
     if axis != "structure" {
@@ -212,12 +248,21 @@ impl PlotFacets {
     /// The titles of `media_type` carrying every `(axis, value)`, each at the lowest confidence it carries any
     /// of them. Empty when a constraint names an axis or value the file doesn't have.
     pub fn matching(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
-        let mut lists: Vec<&Vec<(Key, u8)>> = Vec::with_capacity(constraints.len());
+        let mut lists: Vec<std::borrow::Cow<'_, [(Key, u8)]>> = Vec::with_capacity(constraints.len());
         for (axis, value) in constraints {
             // `structure=…` is the old sidecar's spelling; resolve it to whichever axis answers it.
             let axis = &resolve_axis(axis, value);
-            match self.by_value.get(axis).and_then(|values| values.get(value)) {
-                Some(list) => lists.push(list),
+            let Some(values) = self.by_value.get(axis) else { return Vec::new() };
+            if let Some(merged) = MERGED_ROWS.iter().find(|m| m.axis == axis && m.value == value) {
+                // A title holds one value per axis, so the members are disjoint and their concatenation is
+                // the union, each title at the confidence it carries its one member with.
+                let union: Vec<(Key, u8)> =
+                    merged.members.iter().filter_map(|m| values.get(*m)).flatten().copied().collect();
+                lists.push(union.into());
+                continue;
+            }
+            match values.get(value) {
+                Some(list) => lists.push(list.as_slice().into()),
                 None => return Vec::new(),
             }
         }
@@ -841,6 +886,106 @@ pub(crate) mod tests {
         assert!(facets.matching(MediaType::Movie, &[pair("ending", "sad")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[pair("colour", "blue")]).is_empty());
         assert!(facets.matching(MediaType::Movie, &[]).is_empty());
+    }
+
+    /// Every title of `media_type` a constraint list matches, as a sorted list.
+    fn sorted(facets: &PlotFacets, media_type: MediaType, constraints: &[(&str, &str)]) -> Vec<(Key, u8)> {
+        let owned: Vec<(String, String)> =
+            constraints.iter().map(|(a, v)| ((*a).to_owned(), (*v).to_owned())).collect();
+        let mut titles = facets.matching(media_type, &owned);
+        titles.sort();
+        titles
+    }
+
+    /// A merged row is exactly the union of its members' rows, for either type, alone or combined with
+    /// another axis — and the raw values still answer on their own.
+    #[test]
+    fn a_merged_row_is_the_union_of_its_members() {
+        let sample = r#"{ "schema": 1, "facets": {
+            "movie:1": {"ending": {"value": "open", "confidence": "high"},
+                        "chronology": {"value": "nonlinear", "confidence": "high"},
+                        "tone": {"value": "bleak", "confidence": "high"}},
+            "movie:2": {"ending": {"value": "ambiguous", "confidence": "medium"},
+                        "chronology": {"value": "linear", "confidence": "high"}},
+            "movie:3": {"ending": {"value": "cyclical", "confidence": "low"},
+                        "chronology": {"value": "framed", "confidence": "medium"},
+                        "tone": {"value": "bleak", "confidence": "medium"}},
+            "movie:4": {"ending": {"value": "tragic", "confidence": "high"},
+                        "chronology": {"value": "parallel-strands", "confidence": "high"}},
+            "movie:5": {"ending": {"value": "bittersweet", "confidence": "high"}},
+            "movie:6": {"ending": {"value": "happy", "confidence": "high"}},
+            "tv:7": {"ending": {"value": "tragic", "confidence": "high"},
+                     "chronology": {"value": "nonlinear", "confidence": "low"}}
+        }}"#;
+        let facets = PlotFacets::from_bytes(sample.as_bytes()).unwrap();
+        for merged in MERGED_ROWS {
+            for media_type in [MediaType::Movie, MediaType::Tv] {
+                let mut members: Vec<(Key, u8)> = merged
+                    .members
+                    .iter()
+                    .flat_map(|m| sorted(&facets, media_type, &[(merged.axis, m)]))
+                    .collect();
+                members.sort();
+                assert_eq!(
+                    sorted(&facets, media_type, &[(merged.axis, merged.value)]),
+                    members,
+                    "{}",
+                    merged.value
+                );
+            }
+        }
+        let movie = |id: u32, c: u8| ((MediaType::Movie, id), c);
+        assert_eq!(
+            sorted(&facets, MediaType::Movie, &[("ending", "unresolved")]),
+            [movie(1, 3), movie(2, 2), movie(3, 1)]
+        );
+        assert_eq!(sorted(&facets, MediaType::Movie, &[("ending", "unhappy")]), [movie(4, 3), movie(5, 3)]);
+        assert_eq!(
+            sorted(&facets, MediaType::Movie, &[("chronology", "out-of-order")]),
+            [movie(1, 3), movie(3, 2), movie(4, 3)]
+        );
+        assert_eq!(sorted(&facets, MediaType::Tv, &[("ending", "unhappy")]), [((MediaType::Tv, 7), 3)]);
+        // The old `structure=` spelling reaches the merged chronology row too.
+        assert_eq!(
+            sorted(&facets, MediaType::Movie, &[("structure", "out-of-order")]),
+            sorted(&facets, MediaType::Movie, &[("chronology", "out-of-order")])
+        );
+        // Combined with another axis it intersects like any value, at the lowest confidence.
+        assert_eq!(
+            sorted(&facets, MediaType::Movie, &[("ending", "unresolved"), ("tone", "bleak")]),
+            [movie(1, 3), movie(3, 1)]
+        );
+        // A merged value belongs to its own axis alone.
+        assert!(sorted(&facets, MediaType::Movie, &[("tone", "unhappy")]).is_empty());
+    }
+
+    /// Each merged row's size per type on a REAL store, beside its members'. Opt-in via `DEN_STORE`.
+    #[test]
+    fn merged_row_sizes_on_the_store() {
+        let Ok(store_path) = std::env::var("DEN_STORE") else {
+            eprintln!("SKIP: set DEN_STORE to measure the merged rows");
+            return;
+        };
+        let mapped = crate::store::MappedStore::open(Path::new(&store_path)).expect("store");
+        let facets = PlotFacets::from_store(&mapped.view()).expect("facets");
+        for axis in facets.schema().iter().filter(|a| MERGED_ROWS.iter().any(|m| m.axis == a.axis)) {
+            eprintln!("{} (known {}): {:?}", axis.axis, axis.known, axis.values);
+        }
+        for merged in MERGED_ROWS {
+            for media_type in [MediaType::Movie, MediaType::Tv] {
+                let count = |value: &str| sorted(&facets, media_type, &[(merged.axis, value)]).len();
+                let members: Vec<String> =
+                    merged.members.iter().map(|m| format!("{m} {}", count(m))).collect();
+                let total = count(merged.value);
+                eprintln!(
+                    "{media_type:?} {}={}: {total} = {}",
+                    merged.axis,
+                    merged.value,
+                    members.join(" + ")
+                );
+                assert_eq!(total, merged.members.iter().map(|m| count(m)).sum::<usize>());
+            }
+        }
     }
 
     /// A store with no `card_poster` section still has cards — the producer is dropping it (oxyc/den#118).

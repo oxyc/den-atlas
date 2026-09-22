@@ -174,7 +174,30 @@ pub fn document(indexes: &Indexes) -> Value {
 
     if let Some(plot_facets) = &indexes.plot_facets {
         for facet in plot_facets.schema() {
-            fields.insert(facet.axis, field("enum", true, facet.known, population, facet.values));
+            // Apart from `values`, whose counts partition the axis: a merged row repeats its members' titles.
+            let merged: Vec<Value> = crate::plotrows::MERGED_ROWS
+                .iter()
+                .filter(|m| m.axis == facet.axis)
+                .map(|m| {
+                    let matched: usize = facet
+                        .values
+                        .iter()
+                        .filter(|(value, _)| m.members.contains(&value.as_str()))
+                        .map(|(_, count)| count)
+                        .sum();
+                    json!({
+                        "value": m.value,
+                        "title": m.title,
+                        "of": m.members,
+                        "count": { "matched": matched, "known": facet.known, "population": population },
+                    })
+                })
+                .collect();
+            let mut entry = field("enum", true, facet.known, population, facet.values);
+            if !merged.is_empty() {
+                entry["merged"] = json!(merged);
+            }
+            fields.insert(facet.axis, entry);
         }
     }
 
@@ -281,6 +304,8 @@ pub fn document(indexes: &Indexes) -> Value {
                              denominator",
                 "valueCount": "matched: titles with this value; known: titles with the field on record; \
                                population: the titles the field is out of",
+                "mergedCount": "matched: titles with any value the merged row is of, so it overlaps \
+                                values and is not added to them",
                 "rowTotal": "titles carrying every constraint among those with each constraint's field on \
                              record, which is at most coverage.fields.<field>.count",
                 "resultTotal": "candidates the search retrieved and scored above zero: a pool the ranking \
@@ -374,8 +399,10 @@ fn routes() -> Value {
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
                 with(
-                    param("{axis}", "string", "a plot-facet axis and one of its values, e.g. tone=bleak; \
-                                               repeatable, one per axis"),
+                    param("{axis}", "string", "a plot-facet axis and one of its values, e.g. tone=bleak, or \
+                                               one of its merged rows (fields.<axis>.merged), which \
+                                               matches any of the values it is of; repeatable, one per \
+                                               axis"),
                     json!({ "field": "any enum field of fields whose name is a plot-facet axis" }),
                 ),
                 with(param("subgenre", "string", "a subgenre label"), json!({ "field": "subgenre" })),
@@ -575,6 +602,29 @@ mod tests {
         assert_eq!(schema["fields"]["tone"]["coverage"]["count"], 3);
         assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 12);
         assert_eq!(schema["semantics"]["groupBy"], false);
+    }
+
+    /// The merged display rows are listed under their axis, apart from its values, each with the values it
+    /// is of and how many titles carry any of them. The fixture's four titles all end bittersweet.
+    #[tokio::test]
+    async fn the_schema_lists_the_merged_rows_under_their_axis() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-schema-merged-{}", std::process::id()));
+        let queries = crate::queries::IndexQueries::new(&crate::queries::write_fixture(&dir));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        let schema = document(&indexes);
+        let ending = &schema["fields"]["ending"];
+        let merged = ending["merged"].as_array().expect("ending lists its merged rows");
+        let named: Vec<&str> = merged.iter().map(|m| m["value"].as_str().unwrap()).collect();
+        assert_eq!(named, ["unresolved", "unhappy"]);
+        let unhappy = &merged[1];
+        assert_eq!(unhappy["title"], "Not a happy ending");
+        assert_eq!(unhappy["of"], json!(["tragic", "bittersweet"]));
+        assert_eq!(unhappy["count"], json!({ "matched": 4, "known": 4, "population": 12 }));
+        assert_eq!(merged[0]["count"]["matched"], 0, "no open, ambiguous or cyclical ending in the fixture");
+        // Never among the values, whose counts partition the axis.
+        let values = ending["values"].as_array().unwrap();
+        assert!(values.iter().all(|v| v["value"] != "unhappy" && v["value"] != "unresolved"));
+        assert!(schema["fields"]["tone"].get("merged").is_none(), "an axis with no merged row lists none");
     }
 
     /// An agent reading only this document must find every constraint `/index/query` accepts, in what unit,
