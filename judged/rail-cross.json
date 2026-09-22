@@ -1,0 +1,459 @@
+{
+  "about": {
+    "what": "Hand-judged cross-type More Like This cases: films graded as recommendations for series seeds and series for film seeds, for den-atlas #49 (mixed rows). Same seeds, grades and bases as judged/rail.json, whose `about` defines them; this file only adds titles of the other type. Kept apart because raileval::resolve rejects a judgement whose type differs from the seed's; the #49 scorer change loads both files, keyed by (type, id).",
+    "shape": "`cases` lists seeds in judged/rail.json's order, each with its `seed`, `title` and `split` copied from there. Each `judged` entry is {id, type, title, grade, basis, note?}: `id` is `<type>:<tmdbId>` as in judged/rail.json, and `type` repeats the prefix (`movie` or `series`) so a reader need not parse it. It is always the type the seed is not. A seed with no cross-type candidate is absent.",
+    "basis": "As judged/rail.json. `issue` also covers den-atlas #49, which names the franchise pairs (Twin Peaks: Fire Walk with Me, the Sex and the City films) as rows a mixed ranker should surface.",
+    "pooling": "Candidates are the cross-type titles in the first ten of #49's recommended mixed arm (per-type pooling, z-mapped cross-type cosines, anchored spread and floors, (type, subgenre) cap) on dataset 5b1c3213b6a1, for each of the 61 seeds. Titles the judge did not know well enough were left unjudged rather than guessed."
+  },
+  "cases": [
+    {
+      "seed": "series:1438", "title": "The Wire", "split": "dev",
+      "judged": [
+        {"id": "movie:32047", "type": "movie", "title": "Prince of the City (1981)", "grade": "good", "basis": "known", "note": "An NYPD detective informs on his own unit: corruption as a system, not a bad apple."},
+        {"id": "movie:320882", "type": "movie", "title": "The Seven Five (2014)", "grade": "ok", "basis": "known", "note": "A corrupt NYPD precinct, as documentary."},
+        {"id": "movie:84644", "type": "movie", "title": "Le cousin (1997)", "grade": "ok", "basis": "known", "note": "A drug-squad cop and his informant; the bond, not the system."},
+        {"id": "movie:75622", "type": "movie", "title": "Rampart (2011)", "grade": "ok", "basis": "known", "note": "One corrupt LAPD cop as a character study."},
+        {"id": "movie:47931", "type": "movie", "title": "Elite Squad: The Enemy Within (2010)", "grade": "good", "basis": "known", "note": "Police, militias and politicians followed up the chain as one machine."}
+      ]
+    },
+    {
+      "seed": "series:76331", "title": "Succession", "split": "test",
+      "judged": [
+        {"id": "movie:15824", "type": "movie", "title": "The Inheritance (2003)", "grade": "good", "basis": "known", "note": "A son is made to take over the family steel firm after his father's death and it eats his life."},
+        {"id": "movie:820722", "type": "movie", "title": "The Good Boss (2021)", "grade": "ok", "basis": "known", "note": "A paternalist factory owner manipulating everyone: the corporate satire without the dynasty."},
+        {"id": "movie:9504", "type": "movie", "title": "Glengarry Glen Ross (1992)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:87108", "title": "Chernobyl", "split": "test",
+      "judged": [
+        {"id": "movie:589761", "type": "movie", "title": "Chernobyl: Abyss (2021)", "grade": "ok", "basis": "known", "note": "The same disaster as a heroic action melodrama."},
+        {"id": "movie:258665", "type": "movie", "title": "Bhopal: A Prayer for Rain (2014)", "grade": "good", "basis": "known", "note": "Bhopal: an industrial disaster made by negligence, as The Railway Men is for this seed."},
+        {"id": "movie:335490", "type": "movie", "title": "The Idealist (2015)", "grade": "good", "basis": "known", "note": "A journalist uncovers a covered-up nuclear accident (Thule, 1968) and the workers it poisoned."},
+        {"id": "movie:505638", "type": "movie", "title": "Wackersdorf (2018)", "grade": "ok", "basis": "known", "note": "Resistance to a nuclear plant, as a political drama; no disaster."},
+        {"id": "movie:214137", "type": "movie", "title": "The Man Who Saved the World (2014)", "grade": "ok", "basis": "known", "note": "A Soviet nuclear near-catastrophe (Petrov, 1983), as docudrama."},
+        {"id": "movie:26431", "type": "movie", "title": "Pu-239 (2006)", "grade": "ok", "basis": "known", "note": "A Soviet plant worker irradiated in an accident, told as a crime story."}
+      ]
+    },
+    {
+      "seed": "series:1396", "title": "Breaking Bad", "split": "dev",
+      "judged": [
+        {"id": "movie:54524", "type": "movie", "title": "The Robber (2010)", "grade": "ok", "basis": "known", "note": "A man living a double life as a bank robber; a cold character study, not the descent."},
+        {"id": "movie:413601", "type": "movie", "title": "Wùlu (2016)", "grade": "good", "basis": "known", "note": "An ordinary worker rises through the cocaine trade: the descent, in Mali."},
+        {"id": "movie:1359", "type": "movie", "title": "American Psycho (2000)", "grade": "bad", "basis": "known", "note": "Shares a sociopath at the centre; a yuppie satire in another register."}
+      ]
+    },
+    {
+      "seed": "series:67070", "title": "Fleabag", "split": "test",
+      "judged": [
+        {"id": "movie:21052", "type": "movie", "title": "Levity (2003)", "grade": "bad", "basis": "known"},
+        {"id": "movie:599960", "type": "movie", "title": "French Exit (2020)", "grade": "ok", "basis": "known", "note": "Deadpan tragicomedy of a self-destructive woman; no confession, no intimacy with the viewer."}
+      ]
+    },
+    {
+      "seed": "series:84977", "title": "Russian Doll", "split": "dev",
+      "judged": [
+        {"id": "movie:206487", "type": "movie", "title": "Predestination (2014)", "grade": "ok", "basis": "known", "note": "Time paradox as a straight thriller."},
+        {"id": "movie:273404", "type": "movie", "title": "I'll Follow You Down (2014)", "grade": "ok", "basis": "known"},
+        {"id": "movie:843543", "type": "movie", "title": "Meet Cute (2022)", "grade": "good", "basis": "known", "note": "A woman relives the same night over and again, a comedy with self-destruction under it."},
+        {"id": "movie:512196", "type": "movie", "title": "Happy Death Day 2U (2019)", "grade": "ok", "basis": "known", "note": "Dying on a loop, as a teen slasher-comedy sequel."},
+        {"id": "movie:26466", "type": "movie", "title": "Triangle (2009)", "grade": "ok", "basis": "known", "note": "A loop as horror."},
+        {"id": "movie:298618", "type": "movie", "title": "The Flash (2023)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:1104", "title": "Mad Men", "split": "test",
+      "judged": [
+        {"id": "movie:614560", "type": "movie", "title": "Mank (2020)", "grade": "ok", "basis": "known"},
+        {"id": "movie:11450", "type": "movie", "title": "Quiz Show (1994)", "grade": "good", "basis": "known", "note": "Late-1950s television, a sponsor and a polished public face over a lie."},
+        {"id": "movie:627725", "type": "movie", "title": "The Banker (2020)", "grade": "ok", "basis": "known"},
+        {"id": "movie:560008", "type": "movie", "title": "Minamata (2020)", "grade": "bad", "basis": "known"},
+        {"id": "movie:4995", "type": "movie", "title": "Boogie Nights (1997)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:1920", "title": "Twin Peaks", "split": "dev",
+      "judged": [
+        {"id": "movie:1923", "type": "movie", "title": "Twin Peaks: Fire Walk with Me (1992)", "grade": "good", "basis": "issue, maker", "note": "The prequel film: Laura Palmer's last days, Lynch directing."},
+        {"id": "movie:638", "type": "movie", "title": "Lost Highway (1997)", "grade": "good", "basis": "maker"},
+        {"id": "movie:21484", "type": "movie", "title": "Possession (1981)", "grade": "ok", "basis": "known", "note": "Uncanny doubles and dread; a marital horror, not a town mystery."},
+        {"id": "movie:793", "type": "movie", "title": "Blue Velvet (1986)", "grade": "good", "basis": "maker", "note": "The rot under a small town, the same director."},
+        {"id": "movie:1018", "type": "movie", "title": "Mulholland Drive (2001)", "grade": "good", "basis": "maker", "note": "Begun as a Lynch TV pilot."},
+        {"id": "movie:1730", "type": "movie", "title": "Inland Empire (2006)", "grade": "ok", "basis": "maker", "note": "Lynch at his most abstract; none of the series' town, mystery or humour."},
+        {"id": "movie:24923", "type": "movie", "title": "Messiah of Evil (1973)", "grade": "ok", "basis": "known", "note": "A coastal town with a secret, as surreal horror."}
+      ]
+    },
+    {
+      "seed": "series:4613", "title": "Band of Brothers", "split": "dev",
+      "judged": [
+        {"id": "movie:12651", "type": "movie", "title": "Memphis Belle (1990)", "grade": "good", "basis": "known", "note": "An American bomber crew's last mission: the unit as the protagonist."},
+        {"id": "movie:36439", "type": "movie", "title": "The Unknown Soldier (1955)", "grade": "good", "basis": "known", "note": "A Finnish machine-gun company followed through the whole war."},
+        {"id": "movie:400728", "type": "movie", "title": "The Unknown Soldier (2017)", "grade": "good", "basis": "known", "note": "The same novel as the 1955 film, the company followed through the war."},
+        {"id": "movie:34449", "type": "movie", "title": "Battle of Neretva (1969)", "grade": "ok", "basis": "known", "note": "A war epic of spectacle, not of a unit."},
+        {"id": "movie:36573", "type": "movie", "title": "The Dirty Dozen: The Fatal Mission (1988)", "grade": "bad", "basis": "known", "note": "A TV sequel to a men-on-a-mission adventure."},
+        {"id": "movie:227306", "type": "movie", "title": "Unbroken (2014)", "grade": "ok", "basis": "known"},
+        {"id": "movie:5925", "type": "movie", "title": "The Great Escape (1963)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:70523", "title": "Dark", "split": "test",
+      "judged": [
+        {"id": "movie:273404", "type": "movie", "title": "I'll Follow You Down (2014)", "grade": "good", "basis": "known", "note": "A son uses time travel to reach his vanished father: the family time-travel drama."},
+        {"id": "movie:4296", "type": "movie", "title": "Millennium (1989)", "grade": "ok", "basis": "known"},
+        {"id": "movie:206487", "type": "movie", "title": "Predestination (2014)", "grade": "good", "basis": "known", "note": "A bootstrap paradox closing on itself, the engine of the seed."}
+      ]
+    },
+    {
+      "seed": "series:42445", "title": "Borgen", "split": "test",
+      "judged": [
+        {"id": "movie:12713", "type": "movie", "title": "Comedy of Power (2006)", "grade": "ok", "basis": "known"},
+        {"id": "movie:476764", "type": "movie", "title": "The Front Runner (2018)", "grade": "good", "basis": "known", "note": "A candidate's private life against the press: the seed's politics-and-media engine."},
+        {"id": "movie:446354", "type": "movie", "title": "The Post (2017)", "grade": "ok", "basis": "known"},
+        {"id": "movie:33792", "type": "movie", "title": "State of the Union (1948)", "grade": "ok", "basis": "known"},
+        {"id": "movie:46948", "type": "movie", "title": "Power (1986)", "grade": "ok", "basis": "known"},
+        {"id": "movie:73358", "type": "movie", "title": "Page Eight (2011)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:93405", "title": "Squid Game", "split": "dev",
+      "judged": [
+        {"id": "movie:5465", "type": "movie", "title": "Das Millionenspiel (1970)", "grade": "good", "basis": "known", "note": "A televised game where the contestant is hunted for a prize."},
+        {"id": "movie:70160", "type": "movie", "title": "The Hunger Games (2012)", "grade": "good", "basis": "known"},
+        {"id": "movie:571785", "type": "movie", "title": "Time to Hunt (2020)", "grade": "ok", "basis": "known"},
+        {"id": "movie:396535", "type": "movie", "title": "Train to Busan (2016)", "grade": "ok", "basis": "known", "note": "Korean survival, as All of Us Are Dead is for this seed."},
+        {"id": "movie:3176", "type": "movie", "title": "Battle Royale (2000)", "grade": "good", "basis": "known"},
+        {"id": "movie:729854", "type": "movie", "title": "Concrete Utopia (2023)", "grade": "ok", "basis": "known"},
+        {"id": "movie:496243", "type": "movie", "title": "Parasite (2019)", "grade": "ok", "basis": "known", "note": "The same class subject, without the game."},
+        {"id": "movie:446159", "type": "movie", "title": "Bacurau (2019)", "grade": "ok", "basis": "known", "note": "The poor hunted for sport by outsiders, as a weird western."}
+      ]
+    },
+    {
+      "seed": "series:64165", "title": "Call My Agent!", "split": "test",
+      "judged": [
+        {"id": "movie:12280", "type": "movie", "title": "The Paper (1994)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:2316", "title": "The Office", "split": "dev",
+      "judged": [
+        {"id": "movie:13172", "type": "movie", "title": "The Promotion (2008)", "grade": "good", "basis": "known", "note": "Two assistant managers at a grocery chain: the same mundane cringe workplace comedy."}
+      ]
+    },
+    {
+      "seed": "series:66980", "title": "Babylon Berlin", "split": "dev",
+      "judged": [
+        {"id": "movie:529210", "type": "movie", "title": "Gun City (2018)", "grade": "good", "basis": "known", "note": "A cop among anarchists and arms dealers in 1921 Barcelona: interwar city noir."},
+        {"id": "movie:829", "type": "movie", "title": "Chinatown (1974)", "grade": "ok", "basis": "known"},
+        {"id": "movie:28307", "type": "movie", "title": "Hammett (1982)", "grade": "ok", "basis": "known"},
+        {"id": "movie:487558", "type": "movie", "title": "BlacKkKlansman (2018)", "grade": "ok", "basis": "known"},
+        {"id": "movie:11699", "type": "movie", "title": "Bad Lieutenant: Port of Call New Orleans (2009)", "grade": "bad", "basis": "known", "note": "Shares a drug-dependent cop; present-day and unhinged in tone."},
+        {"id": "movie:72370", "type": "movie", "title": "The Gang of Oss (2011)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:71446", "title": "Money Heist", "split": "test",
+      "judged": [
+        {"id": "movie:609242", "type": "movie", "title": "The Heist of the Century (2020)", "grade": "good", "basis": "known", "note": "A real bank heist told as a playful caper."},
+        {"id": "movie:1116490", "type": "movie", "title": "Cash Out (2024)", "grade": "ok", "basis": "known"},
+        {"id": "movie:47931", "type": "movie", "title": "Elite Squad: The Enemy Within (2010)", "grade": "bad", "basis": "known"},
+        {"id": "movie:455714", "type": "movie", "title": "Bad Genius (2017)", "grade": "ok", "basis": "known", "note": "A heist structure on an exam."}
+      ]
+    },
+    {
+      "seed": "series:141", "title": "Cheers", "split": "test",
+      "judged": [
+        {"id": "movie:639", "type": "movie", "title": "When Harry Met Sally... (1989)", "grade": "ok", "basis": "known"},
+        {"id": "movie:712", "type": "movie", "title": "Four Weddings and a Funeral (1994)", "grade": "ok", "basis": "known"},
+        {"id": "movie:508", "type": "movie", "title": "Love Actually (2003)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:95", "title": "Buffy the Vampire Slayer", "split": "dev",
+      "judged": [
+        {"id": "movie:10206", "type": "movie", "title": "Buffy the Vampire Slayer (1992)", "grade": "ok", "basis": "maker", "note": "The film the series remade, from Whedon's script; camp comedy."},
+        {"id": "movie:588", "type": "movie", "title": "Silent Hill (2006)", "grade": "bad", "basis": "known"},
+        {"id": "movie:377", "type": "movie", "title": "A Nightmare on Elm Street (1984)", "grade": "ok", "basis": "known"},
+        {"id": "movie:9100", "type": "movie", "title": "The Craft (1996)", "grade": "good", "basis": "known", "note": "High-school outsiders with powers: the supernatural as adolescence."}
+      ]
+    },
+    {
+      "seed": "series:1668", "title": "Friends", "split": "dev",
+      "judged": [
+        {"id": "movie:80038", "type": "movie", "title": "Friends with Kids (2011)", "grade": "good", "basis": "known", "note": "A Manhattan group of friends and two best friends who have a child together."},
+        {"id": "movie:184098", "type": "movie", "title": "Think Like a Man Too (2014)", "grade": "ok", "basis": "known"},
+        {"id": "movie:11068", "type": "movie", "title": "Singles (1992)", "grade": "good", "basis": "known", "note": "Twentysomethings in one Seattle apartment block."},
+        {"id": "movie:82576", "type": "movie", "title": "Erotikon (1920)", "grade": "bad", "basis": "known"},
+        {"id": "movie:14057", "type": "movie", "title": "Trust the Man (2006)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:1405", "title": "Dexter", "split": "test",
+      "judged": [
+        {"id": "movie:36373", "type": "movie", "title": "M (1951)", "grade": "ok", "basis": "known"},
+        {"id": "movie:544627", "type": "movie", "title": "Dark Figure of Crime (2018)", "grade": "ok", "basis": "known"},
+        {"id": "movie:9491", "type": "movie", "title": "Blue Steel (1989)", "grade": "ok", "basis": "known"},
+        {"id": "movie:140212", "type": "movie", "title": "Confession of Murder (2012)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:655", "title": "Star Trek: The Next Generation", "split": "dev",
+      "judged": [
+        {"id": "movie:157", "type": "movie", "title": "Star Trek III: The Search for Spock (1984)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
+        {"id": "movie:172", "type": "movie", "title": "Star Trek V: The Final Frontier (1989)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
+        {"id": "movie:152", "type": "movie", "title": "Star Trek: The Motion Picture (1979)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
+        {"id": "movie:174", "type": "movie", "title": "Star Trek VI: The Undiscovered Country (1991)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."}
+      ]
+    },
+    {
+      "seed": "series:105", "title": "Sex and the City", "split": "dev",
+      "judged": [
+        {"id": "movie:4564", "type": "movie", "title": "Sex and the City (2008)", "grade": "good", "basis": "issue, maker", "note": "The film sequel: the four, same actors, written and directed by the showrunner."},
+        {"id": "movie:37786", "type": "movie", "title": "Sex and the City 2 (2010)", "grade": "ok", "basis": "issue, maker", "note": "The second film: a franchise entry that adds little."},
+        {"id": "movie:351964", "type": "movie", "title": "The Escort (2015)", "grade": "ok", "basis": "known"},
+        {"id": "movie:25128", "type": "movie", "title": "Love & Sex (2000)", "grade": "good", "basis": "known", "note": "A magazine writer works through her past relationships for a column."},
+        {"id": "movie:8849", "type": "movie", "title": "Alfie (2004)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:60059", "title": "Better Call Saul", "split": "dev",
+      "judged": [
+        {"id": "movie:31589", "type": "movie", "title": "The Bad Sleep Well (1960)", "grade": "ok", "basis": "known"},
+        {"id": "movie:64689", "type": "movie", "title": "Killing Them Softly (2012)", "grade": "ok", "basis": "known"},
+        {"id": "movie:559969", "type": "movie", "title": "El Camino: A Breaking Bad Movie (2019)", "grade": "good", "basis": "maker", "note": "Jesse's epilogue in the same world, written and directed by the co-creator."},
+        {"id": "movie:9830", "type": "movie", "title": "Haven (2004)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:1399", "title": "Game of Thrones", "split": "dev",
+      "judged": [
+        {"id": "movie:121", "type": "movie", "title": "The Lord of the Rings: The Two Towers (2002)", "grade": "ok", "basis": "known", "note": "Epic fantasy, heroic rather than political."},
+        {"id": "movie:122", "type": "movie", "title": "The Lord of the Rings: The Return of the King (2003)", "grade": "ok", "basis": "known", "note": "Epic fantasy, heroic rather than political."},
+        {"id": "movie:18978", "type": "movie", "title": "Camelot (1967)", "grade": "bad", "basis": "known", "note": "Arthurian as a stage musical."}
+      ]
+    },
+    {
+      "seed": "series:4586", "title": "Gilmore Girls", "split": "test",
+      "judged": [
+        {"id": "movie:29371", "type": "movie", "title": "The Incredibly True Adventure of Two Girls in Love (1995)", "grade": "bad", "basis": "known"},
+        {"id": "movie:4587", "type": "movie", "title": "Mermaids (1990)", "grade": "good", "basis": "known", "note": "An eccentric single mother and her teenage daughter in a small town."},
+        {"id": "movie:21349", "type": "movie", "title": "Anywhere but Here (1999)", "grade": "good", "basis": "known", "note": "A mother and daughter at odds over what the daughter will become."},
+        {"id": "movie:9283", "type": "movie", "title": "Beautiful Girls (1996)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:137", "title": "Groundhog Day", "split": "dev",
+      "judged": [
+        {"id": "series:116045", "type": "series", "title": "Hello, Me! (2021)", "grade": "ok", "basis": "known"},
+        {"id": "series:8459", "type": "series", "title": "Being Erica (2009)", "grade": "good", "basis": "known", "note": "Sent back to relive the days she regrets until she changes: the self-improvement loop."}
+      ]
+    },
+    {
+      "seed": "movie:76341", "title": "Mad Max: Fury Road", "split": "dev",
+      "judged": [
+        {"id": "series:106379", "type": "series", "title": "Fallout (2024)", "grade": "ok", "basis": "known", "note": "The wasteland, as a comic adventure."},
+        {"id": "series:48866", "type": "series", "title": "The 100 (2014)", "grade": "bad", "basis": "known", "note": "A young-adult survival drama."},
+        {"id": "series:34438", "type": "series", "title": "Outcasts (2011)", "grade": "bad", "basis": "known"},
+        {"id": "series:4271", "type": "series", "title": "Farscape (1999)", "grade": "bad", "basis": "known"},
+        {"id": "series:433", "type": "series", "title": "Terminator: The Sarah Connor Chronicles (2008)", "grade": "bad", "basis": "known", "note": "Shares a coming apocalypse; a slow family drama on the run."}
+      ]
+    },
+    {
+      "seed": "movie:60308", "title": "Moneyball", "split": "dev",
+      "judged": [
+        {"id": "series:95484", "type": "series", "title": "Hot Stove League (2019)", "grade": "good", "basis": "known", "note": "A new general manager rebuilds a losing baseball club against its habits: the premise twin."},
+        {"id": "series:62704", "type": "series", "title": "Ballers (2015)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:38", "title": "Eternal Sunshine of the Spotless Mind", "split": "test",
+      "judged": [
+        {"id": "series:232315", "type": "series", "title": "Alice & Jack (2024)", "grade": "ok", "basis": "known", "note": "An on-off love over years, told out of order; no memory conceit."}
+      ]
+    },
+    {
+      "seed": "movie:76", "title": "Before Sunrise", "split": "test",
+      "judged": [
+        {"id": "series:60649", "type": "series", "title": "The 7.39 (2014)", "grade": "ok", "basis": "known", "note": "Strangers on a commuter train, as an adultery drama."}
+      ]
+    },
+    {
+      "seed": "movie:77", "title": "Memento", "split": "dev",
+      "judged": [
+        {"id": "series:127641", "type": "series", "title": "Surface (2022)", "grade": "ok", "basis": "known", "note": "Memory loss and a reconstructed past, as a glossy melodrama."}
+      ]
+    },
+    {
+      "seed": "movie:424", "title": "Schindler's List", "split": "dev",
+      "judged": [
+        {"id": "series:15571", "type": "series", "title": "Holocaust (1978)", "grade": "ok", "basis": "known", "note": "The same history as a family miniseries."},
+        {"id": "series:46849", "type": "series", "title": "Generation War (2013)", "grade": "ok", "basis": "known"},
+        {"id": "series:200908", "type": "series", "title": "We Were the Lucky Ones (2024)", "grade": "good", "basis": "known", "note": "A Jewish family surviving the Holocaust, from a true story."}
+      ]
+    },
+    {
+      "seed": "movie:150540", "title": "Inside Out", "split": "test",
+      "judged": [
+        {"id": "series:39434", "type": "series", "title": "Anohana (2011)", "grade": "ok", "basis": "known"},
+        {"id": "series:76059", "type": "series", "title": "A Place Further than the Universe (2018)", "grade": "ok", "basis": "known"},
+        {"id": "series:124396", "type": "series", "title": "Sonny Boy (2021)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:851", "title": "Brief Encounter", "split": "dev",
+      "judged": [
+        {"id": "series:7979", "type": "series", "title": "Caminho das Índias (2009)", "grade": "bad", "basis": "known", "note": "A telenovela."}
+      ]
+    },
+    {
+      "seed": "movie:389", "title": "12 Angry Men", "split": "dev",
+      "judged": [
+        {"id": "series:7389", "type": "series", "title": "Nuremberg (2000)", "grade": "ok", "basis": "known"},
+        {"id": "series:94551", "type": "series", "title": "The Twelve (2019)", "grade": "good", "basis": "known", "note": "A murder trial told through the jurors' lives."},
+        {"id": "series:7460", "type": "series", "title": "Criminal Justice (2008)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:14337", "title": "Primer", "split": "test",
+      "judged": [
+        {"id": "series:155441", "type": "series", "title": "Reset (2022)", "grade": "ok", "basis": "known"},
+        {"id": "series:194567", "type": "series", "title": "The Lazarus Project (2022)", "grade": "ok", "basis": "known"},
+        {"id": "series:93784", "type": "series", "title": "Tales from the Loop (2020)", "grade": "ok", "basis": "known"},
+        {"id": "series:119955", "type": "series", "title": "Dr. Brain (2021)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:220289", "title": "Coherence", "split": "test",
+      "judged": [
+        {"id": "series:118906", "type": "series", "title": "Parallels (2022)", "grade": "ok", "basis": "known"},
+        {"id": "series:1867", "type": "series", "title": "The Shining (1997)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:5723", "title": "Once", "split": "test",
+      "judged": [
+        {"id": "series:2742", "type": "series", "title": "Flight of the Conchords (2007)", "grade": "ok", "basis": "known"},
+        {"id": "series:119464", "type": "series", "title": "Navillera (2021)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:758336", "title": "Love Again", "split": "test",
+      "judged": [
+        {"id": "series:88548", "type": "series", "title": "Put Your Head on My Shoulder (2019)", "grade": "bad", "basis": "known"},
+        {"id": "series:112211", "type": "series", "title": "Platonic (2023)", "grade": "bad", "basis": "known"},
+        {"id": "series:111625", "type": "series", "title": "Dash & Lily (2020)", "grade": "ok", "basis": "known", "note": "Strangers falling for each other through written messages."},
+        {"id": "series:135895", "type": "series", "title": "Kiss Sixth Sense (2022)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:129", "title": "Spirited Away", "split": "test",
+      "judged": [
+        {"id": "series:60728", "type": "series", "title": "Kill la Kill (2013)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:496243", "title": "Parasite", "split": "test",
+      "judged": [
+        {"id": "series:84327", "type": "series", "title": "Sky Castle (2018)", "grade": "good", "basis": "known", "note": "Rich families and the outsider they let into their children's education: class satire."},
+        {"id": "series:235", "type": "series", "title": "G.B.H. (1991)", "grade": "bad", "basis": "known"},
+        {"id": "series:46441", "type": "series", "title": "The Haves and the Have Nots (2013)", "grade": "ok", "basis": "known", "note": "A maid and the rich family, as a soap."}
+      ]
+    },
+    {
+      "seed": "movie:194", "title": "Amélie", "split": "test",
+      "judged": [
+        {"id": "series:95941", "type": "series", "title": "Zoey's Extraordinary Playlist (2020)", "grade": "ok", "basis": "known"},
+        {"id": "series:128995", "type": "series", "title": "Yumi's Cells (2021)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:346", "title": "Seven Samurai", "split": "test",
+      "judged": [
+        {"id": "series:13862", "type": "series", "title": "Shōgun (1980)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:103663", "title": "The Hunt", "split": "test",
+      "judged": [
+        {"id": "series:70139", "type": "series", "title": "The Moorside (2017)", "grade": "ok", "basis": "known"},
+        {"id": "series:97405", "type": "series", "title": "The Valhalla Murders (2019)", "grade": "bad", "basis": "known", "note": "Shares Nordic child abuse; a detective procedural."},
+        {"id": "series:95442", "type": "series", "title": "Deadwater Fell (2020)", "grade": "ok", "basis": "known"},
+        {"id": "series:50664", "type": "series", "title": "Secrets & Lies (2014)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:265189", "title": "Force Majeure", "split": "test",
+      "judged": [
+        {"id": "series:65170", "type": "series", "title": "Scenes from a Marriage (1973)", "grade": "good", "basis": "known", "note": "A marriage taken apart scene by scene."},
+        {"id": "series:67280", "type": "series", "title": "Divorce (2016)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:598", "title": "City of God", "split": "dev",
+      "judged": [
+        {"id": "series:234763", "type": "series", "title": "The Boy's Word: Blood on the Asphalt (2023)", "grade": "good", "basis": "known", "note": "Boys drawn into street gangs in 1980s Kazan."},
+        {"id": "series:223397", "type": "series", "title": "City of God: The Fight Rages On (2024)", "grade": "good", "basis": "known", "note": "The continuation: Buscapé and the same favela twenty years on."},
+        {"id": "series:71694", "type": "series", "title": "Snowfall (2017)", "grade": "good", "basis": "known", "note": "A young dealer rises as crack arrives in 1980s Los Angeles."}
+      ]
+    },
+    {
+      "seed": "movie:14139", "title": "Timecrimes", "split": "dev",
+      "judged": [
+        {"id": "series:155441", "type": "series", "title": "Reset (2022)", "grade": "ok", "basis": "known"},
+        {"id": "series:2203", "type": "series", "title": "First Wave (1998)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:13310", "title": "Let the Right One In", "split": "test",
+      "judged": [
+        {"id": "series:136735", "type": "series", "title": "Let the Right One In (2022)", "grade": "ok", "basis": "known", "note": "The series remake."},
+        {"id": "series:1867", "type": "series", "title": "The Shining (1997)", "grade": "ok", "basis": "known"},
+        {"id": "series:19614", "type": "series", "title": "It (1990)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:25237", "title": "Come and See", "split": "dev",
+      "judged": [
+        {"id": "series:93785", "type": "series", "title": "Barbarians (2020)", "grade": "bad", "basis": "known"},
+        {"id": "series:35046", "type": "series", "title": "Un village français (2009)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:427", "title": "Mon Oncle", "split": "test",
+      "judged": [
+        {"id": "series:420", "type": "series", "title": "Whatever Happened to the Likely Lads? (1973)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:17295", "title": "The Battle of Algiers", "split": "test",
+      "judged": [
+        {"id": "series:35046", "type": "series", "title": "Un village français (2009)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:535544", "title": "Downton Abbey", "split": "dev",
+      "judged": [
+        {"id": "series:33907", "type": "series", "title": "Downton Abbey (2010)", "grade": "good", "basis": "maker", "note": "The series the film continues: the same household and cast."},
+        {"id": "series:492", "type": "series", "title": "Upstairs, Downstairs (1971)", "grade": "good", "basis": "known", "note": "Masters and servants of one house."},
+        {"id": "series:46609", "type": "series", "title": "Upstairs Downstairs (2010)", "grade": "ok", "basis": "known", "note": "The revival of Upstairs, Downstairs; adds little."},
+        {"id": "series:39016", "type": "series", "title": "Titanic (2012)", "grade": "ok", "basis": "maker", "note": "Fellowes's class-layered ensemble on a ship."},
+        {"id": "series:62819", "type": "series", "title": "Another Period (2015)", "grade": "bad", "basis": "known", "note": "A parody."}
+      ]
+    },
+    {
+      "seed": "movie:11", "title": "Star Wars", "split": "test",
+      "judged": [
+        {"id": "series:114461", "type": "series", "title": "Star Wars: Ahsoka (2023)", "grade": "ok", "basis": "known"},
+        {"id": "series:2985", "type": "series", "title": "Andromeda (2000)", "grade": "bad", "basis": "known"},
+        {"id": "series:82856", "type": "series", "title": "The Mandalorian (2019)", "grade": "good", "basis": "known", "note": "A frontier space western in the same galaxy."},
+        {"id": "series:9156", "type": "series", "title": "Frank Herbert's Children of Dune (2003)", "grade": "ok", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "movie:348", "title": "Alien", "split": "dev",
+      "judged": [
+        {"id": "series:1972", "type": "series", "title": "Battlestar Galactica (2003)", "grade": "ok", "basis": "known"},
+        {"id": "series:1731", "type": "series", "title": "Blake's 7 (1978)", "grade": "bad", "basis": "known"}
+      ]
+    }
+  ]
+}
