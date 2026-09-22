@@ -49,9 +49,13 @@ members = ["crates/den-index", "crates/den-titlesearch"]
 # not expose the function, and a store is now the only thing the serving path reads, so every test with a
 # dataset in it needs one written. A real implementation, not a second copy of den-store's vendored one:
 # the fixture must fail when the writer is wrong, not agree with it.
+#
+# `sha2` re-derives each judged More Like This case's dev/test half the way den-dataset's split.py does, so
+# a case cannot be moved between halves by hand (`raileval.rs`).
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 blake2 = "0.10"
+sha2 = "0.10"
 
 # Speed over size, everywhere: every More Like This, search and row walks tens of thousands of records, the
 # index load parses tens of megabytes of JSON, and a size-optimised build ("z", with a per-crate override that

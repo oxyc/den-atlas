@@ -18,6 +18,7 @@ mod plotrows;
 mod queries;
 mod rail;
 mod railab;
+mod raileval;
 mod ratings;
 mod recommend;
 mod schema;
@@ -244,6 +245,9 @@ async fn main() {
         }
         if command == "rail-ab" {
             std::process::exit(railab::run(std::path::Path::new(path)));
+        }
+        if command == "rail-eval" {
+            std::process::exit(raileval::run(std::path::Path::new(path)));
         }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
