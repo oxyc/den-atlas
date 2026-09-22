@@ -149,6 +149,15 @@ impl FacetCounts {
                     }
                 }
             }
+            // The merged display rows `/index/row` answers (`ending:unhappy`), as the union of their members.
+            for merged in crate::plotrows::MERGED_ROWS {
+                let Some(values) = kinds.get_mut(merged.axis) else { continue };
+                let mut union = bits();
+                for member in merged.members.iter().filter_map(|m| values.get(*m)) {
+                    union.iter_mut().zip(member).for_each(|(u, m)| *u |= m);
+                }
+                values.insert(merged.value.to_owned(), union);
+            }
         }
         let keys = keys
             .iter()
@@ -436,7 +445,8 @@ mod tests {
         assert_eq!(all["subgenre"], json!({ "Campy/Cult": 1, "Heist": 3 }));
         assert_eq!(all["mood"], json!({ "Tense": 1 }));
         assert_eq!(all["genre"]["80"], json!(1));
-        assert_eq!(all["ending"], json!({ "bittersweet": 3 }));
+        assert_eq!(all["ending"], json!({ "bittersweet": 3, "unhappy": 3 }), "a merged row is its members");
+        assert_eq!(all["tone"], json!({ "bleak": 2, "comic": 1 }));
 
         let korean = counts.answer(Movie, &sel("sel=country:KR"));
         assert_eq!(korean["country"], json!({ "DK": 1, "KR": 2 }), "Spain has nothing left: absent, i.e. 0");
@@ -539,6 +549,11 @@ mod tests {
         assert_eq!(ids(&page("sel=genre:18,genre:80", 0, PAGE)), vec![1], "genres AND");
         assert_eq!(ids(&page("sel=genre:18,genre:35", 0, PAGE)), Vec::<u64>::new());
         assert_eq!(ids(&page("sel=mood:Tense,tone:bleak", 0, PAGE)), vec![1], "labels AND plot axes");
+        assert_eq!(
+            ids(&page("sel=ending:unhappy,tone:comic", 0, PAGE)),
+            vec![3],
+            "a merged row, as /index/row"
+        );
 
         let second = page("sel=subgenre:Heist", 1, 1);
         assert_eq!((ids(&second), &second["total"]), (vec![1], &json!(3)), "a page, and the whole count");
