@@ -737,7 +737,12 @@ enum IndexQuestion {
     /// from the query in `handle_index`, before the load, so a malformed one never pays for it.
     FacetCounts {
         media_type: den_index::MediaType,
-        selection: Vec<(&'static str, String)>,
+        selection: crate::facetcounts::Selection,
+    },
+    /// The titles carrying a selection, paged (`facetcounts::browse`); its query read as `FacetCounts`' is.
+    Browse {
+        media_type: den_index::MediaType,
+        selection: crate::facetcounts::Selection,
     },
 }
 
@@ -763,8 +768,12 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
-            ["facets", type_] => {
-                Some(Self::FacetCounts { media_type: index_media_type(type_)?, selection: Vec::new() })
+            ["facets", type_] => Some(Self::FacetCounts {
+                media_type: index_media_type(type_)?,
+                selection: Default::default(),
+            }),
+            ["browse", type_] => {
+                Some(Self::Browse { media_type: index_media_type(type_)?, selection: Default::default() })
             }
             ["query"] => Some(Self::Query),
             ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
@@ -865,8 +874,16 @@ impl IndexQuestion {
                 )
             }
             Self::FacetCounts { media_type, selection } => {
-                indexes.facet_counts().answer(*media_type, selection)
+                indexes.facet_counts().answer(*media_type, &selection.items)
             }
+            Self::Browse { media_type, selection } => crate::facetcounts::browse(
+                indexes,
+                export,
+                *media_type,
+                &selection.items,
+                selection.skip,
+                selection.limit,
+            ),
             Self::Search | Self::Facets | Self::Query => unreachable!("answered in handle_index"),
         };
         body.to_string()
@@ -1437,10 +1454,18 @@ async fn handle_index(
     let Some(mut question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
         return not_found();
     };
-    // The URL is the facet counts' cache key, so a selection spelled any way but the canonical one is sent
-    // to that spelling rather than answered under a second key.
-    if let IndexQuestion::FacetCounts { selection, .. } = &mut question {
-        let parsed = match crate::facetcounts::Selection::parse(query) {
+    // The URL is the facet counts' and browse pages' cache key, so a selection spelled any way but the
+    // canonical one is sent to that spelling rather than answered under a second key.
+    if let IndexQuestion::FacetCounts { selection, .. } | IndexQuestion::Browse { selection, .. } =
+        &mut question
+    {
+        let paged = rest.starts_with("browse/");
+        let read = if paged {
+            crate::facetcounts::Selection::parse_paged(query)
+        } else {
+            crate::facetcounts::Selection::parse(query)
+        };
+        let parsed = match read {
             Ok(parsed) => parsed,
             Err(detail) => {
                 return json_response(
@@ -1459,7 +1484,7 @@ async fn handle_index(
                 .body(Body::empty())
                 .unwrap();
         }
-        *selection = parsed.items;
+        *selection = parsed;
     }
     // A search's whole text goes to den-embed at once, while the indexes are got — and loaded, after an idle
     // spell — so a cold den-embed loads its model alongside them, not after (`query_answer`).
@@ -2690,6 +2715,62 @@ mod tests {
             assert_eq!(json(body_of(resp).await)["error"], "bad_request", "{path}");
         }
         assert_eq!(get(&state, "/index/facets/anime.json").await.status(), 404);
+    }
+
+    /// Browsing a selection: the titles carrying all of it, as the very cards `/index/row` draws, paged, with
+    /// the page in the canonical URL — which is the cache key, so it carries an ETag and revalidates.
+    #[tokio::test]
+    async fn browse_pages_a_selection_by_canonical_url() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let state = index_state("den-atlas-browse");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+
+        let korean = get(&state, "/index/browse/movie.json?sel=country:KR,subgenre:Heist").await;
+        assert_eq!(korean.status(), 200);
+        assert_eq!(
+            korean.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600, stale-while-revalidate=86400"
+        );
+        let etag = korean.headers()[header::ETAG].clone();
+        let korean = json(body_of(korean).await);
+        assert_eq!((ids(&korean), &korean["total"]), (vec![2, 1], &serde_json::json!(2)));
+
+        // The same card, field for field, that a browse row draws for the same title.
+        let row = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist").await).await);
+        let card = |answer: &serde_json::Value, id: u64| {
+            answer["titles"].as_array().unwrap().iter().find(|t| t["id"] == id).cloned().unwrap()
+        };
+        assert_eq!(card(&korean, 1), card(&row, 1));
+        assert_eq!(card(&korean, 2), card(&row, 2));
+
+        let page = json(
+            body_of(get(&state, "/index/browse/movie.json?sel=subgenre:Heist&skip=1&limit=1").await).await,
+        );
+        assert_eq!((ids(&page), &page["total"]), (vec![1], &serde_json::json!(3)));
+        let top = json(body_of(get(&state, "/index/browse/movie.json").await).await);
+        assert_eq!(ids(&top), vec![2, 1, 3], "no selection: most voted first");
+
+        let req = HttpRequest::builder()
+            .uri("/index/browse/movie.json?sel=country:KR,subgenre:Heist")
+            .header("if-none-match", etag);
+        let revalidated = handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await;
+        assert_eq!(revalidated.status(), 304);
+
+        let redirect =
+            get(&state, "/index/browse/movie.json?limit=500&skip=0&sel=subgenre:Heist,country:kr").await;
+        assert_eq!(redirect.status(), 308);
+        assert_eq!(
+            redirect.headers()[header::LOCATION],
+            "movie.json?sel=country:KR,subgenre:Heist&limit=100"
+        );
+        for path in ["/index/browse/movie.json?skip=x", "/index/browse/movie.json?sel=nope:1"] {
+            assert_eq!(get(&state, path).await.status(), 400, "{path}");
+        }
+        assert_eq!(get(&state, "/index/browse/anime.json").await.status(), 404);
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

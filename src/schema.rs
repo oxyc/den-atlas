@@ -500,6 +500,26 @@ fn routes() -> Value {
             "returns": "{<kind>: {<id>: count}}",
         },
         {
+            "method": "GET",
+            "path": "/index/browse/{type}.json",
+            "example": "/index/browse/movie.json?sel=country:SE,genre:28&limit=40",
+            "about": "The titles of one type carrying every selected value, most voted first; no selection is \
+                      every title of the type.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("sel", "string", "as /index/facets/{type}.json takes it"),
+                    json!({ "max": crate::facetcounts::MAX_SELECTION }),
+                ),
+                with(param("skip", "integer", "titles to skip; left out when 0"), json!({ "default": 0 })),
+                with(
+                    param("limit", "integer", "titles in the page; left out when the default"),
+                    json!({ "default": ROW_PAGE, "max": MAX_ROW_PAGE }),
+                ),
+            ],
+            "returns": "{titles, total}: titles as /index/row/{type}.json draws them",
+        },
+        {
             "method": "GET", "path": "/index/taxonomy.json", "example": "/index/taxonomy.json",
             "about": "The label names alone, kept for the TV app. Use this document instead.",
         },

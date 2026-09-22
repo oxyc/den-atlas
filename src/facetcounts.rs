@@ -48,6 +48,8 @@ pub struct FacetCounts {
     /// The titles of each type.
     movie: Vec<u64>,
     tv: Vec<u64>,
+    /// Each store row's title, so a bit can be named.
+    keys: Vec<(MediaType, u32)>,
     /// kind → value → the titles carrying it. Sorted, so an answer's bytes — and its ETag — never vary.
     /// A kind is present only when its source loaded; one that did not is absent from every answer.
     kinds: BTreeMap<&'static str, BTreeMap<String, Vec<u64>>>,
@@ -148,21 +150,20 @@ impl FacetCounts {
                 }
             }
         }
-        FacetCounts { movie, tv, kinds }
+        let keys = keys
+            .iter()
+            .map(|&packed| {
+                (if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie }, packed as u32)
+            })
+            .collect();
+        FacetCounts { movie, tv, keys, kinds }
     }
 
     /// Per kind, every value with a count above 0 among the titles of `media_type` carrying the selection.
     /// A value missing from a kind that is present counts 0. A selection naming a kind this load lacks can
     /// say nothing about anything, so every kind is absent then.
     pub fn answer(&self, media_type: MediaType, selection: &[(&'static str, String)]) -> Value {
-        let mut matched = if media_type == MediaType::Tv { self.tv.clone() } else { self.movie.clone() };
-        for (kind, value) in selection {
-            let Some(values) = self.kinds.get(kind) else { return Value::Object(Map::new()) };
-            match values.get(value) {
-                Some(bits) => matched.iter_mut().zip(bits).for_each(|(m, b)| *m &= b),
-                None => matched.fill(0),
-            }
-        }
+        let Some(matched) = self.selected(media_type, selection) else { return Value::Object(Map::new()) };
         let any = matched.iter().any(|&w| w != 0);
         let mut answer = Map::new();
         for (kind, values) in &self.kinds {
@@ -179,17 +180,98 @@ impl FacetCounts {
         }
         Value::Object(answer)
     }
+
+    /// The titles of `media_type` carrying every selected value, in store order; `None` when the selection
+    /// names a kind this load lacks.
+    pub fn matching(
+        &self,
+        media_type: MediaType,
+        selection: &[(&'static str, String)],
+    ) -> Option<Vec<(MediaType, u32)>> {
+        let matched = self.selected(media_type, selection)?;
+        let mut keys = Vec::new();
+        for (word, &bits) in matched.iter().enumerate() {
+            let mut rest = bits;
+            while rest != 0 {
+                keys.push(self.keys[word * 64 + rest.trailing_zeros() as usize]);
+                rest &= rest - 1;
+            }
+        }
+        Some(keys)
+    }
+
+    /// The selection's bitset over the titles of `media_type`; `None` when it names a kind this load lacks.
+    fn selected(&self, media_type: MediaType, selection: &[(&'static str, String)]) -> Option<Vec<u64>> {
+        let mut matched = if media_type == MediaType::Tv { self.tv.clone() } else { self.movie.clone() };
+        for (kind, value) in selection {
+            match self.kinds.get(kind)?.get(value) {
+                Some(bits) => matched.iter_mut().zip(bits).for_each(|(m, b)| *m &= b),
+                None => matched.fill(0),
+            }
+        }
+        Some(matched)
+    }
+}
+
+/// `GET /index/browse/<type>.json`: the titles of `media_type` carrying every selected value, most voted
+/// first (the order `/index/row` falls back to after confidence), `skip` then `limit` of them, each as the
+/// card `/index/row` draws, and how many there are. An empty selection is every title of the type. A title
+/// with no card is left out, as a row leaves it out; so is every title when the selection names a kind this
+/// load lacks, since nothing can be said to carry it.
+///
+/// The order is worked out once per type and selection (`Indexes::row_order`), so every page is a slice of
+/// one order and a scroll neither repeats nor skips.
+pub fn browse(
+    indexes: &Indexes,
+    export: Option<&den_titlesearch::TitleIndex>,
+    media_type: MediaType,
+    selection: &[(&'static str, String)],
+    skip: usize,
+    limit: usize,
+) -> Value {
+    let Some(cards) = indexes.cards.as_ref() else {
+        return serde_json::json!({ "titles": [], "total": 0 });
+    };
+    let spelled: Vec<String> = selection.iter().map(|(kind, id)| format!("{kind}:{id}")).collect();
+    let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
+    let order = indexes.row_order(format!("browse:{kind}?{}", spelled.join(",")), || {
+        let Some(keys) = indexes.facet_counts().matching(media_type, selection) else { return Vec::new() };
+        let mut ranked: Vec<((MediaType, u32), f64)> = keys
+            .into_iter()
+            .filter(|key| cards.contains_key(key))
+            .map(|key| (key, crate::plotrows::popularity(indexes, export, key)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0 .1.cmp(&b.0 .1)));
+        // A store that repeats a title would list it twice.
+        ranked.dedup_by_key(|(key, _)| *key);
+        ranked.into_iter().map(|(key, _)| key).collect()
+    });
+    let titles: Vec<Value> = order
+        .iter()
+        .skip(skip)
+        .take(limit)
+        .map(|&key| crate::plotrows::title_json(indexes, key, &cards[&key]))
+        .collect();
+    serde_json::json!({ "titles": titles, "total": order.len() })
 }
 
 /// A request's `sel`, read and checked before anything loads.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Selection {
     /// The values, sorted by kind then id and de-duplicated.
     pub items: Vec<(&'static str, String)>,
-    /// Whether the request already spelled exactly `items`, and nothing else, so its URL is the one every
-    /// identical selection shares. `false` means redirect to `location`.
+    /// A browse page: titles to skip, and how many to return (`parse_paged`). A facet count takes neither,
+    /// and has 0 and `PAGE` here.
+    pub skip: usize,
+    pub limit: usize,
+    /// Whether the request already spelled exactly this, and nothing else, so its URL is the one every
+    /// identical request shares. `false` means redirect to `query`.
     pub canonical: bool,
 }
+
+/// A browse page's size when the request names none, and the most one page returns.
+pub const PAGE: usize = crate::handler::ROW_PAGE;
+pub const MAX_PAGE: usize = crate::handler::MAX_ROW_PAGE;
 
 impl Selection {
     /// `sel=<kind>:<id>,…` out of a query string. The value may arrive percent-encoded as a whole (a
@@ -200,17 +282,49 @@ impl Selection {
     /// country uppercase; a plot value lowercase; `structure` as the axis that answers it), sorted by kind
     /// and then id as strings, each once. The error is a malformed or oversized selection.
     pub fn parse(query: &str) -> Result<Selection, String> {
+        Self::read(query, false)
+    }
+
+    /// `parse`, plus `skip` and `limit`, which follow `sel` in that order, each only when it is not its
+    /// default (0, and `PAGE`), as a plain decimal. A `limit` over `MAX_PAGE` or under 1 is redirected to
+    /// the nearest one allowed; one that is not a number is refused.
+    pub fn parse_paged(query: &str) -> Result<Selection, String> {
+        Self::read(query, true)
+    }
+
+    fn read(query: &str, paged: bool) -> Result<Selection, String> {
         if query.len() > MAX_QUERY {
             return Err(format!("a query of at most {MAX_QUERY} bytes"));
         }
-        let mut raw_sel = None;
+        let (mut raw_sel, mut raw_skip, mut raw_limit) = (None, None, None);
         let mut others = false;
+        let mut names = Vec::new();
         for pair in query.split('&').filter(|p| !p.is_empty()) {
-            match pair.split_once('=') {
-                Some(("sel", value)) if raw_sel.is_none() => raw_sel = Some(value),
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            names.push(name);
+            match name {
+                "sel" if raw_sel.is_none() => raw_sel = Some(value),
+                "skip" if paged && raw_skip.is_none() => raw_skip = Some(value),
+                "limit" if paged && raw_limit.is_none() => raw_limit = Some(value),
                 _ => others = true,
             }
         }
+        let number = |name: &str, raw: Option<&str>, default: usize| {
+            raw.map_or(Ok(default), |v| {
+                v.parse::<usize>().map_err(|_| format!("{name}: {v:?} is not a count"))
+            })
+        };
+        let skip = number("skip", raw_skip, 0)?;
+        let asked = number("limit", raw_limit, PAGE)?;
+        let limit = asked.clamp(1, MAX_PAGE);
+        let order: Vec<&str> = [("sel", raw_sel), ("skip", raw_skip), ("limit", raw_limit)]
+            .iter()
+            .filter(|(_, raw)| raw.is_some())
+            .map(|(name, _)| *name)
+            .collect();
+        let paging_canonical = raw_skip.is_none_or(|v| skip != 0 && v == skip.to_string())
+            && raw_limit.is_none_or(|v| limit == asked && limit != PAGE && v == limit.to_string())
+            && names == order;
         let decoded =
             raw_sel.map(|v| crate::handler::percent_decode(&v.replace('+', " "))).unwrap_or_default();
         let raw: Vec<&str> = if decoded.is_empty() { Vec::new() } else { decoded.split(',').collect() };
@@ -227,19 +341,31 @@ impl Selection {
         let spelled: Vec<String> = items.iter().map(|(kind, id)| format!("{kind}:{id}")).collect();
         // An empty selection is spelled with no `sel` at all.
         let empty_sel = raw_sel.is_some() && items.is_empty();
-        let canonical = !others && !empty_sel && raw == spelled;
-        Ok(Selection { items, canonical })
+        let canonical = !others && !empty_sel && raw == spelled && paging_canonical;
+        Ok(Selection { items, skip, limit, canonical })
     }
 
-    /// The canonical URL's query, `?sel=…`, or nothing for an empty selection: what a redirect appends to the
-    /// path. Ids are percent-encoded; the `:` and `,` between them are not.
+    /// The canonical URL's query — `?sel=…&skip=…&limit=…`, each part only when it is not its default, or
+    /// nothing at all: what a redirect appends to the path. Ids are percent-encoded; the `:` and `,` between
+    /// them are not.
     pub fn query(&self) -> String {
-        if self.items.is_empty() {
-            return String::new();
+        let mut parts = Vec::new();
+        if !self.items.is_empty() {
+            let items: Vec<String> =
+                self.items.iter().map(|(kind, id)| format!("{kind}:{}", encode(id))).collect();
+            parts.push(format!("sel={}", items.join(",")));
         }
-        let items: Vec<String> =
-            self.items.iter().map(|(kind, id)| format!("{kind}:{}", encode(id))).collect();
-        format!("?sel={}", items.join(","))
+        if self.skip != 0 {
+            parts.push(format!("skip={}", self.skip));
+        }
+        if self.limit != PAGE {
+            parts.push(format!("limit={}", self.limit));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        }
     }
 }
 
@@ -395,6 +521,70 @@ mod tests {
         assert!(canonical(&parsed.query()[1..]));
     }
 
+    /// Browsing lists the titles carrying EVERY selected value — two genres are both genres — most voted
+    /// first (movie 2 has 500 votes, 1 has 100, 3 has 50), paged, with the whole count beside the page.
+    #[test]
+    fn browse_lists_titles_carrying_every_value_most_voted_first() {
+        let indexes = fixture("browse");
+        let ids = |answer: &Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        let page = |query: &str, skip, limit| browse(&indexes, None, Movie, &sel(query), skip, limit);
+
+        let top = page("", 0, PAGE);
+        assert_eq!((ids(&top), &top["total"]), (vec![2, 1, 3], &json!(3)), "no selection is every title");
+        assert_eq!(ids(&page("sel=country:KR", 0, PAGE)), vec![2, 1]);
+        assert_eq!(ids(&page("sel=country:KR,decade:1980", 0, PAGE)), vec![1]);
+        assert_eq!(ids(&page("sel=genre:18", 0, PAGE)), vec![2, 1]);
+        assert_eq!(ids(&page("sel=genre:18,genre:80", 0, PAGE)), vec![1], "genres AND");
+        assert_eq!(ids(&page("sel=genre:18,genre:35", 0, PAGE)), Vec::<u64>::new());
+        assert_eq!(ids(&page("sel=mood:Tense,tone:bleak", 0, PAGE)), vec![1], "labels AND plot axes");
+
+        let second = page("sel=subgenre:Heist", 1, 1);
+        assert_eq!((ids(&second), &second["total"]), (vec![1], &json!(3)), "a page, and the whole count");
+        let past = page("sel=subgenre:Heist", 9, 1);
+        assert_eq!((ids(&past), &past["total"]), (vec![], &json!(3)));
+
+        let series = browse(&indexes, None, Tv, &sel("sel=country:KR"), 0, PAGE);
+        assert_eq!(ids(&series), vec![4], "the type is part of the selection");
+
+        let mut lacking = fixture("browse-lacking");
+        lacking.facts = None;
+        // Built again: the load built its own before the facts were taken away.
+        let counts = FacetCounts::build(&lacking);
+        assert_eq!(counts.matching(Movie, &sel("sel=country:KR")), None, "a kind the load lacks");
+        assert_eq!(counts.matching(Movie, &sel("sel=subgenre:Heist")).map(|keys| keys.len()), Some(3));
+    }
+
+    #[test]
+    fn a_page_is_canonical_only_with_its_defaults_left_out_and_in_order() {
+        let paged = |q: &str| Selection::parse_paged(q).unwrap();
+        for query in ["", "sel=genre:28", "sel=genre:28&skip=24", "sel=genre:28&skip=24&limit=40", "limit=40"]
+        {
+            assert!(paged(query).canonical, "{query}");
+        }
+        for query in [
+            "sel=genre:28&skip=0",
+            "sel=genre:28&limit=24",
+            "limit=40&sel=genre:28",
+            "sel=genre:28&limit=500",
+            "sel=genre:28&limit=0",
+            "sel=genre:28&skip=024",
+        ] {
+            assert!(!paged(query).canonical, "{query}");
+        }
+        let capped = paged("limit=500&sel=genre:28,country:se&skip=0");
+        assert_eq!((capped.skip, capped.limit), (0, MAX_PAGE));
+        assert_eq!(capped.query(), format!("?sel=country:SE,genre:28&limit={MAX_PAGE}"));
+        assert!(paged(&capped.query()[1..]).canonical, "the redirect's target is canonical");
+        assert_eq!(paged("limit=0").limit, 1);
+        assert!(Selection::parse_paged("skip=x").is_err());
+        assert!(Selection::parse_paged("limit=-1").is_err());
+        // Paging is a browse parameter only: on the facet counts it is a parameter to redirect away.
+        assert!(!Selection::parse("sel=genre:28&skip=24").unwrap().canonical);
+        assert_eq!(Selection::parse("sel=genre:28&skip=24").unwrap().query(), "?sel=genre:28");
+    }
+
     #[test]
     fn malformed_and_oversized_selections_are_refused() {
         for query in ["sel=genre", "sel=nope:1", "sel=genre:action", "sel=decade:199x", "sel=genre:"] {
@@ -450,6 +640,26 @@ mod tests {
             assert!(values.keys().all(|value| !value.contains(',')), "a {kind} value holds a comma");
         }
         assert!(values > 100, "the real corpus has hundreds of values");
+        for query in [
+            "",
+            "sel=genre:28",
+            "sel=country:US,decade:1990,genre:28",
+            "sel=country:KR,decade:2000,tone:bleak",
+        ] {
+            let selection = sel(query);
+            let started = std::time::Instant::now();
+            let first = browse(&indexes, None, Movie, &selection, 0, 40).to_string();
+            let cold = started.elapsed();
+            let started = std::time::Instant::now();
+            let next = browse(&indexes, None, Movie, &selection, 40, 40).to_string();
+            eprintln!(
+                "browse {query:?}: first page {cold:?} (orders the selection), next page {:?}; limit=40 is {} \
+                 bytes of {} titles",
+                started.elapsed(),
+                first.len(),
+                serde_json::from_str::<Value>(&next).unwrap()["total"]
+            );
+        }
         let series = counts.answer(Tv, &[]);
         eprintln!("series, no selection: {} bytes", series.to_string().len());
         for composite in SERIES_COMPOSITE_GENRES {

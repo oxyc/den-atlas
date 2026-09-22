@@ -614,14 +614,7 @@ pub fn row(
     let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
     let row_key = format!("{kind}?{}", named.join("&"));
     let order = indexes.row_order(row_key.clone(), || {
-        let popularity = |(media_type, id): Key| {
-            let votes = indexes.votes(media_type, id);
-            let kind = match media_type {
-                MediaType::Movie => den_titlesearch::MediaType::Movie,
-                MediaType::Tv => den_titlesearch::MediaType::Tv,
-            };
-            crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
-        };
+        let popularity = |key: Key| popularity(indexes, export, key);
         let mut matched: Vec<(Key, u8, f64)> = carrying(indexes, media_type, constraints)
             .into_iter()
             .filter(|(key, _)| cards.contains_key(key))
@@ -640,37 +633,8 @@ pub fn row(
         None => order,
     };
     let total = order.len();
-    let titles: Vec<serde_json::Value> = order
-        .iter()
-        .skip(skip)
-        .take(limit)
-        .map(|&key| {
-            let (media_type, id) = key;
-            let card = &cards[&key];
-            let mut title = serde_json::json!({
-                "type": if media_type == MediaType::Tv { "series" } else { "movie" },
-                "id": id,
-                "title": card.title,
-                "posterPath": card.poster_path,
-                "year": card.year,
-                "genreIds": genres(indexes, key),
-                "primaryGenre": primary_genre(indexes, key),
-            });
-            // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
-            // for it, a request a card.
-            if let Some(imdb) =
-                indexes.facts.as_ref().and_then(|f| f.get(id, media_type)).and_then(|r| r.imdb_id.as_deref())
-            {
-                title["imdbId"] = serde_json::json!(imdb);
-            }
-            if let Some(language) =
-                indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).and_then(|t| t.language)
-            {
-                title["originalLanguage"] = serde_json::json!(String::from_utf8_lossy(&language));
-            }
-            title
-        })
-        .collect();
+    let titles: Vec<serde_json::Value> =
+        order.iter().skip(skip).take(limit).map(|&key| title_json(indexes, key, &cards[&key])).collect();
     let mut answer = serde_json::json!({ "titles": titles, "total": total, "coverage": coverage });
     // Which order this page is a slice of, for a client that pages a row while the household's taste moves:
     // a page whose `taste` differs from the one before it came from a different order, so the two must not
@@ -715,6 +679,48 @@ pub(crate) fn carrying(
                 .map(|lowest| (key, lowest))
         })
         .collect()
+}
+
+/// How much attention a title gets — what "most voted" orders by: its vote count, else TMDB's popularity in
+/// the daily `export`.
+pub(crate) fn popularity(
+    indexes: &Indexes,
+    export: Option<&den_titlesearch::TitleIndex>,
+    (media_type, id): Key,
+) -> f64 {
+    let votes = indexes.votes(media_type, id);
+    let kind = match media_type {
+        MediaType::Movie => den_titlesearch::MediaType::Movie,
+        MediaType::Tv => den_titlesearch::MediaType::Tv,
+    };
+    crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
+}
+
+/// One title of a row as the card a client draws, with what its hide rules read.
+pub(crate) fn title_json(indexes: &Indexes, key: Key, card: &Card) -> serde_json::Value {
+    let (media_type, id) = key;
+    let mut title = serde_json::json!({
+        "type": if media_type == MediaType::Tv { "series" } else { "movie" },
+        "id": id,
+        "title": card.title,
+        "posterPath": card.poster_path,
+        "year": card.year,
+        "genreIds": genres(indexes, key),
+        "primaryGenre": primary_genre(indexes, key),
+    });
+    // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
+    // for it, a request a card.
+    if let Some(imdb) =
+        indexes.facts.as_ref().and_then(|f| f.get(id, media_type)).and_then(|r| r.imdb_id.as_deref())
+    {
+        title["imdbId"] = serde_json::json!(imdb);
+    }
+    if let Some(language) =
+        indexes.facets.as_ref().and_then(|f| f.title(id, media_type)).and_then(|t| t.language)
+    {
+        title["originalLanguage"] = serde_json::json!(String::from_utf8_lossy(&language));
+    }
+    title
 }
 
 /// The confidence a label row needs (the label rows' own floor).
