@@ -2527,6 +2527,44 @@ mod tests {
         assert_eq!(get(&state, "/index/plot/anime.json?ending=happy").await.status(), 404);
     }
 
+    /// A merged row answers like any row: the union of its members, in the row order, paged, with the
+    /// axis's coverage. Every drawable fixture title ends bittersweet, so `unhappy` is that row exactly.
+    #[tokio::test]
+    async fn a_merged_row_answers_and_pages_like_any_row() {
+        let state = index_state("den-atlas-merged-rows");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        let member = json(body_of(get(&state, "/index/row/movie.json?ending=bittersweet").await).await);
+        let merged = json(body_of(get(&state, "/index/row/movie.json?ending=unhappy").await).await);
+        assert_eq!(ids(&merged), vec![2, 3, 1]);
+        assert_eq!(merged["titles"], member["titles"]);
+        assert_eq!(merged["total"], 3);
+        assert_eq!(merged["coverage"]["fields"]["ending"], member["coverage"]["fields"]["ending"]);
+        let mut paged = Vec::new();
+        for skip in 0..4 {
+            let page = json(
+                body_of(
+                    get(&state, &format!("/index/row/movie.json?ending=unhappy&skip={skip}&limit=1")).await,
+                )
+                .await,
+            );
+            assert_eq!(page["total"], 3, "every page names the whole row's total");
+            paged.extend(ids(&page));
+        }
+        assert_eq!(paged, vec![2, 3, 1], "the pages tile the row");
+        let series = json(body_of(get(&state, "/index/row/series.json?ending=unhappy").await).await);
+        assert_eq!(ids(&series), vec![4]);
+        let bleak = json(body_of(get(&state, "/index/row/movie.json?ending=unhappy&tone=bleak").await).await);
+        assert_eq!(ids(&bleak), vec![1, 2]);
+        let none = json(body_of(get(&state, "/index/row/movie.json?ending=unresolved").await).await);
+        assert_eq!(
+            (none["titles"].clone(), none["total"].clone()),
+            (serde_json::json!([]), serde_json::json!(0))
+        );
+    }
+
     /// A row may name a mood or subgenre, alone or with the plot facets: the surest first, then the most voted.
     #[tokio::test]
     async fn rows_name_labels_alone_or_with_plot_facets() {
