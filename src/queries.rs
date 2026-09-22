@@ -691,6 +691,7 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             released: Some((D2026_09_01, 0)),
             genres: vec![80, 18],
             countries: vec!["KR", "DK"],
+            languages: vec!["ko"],
             makers: vec![1, 9],
             cast: vec![2, 3],
             franchise: Some(50),
@@ -710,6 +711,7 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             votes: 500,
             released: Some((D1995, 0)),
             countries: vec!["KR"],
+            languages: vec!["ko"],
             ..Title::default()
         },
         Title {
@@ -724,6 +726,7 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             votes: 50,
             released: Some((D1985, 0)),
             countries: vec!["ES"],
+            languages: vec!["es"],
             ..Title::default()
         },
         Title {
@@ -738,6 +741,7 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             votes: 300,
             released: Some((D2010, 0)),
             countries: vec!["KR"],
+            languages: vec!["ko"],
             ..Title::default()
         },
     ];

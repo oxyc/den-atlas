@@ -1666,6 +1666,16 @@ mod tests {
         handle(State(Arc::clone(state)), HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await
     }
 
+    /// One row, as JSON, with the ids it lists — and the check that `total` counts the whole row rather
+    /// than the page, which every row assertion below would otherwise have to repeat.
+    async fn row_of(state: &Arc<AppState>, path: &str) -> (serde_json::Value, Vec<u64>) {
+        let answer: serde_json::Value = serde_json::from_str(&body_of(get(state, path).await).await).unwrap();
+        let ids: Vec<u64> =
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect();
+        assert_eq!(answer["total"].as_u64(), Some(ids.len() as u64), "{path}: {answer}");
+        (answer, ids)
+    }
+
     async fn body_of(resp: axum::response::Response) -> String {
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         String::from_utf8_lossy(&b).into_owned()
@@ -2145,6 +2155,116 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A row may name a FACT — where a title was made, in what language, when, and what it is — alone or
+    /// with a label or a plot facet.
+    ///
+    /// These five are what `schema.json` has always advertised and no row understood: `?country=KR`
+    /// answered `{"titles":[],"total":0}` with a 200, because the builder had only the plot axes and
+    /// `mood`/`subgenre` to try. A fact carries no confidence, so such a row is ordered by attention alone
+    /// — which is the order every other browse row falls back to once confidences tie.
+    #[tokio::test]
+    async fn rows_name_the_facts_the_schema_advertises() {
+        let state = index_state("den-atlas-fact-rows");
+        let ids = async |path: &str| row_of(&state, path).await.1;
+        // Korea: movies 2 (500 votes) and 1 (100). Ordered by attention, as a label row is once the
+        // confidences tie — never by tmdb id, which is what `votes_unusable` exists to catch.
+        assert_eq!(ids("/index/row/movie.json?country=KR").await, vec![2, 1]);
+        assert_eq!(ids("/index/row/series.json?country=KR").await, vec![4]);
+        assert_eq!(ids("/index/row/movie.json?country=ES").await, vec![3]);
+        // The facts list movie 1 as KR *and* DK; the facet index holds the first country per title, so a
+        // co-production is findable under the one Wikidata names first and not under the other.
+        assert!(ids("/index/row/movie.json?country=DK").await.is_empty());
+        assert!(ids("/index/row/movie.json?country=ZZ").await.is_empty());
+
+        // Language is its own axis, not a spelling of country: movie 3 is the Spanish-language row and the
+        // Spanish row alike here, but over the corpus most Spanish-language films are made elsewhere.
+        assert_eq!(ids("/index/row/movie.json?language=ko").await, vec![2, 1]);
+        assert_eq!(ids("/index/row/movie.json?language=es").await, vec![3]);
+
+        // Time comes from the release date in the facts, not from the card's year: movie 1's card says
+        // 1985 and it was released in 2026, and it belongs to the 2020s.
+        assert_eq!(ids("/index/row/movie.json?decade=1980").await, vec![3]);
+        assert_eq!(ids("/index/row/movie.json?decade=1990").await, vec![2]);
+        assert_eq!(ids("/index/row/movie.json?decade=2020").await, vec![1]);
+        assert_eq!(ids("/index/row/movie.json?year=1985").await, vec![3]);
+        assert_eq!(ids("/index/row/movie.json?year=2026").await, vec![1]);
+        assert!(ids("/index/row/movie.json?decade=1900").await.is_empty());
+        assert!(ids("/index/row/movie.json?decade=nineties").await.is_empty());
+
+        // The genre the labels call a title's own — what it IS, rather than every id TMDB tagged it with.
+        assert_eq!(ids("/index/row/movie.json?primaryGenre=Drama").await, vec![2, 1]);
+        assert_eq!(ids("/index/row/movie.json?primaryGenre=Comedy").await, vec![3]);
+        assert_eq!(ids("/index/row/series.json?primaryGenre=Drama").await, vec![4]);
+        assert!(ids("/index/row/movie.json?primaryGenre=Western").await.is_empty());
+
+        // And they combine, with each other and with the axes a row already understood. That is the half
+        // of a recipe row atlas can express without keywords: a country plus a plot reading.
+        assert_eq!(ids("/index/row/movie.json?subgenre=Heist&country=KR").await, vec![2, 1]);
+        assert_eq!(ids("/index/row/movie.json?country=KR&decade=1990").await, vec![2]);
+        assert_eq!(ids("/index/row/movie.json?tone=bleak&country=KR").await, vec![1, 2]);
+        assert_eq!(ids("/index/row/movie.json?primaryGenre=Drama&language=ko&decade=1990").await, vec![2]);
+        assert_eq!(ids("/index/row/movie.json?subgenre=Heist&country=ES").await, vec![3]);
+        assert!(ids("/index/row/movie.json?subgenre=Heist&country=JP").await.is_empty());
+    }
+
+    /// A fact row's coverage block names the fact's own denominator.
+    ///
+    /// Without it the fields fell through to the plot axes, which know nothing about country, and a row
+    /// listing Korean films reported 0 of 47,618 known — a coverage block worse than none, because a
+    /// client is entitled to read it as "this row is guesswork".
+    #[tokio::test]
+    async fn a_fact_row_reports_the_facts_own_coverage() {
+        let state = index_state("den-atlas-fact-coverage");
+        let answer = async |path: &str| row_of(&state, path).await.0;
+        let movies = answer("/index/row/movie.json?country=KR&primaryGenre=Drama").await;
+        let coverage = &movies["coverage"];
+        assert_eq!(coverage["denominator"], 3, "three movies in the fixture");
+        assert_eq!(coverage["fields"]["country"]["count"], 3, "every fixture movie has a country");
+        assert_eq!(coverage["fields"]["primaryGenre"]["count"], 3);
+
+        // Partial is the normal case and must read as partial: eight of the nine fixture series carry no
+        // country at all, and none of them is in the row above or below.
+        let series = answer("/index/row/series.json?country=KR").await;
+        assert_eq!(series["coverage"]["denominator"], 9);
+        assert_eq!(series["coverage"]["fields"]["country"]["count"], 1, "{series}");
+    }
+
+    /// Every field `schema.json` advertises with a value vocabulary answers a row for its own top value.
+    ///
+    /// The schema is a contract, and it promised a superset of what rows delivered for as long as rows
+    /// existed. This is the assertion that keeps the two from drifting apart again: a field added to the
+    /// document without a row builder that understands it fails here, and so does one whose spelling
+    /// differs between the two.
+    ///
+    /// `mediaType` is the exception, and the only one: a row names its type in the path rather than the
+    /// query, so there is no `?mediaType=` to answer.
+    #[tokio::test]
+    async fn every_advertised_field_with_values_answers_a_row() {
+        let state = index_state("den-atlas-schema-contract");
+        let schema: serde_json::Value =
+            serde_json::from_str(&body_of(get(&state, "/index/schema.json").await).await).unwrap();
+        let fields = schema["fields"].as_object().expect("the schema names fields");
+        let mut checked = 0;
+        for (field, described) in fields {
+            let Some(values) = described["values"].as_array() else { continue };
+            if field == "mediaType" {
+                continue;
+            }
+            let value = values[0]["value"].as_str().expect("a value is a string");
+            let encoded = value.replace('%', "%25").replace(' ', "%20").replace('/', "%2F");
+            let path = format!("/index/row/movie.json?{field}={encoded}");
+            let row: serde_json::Value =
+                serde_json::from_str(&body_of(get(&state, &path).await).await).unwrap();
+            assert!(
+                row["total"].as_u64().unwrap_or(0) > 0,
+                "schema.json advertises {field}={value}, and the row for it is empty: {row}"
+            );
+            checked += 1;
+        }
+        // The count, not just the tick: a schema that stopped listing values would pass an empty loop.
+        assert!(checked >= 8, "only {checked} fields carried a value vocabulary");
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

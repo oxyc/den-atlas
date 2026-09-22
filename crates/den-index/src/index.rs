@@ -381,6 +381,37 @@ impl Index {
         self.named_counts(counts)
     }
 
+    /// Titles whose primary genre is `genre`, optionally of one type.
+    ///
+    /// Unordered: the caller ranks them, as every browse row does. There is no confidence to page by
+    /// either — a primary genre is the one the labelling pass settled on, not a scored guess among
+    /// several, which is why this has no floor where `titles_with_subgenre` does.
+    pub fn titles_with_primary_genre(
+        &self,
+        genre: &str,
+        media_type: Option<MediaType>,
+    ) -> Vec<(u32, MediaType)> {
+        self.records
+            .iter()
+            .filter_map(|record| {
+                let kind = record.media_type?;
+                let wanted = media_type.is_none_or(|w| w == kind) && self.name(record.primary_genre) == genre;
+                wanted.then_some((record.tmdb_id, kind))
+            })
+            .collect()
+    }
+
+    /// Titles of one type carrying any primary genre — the denominator a `primaryGenre` row is a slice of.
+    pub fn primary_genre_coverage_for(&self, media_type: Option<MediaType>) -> usize {
+        self.records
+            .iter()
+            .filter(|record| {
+                record.media_type.is_some_and(|kind| media_type.is_none_or(|w| w == kind))
+                    && !self.name(record.primary_genre).is_empty()
+            })
+            .count()
+    }
+
     /// Every label in one family and the number of usable titles carrying it at or above `min_confidence`.
     /// This is the population a displayed label row actually draws from, rather than the number of raw guesses
     /// the producer happened to retain.

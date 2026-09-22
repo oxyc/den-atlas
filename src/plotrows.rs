@@ -1,10 +1,10 @@
 //! Browse rows from the store's facet axes: closed axes read from Wikipedia plots — how a story ends, when
 //! it is set, how it is told — which cut across genre in a way a primary genre can't. A row may also name a
-//! mood or subgenre from the labels, alone or with the facets.
+//! mood or subgenre from the labels, or one of the facts the store holds outright — country, original
+//! language, release decade or year, primary genre — alone or together (`FACT_FIELDS`).
 //!
 //! Rows only, never filters. A title the corpus does not describe is unknown, not a negative: a row lists
-//! what is known, and nothing may read it as exhaustive. Not `facets.bin`, which is country, language and
-//! year for attribute search.
+//! what is known, and nothing may read it as exhaustive.
 //!
 //! # These used to come from `plotFacetsFile`
 //!
@@ -535,9 +535,11 @@ fn media_letter(media_type: MediaType) -> char {
 
 /// A row: the titles of `media_type` carrying every constraint, most confident first, then most voted — each as
 /// the card a client draws, with what its hide rules read — `skip` then `limit` of them, and how many there are.
-/// A constraint is a plot facet (`tone=bleak`) or one of the labels (`mood=Feel-good`, `subgenre=Heist`), and
-/// they combine. A title with no card is left out, since there is nothing to draw. "Most voted" reads TMDB's
-/// popularity in its daily `export` for a title facets.bin has no votes for.
+/// A constraint is a plot facet (`tone=bleak`), one of the labels (`mood=Feel-good`, `subgenre=Heist`) or one of
+/// the facts (`country=KR`, `language=ko`, `decade=1990`, `year=1999`, `primaryGenre=Horror`), and they combine:
+/// `subgenre=Heist&country=KR` is a row, and so is `tone=bleak&decade=1990`. A title with no card is left out,
+/// since there is nothing to draw. "Most voted" reads TMDB's popularity in its daily `export` for a title the
+/// store and IMDb both have no count for.
 ///
 /// `tilt` reorders the WHOLE row for a household before the page is cut, so a title the untilted order puts
 /// on page 3 can lead page 1 — the ceiling a client-side tilt over an already-loaded page cannot pass. It
@@ -562,8 +564,10 @@ pub fn row(
     let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
     let row_key = format!("{kind}?{}", named.join("&"));
     let order = indexes.row_order(row_key.clone(), || {
+        let (facts, rest): (Vec<_>, Vec<_>) =
+            constraints.iter().cloned().partition(|(field, _)| FACT_FIELDS.contains(&field.as_str()));
         let (labels, plot): (Vec<_>, Vec<_>) =
-            constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
+            rest.into_iter().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
         let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
             indexes.plot_facets.as_ref().map_or_else(Vec::new, |facets| facets.matching(media_type, &plot))
         } else if let Some((family, label)) = labels.first() {
@@ -573,6 +577,11 @@ pub fn row(
                 indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
             };
             titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
+        } else if !facts.is_empty() {
+            // A fact carries no confidence — a title is made in Korea or it is not — so every candidate
+            // enters at the top of the scale and the row is ordered by attention alone, which is what a
+            // country or decade row is ordered by however it is composed.
+            fact_candidates(indexes, media_type, &facts).into_iter().map(|key| (key, 3)).collect()
         } else {
             Vec::new()
         };
@@ -587,6 +596,7 @@ pub fn row(
         let mut matched: Vec<(Key, u8, f64)> = candidates
             .into_iter()
             .filter(|(key, _)| cards.contains_key(key))
+            .filter(|(key, _)| facts_match(indexes, *key, &facts))
             .filter_map(|(key, confidence)| {
                 labels
                     .iter()
@@ -653,6 +663,74 @@ pub fn row(
 
 /// The confidence a label row needs (the label rows' own floor).
 const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
+
+/// The row fields that are FACTS about a title rather than a reading of its plot: where it was made, what
+/// language it was made in, when it came out, and the one genre the labelling pass settled on.
+///
+/// `/index/schema.json` has advertised all five as filterable since the schema existed, and a row
+/// understood none of them: `?country=KR` answered `{"titles":[],"total":0}` with a 200, because the row
+/// builder fell through to the plot axes and `matching` has no axis called `country`. A field a client is
+/// told it can query and cannot is the bug — the point of a self-describing schema is that the description
+/// is true — so they are answered here rather than dropped from the document.
+///
+/// `year` is exact (`year=1999`); the schema types it as an integer, not a range, and a decade is how a
+/// browse row asks about a span.
+const FACT_FIELDS: &[&str] = &["country", "language", "decade", "year", "primaryGenre"];
+
+/// The titles a fact-only row starts from.
+///
+/// Only a SUPERSET is required — `facts_match` is what decides membership — so this may narrow with
+/// whichever index answers cheapest and need not honour every constraint. An unparseable decade or a
+/// missing facet index therefore costs a wider scan, never a wrong row.
+fn fact_candidates(indexes: &Indexes, media_type: MediaType, facts: &[(String, String)]) -> Vec<Key> {
+    let value = |field: &str| facts.iter().find(|(f, _)| f == field).map(|(_, v)| v.as_str());
+    let (country, language) = (value("country"), value("language"));
+    let decade = value("decade").and_then(|d| d.parse::<u16>().ok());
+    if let (true, Some(index)) =
+        (country.is_some() || language.is_some() || decade.is_some(), indexes.facets.as_ref())
+    {
+        let matched = index.filter_all(Some(media_type), country, language, decade, None, None);
+        return matched.into_iter().map(|(id, kind)| (kind, id)).collect();
+    }
+    if let Some(genre) = value("primaryGenre") {
+        let matched = indexes.plot.titles_with_primary_genre(genre, Some(media_type));
+        return matched.into_iter().map(|(id, kind)| (kind, id)).collect();
+    }
+    // A bare year: the type's whole table, which `facts_match` then cuts to the year asked for.
+    indexes.plot.titles().filter(|&(kind, _)| kind == media_type).collect()
+}
+
+/// Whether a title carries every fact constraint.
+///
+/// Unknown is never a match, which is the opposite of the search lane's year window (`filter_years` keeps
+/// an unknown year rather than lose a candidate). A row LISTS what is known: a title whose country the
+/// facts do not give belongs in no country row, and putting it in one would make the row read as a census
+/// of the corpus rather than of what the corpus knows.
+fn facts_match(indexes: &Indexes, key: Key, facts: &[(String, String)]) -> bool {
+    if facts.is_empty() {
+        return true;
+    }
+    let (media_type, id) = key;
+    let title = indexes.facets.as_ref().and_then(|index| index.title(id, media_type));
+    let code_is = |code: Option<[u8; 2]>, want: &str| {
+        let (Some(code), [a, b]) = (code, want.as_bytes()) else { return false };
+        code[0].eq_ignore_ascii_case(a) && code[1].eq_ignore_ascii_case(b)
+    };
+    facts.iter().all(|(field, value)| match field.as_str() {
+        "primaryGenre" => primary_genre(indexes, key) == Some(value.as_str()),
+        "country" => code_is(title.and_then(|t| t.country), value),
+        "language" => code_is(title.and_then(|t| t.language), value),
+        "decade" => {
+            let asked = value.parse::<u16>();
+            title.and_then(|t| t.year).is_some_and(|y| asked.as_ref() == Ok(&(y / 10 * 10)))
+        }
+        "year" => {
+            let asked = value.parse::<u16>();
+            title.and_then(|t| t.year).is_some_and(|y| asked.as_ref() == Ok(&y))
+        }
+        _ => false,
+    })
+}
 
 /// How sure the labels are that a title carries a mood or subgenre, on the plot facets' scale (3 high, 2 medium,
 /// 1 low), or `None` under the floor.

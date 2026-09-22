@@ -161,6 +161,14 @@ pub fn row_coverage(indexes: &Indexes, media_type: MediaType, constraints: &[(St
         let known = match name.as_str() {
             "subgenre" => indexes.plot.subgenre_coverage_for(Some(media_type), DISPLAY_CONFIDENCE_FLOOR),
             "mood" => indexes.plot.mood_coverage_for(Some(media_type), DISPLAY_CONFIDENCE_FLOOR),
+            "primaryGenre" => indexes.plot.primary_genre_coverage_for(Some(media_type)),
+            // The facts, which live in the facet index rather than among the plot axes. Without this arm
+            // they fell to the axis branch and reported 0 known of 47,618 for a row that had just listed
+            // 961 Korean films — a coverage block that is worse than none, since a client is entitled to
+            // read it as "this row is guesswork".
+            field @ ("country" | "language" | "year" | "decade") => {
+                indexes.facets.as_ref().map_or(0, |facets| facets.coverage_for(field, Some(media_type)))
+            }
             axis => {
                 indexes.plot_facets.as_ref().map_or(0, |facets| facets.coverage_for(axis, Some(media_type)))
             }
