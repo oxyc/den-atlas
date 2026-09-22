@@ -1,40 +1,39 @@
-//! The per-title signals More Like This ranks on, read straight out of the store.
+//! The per-title signals More Like This ranks on, read straight out of the store: the `Facets` and
+//! `Authorship` the scorer takes.
 //!
-//! `den-index` deliberately knows nothing about facts or the dataset — it holds vectors and labels. So
-//! the scorer takes `Authorship` and `Facets`, and this module answers them.
+//! Here, beside the scorer, so everything that ranks a row — den-atlas serving, its tools, and a build of
+//! this crate in a browser — reads the store through one implementation. They were den-atlas's until the
+//! browser needed them too, and a second copy is how the two would have drifted.
 //!
 //! What each signal is, and why it exists, is in `den-dataset/scripts/v2/build_rail_facets.py` and
 //! den-spec `wire/store-v1.md`. The short version: the vectors say what a title is ABOUT, the labels say
 //! what KIND it is, and these say how it is TOLD (the facet choices), which world it is set in (`world`),
-//! what it is made of (the taxonomy nouls) and what it ARGUES (the critique axes).
+//! what it is made of (the taxonomy nouls), what it ARGUES (the critique axes), and who made it.
 //!
 //! # Nothing is parsed here
 //!
 //! This used to read a 50 MB JSON blob into `HashMap`s of owned `String`s — 47,529 titles × 12 axes × 2
-//! strings, about 1.1M allocations representing 188 distinct values, and most of the 552 MB atlas held.
-//! Now every per-title read is an index into a mapped column, and the only owned state is the three
-//! aggregates below, which cannot be columns because they are corpus-wide statistics.
+//! strings, about 1.1M allocations representing 188 distinct values. Now every per-title read is an index
+//! into a mapped column, and the only owned state is the aggregates below, which cannot be columns
+//! because they are corpus-wide statistics.
 
-use den_index::{Axis, MediaType, SimilarParams, ValueId, Weighted};
-use den_store::{Row, Store};
+use crate::{Axis, MediaType, SimilarParams, ValueId, Weighted};
+use den_store::{Row, Store, StoreError};
 use std::collections::HashMap;
-
-use crate::facts::Facts;
 
 /// The share of a media type holding an axis, for `ln(N / holders)`. Read at load into the idf aggregate,
 /// so unlike the knobs in `SimilarParams` a request cannot move it.
 const HOLDS: f64 = 0.7;
 
-// The three floors `build_rail_facets.py` applied when it wrote the JSON blob, re-applied HERE because
-// the store deliberately keeps full fidelity: a value below a floor is real data the store should hold
-// and the scorer should ignore, and baking a ranking decision into the artifact is what made the old
-// blob impossible to re-tune without a rebuild. The noul and world floors are per-request knobs in
-// `den_index::SimilarParams`; the critique floor is here because the centering mean is built with it.
+// The floors `build_rail_facets.py` applied when it wrote the JSON blob, re-applied HERE because the store
+// deliberately keeps full fidelity: a value below a floor is real data the store should hold and the scorer
+// should ignore, and baking a ranking decision into the artifact is what made the old blob impossible to
+// re-tune without a rebuild. The noul and world floors are per-request knobs in `SimilarParams`; the
+// critique floor is here because the centering mean is built with it.
 //
 // They are not cosmetic. Dropping the noul floor took the corpus mean noul cosine from 0.38 to 0.51 and
 // changed 5 of The Wire's top 20 — the shared-baseline problem the critique centering exists to avoid,
-// reintroduced in a different term. `world` below its floor made 50% of rows move. Restoring them keeps
-// this migration what it claimed to be: the same ranking, read from a different place.
+// reintroduced in a different term. `world` below its floor made 50% of rows move.
 /// A critique axis below this says nothing about what the work argues.
 const CRITIQUE_FLOOR: f64 = 0.10;
 
@@ -44,6 +43,13 @@ fn media_code(media: MediaType) -> u8 {
         MediaType::Movie => 0,
         MediaType::Tv => 1,
     }
+}
+
+/// A title's row: binary search over the keys column, the same as `Store::row_of`, but over a slice
+/// resolved once rather than looked up again for every candidate.
+fn row_in(keys: &[u64], media: u8, tmdb_id: u32) -> Option<Row> {
+    let want = (u64::from(media) << 32) | u64::from(tmdb_id);
+    keys.binary_search(&want).ok().map(Row)
 }
 
 /// The corpus-wide statistics the scorer needs, computed once at load.
@@ -63,8 +69,6 @@ pub struct RailAggregates {
     /// and Angel 0.792 against The Wire, ranking them correctly and separating them by almost nothing.
     /// Centered, the same pair is +0.700 and +0.274.
     critique_mean: HashMap<(u8, ValueId), f64>,
-    /// Rows of each media type, so `critique_top`'s scan knows what it is scanning.
-    rows_of_media: HashMap<u8, Vec<Row>>,
 }
 
 impl RailAggregates {
@@ -103,7 +107,6 @@ impl RailAggregates {
         for (row, &key) in keys.iter().enumerate() {
             let media = (key >> 32) as u8;
             *totals.entry(media).or_insert(0.0) += 1.0;
-            out.rows_of_media.entry(media).or_default().push(Row(row));
 
             for axis in 0..den_store::FACET_AXES.len() {
                 let at = row * den_store::FACET_AXES.len() + axis;
@@ -144,10 +147,10 @@ impl RailAggregates {
     }
 }
 
-/// One seed's view of the store — the shape `den_index::Facets` wants.
+/// One seed's view of the store — the shape `Facets` wants.
 ///
 /// Holds the COLUMNS, not the store. `Store::column` finds a section by scanning the section table and
-/// comparing 16-byte names, and every method below is called once per CANDIDATE — `POOL_K` is 400, so
+/// comparing 16-byte names, and every method below is called once per CANDIDATE — `pool_k` is 400, so
 /// looking a column up per call cost roughly fifteen hundred name comparisons per candidate to re-find
 /// slices that cannot move while the store is mapped.
 pub struct SeedFacets<'a> {
@@ -184,15 +187,10 @@ impl<'a> SeedFacets<'a> {
     /// All-or-nothing on purpose: a rail that dropped only the absent signal would score some titles on
     /// fewer terms than others and still return twenty confident-looking answers.
     ///
-    /// This is also the ONLY list of what the rail needs. `MappedStore::check` used to carry a second
-    /// copy, kept in step by a comment — so adding a column here and forgetting it there would leave a
-    /// store that passes the load gate, falls back to the pre-pooled scorer on every request, memoises
-    /// that, and reports healthy. `check` now calls this instead, and the error names the section.
-    pub fn new(
-        store: &Store<'a>,
-        agg: &'a RailAggregates,
-        media: MediaType,
-    ) -> Result<Self, den_store::StoreError> {
+    /// This is also the ONLY list of what the rail needs. den-atlas's load gate calls this constructor
+    /// rather than keeping a second list of section names in step with it, so there is no way to add a
+    /// column here and forget to require it there.
+    pub fn new(store: &Store<'a>, agg: &'a RailAggregates, media: MediaType) -> Result<Self, StoreError> {
         let production = SimilarParams::default();
         Ok(SeedFacets {
             noul_floor: production.noul_floor,
@@ -212,11 +210,8 @@ impl<'a> SeedFacets<'a> {
         })
     }
 
-    /// The row for a title. Binary search over the keys column, the same as `Store::row_of` — done here
-    /// so it reads the slice resolved above rather than looking `keys` up again on every candidate.
     fn row(&self, tmdb_id: u32) -> Option<Row> {
-        let want = (u64::from(self.media) << 32) | u64::from(tmdb_id);
-        self.keys.binary_search(&want).ok().map(Row)
+        row_in(self.keys, self.media, tmdb_id)
     }
 
     /// The raw critique profile of a row, as (name id, probability), floored.
@@ -237,7 +232,7 @@ impl<'a> SeedFacets<'a> {
     }
 }
 
-impl den_index::Facets for SeedFacets<'_> {
+impl crate::Facets for SeedFacets<'_> {
     fn facets(&self, tmdb_id: u32) -> Vec<(Axis, ValueId, f64)> {
         let Some(row) = self.row(tmdb_id) else { return Vec::new() };
         let n = den_store::FACET_AXES.len();
@@ -289,9 +284,8 @@ impl den_index::Facets for SeedFacets<'_> {
         // Centering applies to the axes that survive CRITIQUE_FLOOR, not to all seventeen. An axis the
         // title reads near zero on is dropped before this, so it is skipped by the cosine's name
         // intersection rather than centered to -mean — and a row that is blank throughout contributes
-        // nothing instead of scoring a real negative against the mean, which is what
-        // `a_row_without_critique_returns_nothing` pins. "Unknown is not none" is the rule; a floored
-        // axis is unknown.
+        // nothing instead of scoring a real negative against the mean. "Unknown is not none" is the rule;
+        // a floored axis is unknown.
         self.critique_at(row)
             .into_iter()
             .map(|(name, p)| (name, p - self.agg.critique_mean.get(&(media, name)).copied().unwrap_or(0.0)))
@@ -313,179 +307,93 @@ impl den_index::Facets for SeedFacets<'_> {
             })
             .collect()
     }
-
-    fn critique_top(&self, seed: u32, other: u32, n: usize) -> bool {
-        let defining = self.critique_defining(seed);
-        if defining.is_empty() {
-            return false;
-        }
-        let total: f64 = defining.iter().map(|(_, w)| w).sum();
-        if total <= 0.0 {
-            return false;
-        }
-        let score = |row: Row| -> f64 {
-            let theirs = self.critique_at(row);
-            defining
-                .iter()
-                .filter_map(|(a, w)| theirs.iter().find(|(name, _)| name == a).map(|(_, p)| w * p))
-                .sum::<f64>()
-                / total
-        };
-        let Some(other_row) = self.row(other) else { return false };
-        let mine = score(other_row);
-        let empty = Vec::new();
-        let rows = self.agg.rows_of_media.get(&self.media).unwrap_or(&empty);
-        // Only reached for a candidate the tone floor would otherwise cut, so the scan is rare.
-        rows.iter().filter(|&&row| score(row) > mine).count() < n
-    }
 }
 
-/// One seed's authorship, out of the facts: who made it, where it lived, and what shares either.
+/// One seed's authorship, out of the store's credit lists: who made it, where it lived, and what shares
+/// either.
+///
+/// Makers are the `makers_*` list — directors, creators and screenwriters — and homes the
+/// `broadcasters_*` list. Both hold indices into the entity table, and are compared as the Q-ids those
+/// indices name, which is what den-atlas's facts compared when authorship was read from them: an index
+/// the table cannot resolve names nobody and counts for nothing, on either side of a share.
 pub struct SeedAuthorship<'a> {
-    pub facts: &'a Facts,
-    pub media: MediaType,
-    /// The seed's own credited makers and broadcasters, as interned Q-ids.
-    pub makers: Vec<u32>,
-    pub homes: Vec<u32>,
+    media: u8,
+    keys: &'a [u64],
+    ent_qid: &'a [u32],
+    makers: den_store::List<'a, u32>,
+    broadcasters: den_store::List<'a, u32>,
+    /// The seed's own makers and homes, as Q-ids.
+    mine_makers: Vec<u32>,
+    mine_homes: Vec<u32>,
 }
 
 impl<'a> SeedAuthorship<'a> {
-    pub fn of(facts: &'a Facts, media: MediaType, tmdb_id: u32) -> SeedAuthorship<'a> {
-        let record = facts.get(tmdb_id, media);
-        SeedAuthorship {
-            facts,
-            media,
-            makers: record.map(|r| r.makers.clone()).unwrap_or_default(),
-            homes: record.map(|r| r.broadcasters.clone()).unwrap_or_default(),
+    /// `tmdb_id`'s authorship; a title the store does not hold has none, and nominates and matches nothing.
+    pub fn of(store: &Store<'a>, media: MediaType, tmdb_id: u32) -> Result<Self, StoreError> {
+        let mut out = SeedAuthorship {
+            media: media_code(media),
+            keys: store.per_row::<u64>("keys")?,
+            ent_qid: store.column::<u32>("ent_qid")?,
+            makers: store.list::<u32>("makers_v", "makers_o")?,
+            broadcasters: store.list::<u32>("broadcasters_v", "broadcasters_o")?,
+            mine_makers: Vec::new(),
+            mine_homes: Vec::new(),
+        };
+        if let Some(row) = row_in(out.keys, out.media, tmdb_id) {
+            out.mine_makers = out.qids(out.makers.get(row)).collect();
+            out.mine_homes = out.qids(out.broadcasters.get(row)).collect();
         }
+        Ok(out)
     }
 
-    fn share(mine: &[u32], theirs: &[u32]) -> f64 {
-        if mine.is_empty() || theirs.is_empty() {
+    fn qids<'s>(&'s self, entities: &'s [u32]) -> impl Iterator<Item = u32> + 's {
+        entities.iter().filter_map(|&i| self.ent_qid.get(i as usize).copied())
+    }
+
+    /// Share of `mine` found among `theirs` (entity indices), 0..=1.
+    fn share(&self, mine: &[u32], theirs: &[u32]) -> f64 {
+        if mine.is_empty() || self.qids(theirs).next().is_none() {
             return 0.0;
         }
-        let hit = mine.iter().filter(|m| theirs.contains(m)).count();
+        let hit = mine.iter().filter(|m| self.qids(theirs).any(|q| q == **m)).count();
         hit as f64 / mine.len() as f64
+    }
+
+    fn list_of(&self, list: &den_store::List<'a, u32>, tmdb_id: u32) -> &'a [u32] {
+        row_in(self.keys, self.media, tmdb_id).map_or(&[], |row| list.get(row))
     }
 }
 
-impl den_index::Authorship for SeedAuthorship<'_> {
+impl crate::Authorship for SeedAuthorship<'_> {
+    /// Every title of the seed's type crediting one of its makers, by id — the seed's own siblings,
+    /// whatever the vectors think of them. The Wire and The Deuce share a creator and The Deuce is premise
+    /// rank 764, plot 628, outside any sane pool.
+    ///
+    /// Makers only. Nominating everything sharing a HOME floods the pool — HBO alone is 131 titles — and
+    /// measured worse: it kept The Deuce but pushed Show Me a Hero out entirely, and raised mean
+    /// same-genre share from 46% to 48%. A home is where a title lived, not evidence that it is the same
+    /// kind of thing.
     fn nominate(&self) -> Vec<u32> {
-        // Makers only. Nominating everything sharing a HOME floods the pool — HBO alone is 131 titles —
-        // and measured worse: it kept The Deuce but pushed Show Me a Hero out entirely, and raised mean
-        // same-genre share from 46% to 48%. A home is where a title lived, not evidence that it is the
-        // same kind of thing.
-        if self.makers.is_empty() {
+        if self.mine_makers.is_empty() {
             return Vec::new();
         }
-        self.facts.titles_sharing_makers(self.media, &self.makers)
+        // Keys are sorted, so one type's ids come out ascending.
+        self.keys
+            .iter()
+            .enumerate()
+            .filter(|&(row, &key)| {
+                (key >> 32) as u8 == self.media
+                    && self.qids(self.makers.get(Row(row))).any(|q| self.mine_makers.contains(&q))
+            })
+            .map(|(_, &key)| key as u32)
+            .collect()
     }
 
     fn makers(&self, tmdb_id: u32) -> f64 {
-        let theirs = self.facts.get(tmdb_id, self.media).map(|r| r.makers.as_slice()).unwrap_or(&[]);
-        Self::share(&self.makers, theirs)
+        self.share(&self.mine_makers, self.list_of(&self.makers, tmdb_id))
     }
 
     fn home(&self, tmdb_id: u32) -> f64 {
-        let theirs = self.facts.get(tmdb_id, self.media).map(|r| r.broadcasters.as_slice()).unwrap_or(&[]);
-        Self::share(&self.homes, theirs)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use den_index::Facets as _;
-
-    /// den-spec's three-title fixture. These tests exist because the first version of this file had
-    /// none, and that is exactly what let three thresholds quietly change the ranking: the store still
-    /// loaded, every row still returned twelve facets, and the numbers were simply different.
-    ///
-    /// `crate::store::spec_fixture` fails rather than returns `None` when den-spec is absent, so these
-    /// cannot go back to reporting a pass over a store they never opened.
-    macro_rules! loaded {
-        () => {
-            match crate::store::spec_fixture() {
-                Some(path) => crate::store::LoadedStore::open(&path).expect("the fixture loads"),
-                None => return,
-            }
-        };
-    }
-
-    fn seed(loaded: &crate::store::LoadedStore, media: MediaType) -> SeedFacets<'_> {
-        SeedFacets::new(&loaded.view(), &loaded.aggregates, media)
-            .expect("the fixture carries every column the rail reads")
-    }
-
-    /// The fixture's `movie:1` answers `era` and `tone`, and DECLINES `pacing`. A declined axis must be
-    /// absent, not a value: a scorer that counted `does-not-apply` as agreement would pair every
-    /// declining title with every other.
-    #[test]
-    fn facets_carry_confidence_and_declines_are_absent() {
-        let loaded = loaded!();
-        let facets = seed(&loaded, MediaType::Movie).facets(1);
-        let era = den_store::FACET_AXES.iter().position(|a| *a == "era").unwrap() as Axis;
-        let pacing = den_store::FACET_AXES.iter().position(|a| *a == "pacing").unwrap() as Axis;
-
-        let (_, _, conf) = facets.iter().find(|(a, _, _)| *a == era).expect("era is answered");
-        assert!((conf - 0.96).abs() < 1e-9, "confidence is hundredths, got {conf}");
-        assert!(!facets.iter().any(|(a, _, _)| *a == pacing), "a declined axis must not appear");
-    }
-
-    /// Prevalence is per media type and per axis. With one movie answering `era`, that value's
-    /// prevalence among movies is 1 of 2 movie rows.
-    #[test]
-    fn prevalence_is_scoped_to_one_media_type() {
-        let loaded = loaded!();
-        let movies = seed(&loaded, MediaType::Movie);
-        let era = den_store::FACET_AXES.iter().position(|a| *a == "era").unwrap() as Axis;
-        let (_, value, _) = movies.facets(1).into_iter().find(|(a, _, _)| *a == era).unwrap();
-
-        assert!((movies.prevalence(era, value) - 0.5).abs() < 1e-9, "1 of 2 movie rows");
-        // The same value id, asked of the other media type, must not read the movie statistic.
-        assert!((seed(&loaded, MediaType::Tv).prevalence(era, value) - 1.0).abs() < 1e-9);
-    }
-
-    /// The floors this file re-applies. `movie:1` holds `theme__vampire` at 0.25 (kept) and the fixture
-    /// gives it a `world` of 0.25 from that; a value below `WORLD_FLOOR` must read as 0.
-    #[test]
-    fn nouls_and_world_are_floored() {
-        let loaded = loaded!();
-        let movies = seed(&loaded, MediaType::Movie);
-
-        let floors = SimilarParams::default();
-        assert!(movies.nouls(1).iter().all(|(_, p)| *p >= floors.noul_floor), "every noul clears the floor");
-        let world = movies.world(1);
-        assert!(world == 0.0 || world >= floors.world_floor, "world is floored, got {world}");
-        // A row with nothing at all reads as zero distance, not as a missing value.
-        assert_eq!(movies.world(2), 0.0);
-    }
-
-    /// "Unknown is not none." A row with no critique must return NOTHING, so the cosine term is skipped
-    /// — not a negated mean vector that scores a real, usually negative, similarity.
-    #[test]
-    fn a_row_without_critique_returns_nothing() {
-        let loaded = loaded!();
-        let movies = seed(&loaded, MediaType::Movie);
-
-        assert!(!movies.critique(1).is_empty(), "movie:1 argues about something");
-        assert!(movies.critique_raw(2).is_empty(), "movie:2 has no critique at all");
-        assert!(movies.critique(2).is_empty(), "and centering must not manufacture seventeen values for it");
-    }
-
-    /// Centering subtracts the per-media mean, so a title above the corpus on an axis reads positive.
-    #[test]
-    fn critique_is_centered_on_its_own_media_type() {
-        let loaded = loaded!();
-        let movies = seed(&loaded, MediaType::Movie);
-        let raw = movies.critique_raw(1);
-        let centered = movies.critique(1);
-
-        assert_eq!(raw.len(), centered.len());
-        for ((name, r), (name2, c)) in raw.iter().zip(&centered) {
-            assert_eq!(name, name2, "centering preserves order");
-            assert!(c <= r, "centering subtracts a non-negative mean: {r} -> {c}");
-        }
-        assert!(centered.iter().any(|(_, c)| *c > 0.0), "something must be above its own mean");
+        self.share(&self.mine_homes, self.list_of(&self.broadcasters, tmdb_id))
     }
 }

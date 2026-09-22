@@ -9,13 +9,15 @@
 pub mod eval;
 mod facets;
 mod index;
+mod rail;
 mod similar;
 
 pub use facets::{FacetIndex, FacetQuery, TitleFacets};
-pub use index::{Index, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
+pub use index::{Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
+pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use similar::{
-    more_like_this, more_like_this_pooled, more_like_this_scored, Authorship, Axis, Facets, Knob, Scored,
-    SimilarParams, ValueId, Weighted, MAX_ROW,
+    more_like_this, more_like_this_pooled, more_like_this_scored, rank_pool, Authorship, Axis, Candidate,
+    Facets, Knob, Scored, SimilarParams, ValueId, Weighted, MAX_ROW,
 };
 
 /// The two kinds of title in the index. The store packs the distinction into a key's high word; this

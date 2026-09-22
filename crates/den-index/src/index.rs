@@ -130,6 +130,72 @@ pub struct Labels<'a> {
     pub moods: Vec<(&'a str, f64)>,
 }
 
+/// The store's label sections, resolved once: the one reader of them.
+///
+/// `Index` builds its records through this, and a caller that ranks without an `Index` — one holding the
+/// label columns but no vectors — reads labels through it too, so the two cannot disagree about what a
+/// title's labels are.
+pub struct LabelColumns<'a> {
+    keys: &'a [u64],
+    strings: den_store::Strings<'a>,
+    primary_genre: &'a [u32],
+    animated: &'a [u8],
+    // Values and confidences share one offsets array, so row i owns the same span in both.
+    subgenre_v: den_store::List<'a, u32>,
+    subgenre_c: den_store::List<'a, u8>,
+    mood_v: den_store::List<'a, u32>,
+    mood_c: den_store::List<'a, u8>,
+}
+
+impl<'a> LabelColumns<'a> {
+    pub fn new(store: &den_store::Store<'a>) -> Result<Self, den_store::StoreError> {
+        Ok(LabelColumns {
+            keys: store.per_row::<u64>("keys")?,
+            strings: store.strings()?,
+            primary_genre: store.per_row::<u32>("primary_genre")?,
+            animated: store.per_row::<u8>("animated")?,
+            subgenre_v: store.list::<u32>("subgenre_v", "subgenre_o")?,
+            subgenre_c: store.list::<u8>("subgenre_c", "subgenre_o")?,
+            mood_v: store.list::<u32>("mood_v", "mood_o")?,
+            mood_c: store.list::<u8>("mood_c", "mood_o")?,
+        })
+    }
+
+    /// A title's labels; `None` when the store does not hold it.
+    pub fn of(&self, tmdb_id: u32, media_type: MediaType) -> Option<Labels<'a>> {
+        let media = u64::from(media_type == MediaType::Tv);
+        let row = self.keys.binary_search(&((media << 32) | u64::from(tmdb_id))).ok()?;
+        Some(self.labels(den_store::Row(row)))
+    }
+
+    /// A row's labels. Confidence is stored in hundredths, so `57u8 as f64 / 100.0` is bit-identical to
+    /// parsing `"0.57"`.
+    fn labels(&self, row: den_store::Row) -> Labels<'a> {
+        // An id the dictionary cannot resolve is dropped, never read as "": a nameless label would collide
+        // with the absent primary genre and become a bucket nothing can ask for.
+        let scored = |values: &'a [u32], confidences: &'a [u8]| -> Vec<(&'a str, f64)> {
+            values
+                .iter()
+                .zip(confidences)
+                .filter_map(|(&value, &confidence)| {
+                    Some((self.strings.get(value)?, f64::from(confidence) / 100.0))
+                })
+                .collect()
+        };
+        Labels {
+            // Absent is "", as it is in the blob, where `primaryGenre` defaults to the empty string.
+            primary_genre: self
+                .primary_genre
+                .get(row.0)
+                .and_then(|&id| self.strings.get(id))
+                .unwrap_or_default(),
+            animated: self.animated.get(row.0).is_some_and(|&a| a != 0),
+            subgenres: scored(self.subgenre_v.get(row), self.subgenre_c.get(row)),
+            moods: scored(self.mood_v.get(row), self.mood_c.get(row)),
+        }
+    }
+}
+
 pub struct Index {
     taxonomy_version: String,
     dim: usize,
@@ -258,15 +324,8 @@ impl Index {
         let (vector_section, has_section) = space.sections();
         let labelled = |e: den_store::StoreError| LoadError::Labels(e.to_string());
         let vectored = |e: den_store::StoreError| LoadError::Vectors(e.to_string());
-        let keys = store.per_row::<u64>("keys").map_err(labelled)?;
-        let strings = store.strings().map_err(labelled)?;
-        let primary_genre = store.per_row::<u32>("primary_genre").map_err(labelled)?;
-        let animated = store.per_row::<u8>("animated").map_err(labelled)?;
-        // Values and confidences share one offsets array, so row i owns the same span in both.
-        let subgenre_v = store.list::<u32>("subgenre_v", "subgenre_o").map_err(labelled)?;
-        let subgenre_c = store.list::<u8>("subgenre_c", "subgenre_o").map_err(labelled)?;
-        let mood_v = store.list::<u32>("mood_v", "mood_o").map_err(labelled)?;
-        let mood_c = store.list::<u8>("mood_c", "mood_o").map_err(labelled)?;
+        let columns = LabelColumns::new(store).map_err(labelled)?;
+        let keys = columns.keys;
         let has_vector = store.per_row::<u8>(has_section).map_err(vectored)?;
         let space_vectors = store.column::<i8>(vector_section).map_err(vectored)?;
 
@@ -300,26 +359,17 @@ impl Index {
             if has_vector[i] == 0 {
                 continue;
             }
-            let row = den_store::Row(i);
-            // An id the dictionary cannot resolve is dropped, never interned as "": a nameless label would
-            // collide with the absent primary genre and become a bucket nothing can ask for.
-            let mut scored = |values: &[u32], confidences: &[u8]| -> Box<[(u32, f64)]> {
-                values
-                    .iter()
-                    .zip(confidences)
-                    .filter_map(|(&value, &confidence)| {
-                        Some((intern(strings.get(value)?.to_owned()), f64::from(confidence) / 100.0))
-                    })
-                    .collect()
+            let labels = columns.labels(den_store::Row(i));
+            let mut interned = |pairs: &[(&str, f64)]| -> Box<[(u32, f64)]> {
+                pairs.iter().map(|&(name, confidence)| (intern(name.to_owned()), confidence)).collect()
             };
-            let subgenres = scored(subgenre_v.get(row), subgenre_c.get(row));
-            let moods = scored(mood_v.get(row), mood_c.get(row));
+            let subgenres = interned(&labels.subgenres);
+            let moods = interned(&labels.moods);
             records.push(Record {
                 tmdb_id: packed as u32,
                 media_type: Some(if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie }),
-                // Absent is "", as it is in the blob, where `primaryGenre` defaults to the empty string.
-                primary_genre: intern(strings.get(primary_genre[i]).unwrap_or_default().to_owned()),
-                animated: animated[i] != 0,
+                primary_genre: intern(labels.primary_genre.to_owned()),
+                animated: labels.animated,
                 subgenres,
                 moods,
             });

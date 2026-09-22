@@ -14,17 +14,16 @@
 //! panicked on any current generation — while still COMPILING, because CI builds examples. A tuning tool
 //! nobody can start is the same as one that does not exist, and that had now happened to this file twice.
 //!
-//! Everything it parsed is in the store, and the readers are already here: `Facts::from_store`,
-//! `SeedFacets`, `SeedAuthorship`. `den-index` cannot take `den-store` — it has to keep building for
-//! wasm32 and aarch64-apple-tvos — so the harness moved to where the store already is. About two hundred
-//! lines of bespoke JSON parsing went with it, and with them the risk that mattered most: the harness
-//! built its own facets and its own authorship, by hand, from a different file than serving reads. It now
-//! measures what serving actually does, through the same code.
+//! Everything it parsed is in the store, and serving's readers of it are `den_index::SeedFacets` and
+//! `den_index::SeedAuthorship`, over the store serving maps. About two hundred lines of bespoke JSON
+//! parsing went with the move, and with them the risk that mattered most: the harness built its own facets
+//! and its own authorship, by hand, from a different file than serving reads. It now measures what serving
+//! actually does, through the same code.
 
-use crate::facts::Facts;
 use crate::queries::Indexes;
-use crate::rail::{SeedAuthorship, SeedFacets};
-use den_index::{more_like_this, more_like_this_pooled, Facets, Index, MediaType};
+use den_index::{
+    more_like_this, more_like_this_pooled, Authorship, Facets, Index, MediaType, SeedAuthorship, SeedFacets,
+};
 use std::collections::HashMap;
 
 /// Anchors chosen to cover the reported defects and the cases the rail already gets right, so a change
@@ -127,16 +126,16 @@ fn title(index: &Index, id: u32, media: MediaType) -> String {
 ///
 /// An independently constructed copy printed a different row than the one being measured, which is worse
 /// than no print at all.
-fn pooled(indexes: &Indexes, facts: &Facts, id: u32, media: MediaType) -> Option<Vec<u32>> {
+fn pooled(indexes: &Indexes, id: u32, media: MediaType) -> Option<Vec<u32>> {
     let view = indexes.store.view();
     let facets = SeedFacets::new(&view, &indexes.store.aggregates, media).ok()?;
-    let authorship = SeedAuthorship::of(facts, media, id);
+    let authorship = SeedAuthorship::of(&view, media, id).ok()?;
     Some(more_like_this_pooled(
         Some(&indexes.plot),
         indexes.premise.as_ref(),
         id,
         media,
-        Some(&authorship as &dyn den_index::Authorship),
+        Some(&authorship as &dyn Authorship),
         Some(&facets as &dyn Facets),
     ))
 }
@@ -161,10 +160,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
         }
     };
     // No store-less arm to guard against any more: `load_for_tools` fails without one.
-    let Some(facts) = indexes.facts.as_ref() else {
-        eprintln!("rail-ab: this dataset has no readable facts — authorship cannot be scored");
-        return 1;
-    };
+    let view = indexes.store.view();
 
     println!(
         "{:<24} {:>9} {:>9}   {:>9} {:>9}   {:>4} {:>4}",
@@ -206,7 +202,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
         };
         let genre = seed.primary_genre.to_string();
         let a = more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, media);
-        let Some(b_full) = pooled(&indexes, facts, id, media) else {
+        let Some(b_full) = pooled(&indexes, id, media) else {
             println!("{name:<24}  NO POOLED ROW");
             continue;
         };
@@ -232,17 +228,11 @@ pub fn run(dir: &std::path::Path) -> i32 {
 
         // Share of the visible twenty crediting one of the seed's own makers.
         let by_same_maker = |row: &[u32]| -> f64 {
-            let mine = &SeedAuthorship::of(facts, media, id).makers;
-            if mine.is_empty() || row.is_empty() {
+            let Ok(authorship) = SeedAuthorship::of(&view, media, id) else { return 0.0 };
+            if row.is_empty() {
                 return 0.0;
             }
-            let hits = row
-                .iter()
-                .take(20)
-                .filter(|&&other| {
-                    facts.get(other, media).is_some_and(|r| r.makers.iter().any(|m| mine.contains(m)))
-                })
-                .count();
+            let hits = row.iter().take(20).filter(|&&other| authorship.makers(other) > 0.0).count();
             hits as f64 / row.len().min(20) as f64
         };
         auth_share_a += by_same_maker(&a);
@@ -311,7 +301,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
 
     if let Ok(want) = std::env::var("RAIL_SHOW") {
         if let Some(&(name, id, media)) = ANCHORS.iter().find(|a| a.0 == want) {
-            if let Some(row) = pooled(&indexes, facts, id, media) {
+            if let Some(row) = pooled(&indexes, id, media) {
                 println!("\n{name}, pooled scorer:");
                 for (i, id) in row.iter().enumerate().take(20) {
                     println!("  {:>2}. {}", i + 1, title(&indexes.plot, *id, media));
