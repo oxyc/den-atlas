@@ -61,6 +61,8 @@ const EXACT_POPULAR: f64 = 0.25;
 const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 /// Candidates each lane proposes.
 const TITLE_LANE: usize = 50;
+/// Titles a ruled-out name is looked up among: enough for every film in a long series ("harry potter").
+const EXCLUDED_TITLES: usize = 200;
 const FACET_LANE: usize = 500;
 const LANE: usize = 200;
 /// The vote count at which a title counts as fully popular.
@@ -223,6 +225,9 @@ pub struct Parsed {
     leftover: String,
     /// The share of the query's words left over: how thematic it is.
     lambda: f64,
+    /// The words asked for — the query without what it rules out — folded.
+    kept: String,
+    excluded: Excluded,
 }
 
 /// A query as `Parsed` reads it, before anything is read out of it: folded words joined by single spaces.
@@ -236,10 +241,11 @@ impl Parsed {
         &self.text
     }
 
-    /// What the plot vectors are asked about: the leftover words, or the whole query when nothing is left over.
-    /// `None` for a query too short to mean anything.
+    /// What the plot vectors are asked about: the leftover words, or the words asked for when nothing is left
+    /// over — never a ruled-out word, which the vectors would read as the very thing it rules out. `None` for a
+    /// query too short to mean anything.
     pub fn embed_text(&self) -> Option<&str> {
-        if self.text.chars().count() < 2 {
+        if self.kept.chars().count() < 2 {
             return None;
         }
         // NOTHING LEFT OVER MEANS NOTHING TO ASK THE VECTORS.
@@ -255,7 +261,7 @@ impl Parsed {
         if self.leftover.is_empty() && self.names_something() {
             return None;
         }
-        Some(if self.leftover.is_empty() { &self.text } else { &self.leftover })
+        Some(if self.leftover.is_empty() { &self.kept } else { &self.leftover })
     }
 
     /// Set the release-year window from a caller that computed it, overriding whatever the text implied.
@@ -308,12 +314,73 @@ fn words(text: &str) -> Vec<String> {
     fold(text).split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_owned).collect()
 }
 
+/// What a run of words names: the tables' matches, and the words no table consumed.
+#[derive(Default)]
+struct Names {
+    genres: Vec<u16>,
+    labels: Vec<(String, bool)>,
+    plot: Vec<(&'static str, &'static str)>,
+    source_kinds: u16,
+    people: Vec<u32>,
+    rest: Vec<String>,
+}
+
+impl Names {
+    fn names_anything(&self) -> bool {
+        !self.genres.is_empty()
+            || !self.labels.is_empty()
+            || !self.plot.is_empty()
+            || self.source_kinds != 0
+            || !self.people.is_empty()
+    }
+}
+
+/// What a query rules out ("not", "without" — `split_negation`). Each is a DROP: the person said they do not
+/// want it, which is a statement, not a reading of ambiguous words.
+#[derive(Default)]
+struct Excluded {
+    /// The ruled-out phrases as written, for the parse report.
+    phrases: Vec<String>,
+    countries: Vec<&'static str>,
+    decades: Vec<u16>,
+    media_types: Vec<MediaType>,
+    names: Names,
+    /// Titles CALLED what was ruled out, and the rest of a franchise one of them leads.
+    titles: HashSet<Key>,
+}
+
+impl Excluded {
+    fn is_empty(&self) -> bool {
+        self.phrases.is_empty()
+    }
+}
+
+/// Leading and trailing words that cannot name a title on their own: "not from the 80s" leaves "from the"
+/// once the decade is read, and that must not rule out *From the Earth to the Moon*.
+const FILLER: &[&str] = &["a", "an", "the", "any", "from", "of", "in", "with", "too", "much", "so", "very"];
+
 /// Read a query: the facets first (`FacetQuery`), then the longest phrases among the rest that name a plot facet,
-/// a genre or a label; whatever is left is the leftover.
+/// a genre or a label; whatever is left is the leftover. Words after a negation are read the same way and rule
+/// out what they name.
 pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
-    let facet = FacetQuery::parse(text);
-    let total = words(text).len().max(1);
-    let tokens = words(&facet.leftover);
+    let whole = normalized(text);
+    let title_query = TitleQuery::new(&whole);
+    let mut negation = den_index::split_negation(&whole);
+    // A title that contains a negation is a title: `do not disturb` asks for the film, not for things without
+    // a disturbance.
+    let is_a_title = || {
+        indexes.display.as_ref().is_some_and(|display| {
+            display
+                .search_with(&whole, None, TITLE_LANE, MIN_COVERAGE)
+                .iter()
+                .any(|h| title_query.score(h.title).1)
+        })
+    };
+    if !negation.excluded.is_empty() && is_a_title() {
+        negation = den_index::Negation { kept: whole.clone(), excluded: Vec::new() };
+    }
+    let facet = FacetQuery::parse(&negation.kept);
+    let total = words(&negation.kept).len().max(1);
     let label_names: Vec<(String, &str, bool)> = indexes
         .plot
         .subgenre_labels()
@@ -322,6 +389,122 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         .chain(indexes.plot.mood_labels().into_iter().map(|name| (name, true)))
         .map(|(name, mood)| (words(name).join(" "), name, mood))
         .collect();
+    let tokens = words(&facet.leftover);
+    let one_word_names = tokens.len() == 1;
+    let Names { genres, labels, plot, source_kinds, people, rest } =
+        read_names(&tokens, one_word_names, indexes, &label_names);
+    let excluded = read_excluded(&negation.excluded, indexes, &label_names);
+    let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
+        .facts
+        .as_ref()
+        .map(|facts| people.iter().map(|&qid| (qid, facts.credits(qid))).collect())
+        .unwrap_or_default();
+    let makers = people
+        .iter()
+        .copied()
+        .filter(|qid| {
+            credits.get(qid).is_some_and(|c| 2 * c.iter().filter(|(_, made)| *made).count() >= c.len())
+        })
+        .collect();
+    Parsed {
+        title_query,
+        text: whole,
+        kept: normalized(&negation.kept),
+        credits,
+        lambda: rest.len() as f64 / total as f64,
+        leftover: rest.join(" "),
+        facet,
+        genres,
+        labels,
+        plot,
+        source_kinds,
+        runtime_max: None,
+        broadcaster: None,
+        year_from_param: false,
+        people,
+        makers,
+        excluded,
+    }
+}
+
+/// The ruled-out phrases, each read by the facet parser and the same tables as the words asked for.
+fn read_excluded(phrases: &[String], indexes: &Indexes, label_names: &[(String, &str, bool)]) -> Excluded {
+    let mut out = Excluded { phrases: phrases.to_vec(), ..Excluded::default() };
+    for phrase in phrases {
+        let facet = FacetQuery::parse(phrase);
+        out.countries.extend(facet.country);
+        out.decades.extend(facet.decade);
+        out.media_types.extend(facet.media_type);
+        // A one-word name is never read here: "without batman" means the character, not someone called Batman.
+        let names = read_names(&words(&facet.leftover), false, indexes, label_names);
+        let named_facet = facet.country.is_some() || facet.decade.is_some() || facet.media_type.is_some();
+        let franchises = !names.names_anything() && !named_facet;
+        let called = trim_filler(&names.rest);
+        if !called.is_empty() {
+            out.titles.extend(titles_called(indexes, called, franchises));
+        }
+        let into = &mut out.names;
+        into.genres.extend(names.genres);
+        into.labels.extend(names.labels);
+        into.plot.extend(names.plot);
+        into.source_kinds |= names.source_kinds;
+        into.people.extend(names.people);
+    }
+    out
+}
+
+fn trim_filler(phrase: &[String]) -> &[String] {
+    let filler = |w: &String| FILLER.contains(&w.as_str());
+    let start = phrase.iter().position(|w| !filler(w)).unwrap_or(phrase.len());
+    let end = phrase.iter().rposition(|w| !filler(w)).map_or(start, |at| at + 1);
+    &phrase[start..end]
+}
+
+/// Titles the phrase ruled out BY NAME: every title whose words contain the phrase's words in order ("star wars"
+/// → *Lego Star Wars: Revenge of the Brick*). When `franchises`, a title that LEADS with the phrase also rules
+/// out the rest of its series (P179) — *Batman Begins* takes *The Dark Knight* with it, which no title match
+/// can — but one that merely contains it does not: *The Lego Batman Movie* must not take *The Lego Movie*.
+fn titles_called(indexes: &Indexes, phrase: &[String], franchises: bool) -> HashSet<Key> {
+    let mut titles = HashSet::new();
+    let Some(display) = &indexes.display else { return titles };
+    let mut series: HashSet<u32> = HashSet::new();
+    for hit in display.search_with(&phrase.join(" "), None, EXCLUDED_TITLES, MIN_COVERAGE) {
+        let title = words(hit.title);
+        let Some(at) = title.windows(phrase.len()).position(|w| w == phrase) else { continue };
+        let key = (title_type(hit.media_type), hit.tmdb_id);
+        titles.insert(key);
+        let leads = at == 0 || (at == 1 && ["the", "a", "an"].contains(&title[0].as_str()));
+        // Its most specific series only: a broader one ("Batman in film") would take titles the words
+        // never named.
+        if franchises && leads {
+            let record = indexes.facts.as_ref().and_then(|f| f.get(key.1, key.0));
+            series.extend(record.and_then(|r| r.franchise.first().copied()));
+        }
+    }
+    if let (false, Some(facts)) = (series.is_empty(), indexes.facts.as_ref()) {
+        let in_series = |&(kind, id): &Key| {
+            facts.get(id, kind).is_some_and(|r| r.franchise.iter().any(|f| series.contains(f)))
+        };
+        titles.extend(facts.keys().filter(in_series));
+    }
+    titles
+}
+
+fn title_type(kind: den_titlesearch::MediaType) -> MediaType {
+    match kind {
+        den_titlesearch::MediaType::Movie => MediaType::Movie,
+        den_titlesearch::MediaType::Tv => MediaType::Tv,
+    }
+}
+
+/// The longest phrases among `tokens` that name a source kind, plot facet, genre, label or person. A person is read
+/// from one word only when `one_word_names`.
+fn read_names(
+    tokens: &[String],
+    one_word_names: bool,
+    indexes: &Indexes,
+    label_names: &[(String, &str, bool)],
+) -> Names {
     let (mut genres, mut labels, mut plot, mut rest) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut source_kinds: u16 = 0;
     let mut people: Vec<u32> = Vec::new();
@@ -357,16 +540,18 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
                     genres.push(genre);
                 }
             }
-            for (folded, name, mood) in &label_names {
+            for (folded, name, mood) in label_names {
                 if *folded == phrase && !labels.iter().any(|(n, m)| n == name && m == mood) {
                     labels.push(((*name).to_owned(), *mood));
                 }
             }
             // A one-word name ("Nolan", "Common") counts only as the whole query: inside a longer one it is more
-            // likely just a word.
-            if let Some(facts) = indexes.facts.as_ref().filter(|_| span >= 2 || tokens.len() == 1) {
+            // likely just a word. Even then it only lifts, and keeps the word: names are matched with their
+            // aliases, so `dinosaur movies` read a one-credit person called that and answered with the single
+            // film they appear in.
+            if let Some(facts) = indexes.facts.as_ref().filter(|_| span >= 2 || one_word_names) {
                 let going_by = facts.people_named(&phrase);
-                matched |= !going_by.is_empty();
+                matched |= span >= 2 && !going_by.is_empty();
                 for qid in going_by {
                     if !people.contains(&qid) {
                         people.push(qid);
@@ -381,36 +566,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         rest.push(tokens[at].clone());
         at += 1;
     }
-    let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
-        .facts
-        .as_ref()
-        .map(|facts| people.iter().map(|&qid| (qid, facts.credits(qid))).collect())
-        .unwrap_or_default();
-    let makers = people
-        .iter()
-        .copied()
-        .filter(|qid| {
-            credits.get(qid).is_some_and(|c| 2 * c.iter().filter(|(_, made)| *made).count() >= c.len())
-        })
-        .collect();
-    let whole = normalized(text);
-    Parsed {
-        title_query: TitleQuery::new(&whole),
-        text: whole,
-        credits,
-        lambda: rest.len() as f64 / total as f64,
-        leftover: rest.join(" "),
-        facet,
-        genres,
-        labels,
-        plot,
-        source_kinds,
-        runtime_max: None,
-        broadcaster: None,
-        year_from_param: false,
-        people,
-        makers,
-    }
+    Names { genres, labels, plot, source_kinds, people, rest }
 }
 
 /// What the lanes found about a candidate before scoring.
@@ -457,15 +613,24 @@ pub fn answer(
     // all, because the words said series and the caller said film.
     let wanted = |kind: MediaType| match media_type.or(parsed.facet.media_type) {
         Some(want) => want == kind,
-        None => true,
+        None => !parsed.excluded.media_types.contains(&kind),
     };
+    // What the query ruled out by title or plot facet, worked out once; the rest is read per title.
+    let mut ruled_out: HashSet<Key> = parsed.excluded.titles.clone();
+    if let Some(plot_facets) = &indexes.plot_facets {
+        for &(axis, value) in &parsed.excluded.names.plot {
+            for kind in [MediaType::Movie, MediaType::Tv] {
+                let facet = [(axis.to_owned(), value.to_owned())];
+                ruled_out.extend(plot_facets.matching(kind, &facet).into_iter().map(|(key, _)| key));
+            }
+        }
+    }
+    // Every lane drops what was ruled out BEFORE it truncates, or a lane of the 500 most-voted comedies is
+    // mostly American and "comedies not american" is left with what the vectors happen to find.
+    let allowed = |key: Key| !rules_out(indexes, parsed, &ruled_out, key);
     let mut found: HashMap<Key, Found> = HashMap::new();
 
     // Titles, by the name TMDB exports and the name atlas displays.
-    let title_type = |kind: den_titlesearch::MediaType| match kind {
-        den_titlesearch::MediaType::Movie => MediaType::Movie,
-        den_titlesearch::MediaType::Tv => MediaType::Tv,
-    };
     if let Some(export) = export {
         for hit in export.search_with(&parsed.text, None, TITLE_LANE, MIN_COVERAGE) {
             found.entry((title_type(hit.media_type), hit.tmdb_id)).or_default().export =
@@ -497,7 +662,7 @@ pub fn answer(
             .map(|(id, kind)| (kind, id))
             .collect()
         });
-    for &key in facet_titles.iter().flatten().take(FACET_LANE) {
+    for &key in facet_titles.iter().flatten().filter(|&&key| allowed(key)).take(FACET_LANE) {
         found.entry(key).or_default();
     }
     // SOURCE KIND AND GENRE PROPOSE TOO. Without a lane of their own they could only filter or boost titles
@@ -524,6 +689,7 @@ pub fn answer(
         if let Some(media_type) = parsed.facet.media_type {
             named_titles.retain(|(kind, _)| *kind == media_type);
         }
+        named_titles.retain(|&key| allowed(key));
         let votes =
             |key: &Key| indexes.facets.as_ref().and_then(|f| f.title(key.1, key.0)).map_or(0, |t| t.votes);
         named_titles.sort_by_key(|key| std::cmp::Reverse(votes(key)));
@@ -568,11 +734,12 @@ pub fn answer(
     // standardised against its own corpus distribution; taking their stronger normalised answer below lets the
     // premise representation propose a title without doubling the semantic term's weight.
     if let Some(vector) = vector {
-        let (near, stats) = indexes.plot.scan_vector(
-            vector,
-            |id, kind| wanted(kind) && facet_set.as_ref().is_none_or(|set| set.contains(&(kind, id))),
-            LANE,
-        );
+        let eligible = |id: u32, kind: MediaType| {
+            wanted(kind)
+                && facet_set.as_ref().is_none_or(|set| set.contains(&(kind, id)))
+                && allowed((kind, id))
+        };
+        let (near, stats) = indexes.plot.scan_vector(vector, eligible, LANE);
         if stats.sd > 0.0 {
             for n in near {
                 found.entry((n.media_type, n.tmdb_id)).or_default().plot_z =
@@ -580,11 +747,7 @@ pub fn answer(
             }
         }
         if let Some(premise) = &indexes.premise {
-            let (near, stats) = premise.scan_vector(
-                vector,
-                |id, kind| wanted(kind) && facet_set.as_ref().is_none_or(|set| set.contains(&(kind, id))),
-                LANE,
-            );
+            let (near, stats) = premise.scan_vector(vector, eligible, LANE);
             if stats.sd > 0.0 {
                 for n in near {
                     found.entry((n.media_type, n.tmdb_id)).or_default().premise_z =
@@ -596,7 +759,7 @@ pub fn answer(
 
     let mut scored: Vec<Scored> = found
         .iter()
-        .filter(|(key, _)| wanted(key.0))
+        .filter(|(key, _)| wanted(key.0) && allowed(**key))
         .filter_map(|(&key, found)| features(indexes, parsed, key, found, &plot_confidence))
         .collect();
     let exact_answered = scored.iter().any(|s| s.exact && s.pop >= EXACT_POPULAR);
@@ -706,6 +869,7 @@ pub fn answer(
             "broadcaster": parsed.broadcaster,
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
+            "excluded": excluded_json(&parsed.excluded),
         },
         "people": people,
         "hits": hits,
@@ -718,6 +882,28 @@ pub fn answer(
             media_type.or(parsed.facet.media_type),
             &applied(parsed, media_type),
         ),
+    })
+}
+
+/// What the query ruled out, as `parse.excluded` reports it; `null` when it ruled out nothing.
+fn excluded_json(excluded: &Excluded) -> serde_json::Value {
+    if excluded.is_empty() {
+        return serde_json::Value::Null;
+    }
+    let names = &excluded.names;
+    let people: Vec<String> = names.people.iter().map(|qid| format!("Q{qid}")).collect();
+    serde_json::json!({
+        "phrases": excluded.phrases,
+        "countries": excluded.countries,
+        "decades": excluded.decades,
+        "mediaTypes": excluded.media_types.iter()
+            .map(|&t| if t == MediaType::Tv { "series" } else { "movie" }).collect::<Vec<_>>(),
+        "genres": names.genres,
+        "labels": names.labels.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "plotFacets": names.plot.iter().map(|(axis, value)| format!("{axis}={value}")).collect::<Vec<_>>(),
+        "basedOnKind": SourceKinds::names(names.source_kinds),
+        "people": people,
+        "titles": excluded.titles.len(),
     })
 }
 
@@ -832,6 +1018,64 @@ fn semantic_evidence(found: &Found) -> (f64, f64, f64) {
     let plot = strength(found.plot_z);
     let premise = strength(found.premise_z);
     (plot, premise, plot.max(premise))
+}
+
+/// Whether the query ruled a title out: it is on record as having something a negation named, or is in
+/// `ruled_out` (called by a ruled-out name, or carrying a ruled-out plot facet). A title with no record of the
+/// thing is kept — unknown is not a match, here as everywhere.
+fn rules_out(indexes: &Indexes, parsed: &Parsed, ruled_out: &HashSet<Key>, key: Key) -> bool {
+    let excluded = &parsed.excluded;
+    if excluded.is_empty() {
+        return false;
+    }
+    if ruled_out.contains(&key) || excluded.media_types.contains(&key.0) {
+        return true;
+    }
+    let (kind, id) = key;
+    let record = indexes.facts.as_ref().and_then(|f| f.get(id, kind));
+    let facets = indexes.facets.as_ref().and_then(|f| f.title(id, kind));
+    if !excluded.countries.is_empty() {
+        let recorded = record.map(|r| r.countries.as_slice()).unwrap_or_default();
+        let mut known = facets.and_then(|f| f.country).into_iter().chain(recorded.iter().copied());
+        if known.any(|code| excluded.countries.iter().any(|c| c.as_bytes() == code)) {
+            return true;
+        }
+    }
+    if !excluded.decades.is_empty() {
+        let year = facets
+            .and_then(|f| f.year)
+            .map(i64::from)
+            .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
+        if year.is_some_and(|y| excluded.decades.iter().any(|&d| y.div_euclid(10) * 10 == i64::from(d))) {
+            return true;
+        }
+    }
+    let names = &excluded.names;
+    if !names.genres.is_empty()
+        && crate::plotrows::genres(indexes, key).iter().any(|g| names.genres.contains(g))
+    {
+        return true;
+    }
+    if !names.labels.is_empty() {
+        if let Some(labels) = indexes.plot.labels(id, kind) {
+            let carries = |(name, mood): &(String, bool)| {
+                let pairs = if *mood { &labels.moods } else { &labels.subgenres };
+                pairs.iter().any(|(n, confidence)| *n == name.as_str() && *confidence >= LABEL_FLOOR)
+            };
+            if names.labels.iter().any(carries) {
+                return true;
+            }
+        }
+    }
+    if let Some(r) = record {
+        if names.source_kinds != 0 && r.source_kinds.raw() & names.source_kinds != 0 {
+            return true;
+        }
+        if r.makers.iter().chain(&r.cast).any(|q| names.people.contains(q)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A facet guessed from query text is an interpretation, not an explicit constraint. Keep its mismatch penalty

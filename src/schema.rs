@@ -335,7 +335,8 @@ fn routes() -> Value {
                   label, plot facet, person, adaptation source) and every candidate is scored on every signal.",
         "parameters": [
             param("q", "string", "the query; words it does not read as a constraint are in parse.leftover and \
-                                  are matched as prose"),
+                                  are matched as prose. Words after not, no, without, except or excluding \
+                                  drop every title on record as having what they name (parse.excluded)"),
             with(param("type", "enum", "movie or series"), json!({ "field": "mediaType" })),
             skip,
             limit,

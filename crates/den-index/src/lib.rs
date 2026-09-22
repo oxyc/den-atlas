@@ -12,7 +12,7 @@ mod index;
 mod rail;
 mod similar;
 
-pub use facets::{FacetIndex, FacetQuery, TitleFacets};
+pub use facets::{split_negation, FacetIndex, FacetQuery, Negation, TitleFacets};
 pub use index::{Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use similar::{

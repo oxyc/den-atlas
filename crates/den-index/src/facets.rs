@@ -253,6 +253,49 @@ fn smallest_first(mut sets: Vec<&[u32]>) -> Option<(&[u32], Vec<&[u32]>)> {
     Some((smallest, sets))
 }
 
+/// A query's words split at its negations: what it asks for, and each phrase it rules out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Negation {
+    /// The words asked for, lowercased and joined by single spaces.
+    pub kept: String,
+    /// Each ruled-out phrase, in the order written: "thriller not horror" rules out `horror`.
+    pub excluded: Vec<String>,
+}
+
+/// Words that open a ruled-out phrase.
+const NEGATIONS: &[&str] = &["not", "no", "without", "except", "excluding"];
+/// A word that only joins a negation to what came before it: the "but" of "horror but not gory".
+const JOINERS: &[&str] = &["but", "and"];
+
+/// Split a query at its negations. A negation word opens a phrase that runs to the next one or to the end, and
+/// only when there are words on both sides of it: a query that STARTS with one ("no time to die", "not another
+/// teen movie") or ends with one ("ready or not", "dr no") is a title's words, not a request.
+///
+/// Parsing a negation is not optional. A dense retriever encodes "not gory" as similarity to gore, and the
+/// facet tables read "not british" as `country: GB` — every negated word used to act as the thing it ruled out.
+pub fn split_negation(text: &str) -> Negation {
+    let lowered = text.to_lowercase();
+    let tokens: Vec<&str> = lowered.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut excluded: Vec<Vec<&str>> = Vec::new();
+    for (at, &token) in tokens.iter().enumerate() {
+        let opens = NEGATIONS.contains(&token) && !kept.is_empty() && at + 1 < tokens.len();
+        if opens {
+            let before = excluded.last_mut().unwrap_or(&mut kept);
+            if before.len() > 1 && before.last().is_some_and(|w| JOINERS.contains(w)) {
+                before.pop();
+            }
+            excluded.push(Vec::new());
+            continue;
+        }
+        excluded.last_mut().unwrap_or(&mut kept).push(token);
+    }
+    Negation {
+        kept: kept.join(" "),
+        excluded: excluded.into_iter().filter(|p| !p.is_empty()).map(|p| p.join(" ")).collect(),
+    }
+}
+
 /// A search query split into hard facets and the leftover words, which rank semantically.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FacetQuery {
@@ -865,6 +908,34 @@ mod tests {
             assert_eq!(country(word), (None, word.to_owned()), "{word}");
         }
         assert_eq!(country("king kong"), (None, "king kong".to_owned()));
+    }
+
+    #[test]
+    fn a_negation_rules_out_the_words_after_it() {
+        let split = |text: &str| {
+            let n = split_negation(text);
+            (n.kept, n.excluded)
+        };
+        let ruled = |kept: &str, out: &[&str]| (kept.to_owned(), out.iter().map(|s| s.to_string()).collect());
+        assert_eq!(split("thriller not horror"), ruled("thriller", &["horror"]));
+        assert_eq!(split("Horror, but NOT gory"), ruled("horror", &["gory"]), "the joining `but` goes too");
+        assert_eq!(split("space films not star wars"), ruled("space films", &["star wars"]));
+        assert_eq!(
+            split("comedies without romance and not american"),
+            ruled("comedies", &["romance", "american"]),
+            "each negation opens its own phrase"
+        );
+        assert_eq!(split("horror movies not from the 80s"), ruled("horror movies", &["from the 80s"]));
+        // A negation word with nothing on one side of it is a title's word.
+        for title in ["no time to die", "not another teen movie", "ready or not", "dr no", "without"] {
+            assert_eq!(split(title), ruled(title, &[]), "{title}");
+        }
+        // The facet parser never sees a ruled-out word: "not british" used to read as `country: GB`.
+        let kept = FacetQuery::parse(&split_negation("crime series not british").kept);
+        assert_eq!(
+            (kept.country, kept.media_type, kept.leftover.as_str()),
+            (None, Some(MediaType::Tv), "crime")
+        );
     }
 
     #[test]
