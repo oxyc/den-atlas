@@ -166,6 +166,9 @@ pub struct SeedFacets<'a> {
     noul_names: &'a [u32],
     noul_k: den_store::List<'a, u8>,
     noul_v: den_store::List<'a, u8>,
+    /// The card's release year, for the year term. Empty when the store lacks the section; the term is
+    /// then 0 for every title, which is also what production weighs it at (`w_year = 0`).
+    card_year: &'a [i16],
     /// The per-request floors, from `SimilarParams` (`tuned`); production's unless overridden.
     noul_floor: f64,
     world_floor: f64,
@@ -208,6 +211,9 @@ impl<'a> SeedFacets<'a> {
             noul_names: store.column::<u32>("noul_names")?,
             noul_k: store.list::<u8>("noul_k_v", "noul_k_o")?,
             noul_v: store.list::<u8>("noul_v_v", "noul_v_o")?,
+            // Optional, unlike the rest: a term production does not weigh cannot be a reason to refuse a
+            // store, and the producer has been dropping card sections (oxyc/den#118).
+            card_year: store.per_row::<i16>("card_year").unwrap_or(&[]),
         })
     }
 
@@ -262,6 +268,11 @@ impl crate::Facets for SeedFacets<'_> {
         } else {
             0.0
         }
+    }
+
+    fn year(&self, tmdb_id: u32) -> Option<f64> {
+        let &year = self.card_year.get(self.row(tmdb_id)?.0)?;
+        (year != den_store::NONE_I16).then(|| f64::from(year))
     }
 
     fn nouls(&self, tmdb_id: u32) -> Vec<Weighted> {

@@ -308,6 +308,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
         "coverage": term(s.coverage, p.w_coverage),
         "tone": term(s.tone, p.w_tone),
         "world": term(s.world, -p.w_world),
+        "year": term(s.year, p.w_year),
     })
 }
 

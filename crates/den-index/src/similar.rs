@@ -122,6 +122,41 @@ pub struct SimilarParams {
     pub noul_floor: f64,
     pub world_floor: f64,
     pub defining: f64,
+    /// Release-year proximity (`year_proximity`). Off in production.
+    pub w_year: f64,
+    pub year_halflife: f64,
+    /// A multiplier on `w_facet` per facet axis, in `den_store::FACET_AXES` order (`FACET_AXIS_KNOBS`).
+    pub w_facet_axis: [f64; 12],
+}
+
+/// Production does not weigh release year at all: two titles' years are part of what the facet axis `era`
+/// already reads, and nothing has measured a separate term as better. The knob exists so it can be.
+const W_YEAR: f64 = 0.0;
+/// Years apart at which the year term halves; see `year_proximity`.
+const YEAR_HALFLIFE: f64 = 10.0;
+
+/// The per-axis facet knobs, in `den_store::FACET_AXES` order: `w_facet_<axis>`. Each multiplies `w_facet`
+/// for its axis alone, so 1.0 everywhere is exactly the single weight production ranks with.
+pub const FACET_AXIS_KNOBS: [&str; 12] = [
+    "w_facet_era",
+    "w_facet_setting",
+    "w_facet_scope",
+    "w_facet_ending",
+    "w_facet_pacing",
+    "w_facet_chronology",
+    "w_facet_continuity",
+    "w_facet_conflict",
+    "w_facet_ensemble",
+    "w_facet_tone",
+    "w_facet_timespan",
+    "w_facet_archetype",
+];
+
+/// How close two release years are, in 0..=1: `2^(-|Δyear| / halflife)`. The same year is 1, `halflife`
+/// years apart is 0.5, twice that 0.25 — a smooth decay with no cliff at a decade boundary. `libm`'s
+/// `exp2`, so every target rounds it alike.
+fn year_proximity(a: f64, b: f64, halflife: f64) -> f64 {
+    libm::exp2(-(a - b).abs() / halflife)
 }
 
 impl Default for SimilarParams {
@@ -147,6 +182,9 @@ impl Default for SimilarParams {
             noul_floor: NOUL_FLOOR,
             world_floor: WORLD_FLOOR,
             defining: DEFINING,
+            w_year: W_YEAR,
+            year_halflife: YEAR_HALFLIFE,
+            w_facet_axis: [1.0; 12],
         }
     }
 }
@@ -202,6 +240,20 @@ impl SimilarParams {
         knob("pool_k", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
         knob("max_row", 1.0, 400.0, true, "the longest row kept"),
         knob("same_animation", 0.0, 1.0, true, "1: never mix animated with live action"),
+        knob("w_year", 0.0, 10.0, false, "release-year proximity: 2^(-|years apart| / year_halflife)"),
+        knob("year_halflife", 1.0, 100.0, false, "years apart at which the year term halves"),
+        knob("w_facet_era", 0.0, 10.0, false, "x w_facet for the era axis alone"),
+        knob("w_facet_setting", 0.0, 10.0, false, "x w_facet for the setting axis alone"),
+        knob("w_facet_scope", 0.0, 10.0, false, "x w_facet for the scope axis alone"),
+        knob("w_facet_ending", 0.0, 10.0, false, "x w_facet for the ending axis alone"),
+        knob("w_facet_pacing", 0.0, 10.0, false, "x w_facet for the pacing axis alone"),
+        knob("w_facet_chronology", 0.0, 10.0, false, "x w_facet for the chronology axis alone"),
+        knob("w_facet_continuity", 0.0, 10.0, false, "x w_facet for the continuity axis alone"),
+        knob("w_facet_conflict", 0.0, 10.0, false, "x w_facet for the conflict axis alone"),
+        knob("w_facet_ensemble", 0.0, 10.0, false, "x w_facet for the ensemble axis alone"),
+        knob("w_facet_tone", 0.0, 10.0, false, "x w_facet for the tone axis alone"),
+        knob("w_facet_timespan", 0.0, 10.0, false, "x w_facet for the timespan axis alone"),
+        knob("w_facet_archetype", 0.0, 10.0, false, "x w_facet for the archetype axis alone"),
     ];
 
     /// A knob's value, as a number.
@@ -227,7 +279,9 @@ impl SimilarParams {
             "pool_k" => self.pool_k as f64,
             "max_row" => self.max_row as f64,
             "same_animation" => f64::from(u8::from(self.same_animation)),
-            _ => return None,
+            "w_year" => self.w_year,
+            "year_halflife" => self.year_halflife,
+            _ => self.w_facet_axis[FACET_AXIS_KNOBS.iter().position(|k| *k == name)?],
         })
     }
 
@@ -264,7 +318,15 @@ impl SimilarParams {
             "pool_k" => self.pool_k = whole,
             "max_row" => self.max_row = whole,
             "same_animation" => self.same_animation = whole == 1,
-            _ => return Err(format!("unknown parameter {name}")),
+            "w_year" => self.w_year = value,
+            "year_halflife" => self.year_halflife = value,
+            _ => {
+                let axis = FACET_AXIS_KNOBS
+                    .iter()
+                    .position(|k| *k == name)
+                    .ok_or_else(|| format!("unknown parameter {name}"))?;
+                self.w_facet_axis[axis] = value;
+            }
         }
         Ok(())
     }
@@ -479,13 +541,28 @@ pub trait Facets {
         let _ = tmdb_id;
         0.0
     }
+    /// The year the title was released, when known.
+    fn year(&self, tmdb_id: u32) -> Option<f64> {
+        let _ = tmdb_id;
+        None
+    }
     /// Share of the corpus carrying this axis value, for rarity weighting. A shared `chronology = linear`
     /// is worth almost nothing (76% of titles) where a shared `conflict = person-vs-system` is worth a lot.
     fn prevalence(&self, axis: Axis, value: ValueId) -> f64;
 }
 
-/// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1.
-fn facet_agreement(f: &dyn Facets, seed: &[(Axis, ValueId, f64)], other: u32) -> Option<f64> {
+/// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1 at production's
+/// per-axis weights.
+///
+/// `axis_weight` multiplies what an agreeing axis adds and leaves the denominator alone, so it acts as a
+/// per-axis `w_facet`: at 1.0 an axis counts as it always has (and `1.0 * weight` is `weight` exactly), at 0
+/// agreeing on it adds nothing, at 2 it counts double.
+fn facet_agreement(
+    f: &dyn Facets,
+    seed: &[(Axis, ValueId, f64)],
+    other: u32,
+    axis_weight: &[f64; 12],
+) -> Option<f64> {
     let theirs = f.facets(other);
     if seed.is_empty() || theirs.is_empty() {
         return None; // Unknown is not none.
@@ -499,7 +576,7 @@ fn facet_agreement(f: &dyn Facets, seed: &[(Axis, ValueId, f64)], other: u32) ->
         let weight = conf * libm::log(1.0 / f.prevalence(*axis, *value).max(1e-6)).max(0.0);
         den += weight;
         if their_value == value {
-            num += weight * their_conf;
+            num += axis_weight.get(usize::from(*axis)).copied().unwrap_or(1.0) * weight * their_conf;
         }
     }
     if den <= 0.0 {
@@ -583,6 +660,8 @@ pub struct Scored {
     pub home: f64,
     pub facet: f64,
     pub world: f64,
+    /// Release-year proximity (`year_proximity`), 0 when either year is unknown.
+    pub year: f64,
     /// The dominant confident subgenre the cap counts against; empty when there is none.
     pub subgenre: String,
     /// Held back by the subgenre cap and placed after the capped window instead of at its score rank.
@@ -668,6 +747,7 @@ pub fn rank_pool<'l>(
     let seed = seed_labels(&mine, p.min_confidence);
     let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
     let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
+    let seed_year = facets.and_then(|f| f.year(tmdb_id));
     let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
     let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
@@ -734,8 +814,14 @@ pub fn rank_pool<'l>(
             let home = authorship.map_or(0.0, |a| a.home(id));
             // A candidate with no facets scores the term at 0 rather than being penalised or exempted: it
             // simply brings no facet evidence, which is different from bringing disagreeing evidence.
-            let fa = facets.and_then(|f| facet_agreement(f, &seed_facets, id)).unwrap_or(0.0);
+            let fa =
+                facets.and_then(|f| facet_agreement(f, &seed_facets, id, &p.w_facet_axis)).unwrap_or(0.0);
             let world = facets.map_or(0.0, |f| (f.world(id) - seed_world).abs());
+            // A year missing on either side brings no evidence, so the term is 0 rather than a guess.
+            let year = match (seed_year, facets.and_then(|f| f.year(id))) {
+                (Some(a), Some(b)) => year_proximity(a, b, p.year_halflife),
+                _ => 0.0,
+            };
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
             // against a pair, not merely absence of evidence for it.
@@ -751,7 +837,9 @@ pub fn rank_pool<'l>(
                         + p.w_maker * maker
                         + p.w_home * home
                         + p.w_facet * fa
-                        - p.w_world * world);
+                        - p.w_world * world
+                        // Last, so at production's `w_year = 0` it adds an exact 0.0 to the sum above.
+                        + p.w_year * year);
             Scored {
                 tmdb_id: id,
                 score,
@@ -767,6 +855,7 @@ pub fn rank_pool<'l>(
                 home,
                 facet: fa,
                 world,
+                year,
                 subgenre: dominant,
                 held: false,
             }
@@ -1007,7 +1096,12 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 20, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 34, "a field was added without a knob, or the reverse");
+        // The per-axis knobs name the store's axes, in its order.
+        for (knob, axis) in FACET_AXIS_KNOBS.iter().zip(den_store::FACET_AXES) {
+            assert_eq!(*knob, format!("w_facet_{axis}"));
+            assert!(SimilarParams::KNOBS.iter().any(|k| k.name == *knob), "{knob} is not a knob");
+        }
     }
 
     #[test]
@@ -1114,6 +1208,78 @@ mod tests {
         assert_eq!(ranked, served);
         assert_eq!(served.len(), 4, "three retrieved and one nominated: {served:?}");
         assert!(served.iter().any(|s| s.tmdb_id == 6), "the nomination the vectors missed is ranked");
+    }
+
+    /// Facets for the era knobs: the seed (1) holds value 1 on every axis and was released in 2000. Title 2
+    /// agrees with it on one axis only, `axis`, and shares its year; title 3 agrees on nothing and is ten
+    /// years off. On vectors 3 is well ahead of 2. (An axis a candidate does not answer is skipped, not
+    /// counted as a disagreement, so title 2 answers all twelve.)
+    struct Era {
+        axis: Axis,
+    }
+
+    impl Facets for Era {
+        fn facets(&self, id: u32) -> Vec<(Axis, ValueId, f64)> {
+            match id {
+                1 => (0..12).map(|axis| (axis, 1, 1.0)).collect(),
+                // Answers every axis, so the ones it disagrees on count against it.
+                2 => (0..12).map(|axis| (axis, if axis == self.axis { 1 } else { 2 }, 1.0)).collect(),
+                _ => Vec::new(),
+            }
+        }
+        fn year(&self, id: u32) -> Option<f64> {
+            Some(if id == 3 { 1990.0 } else { 2000.0 })
+        }
+        fn prevalence(&self, _: Axis, _: ValueId) -> f64 {
+            0.1
+        }
+    }
+
+    /// Whether title 2 ranks ahead of title 3 for the seed, with these knobs.
+    fn two_before_three(axis: Axis, p: &SimilarParams) -> bool {
+        let premise = fixture(&[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (3, "movie", "Drama", false, &[], &[], [99, 0, 0]),
+            (2, "movie", "Drama", false, &[], &[], [80, 0, 0]),
+            (4, "movie", "Drama", false, &[], &[], [70, 0, 0]),
+            (5, "movie", "Drama", false, &[], &[], [60, 0, 0]),
+            (6, "movie", "Drama", false, &[], &[], [50, 0, 0]),
+            (7, "movie", "Drama", false, &[], &[], [40, 0, 0]),
+            (8, "movie", "Drama", false, &[], &[], [30, 0, 0]),
+        ]);
+        let row: Vec<u32> =
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, None, Some(&Era { axis }), p)
+                .iter()
+                .map(|s| s.tmdb_id)
+                .collect();
+        let at = |id: u32| row.iter().position(|&x| x == id).expect("both titles are ranked");
+        at(2) < at(3)
+    }
+
+    /// Each per-axis facet weight moves the row on its own, and at production's 1.0 it does not.
+    #[test]
+    fn each_facet_axis_weight_moves_a_row() {
+        for (axis, name) in FACET_AXIS_KNOBS.iter().enumerate() {
+            let axis = axis as Axis;
+            assert!(!two_before_three(axis, &SimilarParams::default()), "{name}: production");
+            let mut p = SimilarParams::default();
+            p.set(name, 10.0).unwrap();
+            assert!(two_before_three(axis, &p), "{name} = 10 lifts the title agreeing on that axis alone");
+        }
+    }
+
+    /// The year term: off in production, a lift for the same year once weighted, and the half-life decides
+    /// how far ten years apart is from the same year.
+    #[test]
+    fn the_year_knobs_move_a_row() {
+        assert!(!two_before_three(0, &SimilarParams::default()), "production does not weigh the year");
+        let mut p = SimilarParams::default();
+        p.set("w_year", 0.5).unwrap();
+        assert!(two_before_three(0, &p), "the same year beats ten years apart");
+        p.set("year_halflife", 100.0).unwrap();
+        assert!(!two_before_three(0, &p), "with a century's half-life ten years is nearly the same year");
+        assert!((year_proximity(2000.0, 1990.0, 10.0) - 0.5).abs() < 1e-15);
+        assert_eq!(year_proximity(2000.0, 2000.0, 10.0), 1.0);
     }
 
     #[test]

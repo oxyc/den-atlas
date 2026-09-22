@@ -110,9 +110,6 @@
 
   <h2>Not tunable yet</h2>
   <ul>
-    <li><b>Per-axis facet weights</b> (era, tone, pacing, ending, …): one <code>w_facet</code> covers all
-        twelve axes, each weighted by its rarity. Needs a weight per axis in <code>SimilarParams</code>,
-        applied in <code>facet_agreement</code>.</li>
     <li><b>Facet filters</b> (e.g. only <code>tone=bleak</code>): More Like This takes no constraint. Needs
         the constraint list <code>/index/row</code> already parses, applied as a candidate filter.</li>
     <li><b>IMDb rating cutoff</b> and <b>IMDb votes floor</b>: the scorer never reads ratings. atlas holds
@@ -136,7 +133,7 @@
 const base = location.pathname.replace(/\/+$/, "");
 const root = base.replace(/\/playground$/, "");
 const $ = (id) => document.getElementById(id);
-const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world"];
+const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world", "year"];
 // Every row is re-ranked in ONE request (`rows.json`), and only once typing pauses: the relay allows an
 // address a few dozen playground requests a minute, which a request per seed per keystroke would spend in
 // seconds.
