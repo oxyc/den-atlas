@@ -443,7 +443,7 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
 ///     "atlas": "<version>", "datasetVersion": "…", "storeSha256": "…", "at": "<RFC 3339 UTC>",
 ///     "changed": ["<knob>", …],
 ///     "rows": [ /* each seed's /playground/similar answer: its titles' ranks, production ranks, scores
-///                  and every signal's value and points; the first 20 unless exported in full */ ],
+///                  and every signal's value and points; the first 20, or 50 exported in full */ ],
 ///     "suggest": { /* You Might Also Like, as rows.json gives it */ },
 ///     "judged": { /* /playground/judged.json, when it was asked for */ }
 ///   }
@@ -454,7 +454,8 @@ pub const FILE_VERSION: u64 = 1;
 /// Bumped when a knob is removed or changes meaning. An older file's knob that no longer exists is reported
 /// and skipped; a same-version file naming an unknown knob is refused, since it can only be a mistake.
 pub const KNOB_SCHEMA: u64 = 1;
-/// Titles per seed in a snapshot unless exported in full.
+/// Titles per seed in a snapshot unless exported in full. In full it is `MAX_ROWS_LIMIT`, what the page
+/// can show: at 200 a twelve-seed export cost ~0.8 s of CPU and 2 MB.
 const SNAPSHOT_TITLES: usize = 20;
 
 /// Everything the page holds: the tuning and both seed lists.
@@ -546,7 +547,7 @@ pub fn export(
     full: bool,
     judged_too: bool,
 ) -> Value {
-    let shown = Tuning { limit: if full { MAX_LIMIT } else { SNAPSHOT_TITLES }, ..state.tuning.clone() };
+    let shown = Tuning { limit: if full { MAX_ROWS_LIMIT } else { SNAPSHOT_TITLES }, ..state.tuning.clone() };
     let rows: Vec<Value> = state
         .seeds
         .iter()
