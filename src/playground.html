@@ -21,23 +21,28 @@
   main { max-width: 1400px; margin: 0 auto; }
   h1 { font-size: 20px; margin: 0 0 4px; }
   h2 { font-size: 15px; margin: 24px 0 8px; }
+  h3 { font-size: 13px; margin: 12px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   p, li { color: var(--muted); }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
             margin-top: 12px; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
   label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+  label.inline { flex-direction: row; align-items: center; gap: 4px; }
   input, select, button, textarea { font: inherit; color: var(--text); background: var(--bg);
          border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .card-head { justify-content: space-between; align-items: center; }
   .card-head h2 { margin: 0; }
-  #hits button { font-size: 12px; padding: 2px 8px; margin-left: 6px; }
+  #hits button, .chip button { font-size: 12px; padding: 2px 8px; margin-left: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; padding: 0; list-style: none; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 10px; color: var(--text); }
   .knobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
   .knob input { width: 100%; }
   .knob.changed input { background: var(--changed); }
   .knob small { font-size: 11px; }
   .error { color: var(--down); white-space: pre-wrap; }
+  .note { color: var(--accent); }
   .scroll { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   th, td { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
@@ -46,7 +51,6 @@
   td.title a { color: var(--text); }
   .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
   .neg { color: var(--down); }
-  textarea { width: 100%; }
 </style>
 </head>
 <body>
@@ -55,20 +59,37 @@
   <p>More Like This for a set of seeds, ranked by the scorer atlas serves, with any of its knobs moved. Every
      field starts at production's value; only what you change is sent, and every row re-ranks when you stop
      typing. Beside each title is its rank in production's row. Points are what each signal added to the
-     score (spread &times; weight &times; value). The seeds and knobs are in the address, so a setup can be
-     shared.</p>
+     score (spread &times; weight &times; value). Everything on the page is in the address, so a setup can be
+     shared with Copy link, or saved with Export.</p>
 
   <section>
     <div class="row">
+      <button type="button" id="copy">Copy link</button>
+      <button type="button" id="export">Export</button>
+      <label class="inline"><input type="checkbox" id="export-full"> full rows</label>
+      <label class="inline">Import <input type="file" id="import" accept="application/json,.json"></label>
+      <button type="button" id="reset-knobs">Reset knobs to production</button>
+      <button type="button" id="reset-seeds">Reset seeds to the defaults</button>
+      <button type="button" id="reset-all">Reset all</button>
+    </div>
+    <p id="note" class="note"></p>
+    <p>Export saves the knobs, seeds, watched titles and filters, and a read-only snapshot for whoever
+       debugs it: the atlas and store it was ranked on, each seed's row with every signal's points, and the
+       judged scores if you scored them. Import restores the knobs and seeds and ignores the snapshot.</p>
+  </section>
+
+  <section>
+    <h3>Seeds</h3>
+    <div class="row">
       <label>Titles per seed <input id="limit" type="number" min="1" size="5"></label>
-      <button type="button" id="reset">Reset knobs to production</button>
-      <button type="button" id="defaults">Default seeds</button>
       <button type="button" id="clear">Clear seeds</button>
     </div>
     <form id="add" class="row" style="margin-top:8px">
       <label>Type <select id="type"><option value="series">series</option><option value="movie">movie</option></select></label>
       <label>TMDB id <input id="id" inputmode="numeric" size="9"></label>
-      <button type="submit">Add seed</button>
+      <button type="submit" data-to="seeds">Add seed</button>
+      <button type="submit" data-to="suggest">Add to You might also like</button>
+      <button type="submit" data-to="watched">Add to watched</button>
     </form>
     <form id="search" class="row" style="margin-top:8px">
       <label>Or find it by title <input id="q" size="30" placeholder="the wire"></label>
@@ -78,15 +99,27 @@
   </section>
 
   <section>
-    <div class="knobs" id="knobs"></div>
+    <h3>I have watched</h3>
+    <p>Dropped from every row and from You might also like, and each row ordered for someone who watched
+       them: den-core's household tilt, the same one a browse row's <code>tilt.liked</code> applies, with
+       these titles as what was liked.</p>
+    <ul class="chips" id="watched"></ul>
   </section>
 
   <section>
-    <label>I have watched (TMDB ids)
-      <textarea rows="2" disabled placeholder="Not available yet"></textarea></label>
-    <p>Disabled: More Like This takes no viewing history today. The household tilt (den-core's order,
-       <code>tilt.liked</code>/<code>tilt.disliked</code>) runs on browse rows only, and
-       <code>/index/suggest</code> can only exclude titles.</p>
+    <h3>Filters</h3>
+    <p>Only candidates carrying every filter are ranked: a plot facet (<code>tone=bleak</code>,
+       <code>ending=bittersweet</code>, <code>era=…</code>) or a label (<code>mood=Feel-good</code>,
+       <code>subgenre=Heist</code>) — the constraints <code>/index/plot</code> reads.</p>
+    <form id="filter" class="row">
+      <label>axis=value <input id="filter-text" size="30" placeholder="tone=bleak"></label>
+      <button type="submit">Add filter</button>
+    </form>
+    <ul class="chips" id="filters"></ul>
+  </section>
+
+  <section>
+    <div id="knobs"></div>
   </section>
 
   <section>
@@ -104,27 +137,23 @@
     </details>
   </section>
 
+  <section>
+    <h3>You might also like</h3>
+    <p><code>/index/suggest</code> for these seeds: each seed's row minus the seeds and the watched titles,
+       pooled in seed order, with the same knobs. Beside each title is its place in production's pool.</p>
+    <ul class="chips" id="suggest-seeds"></ul>
+    <div class="scroll"><table id="suggest"></table></div>
+  </section>
+
   <p id="status" class="muted"></p>
   <p id="error" class="error"></p>
   <div id="rows"></div>
 
-  <h2>Not tunable yet</h2>
+  <h2>Not here</h2>
   <ul>
-    <li><b>Facet filters</b> (e.g. only <code>tone=bleak</code>): More Like This takes no constraint. Needs
-        the constraint list <code>/index/row</code> already parses, applied as a candidate filter.</li>
-    <li><b>IMDb rating cutoff</b> and <b>IMDb votes floor</b>: the scorer never reads ratings. atlas holds
-        IMDb's daily ratings (<code>Indexes::imdb_rating</code>, <code>Indexes::votes</code>) when
-        <code>IMDB_RATINGS</code> is on; needs them passed into the scorer (a trait like
-        <code>Authorship</code>) as a filter or a term.</li>
-    <li><b>TMDB votes</b>: atlas has no TMDB vote count any more (the store dropped it). Needs a source first;
-        TMDB's own recommendations are merged by the client, not here.</li>
-    <li><b>I have watched</b>: see above. Needs More Like This to take <code>tilt.*</code> and compose
-        den-core's order over its row, as browse rows do, or an exclude list.</li>
-    <li><b>Critique floor</b> (0.10) and the <b>idf holds share</b> (0.7): baked into corpus-wide aggregates
-        built once at load. Needs those aggregates rebuilt (or memoised) per value.</li>
-    <li><b>Pool floor and spread percentiles</b> (10th / 90th): literals in the scorer. Could become knobs.</li>
-    <li><b>You might also like</b> (<code>/index/suggest</code>): pools More Like This per seed; not on this
-        page yet.</li>
+    <li><b>TMDB votes</b>: atlas has no TMDB vote count any more (the store dropped it); TMDB's export
+        popularity is the popularity knob.</li>
+    <li><b>Franchise</b>: More Like This does not read it, so there is nothing to tune.</li>
   </ul>
 </main>
 <script>
@@ -133,40 +162,49 @@
 const base = location.pathname.replace(/\/+$/, "");
 const root = base.replace(/\/playground$/, "");
 const $ = (id) => document.getElementById(id);
-const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world", "year"];
+const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world", "year", "popularity"];
 // Every row is re-ranked in ONE request (`rows.json`), and only once typing pauses: the relay allows an
 // address a few dozen playground requests a minute, which a request per seed per keystroke would spend in
 // seconds.
 const DEBOUNCE_MS = 300;
+const FILTER = "filter.";
+let p = {};
 let knobs = [];
-let defaultLimit = 20;
-let defaultSeeds = [];
-let maxSeeds = 12;
-// The seeds shown, as `movie:<id>` / `series:<id>`, in order.
-let seeds = [];
+// The page's state, apart from the knob inputs. Seeds are `movie:<id>` / `series:<id>`, in order.
+let seeds = [], suggestSeeds = [], watched = [], filters = [];
 let timer = 0;
 // Answers can arrive out of order; only the newest request's is drawn.
 let asked = 0;
+// Whether the judged scores shown are for the current state, so Export can include them.
+let judgedFresh = false;
 
 function fmt(n, d = 3) { return n == null ? "–" : Number(n).toFixed(d); }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 
+// The knobs, grouped by what they affect, in the order `params.json` names the groups.
 function buildKnobs(values) {
   $("knobs").innerHTML = "";
-  for (const k of knobs) {
-    const wrap = document.createElement("label");
-    wrap.className = "knob";
-    const step = k.integer ? 1 : 0.05;
-    wrap.innerHTML = `${esc(k.name)} <small>(${k.default})</small>` +
-      `<input type="number" name="${esc(k.name)}" min="${k.min}" max="${k.max}" step="${step}">` +
-      `<small>${esc(k.about)}</small>`;
-    const input = wrap.querySelector("input");
-    input.value = values[k.name] ?? k.default;
-    const mark = () => wrap.classList.toggle("changed", Number(input.value) !== k.default);
-    input.addEventListener("input", mark);
-    input.addEventListener("input", schedule);
-    mark();
-    $("knobs").appendChild(wrap);
+  for (const group of p.knobGroups) {
+    const heading = document.createElement("h3");
+    heading.textContent = group;
+    const grid = document.createElement("div");
+    grid.className = "knobs";
+    for (const k of knobs.filter((k) => k.group === group)) {
+      const wrap = document.createElement("label");
+      wrap.className = "knob";
+      const step = k.integer ? 1 : 0.05;
+      wrap.innerHTML = `${esc(k.name)} <small>(${k.default})</small>` +
+        `<input type="number" name="${esc(k.name)}" min="${k.min}" max="${k.max}" step="${step}">` +
+        `<small>${esc(k.about)}</small>`;
+      const input = wrap.querySelector("input");
+      input.value = values[k.name] ?? k.default;
+      const mark = () => wrap.classList.toggle("changed", Number(input.value) !== k.default);
+      input.addEventListener("input", mark);
+      input.addEventListener("input", schedule);
+      mark();
+      grid.appendChild(wrap);
+    }
+    $("knobs").append(heading, grid);
   }
 }
 
@@ -179,13 +217,45 @@ function changed() {
   return out;
 }
 
-// The page's state as a query string: the knobs moved, the count, and the seeds. The seed list is written
-// raw — `movie:5723,series:1438` — so the address stays readable; an absent list means the defaults and an
-// empty one means none, which is how "clear" survives a reload.
+// The page's state as a query string — the shape `State::query` writes and `State::parse` reads. Lists are
+// written raw (`movie:5723,series:1438`) so the address stays readable; an absent seed list means the
+// defaults and an empty one means none, which is how "clear" survives a reload.
 function query() {
   const q = new URLSearchParams(changed());
-  q.set("limit", $("limit").value || defaultLimit);
-  return `${q}&seeds=${seeds.join(",")}`;
+  q.set("limit", $("limit").value || p.defaultLimit);
+  let out = `${q}&seeds=${seeds.join(",")}&suggest=${suggestSeeds.join(",")}`;
+  if (watched.length) out += `&watched=${watched.join(",")}`;
+  for (const f of filters) out += `&${FILTER}${encodeURIComponent(f.axis)}=${encodeURIComponent(f.value)}`;
+  return out;
+}
+
+// Read a state back from a query string into the page.
+function applyQuery(search) {
+  const url = new URLSearchParams(search);
+  const values = {};
+  for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
+  buildKnobs(values);
+  $("limit").value = Math.min(Number(url.get("limit")) || p.defaultLimit, p.maxRowsLimit);
+  const list = (name, fallback, max) =>
+    url.has(name) ? url.get(name).split(",").filter(Boolean).slice(0, max) : [...fallback];
+  seeds = list("seeds", p.defaultSeeds, p.maxSeeds);
+  suggestSeeds = list("suggest", p.defaultSuggestSeeds, p.maxSuggestSeeds);
+  watched = list("watched", [], p.maxWatched);
+  filters = [...url.entries()].filter(([key]) => key.startsWith(FILTER))
+    .map(([key, value]) => ({ axis: key.slice(FILTER.length), value }));
+  drawLists();
+}
+
+function chips(id, list, attr) {
+  $(id).innerHTML = list.map((key) =>
+    `<li class=chip>${esc(key)}<button type="button" data-${attr}="${esc(key)}">×</button></li>`).join("");
+}
+
+function drawLists() {
+  chips("watched", watched, "unwatch");
+  chips("suggest-seeds", suggestSeeds, "unsuggest");
+  $("filters").innerHTML = filters.map((f, i) =>
+    `<li class=chip>${esc(f.axis)}=${esc(f.value)}<button type="button" data-unfilter="${i}">×</button></li>`).join("");
 }
 
 function schedule() {
@@ -195,33 +265,45 @@ function schedule() {
 
 async function refresh() {
   clearTimeout(timer);
+  judgedFresh = false;
   const q = query();
   history.replaceState(null, "", `${base}?${q}`);
   $("error").textContent = "";
-  if (!seeds.length) { $("status").textContent = "No seeds: add one above."; $("rows").innerHTML = ""; return; }
+  if (!seeds.length && !suggestSeeds.length) {
+    $("status").textContent = "No seeds: add one above.";
+    $("rows").innerHTML = ""; $("suggest").innerHTML = "";
+    return;
+  }
   const mine = ++asked;
   $("status").textContent = "Ranking…";
   const resp = await fetch(`${base}/rows.json?${q}`);
   const body = await resp.json().catch(() => ({}));
   if (mine !== asked) return;
   if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
-  $("status").textContent = body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters";
-  $("rows").innerHTML = body.rows.map(card).join("");
+  $("status").textContent = (body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters") +
+    (watched.length ? ` · ${watched.length} watched` : "") + (filters.length ? ` · ${filters.length} filters` : "");
+  $("rows").innerHTML = seeds.length ? body.rows.map(card).join("") : "<p class=muted>No More Like This seeds.</p>";
+  $("suggest").innerHTML = suggestTable(body.suggest);
 }
+
+function note(text) { $("note").textContent = text; }
 
 function remove(key) {
   seeds = seeds.filter((s) => s !== key);
   document.querySelector(`[data-card="${key}"]`)?.remove();
   // Nothing re-ranks when a seed goes, so only the address changes.
   history.replaceState(null, "", `${base}?${query()}`);
-  if (!seeds.length) $("status").textContent = "No seeds: add one above.";
+  if (!seeds.length) $("status").textContent = "No More Like This seeds.";
 }
 
-function add(key) {
+function add(key, to) {
   $("error").textContent = "";
-  if (seeds.includes(key)) return;
-  if (seeds.length >= maxSeeds) { $("error").textContent = `At most ${maxSeeds} seeds.`; return; }
-  seeds.push(key);
+  const [list, max, what] = to === "suggest" ? [suggestSeeds, p.maxSuggestSeeds, "You might also like seeds"]
+    : to === "watched" ? [watched, p.maxWatched, "watched titles"] : [seeds, p.maxSeeds, "seeds"];
+  if (list.includes(key)) return;
+  if (list.length >= max) { $("error").textContent = `At most ${max} ${what}.`; return; }
+  list.push(key);
+  drawLists();
   refresh().catch(report);
 }
 
@@ -232,10 +314,19 @@ async function search() {
   const resp = await fetch(`${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`);
   const body = await resp.json().catch(() => ({}));
   const hits = (body.hits || []).filter((h) => h.type === "movie" || h.type === "series");
+  const button = (key, to, text) => `<button type="button" data-add="${key}" data-to="${to}">${text}</button>`;
   $("hits").innerHTML = hits.length
     ? hits.map((h) => `<li>${esc(h.title || h.id)}${h.year ? ` <span class=muted>(${h.year})</span>` : ""} ` +
-        `<span class=muted>${h.type}</span><button type="button" data-add="${h.type}:${h.id}">Add</button></li>`).join("")
+        `<span class=muted>${h.type}</span>${button(`${h.type}:${h.id}`, "seeds", "Seed")}` +
+        `${button(`${h.type}:${h.id}`, "suggest", "You might also like")}` +
+        `${button(`${h.type}:${h.id}`, "watched", "Watched")}</li>`).join("")
     : `<li class=muted>${resp.ok ? "Nothing found." : esc(body.detail || body.error || resp.status)}</li>`;
+}
+
+function moved(rank, production) {
+  return production == null ? "<span class=up>new</span>"
+    : production === rank ? `<span class=muted>${production}</span>`
+    : `<span class=${production > rank ? "up" : "down"}>${production}</span>`;
 }
 
 // One seed's card: its row, production's rank beside each title, and what the tuning pushed out.
@@ -243,8 +334,9 @@ function card(a) {
   const type = a.key.split(":")[0];
   const seed = a.seed.title ? `${esc(a.seed.title)}${a.seed.year ? ` <span class=muted>(${a.seed.year})</span>` : ""}` : esc(a.key);
   const counts = a.total
-    ? `${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); spread ${fmt(a.spread, 4)}`
-    : "No row: atlas has no neighbours for this title.";
+    ? `${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); spread ${fmt(a.spread, 4)}` +
+      (a.tilted ? "; ordered for the watched titles" : "")
+    : "No row: atlas has no neighbours for this title, or the filters left none.";
   let html = `<section data-card="${esc(a.key)}"><div class="row card-head"><h2>${seed} <span class=muted>${esc(a.key)}</span></h2>` +
     `<button type="button" data-remove="${esc(a.key)}">Remove</button></div><p class=muted>${counts}</p>`;
   if (a.titles.length) html += `<div class=scroll><table>${table(a, type)}</table></div>`;
@@ -260,11 +352,8 @@ function table(a, type) {
   let html = "<thead><tr><th>#</th><th>prod</th><th class=title>title</th><th>score</th><th>base</th>" +
     SIGNALS.map((s) => `<th>${s}</th>`).join("") + "<th class=title>subgenre</th></tr></thead><tbody>";
   for (const t of a.titles) {
-    const moved = t.production == null ? "<span class=up>new</span>"
-      : t.production === t.rank ? `<span class=muted>${t.production}</span>`
-      : `<span class=${t.production > t.rank ? "up" : "down"}>${t.production}</span>`;
     const name = t.title ? `${esc(t.title)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""}` : t.id;
-    html += `<tr><td>${t.rank}</td><td>${moved}</td>` +
+    html += `<tr><td>${t.rank}</td><td>${moved(t.rank, t.production)}</td>` +
       `<td class=title><a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">${name}</a></td>` +
       `<td>${fmt(t.score)}</td><td>${fmt(t.base)}</td>` +
       SIGNALS.map((s) => {
@@ -277,11 +366,19 @@ function table(a, type) {
   return html + "</tbody>";
 }
 
+function suggestTable(s) {
+  if (!s || !s.titles.length) return "<tbody><tr><td class=title>No suggestions.</td></tr></tbody>";
+  return "<thead><tr><th>#</th><th>prod</th><th class=title>title</th></tr></thead><tbody>" +
+    s.titles.map((t) => `<tr><td>${t.rank}</td><td>${moved(t.rank, t.production)}</td>` +
+      `<td class=title>${esc(t.title || t.key)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""} ` +
+      `<span class=muted>${esc(t.key)}</span></td></tr>`).join("") + "</tbody>";
+}
+
 // One half's mean and cases, tuned against production.
 function halfHtml(j, half) {
   const m = j[half];
-  const delta = (t, p) => {
-    const d = t - p;
+  const delta = (t, pr) => {
+    const d = t - pr;
     return d === 0 ? "" : ` <span class=${d > 0 ? "up" : "down"}>${d > 0 ? "+" : ""}${fmt(d)}</span>`;
   };
   let html = `<p><b>${half} nDCG@${j.k} ${fmt(m.tuned.ndcg)}</b>${delta(m.tuned.ndcg, m.production.ndcg)} ` +
@@ -298,51 +395,98 @@ function halfHtml(j, half) {
   return html + "</tbody></table></div>";
 }
 
+// The judged set ranks with everything but the seed lists, so they are left out of its query.
+function tuningQuery() {
+  return query().split("&").filter((kv) => !/^(seeds|suggest)=/.test(kv)).join("&");
+}
+
 async function judge() {
   $("judged-status").textContent = "Scoring…";
-  const resp = await fetch(`${base}/judged.json?${new URLSearchParams(changed())}`);
+  const resp = await fetch(`${base}/judged.json?${tuningQuery()}`);
   const body = await resp.json().catch(() => ({}));
   if (!resp.ok) { $("judged-status").textContent = body.detail || body.error || resp.status; return; }
   $("judged-status").textContent = body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters";
   $("judged").innerHTML = halfHtml(body, "dev");
   $("judged-test").innerHTML = halfHtml(body, "test");
+  judgedFresh = true;
+}
+
+async function exportFile() {
+  const full = $("export-full").checked ? "&full=1" : "";
+  const resp = await fetch(`${base}/export.json?${query()}${full}${judgedFresh ? "&judged=1" : ""}`);
+  if (!resp.ok) { const body = await resp.json().catch(() => ({})); report(body.detail || body.error || resp.status); return; }
+  const blob = new Blob([await resp.text()], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `playground-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  note("Exported.");
+}
+
+async function importFile(file) {
+  const resp = await fetch(`${base}/import.json`, { method: "POST", body: await file.text() });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { report(`Import refused: ${body.detail || body.error || resp.status}`); return; }
+  applyQuery(body.query);
+  note(body.removed.length
+    ? `Imported. These knobs from an older file no longer exist and were skipped: ${body.removed.join(", ")}.`
+    : "Imported.");
+  await refresh();
 }
 
 async function start() {
-  const resp = await fetch(`${base}/params.json`);
-  const p = await resp.json();
+  p = await (await fetch(`${base}/params.json`)).json();
   knobs = p.knobs;
-  defaultLimit = p.defaultLimit;
-  defaultSeeds = p.defaultSeeds;
-  maxSeeds = p.maxSeeds;
   $("limit").max = p.maxRowsLimit;
-  const url = new URLSearchParams(location.search);
-  const values = {};
-  for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
-  buildKnobs(values);
-  $("limit").value = Math.min(Number(url.get("limit")) || defaultLimit, p.maxRowsLimit);
-  seeds = url.has("seeds") ? url.get("seeds").split(",").filter(Boolean).slice(0, maxSeeds) : [...defaultSeeds];
+  applyQuery(location.search);
   await refresh();
 }
 
 const report = (e) => { $("error").textContent = String(e); };
 $("limit").addEventListener("input", schedule);
-$("reset").addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
-$("defaults").addEventListener("click", () => { seeds = [...defaultSeeds]; refresh().catch(report); });
+$("copy").addEventListener("click", async () => {
+  history.replaceState(null, "", `${base}?${query()}`);
+  await navigator.clipboard.writeText(location.href).then(() => note("Link copied."), () => note(location.href));
+});
+$("export").addEventListener("click", () => exportFile().catch(report));
+$("import").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (file) importFile(file).catch(report);
+});
+$("reset-knobs").addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
+$("reset-seeds").addEventListener("click", () => {
+  seeds = [...p.defaultSeeds]; suggestSeeds = [...p.defaultSuggestSeeds]; drawLists(); refresh().catch(report);
+});
+$("reset-all").addEventListener("click", () => { applyQuery(""); refresh().catch(report); });
 $("clear").addEventListener("click", () => { seeds = []; refresh().catch(report); });
 $("add").addEventListener("submit", (e) => {
   e.preventDefault();
   const id = $("id").value.trim();
   if (!/^\d+$/.test(id)) { $("error").textContent = "A TMDB id is a number."; return; }
-  add(`${$("type").value}:${id}`);
+  add(`${$("type").value}:${id}`, e.submitter?.dataset.to || "seeds");
 });
 $("search").addEventListener("submit", (e) => { e.preventDefault(); search().catch(report); });
-// Delegated, because the cards and the search results are redrawn.
+$("filter").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const [axis, ...rest] = $("filter-text").value.split("=");
+  const value = rest.join("=").trim();
+  if (!axis.trim() || !value) { $("error").textContent = "A filter is axis=value, e.g. tone=bleak."; return; }
+  filters.push({ axis: axis.trim(), value });
+  $("filter-text").value = "";
+  drawLists();
+  refresh().catch(report);
+});
+// Delegated, because the cards, chips and search results are redrawn.
 document.addEventListener("click", (e) => {
-  const remove_ = e.target.closest("[data-remove]");
-  if (remove_) remove(remove_.dataset.remove);
-  const add_ = e.target.closest("[data-add]");
-  if (add_) add(add_.dataset.add);
+  const at = (attr) => e.target.closest(`[data-${attr}]`)?.dataset;
+  if (at("remove")) remove(at("remove").remove);
+  if (at("add")) add(at("add").add, at("add").to);
+  const drop = (list, key) => list.filter((k) => k !== key);
+  if (at("unwatch")) { watched = drop(watched, at("unwatch").unwatch); drawLists(); refresh().catch(report); }
+  if (at("unsuggest")) { suggestSeeds = drop(suggestSeeds, at("unsuggest").unsuggest); drawLists(); refresh().catch(report); }
+  if (at("unfilter")) { filters.splice(Number(at("unfilter").unfilter), 1); drawLists(); refresh().catch(report); }
 });
 $("judge").addEventListener("click", () => { judge().catch((e) => { $("judged-status").textContent = String(e); }); });
 start().catch((e) => { $("error").textContent = `Could not load the playground: ${e}`; });

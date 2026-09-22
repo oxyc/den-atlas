@@ -73,6 +73,9 @@ pub struct Indexes {
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
     corpus: OnceLock<Corpus>,
+    /// Corpus aggregates for a critique floor and holds share other than production's, by their bits
+    /// (`Indexes::aggregates_for`).
+    aggregates: Mutex<HashMap<(u64, u64), Arc<den_index::RailAggregates>>>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -90,6 +93,8 @@ type Key = (den_index::MediaType, u32);
 /// map is dropped anyway when the indexes go idle, ten minutes after the last query.
 const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 256;
+/// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
+const AGGREGATES_MEMO: usize = 8;
 
 impl Indexes {
     /// More Like This for a title, worked out once while the indexes are loaded: it is deterministic for
@@ -116,24 +121,60 @@ impl Indexes {
         media_type: den_index::MediaType,
         params: &den_index::SimilarParams,
     ) -> Vec<den_index::Scored> {
+        self.more_like_this_with(tmdb_id, media_type, params, den_index::Extras::default())
+    }
+
+    /// `more_like_this_scored` with a request's `Extras`: who is watching, and which candidates to consider.
+    pub fn more_like_this_with(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        params: &den_index::SimilarParams,
+        extras: den_index::Extras<'_>,
+    ) -> Vec<den_index::Scored> {
+        let aggregates = self.aggregates_for(params);
+        let aggregates = aggregates.as_deref().unwrap_or(&self.store.aggregates);
         // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
         // the load fails without a store, so there is no arm here that answers without one.
         let view = self.store.view();
-        let facets = den_index::SeedFacets::new(&view, &self.store.aggregates, media_type)
+        let facets = den_index::SeedFacets::new(&view, aggregates, media_type)
             .expect("MappedStore::check builds this at load, so it cannot fail per request")
             .tuned(params);
         // Without the credit lists the rail ranks without authorship. The facts read the same lists, so a
         // store missing them also reaches `/health` as `facts_unusable`.
         let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id).ok();
-        den_index::more_like_this_scored(
+        den_index::more_like_this_with(
             Some(&self.plot),
             self.premise.as_ref(),
             tmdb_id,
             media_type,
             authorship.as_ref().map(|a| a as &dyn den_index::Authorship),
             Some(&facets),
+            extras,
             params,
         )
+    }
+
+    /// The corpus aggregates for `params`' critique floor and holds share, or `None` for production's, which
+    /// were built at load. Other values are built on first use — one pass over the store, ~0.1 s — and kept,
+    /// a few at a time, so a tuner moving other knobs does not pay it again.
+    fn aggregates_for(&self, params: &den_index::SimilarParams) -> Option<Arc<den_index::RailAggregates>> {
+        let production = den_index::SimilarParams::default();
+        if (params.critique_floor, params.holds) == (production.critique_floor, production.holds) {
+            return None;
+        }
+        let key = (params.critique_floor.to_bits(), params.holds.to_bits());
+        let built = memoised(&self.aggregates, key, AGGREGATES_MEMO, || {
+            let built = den_index::RailAggregates::build_with(
+                &self.store.view(),
+                params.critique_floor,
+                params.holds,
+            )
+            // The same pass production's aggregates passed at load, over the same store.
+            .expect("the store's critique and facet sections were checked at load");
+            Arc::new(built)
+        });
+        Some(built)
     }
 
     /// What a billboard's fit reads off the index as a whole (`fit::Corpus`), worked out once: the first time it is
@@ -676,6 +717,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         similar: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
+        aggregates: Mutex::new(HashMap::new()),
     };
     eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {

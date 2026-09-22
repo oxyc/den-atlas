@@ -78,6 +78,7 @@ mod tests {
                 quantization: "int8-symmetric-x127".into(),
                 signature: signature.map(Into::into),
                 last_modified_http: None,
+                store_sha256: None,
                 store_file: "den-v1.store".into(),
             },
             last_modified: None,

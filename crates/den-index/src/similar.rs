@@ -96,8 +96,9 @@ pub const DEFINING: f64 = 0.8;
 /// `SimilarParams::default()`, so a default here cannot drift from production — changing one IS changing
 /// production. The tuning playground and any offline scorer take the same type and override fields.
 ///
-/// Not here, because a request cannot move them cheaply: the critique floor and the idf "holds" share are
-/// baked into corpus-wide aggregates computed once at load (`RailAggregates`).
+/// The critique floor and the idf "holds" share are here too, though they are baked into corpus-wide
+/// aggregates (`RailAggregates`): production's are built once at load, and a caller asking for other
+/// values builds (and should memoise) aggregates for them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimilarParams {
     pub pool_k: usize,
@@ -127,6 +128,45 @@ pub struct SimilarParams {
     pub year_halflife: f64,
     /// A multiplier on `w_facet` per facet axis, in `den_store::FACET_AXES` order (`FACET_AXIS_KNOBS`).
     pub w_facet_axis: [f64; 12],
+    /// Drop a candidate IMDb rates below this (0: off). A title IMDb has no rating for is kept.
+    pub min_imdb_rating: f64,
+    /// Drop a candidate with fewer IMDb votes than this (0: off). A title IMDb has no count for is kept.
+    pub min_imdb_votes: f64,
+    /// Weight of TMDB export popularity, log-scaled against the pool's most popular (`Audience`). Off.
+    pub w_popularity: f64,
+    /// Drop a candidate whose TMDB export popularity is below this (0: off). Unknown is kept.
+    pub min_popularity: f64,
+    /// A critique axis below this says nothing about what the work argues (`RailAggregates`).
+    pub critique_floor: f64,
+    /// The share of a media type at or above which an axis is "held", for the critique idf.
+    pub holds: f64,
+    /// The percentile of the pool a missing cosine is scored at.
+    pub pool_floor_pct: usize,
+    /// The percentiles of the pool's base scores whose difference is `spread`, the unit of every term.
+    pub spread_low_pct: usize,
+    pub spread_high_pct: usize,
+}
+
+/// Production filters on neither IMDb number nor popularity, and does not weigh popularity: More Like This
+/// is about the seed, and a popularity term would pull every row towards the same few titles.
+const MIN_IMDB_RATING: f64 = 0.0;
+const MIN_IMDB_VOTES: f64 = 0.0;
+const W_POPULARITY: f64 = 0.0;
+const MIN_POPULARITY: f64 = 0.0;
+/// Production's critique floor and holds share: `rail::CRITIQUE_FLOOR` and `rail::HOLDS`, whose doc
+/// comments say why.
+const CRITIQUE_FLOOR: f64 = crate::rail::CRITIQUE_FLOOR;
+const HOLDS: f64 = crate::rail::HOLDS;
+/// A missing cosine is read at the pool's 10th percentile, and the spread is the 90th minus the 10th: wide
+/// enough to be stable against a few outliers at either end.
+const POOL_FLOOR_PCT: usize = 10;
+const SPREAD_LOW_PCT: usize = 10;
+const SPREAD_HIGH_PCT: usize = 90;
+
+/// The `pct`th percentile's position in a sorted list of `len`: `len * pct / 100`, in integers so production's
+/// `len / 10` and `len * 9 / 10` come out exactly, and held inside the list.
+fn percentile_at(len: usize, pct: usize) -> usize {
+    (len * pct / 100).min(len.saturating_sub(1))
 }
 
 /// Production does not weigh release year at all: two titles' years are part of what the facet axis `era`
@@ -185,23 +225,43 @@ impl Default for SimilarParams {
             w_year: W_YEAR,
             year_halflife: YEAR_HALFLIFE,
             w_facet_axis: [1.0; 12],
+            min_imdb_rating: MIN_IMDB_RATING,
+            min_imdb_votes: MIN_IMDB_VOTES,
+            w_popularity: W_POPULARITY,
+            min_popularity: MIN_POPULARITY,
+            critique_floor: CRITIQUE_FLOOR,
+            holds: HOLDS,
+            pool_floor_pct: POOL_FLOOR_PCT,
+            spread_low_pct: SPREAD_LOW_PCT,
+            spread_high_pct: SPREAD_HIGH_PCT,
         }
     }
 }
 
-/// One knob as a client sees it: its name (the field's), the range a value must fall in, whether it is a
-/// whole number, and one line saying what it does.
+/// One knob as a client sees it: its name (the field's), what part of the ranking it affects, the range a
+/// value must fall in, whether it is a whole number, and one line saying what it does.
 #[derive(Clone, Copy, Debug)]
 pub struct Knob {
     pub name: &'static str,
+    pub group: &'static str,
     pub min: f64,
     pub max: f64,
     pub integer: bool,
     pub about: &'static str,
 }
 
-const fn knob(name: &'static str, min: f64, max: f64, integer: bool, about: &'static str) -> Knob {
-    Knob { name, min, max, integer, about }
+/// The groups `Knob::group` names, in the order a form shows them.
+pub const KNOB_GROUPS: &[&str] = &["pool", "signals", "facet axes", "floors", "filters", "row"];
+
+const fn knob(
+    name: &'static str,
+    group: &'static str,
+    min: f64,
+    max: f64,
+    integer: bool,
+    about: &'static str,
+) -> Knob {
+    Knob { name, group, min, max, integer, about }
 }
 
 impl SimilarParams {
@@ -214,46 +274,105 @@ impl SimilarParams {
     /// and 0.16 MB, where the old maxima (`pool_k = 5000`, `max_row = 1000`) cost up to ~100 ms (median 53)
     /// and 0.72 MB. The other knobs change what a candidate scores, not how many are scored.
     pub const KNOBS: &'static [Knob] = &[
-        knob("w_premise", 0.0, 10.0, false, "base: weight of the premise-space cosine"),
-        knob("w_plot", 0.0, 10.0, false, "base: weight of the plot-space cosine"),
-        knob("w_maker", 0.0, 10.0, false, "shared director/writer/creator (share of the seed's makers)"),
-        knob("w_home", 0.0, 10.0, false, "shared broadcaster/production company"),
-        knob("w_facet", 0.0, 10.0, false, "agreement on the twelve narrative facet axes, rarity-weighted"),
-        knob("w_world", 0.0, 10.0, false, "penalty for a different world (realist vs fantastical)"),
-        knob("w_noul", 0.0, 10.0, false, "cosine over the taxonomy nouls"),
-        knob("w_critique", 0.0, 10.0, false, "centered cosine over what the works argue about"),
-        knob("w_coverage", 0.0, 10.0, false, "coverage of the seed's defining arguments, idf-weighted"),
-        knob("w_tone", 0.0, 10.0, false, "coverage of the seed's confident subgenres and moods"),
-        knob("tone_floor", 0.0, 1.0, false, "drop a labelled candidate covering less of the seed's labels"),
-        knob("min_confidence", 0.0, 1.0, false, "a label below this confidence is not part of a title"),
-        knob("noul_floor", 0.0, 1.0, false, "a noul below this is ignored"),
-        knob("world_floor", 0.0, 1.0, false, "a world score below this reads as realist (0)"),
+        knob("pool_k", "pool", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
+        knob("w_premise", "pool", 0.0, 10.0, false, "base: weight of the premise-space cosine"),
+        knob("w_plot", "pool", 0.0, 10.0, false, "base: weight of the plot-space cosine"),
+        knob("pool_floor_pct", "pool", 0.0, 50.0, true, "percentile of the pool a missing cosine is read at"),
         knob(
-            "defining",
+            "spread_low_pct",
+            "pool",
+            0.0,
+            49.0,
+            true,
+            "spread = base at spread_high_pct minus base at this",
+        ),
+        knob("spread_high_pct", "pool", 51.0, 100.0, true, "... the upper percentile of that spread"),
+        knob("w_maker", "signals", 0.0, 10.0, false, "shared director/writer/creator (share of the seed's)"),
+        knob("w_home", "signals", 0.0, 10.0, false, "shared broadcaster/production company"),
+        knob("w_facet", "signals", 0.0, 10.0, false, "agreement on the twelve facet axes, rarity-weighted"),
+        knob(
+            "w_world",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "penalty for a different world (realist vs fantastical)",
+        ),
+        knob("w_noul", "signals", 0.0, 10.0, false, "cosine over the taxonomy nouls"),
+        knob("w_critique", "signals", 0.0, 10.0, false, "centered cosine over what the works argue about"),
+        knob(
+            "w_coverage",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "coverage of the seed's defining arguments, idf-weighted",
+        ),
+        knob("w_tone", "signals", 0.0, 10.0, false, "coverage of the seed's confident subgenres and moods"),
+        knob(
+            "w_year",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "release-year proximity: 2^(-|years apart| / year_halflife)",
+        ),
+        knob(
+            "w_popularity",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "TMDB popularity, ln-scaled to the pool's most popular",
+        ),
+        knob("w_facet_era", "facet axes", 0.0, 10.0, false, "x w_facet for the era axis alone"),
+        knob("w_facet_setting", "facet axes", 0.0, 10.0, false, "x w_facet for the setting axis alone"),
+        knob("w_facet_scope", "facet axes", 0.0, 10.0, false, "x w_facet for the scope axis alone"),
+        knob("w_facet_ending", "facet axes", 0.0, 10.0, false, "x w_facet for the ending axis alone"),
+        knob("w_facet_pacing", "facet axes", 0.0, 10.0, false, "x w_facet for the pacing axis alone"),
+        knob("w_facet_chronology", "facet axes", 0.0, 10.0, false, "x w_facet for the chronology axis alone"),
+        knob("w_facet_continuity", "facet axes", 0.0, 10.0, false, "x w_facet for the continuity axis alone"),
+        knob("w_facet_conflict", "facet axes", 0.0, 10.0, false, "x w_facet for the conflict axis alone"),
+        knob("w_facet_ensemble", "facet axes", 0.0, 10.0, false, "x w_facet for the ensemble axis alone"),
+        knob("w_facet_tone", "facet axes", 0.0, 10.0, false, "x w_facet for the tone axis alone"),
+        knob("w_facet_timespan", "facet axes", 0.0, 10.0, false, "x w_facet for the timespan axis alone"),
+        knob("w_facet_archetype", "facet axes", 0.0, 10.0, false, "x w_facet for the archetype axis alone"),
+        knob(
+            "min_confidence",
+            "floors",
             0.0,
             1.0,
             false,
-            "a critique axis at or above this is one of the seed's defining ones",
+            "a label below this confidence is not part of a title",
         ),
-        knob("subgenre_cap", 0.0, 200.0, true, "at most this many titles sharing a dominant subgenre ..."),
-        knob("cap_window", 0.0, 400.0, true, "... within this many leading titles"),
-        knob("pool_k", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
-        knob("max_row", 1.0, 400.0, true, "the longest row kept"),
-        knob("same_animation", 0.0, 1.0, true, "1: never mix animated with live action"),
-        knob("w_year", 0.0, 10.0, false, "release-year proximity: 2^(-|years apart| / year_halflife)"),
-        knob("year_halflife", 1.0, 100.0, false, "years apart at which the year term halves"),
-        knob("w_facet_era", 0.0, 10.0, false, "x w_facet for the era axis alone"),
-        knob("w_facet_setting", 0.0, 10.0, false, "x w_facet for the setting axis alone"),
-        knob("w_facet_scope", 0.0, 10.0, false, "x w_facet for the scope axis alone"),
-        knob("w_facet_ending", 0.0, 10.0, false, "x w_facet for the ending axis alone"),
-        knob("w_facet_pacing", 0.0, 10.0, false, "x w_facet for the pacing axis alone"),
-        knob("w_facet_chronology", 0.0, 10.0, false, "x w_facet for the chronology axis alone"),
-        knob("w_facet_continuity", 0.0, 10.0, false, "x w_facet for the continuity axis alone"),
-        knob("w_facet_conflict", 0.0, 10.0, false, "x w_facet for the conflict axis alone"),
-        knob("w_facet_ensemble", 0.0, 10.0, false, "x w_facet for the ensemble axis alone"),
-        knob("w_facet_tone", 0.0, 10.0, false, "x w_facet for the tone axis alone"),
-        knob("w_facet_timespan", 0.0, 10.0, false, "x w_facet for the timespan axis alone"),
-        knob("w_facet_archetype", 0.0, 10.0, false, "x w_facet for the archetype axis alone"),
+        knob("noul_floor", "floors", 0.0, 1.0, false, "a noul below this is ignored"),
+        knob("world_floor", "floors", 0.0, 1.0, false, "a world score below this reads as realist (0)"),
+        knob("defining", "floors", 0.0, 1.0, false, "a critique axis at or above this defines the seed"),
+        knob("critique_floor", "floors", 0.0, 1.0, false, "a critique axis below this says nothing"),
+        knob("holds", "floors", 0.0, 1.0, false, "critique idf: ln(titles / titles at or above this)"),
+        knob("year_halflife", "floors", 1.0, 100.0, false, "years apart at which the year term halves"),
+        knob("same_animation", "filters", 0.0, 1.0, true, "1: never mix animated with live action"),
+        knob("tone_floor", "filters", 0.0, 1.0, false, "drop a labelled candidate covering less of the seed"),
+        knob("min_imdb_rating", "filters", 0.0, 10.0, false, "drop below this IMDb rating (unrated kept)"),
+        knob("min_imdb_votes", "filters", 0.0, 1_000_000.0, true, "drop below this many IMDb votes"),
+        knob(
+            "min_popularity",
+            "filters",
+            0.0,
+            1000.0,
+            false,
+            "drop below this TMDB popularity (unknown kept)",
+        ),
+        knob(
+            "subgenre_cap",
+            "row",
+            0.0,
+            200.0,
+            true,
+            "at most this many titles sharing a dominant subgenre ...",
+        ),
+        knob("cap_window", "row", 0.0, 400.0, true, "... within this many leading titles"),
+        knob("max_row", "row", 1.0, 400.0, true, "the longest row kept"),
     ];
 
     /// A knob's value, as a number.
@@ -281,6 +400,15 @@ impl SimilarParams {
             "same_animation" => f64::from(u8::from(self.same_animation)),
             "w_year" => self.w_year,
             "year_halflife" => self.year_halflife,
+            "min_imdb_rating" => self.min_imdb_rating,
+            "min_imdb_votes" => self.min_imdb_votes,
+            "w_popularity" => self.w_popularity,
+            "min_popularity" => self.min_popularity,
+            "critique_floor" => self.critique_floor,
+            "holds" => self.holds,
+            "pool_floor_pct" => self.pool_floor_pct as f64,
+            "spread_low_pct" => self.spread_low_pct as f64,
+            "spread_high_pct" => self.spread_high_pct as f64,
             _ => self.w_facet_axis[FACET_AXIS_KNOBS.iter().position(|k| *k == name)?],
         })
     }
@@ -320,6 +448,15 @@ impl SimilarParams {
             "same_animation" => self.same_animation = whole == 1,
             "w_year" => self.w_year = value,
             "year_halflife" => self.year_halflife = value,
+            "min_imdb_rating" => self.min_imdb_rating = value,
+            "min_imdb_votes" => self.min_imdb_votes = value,
+            "w_popularity" => self.w_popularity = value,
+            "min_popularity" => self.min_popularity = value,
+            "critique_floor" => self.critique_floor = value,
+            "holds" => self.holds = value,
+            "pool_floor_pct" => self.pool_floor_pct = whole,
+            "spread_low_pct" => self.spread_low_pct = whole,
+            "spread_high_pct" => self.spread_high_pct = whole,
             _ => {
                 let axis = FACET_AXIS_KNOBS
                     .iter()
@@ -662,10 +799,32 @@ pub struct Scored {
     pub world: f64,
     /// Release-year proximity (`year_proximity`), 0 when either year is unknown.
     pub year: f64,
+    /// TMDB popularity against the pool's most popular, `ln(1+p) / ln(1+max)`; 0 when unknown.
+    pub popularity: f64,
     /// The dominant confident subgenre the cap counts against; empty when there is none.
     pub subgenre: String,
     /// Held back by the subgenre cap and placed after the capped window instead of at its score rank.
     pub held: bool,
+}
+
+/// What viewers make of a title — IMDb's rating and vote count, TMDB's popularity — for the filters and
+/// the popularity term. Supplied by the caller for the same reason as `Authorship`: `den-index` does not
+/// know where a rating comes from. `None` is unknown, and an unknown title is kept by every filter.
+pub trait Audience {
+    /// IMDb's (rating, vote count).
+    fn imdb(&self, tmdb_id: u32) -> Option<(f64, f64)>;
+    /// TMDB's popularity in its daily export: unbounded, most titles under 50.
+    fn popularity(&self, tmdb_id: u32) -> Option<f64>;
+}
+
+/// What a request adds beyond the corpus: who watches, and which candidates it will consider at all.
+#[derive(Clone, Copy, Default)]
+pub struct Extras<'a> {
+    pub audience: Option<&'a dyn Audience>,
+    /// A candidate this answers `false` for is dropped before anything is scored (a facet filter, titles
+    /// already watched). Before, so the pool's own statistics — its floors and spread — are over what the
+    /// row can actually hold.
+    pub keep: Option<&'a dyn Fn(u32) -> bool>,
 }
 
 /// `more_like_this_pooled` with its knobs as an argument, and every title's signals kept. Serving ranks
@@ -677,6 +836,21 @@ pub fn more_like_this_scored(
     media_type: MediaType,
     authorship: Option<&dyn Authorship>,
     facets: Option<&dyn Facets>,
+    p: &SimilarParams,
+) -> Vec<Scored> {
+    more_like_this_with(plot, premise, tmdb_id, media_type, authorship, facets, Extras::default(), p)
+}
+
+/// `more_like_this_scored`, with a request's `Extras`.
+#[allow(clippy::too_many_arguments)]
+pub fn more_like_this_with(
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
     let mut pool: Vec<u32> = Vec::new();
@@ -714,7 +888,7 @@ pub fn more_like_this_scored(
     let labels = |id: u32| {
         premise.and_then(|x| x.labels(id, media_type)).or_else(|| plot.and_then(|x| x.labels(id, media_type)))
     };
-    rank_pool(&pool, tmdb_id, &labels, authorship, facets, p)
+    rank_pool(&pool, tmdb_id, &labels, authorship, facets, extras, p)
 }
 
 /// One member of a seed's candidate pool, with its cosine to the seed in each space (`None` where that
@@ -739,6 +913,7 @@ pub fn rank_pool<'l>(
     labels: &dyn Fn(u32) -> Option<crate::Labels<'l>>,
     authorship: Option<&dyn Authorship>,
     facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
     let Some(mine) = labels(tmdb_id) else {
@@ -752,8 +927,31 @@ pub fn rank_pool<'l>(
     let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
 
+    let audience = extras.audience;
+    // The request's filters. Each is skipped outright at its production value, so production's pool is
+    // never even asked about them. Unknown passes: a title IMDb has not rated is not a badly rated one.
+    let admitted = |id: u32| -> bool {
+        if extras.keep.is_some_and(|keep| !keep(id)) {
+            return false;
+        }
+        if p.min_imdb_rating > 0.0 || p.min_imdb_votes > 0.0 {
+            if let Some((rating, votes)) = audience.and_then(|a| a.imdb(id)) {
+                if rating < p.min_imdb_rating || votes < p.min_imdb_votes {
+                    return false;
+                }
+            }
+        }
+        if p.min_popularity > 0.0 {
+            if let Some(popularity) = audience.and_then(|a| a.popularity(id)) {
+                if popularity < p.min_popularity {
+                    return false;
+                }
+            }
+        }
+        true
+    };
     let raw: Vec<(u32, Option<f64>, Option<f64>)> =
-        pool.iter().map(|c| (c.tmdb_id, c.premise, c.plot)).collect();
+        pool.iter().filter(|c| admitted(c.tmdb_id)).map(|c| (c.tmdb_id, c.premise, c.plot)).collect();
     // A candidate one index has never seen is scored at that index's pool floor rather than zero, so a
     // missing vector costs it a little and does not disqualify it.
     let floor = |values: Vec<f64>| -> f64 {
@@ -762,7 +960,7 @@ pub fn rank_pool<'l>(
             return 0.0;
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        v[v.len() / 10]
+        v[percentile_at(v.len(), p.pool_floor_pct)]
     };
     let premise_floor = floor(raw.iter().filter_map(|&(_, p, _)| p).collect());
     let plot_floor = floor(raw.iter().filter_map(|&(_, _, l)| l).collect());
@@ -804,7 +1002,21 @@ pub fn rank_pool<'l>(
     // The tonal term is expressed in the pool's own units so one weight works for every seed.
     let mut bases: Vec<f64> = scored.iter().map(|s| s.1).collect();
     bases.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let spread = (bases[bases.len() * 9 / 10] - bases[bases.len() / 10]).max(f64::EPSILON);
+    let spread = (bases[percentile_at(bases.len(), p.spread_high_pct)]
+        - bases[percentile_at(bases.len(), p.spread_low_pct)])
+    .max(f64::EPSILON);
+    // Popularity against the pool's most popular, on a log scale: TMDB's number is unbounded and heavy-tailed,
+    // so linear would make one blockbuster the only title that scores.
+    let most_popular =
+        scored.iter().filter_map(|s| audience.and_then(|a| a.popularity(s.0))).fold(0.0f64, f64::max);
+    let popularity_of = |id: u32| -> f64 {
+        match audience.and_then(|a| a.popularity(id)) {
+            Some(popularity) if most_popular > 0.0 => {
+                libm::log1p(popularity.max(0.0)) / libm::log1p(most_popular)
+            }
+            _ => 0.0,
+        }
+    };
     let mut final_scored: Vec<Scored> = scored
         .into_iter()
         .map(|(id, base, dominant, pc, l)| {
@@ -822,6 +1034,7 @@ pub fn rank_pool<'l>(
                 (Some(a), Some(b)) => year_proximity(a, b, p.year_halflife),
                 _ => 0.0,
             };
+            let popularity = popularity_of(id);
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
             // against a pair, not merely absence of evidence for it.
@@ -838,8 +1051,10 @@ pub fn rank_pool<'l>(
                         + p.w_home * home
                         + p.w_facet * fa
                         - p.w_world * world
-                        // Last, so at production's `w_year = 0` it adds an exact 0.0 to the sum above.
-                        + p.w_year * year);
+                        // Last, so at production's `w_year = 0` and `w_popularity = 0` each adds an exact 0.0
+                        // to the sum above.
+                        + p.w_year * year
+                        + p.w_popularity * popularity);
             Scored {
                 tmdb_id: id,
                 score,
@@ -856,6 +1071,7 @@ pub fn rank_pool<'l>(
                 facet: fa,
                 world,
                 year,
+                popularity,
                 subgenre: dominant,
                 held: false,
             }
@@ -1096,7 +1312,10 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 34, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 43, "a field was added without a knob, or the reverse");
+        for knob in SimilarParams::KNOBS {
+            assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
+        }
         // The per-axis knobs name the store's axes, in its order.
         for (knob, axis) in FACET_AXIS_KNOBS.iter().zip(den_store::FACET_AXES) {
             assert_eq!(*knob, format!("w_facet_{axis}"));
@@ -1203,7 +1422,7 @@ mod tests {
             })
             .collect();
         let labels = |id: u32| premise.labels(id, MediaType::Movie);
-        let ranked = rank_pool(&pool, 1, &labels, Some(&SameHand), None, &p);
+        let ranked = rank_pool(&pool, 1, &labels, Some(&SameHand), None, Extras::default(), &p);
 
         assert_eq!(ranked, served);
         assert_eq!(served.len(), 4, "three retrieved and one nominated: {served:?}");
@@ -1280,6 +1499,118 @@ mod tests {
         assert!(!two_before_three(0, &p), "with a century's half-life ten years is nearly the same year");
         assert!((year_proximity(2000.0, 1990.0, 10.0) - 0.5).abs() < 1e-15);
         assert_eq!(year_proximity(2000.0, 2000.0, 10.0), 1.0);
+    }
+
+    /// Title 2 is rated 5.0 on 100 votes with popularity 1; title 3 has no IMDb record and popularity 1,000;
+    /// every other title has popularity 1.
+    struct Viewers;
+
+    impl Audience for Viewers {
+        fn imdb(&self, id: u32) -> Option<(f64, f64)> {
+            (id == 2).then_some((5.0, 100.0))
+        }
+        fn popularity(&self, id: u32) -> Option<f64> {
+            Some(if id == 3 { 1000.0 } else { 1.0 })
+        }
+    }
+
+    /// The seed (1) and seven candidates, closest first on the premise vectors: 2, 3, then 4..=8.
+    fn audience_row(p: &SimilarParams, keep: Option<&dyn Fn(u32) -> bool>) -> Vec<u32> {
+        let premise = fixture(&[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (2, "movie", "Drama", false, &[], &[], [95, 0, 0]),
+            (3, "movie", "Drama", false, &[], &[], [90, 0, 0]),
+            (4, "movie", "Drama", false, &[], &[], [70, 0, 0]),
+            (5, "movie", "Drama", false, &[], &[], [60, 0, 0]),
+            (6, "movie", "Drama", false, &[], &[], [50, 0, 0]),
+            (7, "movie", "Drama", false, &[], &[], [40, 0, 0]),
+            (8, "movie", "Drama", false, &[], &[], [30, 0, 0]),
+        ]);
+        let extras = Extras { audience: Some(&Viewers), keep };
+        more_like_this_with(None, Some(&premise), 1, MediaType::Movie, None, None, extras, p)
+            .iter()
+            .map(|s| s.tmdb_id)
+            .collect()
+    }
+
+    /// Each audience knob and the `keep` filter moves the row, and at production's values none does.
+    #[test]
+    fn the_audience_knobs_and_the_keep_filter_move_a_row() {
+        let production = audience_row(&SimilarParams::default(), None);
+        assert_eq!(&production[..2], [2, 3], "on vectors alone 2 leads 3");
+        let with = |knob: &str, value: f64| {
+            let mut p = SimilarParams::default();
+            p.set(knob, value).unwrap();
+            audience_row(&p, None)
+        };
+        assert!(!with("min_imdb_rating", 6.0).contains(&2), "rated 5.0: dropped");
+        assert!(with("min_imdb_rating", 6.0).contains(&3), "unrated: kept");
+        assert!(!with("min_imdb_votes", 101.0).contains(&2), "100 votes: dropped");
+        assert_eq!(with("min_popularity", 5.0), [3], "only the popular title clears the floor");
+        assert_eq!(with("w_popularity", 10.0)[0], 3, "popularity lifts 3 over 2");
+        let not_two = |id: u32| id != 2;
+        assert!(!audience_row(&SimilarParams::default(), Some(&not_two)).contains(&2));
+    }
+
+    /// The pool floor and the spread percentiles move a row: a candidate the premise index lacks is scored
+    /// at the pool floor, and the spread scales what a shared maker adds.
+    #[test]
+    fn the_pool_percentiles_move_a_row() {
+        let premise = fixture(&[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (2, "movie", "Drama", false, &[], &[], [95, 0, 0]),
+            (3, "movie", "Drama", false, &[], &[], [90, 0, 0]),
+            (4, "movie", "Drama", false, &[], &[], [80, 0, 0]),
+            (5, "movie", "Drama", false, &[], &[], [70, 0, 0]),
+            (6, "movie", "Drama", false, &[], &[], [40, 0, 0]),
+            (7, "movie", "Drama", false, &[], &[], [20, 0, 0]),
+            (8, "movie", "Drama", false, &[], &[], [10, 0, 0]),
+        ]);
+        let plot = fixture(&[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (9, "movie", "Drama", false, &[], &[], [60, 0, 0]),
+        ]);
+        struct Eight;
+        impl Authorship for Eight {
+            fn nominate(&self) -> Vec<u32> {
+                vec![8]
+            }
+            fn makers(&self, id: u32) -> f64 {
+                f64::from(u8::from(id == 8))
+            }
+        }
+        let rank = |knob: &str, value: f64, of: u32| {
+            let mut p = SimilarParams::default();
+            p.set(knob, value).unwrap();
+            let row: Vec<u32> = more_like_this_scored(
+                Some(&plot),
+                Some(&premise),
+                1,
+                MediaType::Movie,
+                Some(&Eight),
+                None,
+                &p,
+            )
+            .iter()
+            .map(|s| s.tmdb_id)
+            .collect();
+            row.iter().position(|&x| x == of).expect("ranked")
+        };
+        // 9 has no premise vector, so its premise cosine is the pool's floor.
+        assert!(rank("pool_floor_pct", 50.0, 9) < rank("pool_floor_pct", 10.0, 9), "a higher floor lifts 9");
+        // A narrower spread shrinks what the shared maker adds, and 8 falls.
+        assert!(rank("spread_high_pct", 51.0, 8) > rank("spread_high_pct", 90.0, 8), "8 falls");
+        assert!(rank("spread_low_pct", 49.0, 8) > rank("spread_low_pct", 10.0, 8), "8 falls");
+    }
+
+    /// Production's percentile positions are the integer divisions the scorer always used.
+    #[test]
+    fn production_percentiles_are_the_old_integer_divisions() {
+        for len in 1..2000 {
+            assert_eq!(percentile_at(len, POOL_FLOOR_PCT), len / 10);
+            assert_eq!(percentile_at(len, SPREAD_HIGH_PCT), len * 9 / 10);
+        }
+        assert_eq!(percentile_at(10, 100), 9, "held inside the list");
     }
 
     #[test]

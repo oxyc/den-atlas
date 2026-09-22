@@ -21,9 +21,9 @@ use crate::{Axis, MediaType, SimilarParams, ValueId, Weighted};
 use den_store::{Row, Store, StoreError};
 use std::collections::HashMap;
 
-/// The share of a media type holding an axis, for `ln(N / holders)`. Read at load into the idf aggregate,
-/// so unlike the knobs in `SimilarParams` a request cannot move it.
-const HOLDS: f64 = 0.7;
+/// The critique level at or above which a title "holds" an axis, for the idf `ln(N / holders)`. Baked into
+/// the aggregates, so a request with another value (`SimilarParams::holds`) needs aggregates built for it.
+pub(crate) const HOLDS: f64 = 0.7;
 
 // The floors `build_rail_facets.py` applied when it wrote the JSON blob, re-applied HERE because the store
 // deliberately keeps full fidelity: a value below a floor is real data the store should hold and the scorer
@@ -34,8 +34,9 @@ const HOLDS: f64 = 0.7;
 // They are not cosmetic. Dropping the noul floor took the corpus mean noul cosine from 0.38 to 0.51 and
 // changed 5 of The Wire's top 20 — the shared-baseline problem the critique centering exists to avoid,
 // reintroduced in a different term. `world` below its floor made 50% of rows move.
-/// A critique axis below this says nothing about what the work argues.
-const CRITIQUE_FLOOR: f64 = 0.10;
+/// A critique axis below this says nothing about what the work argues. The centering mean is built with
+/// it, so another value (`SimilarParams::critique_floor`) needs aggregates built for it too.
+pub(crate) const CRITIQUE_FLOOR: f64 = 0.10;
 
 /// How the store encodes a media type in the high half of its packed key.
 fn media_code(media: MediaType) -> u8 {
@@ -72,8 +73,14 @@ pub struct RailAggregates {
 }
 
 impl RailAggregates {
-    /// One pass over the store per statistic. Called once, at load.
+    /// Production's aggregates. One pass over the store; called once, at load.
     pub fn build(store: &Store<'_>) -> Result<Self, String> {
+        Self::build_with(store, CRITIQUE_FLOOR, HOLDS)
+    }
+
+    /// The aggregates for another critique floor and holds share — the same pass, with those two values.
+    /// A pass over the whole corpus, so a caller serving many requests with the same values keeps them.
+    pub fn build_with(store: &Store<'_>, critique_floor: f64, holds: f64) -> Result<Self, String> {
         let keys = store.per_row::<u64>("keys").map_err(|e| e.to_string())?;
         let facet_v = store.column::<u32>("facet_v").map_err(|e| e.to_string())?;
         let facet_c = store.column::<u8>("facet_c").map_err(|e| e.to_string())?;
@@ -123,9 +130,9 @@ impl RailAggregates {
                 // Floored, like the read path: an axis the scorer never sees must not move the mean it
                 // is centered against.
                 let raw = f64::from(critique[row * axes + axis]) / 100.0;
-                let p = if raw >= CRITIQUE_FLOOR { raw } else { 0.0 };
+                let p = if raw >= critique_floor { raw } else { 0.0 };
                 *sums.entry((media, name)).or_insert(0.0) += p;
-                if p >= HOLDS {
+                if p >= holds {
                     *above.entry((media, name)).or_insert(0.0) += 1.0;
                 }
             }
@@ -173,15 +180,19 @@ pub struct SeedFacets<'a> {
     noul_floor: f64,
     world_floor: f64,
     defining: f64,
+    /// Must be the floor the aggregates were built with, or the centering mean is over other values.
+    critique_floor: f64,
 }
 
 impl<'a> SeedFacets<'a> {
-    /// The same columns, read with the floors of `params` rather than production's.
+    /// The same columns, read with the floors of `params` rather than production's. The aggregates must be
+    /// the ones built for `params.critique_floor` and `params.holds`.
     pub fn tuned(self, params: &SimilarParams) -> Self {
         SeedFacets {
             noul_floor: params.noul_floor,
             world_floor: params.world_floor,
             defining: params.defining,
+            critique_floor: params.critique_floor,
             ..self
         }
     }
@@ -200,6 +211,7 @@ impl<'a> SeedFacets<'a> {
             noul_floor: production.noul_floor,
             world_floor: production.world_floor,
             defining: production.defining,
+            critique_floor: production.critique_floor,
             agg,
             media: media_code(media),
             keys: store.per_row::<u64>("keys")?,
@@ -233,7 +245,7 @@ impl<'a> SeedFacets<'a> {
             .enumerate()
             .filter_map(|(i, &name)| {
                 let p = f64::from(*self.critique.get(row.0 * axes + i)?) / 100.0;
-                (p >= CRITIQUE_FLOOR).then_some((name, p))
+                (p >= self.critique_floor).then_some((name, p))
             })
             .collect()
     }
