@@ -46,6 +46,9 @@ pub struct Indexes {
     pub facets: Option<FacetIndex>,
     /// The Wikidata facts; without them `/recommend` reads labels and facets alone.
     pub facts: Option<Facts>,
+    /// Each franchise series' strength (`series::SeriesStrength`), out of the facts and the plot index;
+    /// empty without the facts.
+    pub series: crate::series::SeriesStrength,
     /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
     pub plot_facets: Option<PlotFacets>,
     /// The mapped store and its corpus-wide aggregates: the artifact everything above was read out of,
@@ -559,6 +562,11 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             .map_err(|e| eprintln!("facts unusable ({e}) — /recommend and search run without them"))
             .ok()
     });
+    let (series, series_took) = timed(|| {
+        facts
+            .as_ref()
+            .map_or_else(Default::default, |facts| crate::series::SeriesStrength::from_facts(&plot, facts))
+    });
     // The facet rows used to come from `plotFacetsFile`, a 5,336-title sidecar frozen at a dead
     // datasetVersion; the store answers the same axes for all 47,618 titles, and three more besides.
     let (plot_facets, plot_facets_took) = timed(|| {
@@ -606,12 +614,14 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     });
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "store {}, plot {}, premise {}, cards {}, facts {}, facet rows {}, facets {}, display {}",
+        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), facet rows {}, facets {}, display {}",
         seconds(store_took),
         seconds(plot_took),
         seconds(premise_took),
         seconds(cards_took),
         seconds(facts_took),
+        seconds(series_took),
+        series.len(),
         seconds(plot_facets_took),
         seconds(facets_took),
         seconds(display_took)
@@ -623,6 +633,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         premise,
         facets,
         facts,
+        series,
         plot_facets,
         store,
         ratings: sources.ratings.clone(),

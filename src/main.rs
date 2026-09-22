@@ -25,6 +25,7 @@ mod ratings;
 mod recommend;
 mod schema;
 mod search;
+mod series;
 mod store;
 mod titles;
 mod tos;
