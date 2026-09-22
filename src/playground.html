@@ -51,6 +51,61 @@
   td.title a { color: var(--text); }
   .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
   .neg { color: var(--down); }
+  :root { color-scheme: light dark; }
+  p { overflow-wrap: anywhere; }
+  input, select, textarea { max-width: 100%; }
+  label.inline { max-width: 100%; }
+  input[type=file] { min-width: 0; }
+  /* Always in view: how many knobs differ from production, a way back, and whether a re-rank is running. */
+  #bar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+         margin: 8px -16px 0; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  #bar a { color: var(--accent); }
+  #bar.busy { border-bottom-color: var(--accent); box-shadow: 0 1px 0 var(--accent); }
+  #bar-count.changed { background: var(--changed); border-radius: 6px; padding: 2px 6px; color: var(--text); }
+  details.group { border-top: 1px solid var(--line); }
+  details.group:first-of-type { border-top: 0; }
+  details.group > summary { cursor: pointer; padding: 10px 0; font-size: 13px; font-weight: 600; color: var(--muted);
+         text-transform: uppercase; letter-spacing: .04em; }
+  details.group > summary .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  details.group > .knobs { padding-bottom: 12px; }
+  .knob .ctl { display: flex; gap: 8px; align-items: center; }
+  .knob .ctl input[type=range] { flex: 1; min-width: 0; padding: 0; border: 0; background: none; accent-color: var(--accent); }
+  .knob .ctl input[type=number] { width: 6.5em; flex: none; }
+  /* The per-title card list replaces a seed's table on narrow screens; the table stays on wide ones. */
+  .cards { display: none; list-style: none; margin: 0; padding: 0; }
+  .cards > li { border-bottom: 1px solid var(--line); }
+  .cards summary { display: flex; gap: 8px; align-items: baseline; padding: 10px 0; cursor: pointer;
+         font-variant-numeric: tabular-nums; }
+  .cards summary .rank { min-width: 2ch; text-align: right; color: var(--muted); }
+  .cards summary .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .cards summary .score { color: var(--muted); }
+  .cards dl { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 12px; margin: 0 0 10px;
+         font-variant-numeric: tabular-nums; font-size: 13px; }
+  .cards dt { color: var(--muted); } .cards dd { margin: 0; text-align: right; }
+  .cards dd.value { color: var(--muted); font-size: 12px; }
+  .cards dd.meta { grid-column: 1 / -1; text-align: left; color: var(--muted); padding-top: 4px; }
+  .cards .meta a { color: var(--accent); }
+  #knobs, #judged-section, #rows { scroll-margin-top: 64px; }
+  @media (max-width: 760px) {
+    body { padding: 12px; }
+    #bar { margin: 8px -12px 0; padding: 8px 12px; }
+    h2 { font-size: 16px; }
+    button, select, input:not([type=checkbox]):not([type=range]):not([type=file]) { min-height: 44px; }
+    button { padding: 8px 12px; }
+    input[type=checkbox] { width: 22px; height: 22px; }
+    label.inline { min-height: 44px; }
+    .knob .ctl input[type=range] { height: 44px; }
+    .knob .ctl input[type=number] { font-size: 16px; }
+    input, select { font-size: 16px; } /* below 16px iOS zooms the page on focus */
+    details > summary { padding: 10px 0; }
+    #hits li { padding: 6px 0; }
+    #hits button, .chip button { min-height: 36px; min-width: 36px; }
+    .card-head { flex-wrap: nowrap; }
+    .card-head h2 { min-width: 0; overflow-wrap: anywhere; }
+    td.title, th.title { min-width: 120px; }
+    .wide { display: none; }
+    .cards { display: block; }
+  }
 </style>
 </head>
 <body>
@@ -58,9 +113,18 @@
   <h1>Tuning playground</h1>
   <p>More Like This for a set of seeds, ranked by the scorer atlas serves, with any of its knobs moved. Every
      field starts at production's value; only what you change is sent, and every row re-ranks when you stop
-     typing. Beside each title is its rank in production's row. Points are what each signal added to the
+     typing or let go of a slider. Beside each title is its rank in production's row. Points are what each signal added to the
      score (spread &times; weight &times; value). Everything on the page is in the address, so a setup can be
      shared with Copy link, or saved with Export.</p>
+
+  <div id="bar">
+    <span id="bar-count">production</span>
+    <button type="button" id="bar-reset">Reset<span class="wide"> knobs</span></button>
+    <a href="#knobs">Knobs</a>
+    <a href="#rows">Rows</a>
+    <a href="#judged-section">Judged</a>
+    <span id="bar-status" class="muted wide"></span>
+  </div>
 
   <section>
     <div class="row">
@@ -122,7 +186,7 @@
     <div id="knobs"></div>
   </section>
 
-  <section>
+  <section id="judged-section">
     <div class="row">
       <button type="button" id="judge">Score on the judged set</button>
       <span id="judged-status" class="muted"></span>
@@ -181,31 +245,57 @@ let judgedFresh = false;
 function fmt(n, d = 3) { return n == null ? "–" : Number(n).toFixed(d); }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
 
-// The knobs, grouped by what they affect, in the order `params.json` names the groups.
+const narrow = matchMedia("(max-width: 760px)");
+
+// The knobs, grouped by what they affect, in the order `params.json` names the groups. Each group folds;
+// on a narrow screen only the groups with a changed knob start open.
 function buildKnobs(values) {
   $("knobs").innerHTML = "";
   for (const group of p.knobGroups) {
-    const heading = document.createElement("h3");
-    heading.textContent = group;
+    const box = document.createElement("details");
+    box.className = "group";
+    box.dataset.group = group;
+    box.innerHTML = `<summary>${esc(group)} <span class=muted></span></summary>`;
     const grid = document.createElement("div");
     grid.className = "knobs";
     for (const k of knobs.filter((k) => k.group === group)) {
       const wrap = document.createElement("label");
       wrap.className = "knob";
       const step = k.integer ? 1 : 0.05;
+      const range = `min="${k.min}" max="${k.max}" step="${step}"`;
       wrap.innerHTML = `${esc(k.name)} <small>(${k.default})</small>` +
-        `<input type="number" name="${esc(k.name)}" min="${k.min}" max="${k.max}" step="${step}">` +
+        `<span class=ctl><input type="range" ${range} aria-label="${esc(k.name)}">` +
+        `<input type="number" name="${esc(k.name)}" ${range}></span>` +
         `<small>${esc(k.about)}</small>`;
-      const input = wrap.querySelector("input");
+      const [slider, input] = wrap.querySelectorAll("input");
       input.value = values[k.name] ?? k.default;
-      const mark = () => wrap.classList.toggle("changed", Number(input.value) !== k.default);
-      input.addEventListener("input", mark);
-      input.addEventListener("input", schedule);
-      mark();
+      slider.value = input.value;
+      const mark = () => { wrap.classList.toggle("changed", Number(input.value) !== k.default); countChanged(); };
+      input.addEventListener("input", () => { slider.value = input.value; mark(); schedule(); });
+      // Dragging moves the number only; the rows re-rank once the thumb is let go (`change`), so a drag is
+      // one request, not one per step it passed through.
+      slider.addEventListener("input", () => { input.value = slider.value; mark(); });
+      slider.addEventListener("change", schedule);
+      wrap.classList.toggle("changed", Number(input.value) !== k.default);
       grid.appendChild(wrap);
     }
-    $("knobs").append(heading, grid);
+    box.appendChild(grid);
+    box.open = !narrow.matches || grid.querySelector(".changed") !== null;
+    $("knobs").appendChild(box);
   }
+  countChanged();
+}
+
+// The changed-knob count in each group's heading and in the bar.
+function countChanged() {
+  for (const box of $("knobs").querySelectorAll("details.group")) {
+    const n = box.querySelectorAll(".knob.changed").length;
+    box.querySelector("summary .muted").textContent = n ? `· ${n} changed` : "";
+  }
+  const n = $("knobs").querySelectorAll(".knob.changed").length;
+  $("bar-count").textContent = n ? `${n} changed` : "production";
+  $("bar-count").classList.toggle("changed", n > 0);
+  $("bar-reset").disabled = n === 0;
 }
 
 function changed() {
@@ -275,8 +365,11 @@ async function refresh() {
     return;
   }
   const mine = ++asked;
-  $("status").textContent = "Ranking…";
-  const resp = await fetch(`${base}/rows.json?${q}`);
+  $("status").textContent = $("bar-status").textContent = "Ranking…";
+  $("bar").classList.add("busy");
+  const resp = await fetch(`${base}/rows.json?${q}`).finally(() => {
+    if (mine === asked) { $("bar-status").textContent = ""; $("bar").classList.remove("busy"); }
+  });
   const body = await resp.json().catch(() => ({}));
   if (mine !== asked) return;
   if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
@@ -339,7 +432,9 @@ function card(a) {
     : "No row: atlas has no neighbours for this title, or the filters left none.";
   let html = `<section data-card="${esc(a.key)}"><div class="row card-head"><h2>${seed} <span class=muted>${esc(a.key)}</span></h2>` +
     `<button type="button" data-remove="${esc(a.key)}">Remove</button></div><p class=muted>${counts}</p>`;
-  if (a.titles.length) html += `<div class=scroll><table>${table(a, type)}</table></div>`;
+  if (a.titles.length) {
+    html += `<div class="scroll wide"><table>${table(a, type)}</table></div><ul class=cards>${cards(a, type)}</ul>`;
+  }
   if (a.left.length) {
     html += `<details><summary>Pushed out of the first ${a.titles.length} (${a.left.length})</summary><ul>` +
       a.left.map((t) => `<li>${esc(t.title || t.id)} — production #${t.production}</li>`).join("") + "</ul></details>";
@@ -364,6 +459,31 @@ function table(a, type) {
       `<td class=title>${esc(t.subgenre || "")}${t.held ? " <span class=muted>(held by cap)</span>" : ""}</td></tr>`;
   }
   return html + "</tbody>";
+}
+
+// The narrow-screen form of `table`: one line per title (rank, title, places moved against production,
+// score), its per-signal points folded underneath.
+function cards(a, type) {
+  const tmdb = type === "movie" ? "movie" : "tv";
+  return a.titles.map((t) => {
+    const name = t.title ? `${esc(t.title)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""}` : t.id;
+    const shift = t.production == null ? "<span class=up>new</span>"
+      : t.production === t.rank ? "<span class=muted>=</span>"
+      : t.production > t.rank ? `<span class=up title="production #${t.production}">▲${t.production - t.rank}</span>`
+      : `<span class=down title="production #${t.production}">▼${t.rank - t.production}</span>`;
+    const signals = SIGNALS.map((s) => {
+      const sig = t.signals[s];
+      const cls = sig.points < 0 ? "neg" : sig.points === 0 ? "muted" : "";
+      return `<dt>${s}</dt><dd class=value>value ${fmt(sig.value)}</dd><dd class="${cls}">${fmt(sig.points)}</dd>`;
+    }).join("");
+    return `<li><details><summary><span class=rank>${t.rank}</span><span class=name>${name}</span>${shift}` +
+      `<span class=score>${fmt(t.score)}</span></summary><dl>` +
+      `<dt>production</dt><dd></dd><dd>${t.production == null ? "–" : `#${t.production}`}</dd>` +
+      `<dt>base</dt><dd></dd><dd>${fmt(t.base)}</dd>${signals}` +
+      `<dd class=meta>${esc(t.subgenre || "")}${t.held ? " (held by cap)" : ""} · ` +
+      `<a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">TMDB</a></dd>` +
+      `</dl></details></li>`;
+  }).join("");
 }
 
 function suggestTable(s) {
@@ -455,7 +575,9 @@ $("import").addEventListener("change", (e) => {
   e.target.value = "";
   if (file) importFile(file).catch(report);
 });
-$("reset-knobs").addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
+for (const id of ["reset-knobs", "bar-reset"]) {
+  $(id).addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
+}
 $("reset-seeds").addEventListener("click", () => {
   seeds = [...p.defaultSeeds]; suggestSeeds = [...p.defaultSuggestSeeds]; drawLists(); refresh().catch(report);
 });
