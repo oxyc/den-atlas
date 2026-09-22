@@ -384,8 +384,9 @@ mod tests {
 
     /// The byte-identity proof: More Like This ranked with `SimilarParams::default()` — through the
     /// serving entry point and through the playground's — against the rows the scorer served for five
-    /// anchors BEFORE it took parameters (`similar-golden.json`, captured from den-atlas 0.53.0 over HTTP
-    /// with `limit=200`, i.e. the whole row).
+    /// anchors BEFORE it took parameters (`similar-golden.json`: the whole row, `limit=200`, first captured
+    /// from den-atlas 0.53.0 over HTTP). `scripts/similar-golden.py` recaptures it; it was recaptured when
+    /// the scorer's `ln` moved to `libm`, which moved scores by ULPs and changed no id.
     ///
     /// Opt-in, like every test that needs the real corpus: `DEN_STORE` names a store whose directory holds
     /// its `dataset.meta.json`. It skips unless that store is the generation the golden was captured on,
