@@ -168,6 +168,13 @@ const fn knob(name: &'static str, min: f64, max: f64, integer: bool, about: &'st
 
 impl SimilarParams {
     /// Every field, in the order a form shows them. `get`/`set` answer exactly these names.
+    ///
+    /// The ranges are also what bounds a request's cost, because the playground that sets these is reachable
+    /// by anyone who can reach atlas. The size knobs stop at 2.5× (`pool_k`) and 2× (`max_row`) production:
+    /// measured on the published store over 817 seeds (the judged seeds and every title in the golden rows)
+    /// with every size at its maximum and every floor at 0, a request costs at most 30 ms of CPU (median 13)
+    /// and 0.16 MB, where the old maxima (`pool_k = 5000`, `max_row = 1000`) cost up to ~100 ms (median 53)
+    /// and 0.72 MB. The other knobs change what a candidate scores, not how many are scored.
     pub const KNOBS: &'static [Knob] = &[
         knob("w_premise", 0.0, 10.0, false, "base: weight of the premise-space cosine"),
         knob("w_plot", 0.0, 10.0, false, "base: weight of the plot-space cosine"),
@@ -191,9 +198,9 @@ impl SimilarParams {
             "a critique axis at or above this is one of the seed's defining ones",
         ),
         knob("subgenre_cap", 0.0, 200.0, true, "at most this many titles sharing a dominant subgenre ..."),
-        knob("cap_window", 0.0, 1000.0, true, "... within this many leading titles"),
-        knob("pool_k", 1.0, 5000.0, true, "candidates drawn from EACH vector index"),
-        knob("max_row", 1.0, 1000.0, true, "the longest row kept"),
+        knob("cap_window", 0.0, 400.0, true, "... within this many leading titles"),
+        knob("pool_k", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
+        knob("max_row", 1.0, 400.0, true, "the longest row kept"),
         knob("same_animation", 0.0, 1.0, true, "1: never mix animated with live action"),
     ];
 
@@ -989,6 +996,10 @@ mod tests {
         assert!(p.set("w_maker", f64::NAN).unwrap_err().contains("w_maker"));
         assert!(p.set("pool_k", 2.5).unwrap_err().contains("whole number"));
         assert!(p.set("pool_k", 0.0).unwrap_err().contains("pool_k"));
+        // The size knobs are bounded, because they are what a request's cost scales with.
+        assert!(p.set("pool_k", 1001.0).unwrap_err().contains("pool_k"));
+        assert!(p.set("max_row", 401.0).unwrap_err().contains("max_row"));
+        assert!(p.set("cap_window", 401.0).unwrap_err().contains("cap_window"));
         assert!(p.set("w_nope", 1.0).unwrap_err().contains("w_nope"));
         assert_eq!(p, SimilarParams::default(), "a refused value must change nothing");
     }
