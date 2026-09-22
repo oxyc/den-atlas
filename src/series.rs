@@ -16,8 +16,7 @@
 //! strength = max(ramp(plot, PLOT_LO, PLOT_HI), ramp(people, PEOPLE_LO, PEOPLE_HI)), in [0, 1].
 //!
 //! Membership is a LIST per title: a title can be in several real series (The Batman is in "Batman in film"
-//! and in its own trilogy), so [`Title::series`] is a slice, and today's single `franchise` column is adapted
-//! to one in [`SeriesStrength::from_facts`].
+//! and in its own trilogy), so [`Title::series`] is a slice: the facts' `franchise` list.
 
 use crate::facts::Facts;
 use den_index::{Index, MediaType};
@@ -71,8 +70,7 @@ pub struct SeriesStrength {
 }
 
 impl SeriesStrength {
-    /// Every series' strength out of the facts and the plot index. The facts' `franchise` is a single value
-    /// today; it is read as a list of one so this does not change when the column becomes a list.
+    /// Every series' strength out of the facts and the plot index, counting a title in each series it is in.
     pub fn from_facts(plot: &Index, facts: &Facts) -> SeriesStrength {
         let titles = facts.keys().filter_map(|(media, id)| {
             let record = facts.get(id, media)?;
@@ -218,7 +216,7 @@ mod tests {
         let film = |id: u32, plot: Vec<i8>, franchise: Option<u32>, makers: Vec<u32>, cast: Vec<u32>| Row {
             tmdb_id: id,
             plot,
-            franchise,
+            franchise: franchise.into_iter().collect(),
             makers,
             cast,
             ..Row::default()
@@ -315,7 +313,7 @@ mod tests {
 
         let mut members: HashMap<u32, usize> = HashMap::new();
         for (media, id) in facts.keys() {
-            if let Some(f) = facts.get(id, media).and_then(|r| r.franchise) {
+            for &f in facts.get(id, media).map_or(&[][..], |r| r.franchise.as_slice()) {
                 *members.entry(f).or_default() += 1;
             }
         }
