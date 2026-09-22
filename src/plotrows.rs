@@ -446,7 +446,7 @@ impl Tilt {
     ///
     /// The composition is den-core's `tilt::order`, not a copy of it. atlas measures the cosines — they need
     /// the vector space, which is why they are here — and den-core decides what they are worth.
-    fn applied(&self, indexes: &Indexes, order: &[Key], cards: &HashMap<Key, Card>) -> Vec<Key> {
+    pub(crate) fn applied(&self, indexes: &Indexes, order: &[Key], cards: &HashMap<Key, Card>) -> Vec<Key> {
         let index = &indexes.plot;
         let liked = index.centroid(&self.liked);
         let disliked = index.centroid(&self.disliked);
@@ -562,20 +562,6 @@ pub fn row(
     let kind = if media_type == MediaType::Tv { "tv" } else { "movie" };
     let row_key = format!("{kind}?{}", named.join("&"));
     let order = indexes.row_order(row_key.clone(), || {
-        let (labels, plot): (Vec<_>, Vec<_>) =
-            constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
-        let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
-            indexes.plot_facets.as_ref().map_or_else(Vec::new, |facets| facets.matching(media_type, &plot))
-        } else if let Some((family, label)) = labels.first() {
-            let titles = if family == "mood" {
-                indexes.plot.titles_with_mood(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
-            } else {
-                indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
-            };
-            titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
-        } else {
-            Vec::new()
-        };
         let popularity = |(media_type, id): Key| {
             let votes = indexes.votes(media_type, id);
             let kind = match media_type {
@@ -584,17 +570,10 @@ pub fn row(
             };
             crate::search::attention(votes, export.and_then(|e| e.popularity_of(kind, id)))
         };
-        let mut matched: Vec<(Key, u8, f64)> = candidates
+        let mut matched: Vec<(Key, u8, f64)> = carrying(indexes, media_type, constraints)
             .into_iter()
             .filter(|(key, _)| cards.contains_key(key))
-            .filter_map(|(key, confidence)| {
-                labels
-                    .iter()
-                    .try_fold(confidence, |lowest, (family, label)| {
-                        label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
-                    })
-                    .map(|lowest| (key, lowest, popularity(key)))
-            })
+            .map(|(key, lowest)| (key, lowest, popularity(key)))
             .collect();
         matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
         matched.into_iter().map(|(key, _, _)| key).collect()
@@ -649,6 +628,41 @@ pub fn row(
         answer["taste"] = serde_json::json!(tilt.taste);
     }
     answer
+}
+
+/// The titles of `media_type` carrying every constraint — plot facets (`tone=bleak`) and labels
+/// (`mood=Feel-good`, `subgenre=Heist`) — each at the lowest confidence it carries any of them, on the 3/2/1
+/// scale. What a row lists and what the playground's facet filter keeps, so the two cannot disagree.
+pub(crate) fn carrying(
+    indexes: &Indexes,
+    media_type: MediaType,
+    constraints: &[(String, String)],
+) -> Vec<(Key, u8)> {
+    let (labels, plot): (Vec<_>, Vec<_>) =
+        constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
+    let candidates: Vec<(Key, u8)> = if !plot.is_empty() {
+        indexes.plot_facets.as_ref().map_or_else(Vec::new, |facets| facets.matching(media_type, &plot))
+    } else if let Some((family, label)) = labels.first() {
+        let titles = if family == "mood" {
+            indexes.plot.titles_with_mood(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+        } else {
+            indexes.plot.titles_with_subgenre(label, Some(media_type), LABEL_FLOOR, 0, usize::MAX)
+        };
+        titles.into_iter().map(|(id, kind)| ((kind, id), 3)).collect()
+    } else {
+        Vec::new()
+    };
+    candidates
+        .into_iter()
+        .filter_map(|(key, confidence)| {
+            labels
+                .iter()
+                .try_fold(confidence, |lowest, (family, label)| {
+                    label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
+                })
+                .map(|lowest| (key, lowest))
+        })
+        .collect()
 }
 
 /// The confidence a label row needs (the label rows' own floor).

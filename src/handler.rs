@@ -172,6 +172,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             handle_index_post(&state, rest, req).await
         } else if route == "/recommend" {
             handle_recommend(&state, config, req).await
+        } else if route == "/playground/import.json" {
+            handle_playground_import(&state, req).await
         } else {
             json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED)
         };
@@ -286,6 +288,38 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
 }
 
+/// `POST /playground/import.json` — a playground file (`playground::FILE_FORMAT`) read back to the state it
+/// holds: `{"state", "query", "removed"}`, where `query` is that state as the page's address carries it and
+/// `removed` names the knobs an older file had that no longer exist. A 400 names what it refused. Pure JSON:
+/// nothing is ranked, so the indexes are not loaded.
+async fn handle_playground_import(state: &Arc<AppState>, req: Request) -> Response {
+    if !(state.playground && state.index.is_some()) {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    }
+    let bad_request = |detail: String| {
+        json_response(
+            serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+            StatusCode::BAD_REQUEST,
+        )
+    };
+    // A full export of twelve seeds at 200 titles each is well under this.
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024).await else {
+        return bad_request("the file is larger than 8 MB".to_owned());
+    };
+    let file: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(file) => file,
+        Err(e) => return bad_request(format!("not JSON: {e}")),
+    };
+    match crate::playground::import(&file) {
+        Ok((restored, removed)) => json_response(
+            serde_json::json!({ "state": restored.to_json(), "query": restored.query(), "removed": removed })
+                .to_string(),
+            StatusCode::OK,
+        ),
+        Err(detail) => bad_request(detail),
+    }
+}
+
 /// `/playground` (the page), `/playground/params.json` (the knobs and production's values),
 /// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This),
 /// `/playground/rows.json?seeds=…&<knob>=…&limit=` (the same for up to twelve seeds in one request) and
@@ -311,7 +345,8 @@ async fn handle_playground(
     enum Ask {
         Judged,
         Similar(den_index::MediaType, u32),
-        Rows(Vec<(den_index::MediaType, u32)>),
+        Rows,
+        Export { full: bool, judged: bool },
     }
     let bad_request = |detail: String| {
         json_response(
@@ -319,15 +354,15 @@ async fn handle_playground(
             StatusCode::BAD_REQUEST,
         )
     };
-    // Only `rows.json` reads `seeds`; everywhere else it is left in the query, where `parse` refuses it.
+    // Only `rows.json` and `export.json` read `seeds` and `suggest`, and only `export.json` reads `full` and
+    // `judged`; everywhere else they are left in the query, where `parse` refuses them.
     let (ask, query) = match route {
         "/playground/judged.json" => (Ask::Judged, query.to_owned()),
-        "/playground/rows.json" => {
-            let (seeds, rest) = crate::playground::take_seeds(query);
-            match crate::playground::parse_seeds(seeds.as_deref()) {
-                Ok(seeds) => (Ask::Rows(seeds), rest),
-                Err(detail) => return bad_request(detail),
-            }
+        "/playground/rows.json" => (Ask::Rows, query.to_owned()),
+        "/playground/export.json" => {
+            let (full, rest) = crate::playground::take_param(query, "full");
+            let (judged, rest) = crate::playground::take_param(&rest, "judged");
+            (Ask::Export { full: full.as_deref() == Some("1"), judged: judged.as_deref() == Some("1") }, rest)
         }
         _ => {
             let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json"))
@@ -343,13 +378,23 @@ async fn handle_playground(
             (Ask::Similar(media_type, tmdb_id), query.to_owned())
         }
     };
-    let (params, limit) = match crate::playground::parse(&query) {
+    let parsed = match ask {
+        Ask::Rows | Ask::Export { .. } => crate::playground::State::parse(&query),
+        _ => crate::playground::parse(&query).map(|tuning| crate::playground::State {
+            tuning,
+            seeds: Vec::new(),
+            suggest: Vec::new(),
+        }),
+    };
+    let playground_state = match parsed {
         Ok(parsed) => parsed,
         Err(detail) => return bad_request(detail),
     };
-    if let (Ask::Rows(_), Err(detail)) = (&ask, crate::playground::rows_limit(limit)) {
+    if let (Ask::Rows, Err(detail)) = (&ask, crate::playground::rows_limit(playground_state.tuning.limit)) {
         return bad_request(detail);
     }
+    let meta = state.dataset.as_ref().map(|ds| ds.meta.clone());
+    let titles = state.titles.clone();
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
@@ -358,12 +403,28 @@ async fn handle_playground(
         }
     };
     let ranking = Instant::now();
-    let answered = tokio::task::spawn_blocking(move || match ask {
-        Ask::Similar(media_type, tmdb_id) => {
-            crate::playground::answer(&indexes, media_type, tmdb_id, &params, limit).to_string()
+    let answered = tokio::task::spawn_blocking(move || {
+        let export = titles.as_ref().and_then(|t| t.index());
+        let sources = crate::playground::Sources { indexes: &indexes, export: export.as_deref() };
+        let s = &playground_state;
+        match ask {
+            Ask::Similar(media_type, tmdb_id) => {
+                crate::playground::answer(&sources, media_type, tmdb_id, &s.tuning).to_string()
+            }
+            Ask::Rows => crate::playground::rows(&sources, &s.seeds, &s.suggest, &s.tuning).to_string(),
+            Ask::Judged => crate::playground::judged(&sources, &s.tuning).to_string(),
+            Ask::Export { full, judged } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let provenance = crate::playground::Provenance {
+                    dataset_version: meta.as_ref().map_or("", |m| m.dataset_version.as_str()),
+                    store_sha256: meta.as_ref().and_then(|m| m.store_sha256.as_deref()),
+                    now,
+                };
+                crate::playground::export(&sources, s, &provenance, full, judged).to_string()
+            }
         }
-        Ask::Rows(seeds) => crate::playground::rows(&indexes, &seeds, &params, limit).to_string(),
-        Ask::Judged => crate::playground::judged(&indexes, &params).to_string(),
     })
     .await;
     let body = match answered {
@@ -1176,14 +1237,32 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     let mut excluded: std::collections::HashSet<_> = keys(&body.exclude).into_iter().collect();
     excluded.extend(seeds.iter().copied());
     let limit = body.limit.unwrap_or(SUGGEST_LIMIT).min(MAX_TITLES);
+    let (per_seed, pooled) = suggest_pool(&seeds, &excluded, limit, |id, media_type| {
+        indexes.more_like_this(id, media_type).to_vec()
+    });
+    let per_seed: Vec<serde_json::Value> = per_seed
+        .iter()
+        .map(|(seed, ids)| serde_json::json!({ "seed": titles_json(&[*seed])[0], "ids": ids }))
+        .collect();
+    Ok(serde_json::json!({ "perSeed": per_seed, "pooled": titles_json(&pooled) }))
+}
+
+/// Each seed's More Like This (`row`) minus the excluded titles, and those rows pooled in seed order up to
+/// `limit` — You Might Also Like. The playground pools its tuned rows through this too.
+pub(crate) type SuggestPool =
+    (Vec<((u32, den_index::MediaType), Vec<u32>)>, Vec<(u32, den_index::MediaType)>);
+
+pub(crate) fn suggest_pool(
+    seeds: &[(u32, den_index::MediaType)],
+    excluded: &std::collections::HashSet<(u32, den_index::MediaType)>,
+    limit: usize,
+    row: impl Fn(u32, den_index::MediaType) -> Vec<u32>,
+) -> SuggestPool {
     let per_seed: Vec<((u32, den_index::MediaType), Vec<u32>)> = seeds
         .iter()
         .map(|&(id, media_type)| {
-            let similar = indexes.more_like_this(id, media_type);
-            (
-                (id, media_type),
-                similar.iter().copied().filter(|&n| !excluded.contains(&(n, media_type))).collect(),
-            )
+            let ids = row(id, media_type).into_iter().filter(|&n| !excluded.contains(&(n, media_type)));
+            ((id, media_type), ids.collect())
         })
         .collect();
     let mut seen = std::collections::HashSet::new();
@@ -1198,11 +1277,7 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
             }
         }
     }
-    let per_seed: Vec<serde_json::Value> = per_seed
-        .iter()
-        .map(|(seed, ids)| serde_json::json!({ "seed": titles_json(&[*seed])[0], "ids": ids }))
-        .collect();
-    Ok(serde_json::json!({ "perSeed": per_seed, "pooled": titles_json(&pooled) }))
+    (per_seed, pooled)
 }
 
 /// The most a `/recommend` body may carry: a large library and everything it owns, with room to spare.
@@ -1935,6 +2010,51 @@ mod tests {
         ] {
             assert_eq!(get(&on, &query).await.status(), 400, "{query}");
         }
+
+        // Filters and watched titles. Movie 2 is `tone=bleak`, movie 3 `tone=comic`.
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+        let plain = json(body_of(get(&on, "/playground/similar/movie/1.json").await).await);
+        assert!(ids(&plain).contains(&2) && ids(&plain).contains(&3), "{plain}");
+        let bleak = json(body_of(get(&on, "/playground/similar/movie/1.json?filter.tone=bleak").await).await);
+        assert_eq!(ids(&bleak), [2], "a filter keeps only what carries it");
+        let seen = json(body_of(get(&on, "/playground/similar/movie/1.json?watched=movie:2").await).await);
+        assert!(!ids(&seen).contains(&2), "a watched title is dropped");
+        assert_eq!(seen["tilted"], true);
+        assert_eq!(plain["tilted"], false);
+
+        // You Might Also Like rides in rows.json: the suggest seeds' pooled rows, minus the seeds.
+        let suggested = json(body_of(get(&on, "/playground/rows.json?seeds=&suggest=movie:1").await).await);
+        let pooled: Vec<&str> = suggested["suggest"]["titles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["key"].as_str().unwrap())
+            .collect();
+        assert!(!pooled.is_empty() && !pooled.contains(&"movie:1"), "{suggested}");
+        assert_eq!(suggested["suggest"]["titles"][0]["production"], 1, "untuned, production's pool");
+
+        // Export, then import: the same state, and a snapshot the import ignores.
+        let query = "seeds=movie:1&suggest=&w_maker=0.5&watched=movie:3&filter.ending=bittersweet&limit=5";
+        let exported =
+            json(body_of(get(&on, &format!("/playground/export.json?{query}&judged=1")).await).await);
+        assert_eq!(exported["format"], "den-atlas-playground");
+        assert_eq!(exported["snapshot"]["changed"], serde_json::json!(["w_maker"]));
+        assert_eq!(exported["snapshot"]["rows"][0]["key"], "movie:1");
+        assert!(exported["snapshot"]["judged"]["dev"]["n"].is_number(), "asked for, so judged");
+        assert!(exported["snapshot"]["at"].as_str().unwrap().ends_with('Z'));
+        let imported = post(&on, "/playground/import.json", &exported.to_string()).await;
+        assert_eq!(imported.status(), 200);
+        let imported = json(body_of(imported).await);
+        assert_eq!(imported["state"], exported["state"]);
+        assert_eq!(
+            crate::playground::State::parse(imported["query"].as_str().unwrap()).unwrap(),
+            crate::playground::State::parse(query).unwrap()
+        );
+        let refused = post(&on, "/playground/import.json", r#"{"format":"x"}"#).await;
+        assert_eq!(refused.status(), 400);
+        assert_eq!(post(&off, "/playground/import.json", "{}").await.status(), 404, "off is off");
 
         // An override on the production route is ignored with the playground on or off.
         for state in [&on, &off] {

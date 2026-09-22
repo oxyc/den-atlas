@@ -16,8 +16,9 @@ pub use facets::{FacetIndex, FacetQuery, TitleFacets};
 pub use index::{Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use similar::{
-    more_like_this, more_like_this_pooled, more_like_this_scored, rank_pool, Authorship, Axis, Candidate,
-    Facets, Knob, Scored, SimilarParams, ValueId, Weighted, MAX_ROW,
+    more_like_this, more_like_this_pooled, more_like_this_scored, more_like_this_with, rank_pool, Audience,
+    Authorship, Axis, Candidate, Extras, Facets, Knob, Scored, SimilarParams, ValueId, Weighted, KNOB_GROUPS,
+    MAX_ROW,
 };
 
 /// The two kinds of title in the index. The store packs the distinction into a key's high word; this

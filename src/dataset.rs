@@ -37,6 +37,10 @@ pub struct Meta {
     pub signature: Option<String>,
     #[serde(rename = "lastModifiedHttp")]
     pub last_modified_http: Option<String>,
+    /// The store's sha256, as the publisher recorded it. The store has been rebuilt under an unchanged
+    /// `datasetVersion`, so this — not the version — says which bytes a playground export was ranked on.
+    #[serde(rename = "storeSha256", default)]
+    pub store_sha256: Option<String>,
     // The store (den-spec wire/store-v1) — every per-title signal the serving path reads, plus both
     // vector matrices, in one mmap'd file. Read from disk, NEVER served: it is an implementation detail
     // of this server, not an artifact a client fetches.
