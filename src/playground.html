@@ -30,7 +30,9 @@
          border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
   button { cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .anchors button { font-size: 12px; padding: 3px 8px; }
+  .card-head { justify-content: space-between; align-items: center; }
+  .card-head h2 { margin: 0; }
+  #hits button { font-size: 12px; padding: 2px 8px; margin-left: 6px; }
   .knobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
   .knob input { width: 100%; }
   .knob.changed input { background: var(--changed); }
@@ -50,26 +52,29 @@
 <body>
 <main>
   <h1>Tuning playground</h1>
-  <p>More Like This, ranked by the scorer atlas serves, with any of its knobs moved. Every field starts at
-     production's value; only what you change is sent. Points are what each signal added to the score
-     (spread &times; weight &times; value).</p>
+  <p>More Like This for a set of seeds, ranked by the scorer atlas serves, with any of its knobs moved. Every
+     field starts at production's value; only what you change is sent, and every row re-ranks when you stop
+     typing. Beside each title is its rank in production's row. Points are what each signal added to the
+     score (spread &times; weight &times; value). The seeds and knobs are in the address, so a setup can be
+     shared.</p>
 
   <section>
-    <form id="seed" class="row">
-      <label>Type <select id="type"><option value="series">series</option><option value="movie">movie</option></select></label>
-      <label>TMDB id <input id="id" inputmode="numeric" required size="9"></label>
-      <label>Titles <input id="limit" type="number" min="1" size="5"></label>
-      <button class="primary" type="submit">Rank</button>
-      <button type="button" id="reset">Reset to production</button>
-    </form>
-    <div class="row anchors" style="margin-top:8px">
-      <span class="muted">Anchors:</span>
-      <button type="button" data-a="series/1438">The Wire</button>
-      <button type="button" data-a="movie/5723">Once</button>
-      <button type="button" data-a="series/1399">Game of Thrones</button>
-      <button type="button" data-a="series/3322">Oz</button>
-      <button type="button" data-a="series/46786">Bates Motel</button>
+    <div class="row">
+      <label>Titles per seed <input id="limit" type="number" min="1" size="5"></label>
+      <button type="button" id="reset">Reset knobs to production</button>
+      <button type="button" id="defaults">Default seeds</button>
+      <button type="button" id="clear">Clear seeds</button>
     </div>
+    <form id="add" class="row" style="margin-top:8px">
+      <label>Type <select id="type"><option value="series">series</option><option value="movie">movie</option></select></label>
+      <label>TMDB id <input id="id" inputmode="numeric" size="9"></label>
+      <button type="submit">Add seed</button>
+    </form>
+    <form id="search" class="row" style="margin-top:8px">
+      <label>Or find it by title <input id="q" size="30" placeholder="the wire"></label>
+      <button type="submit">Search</button>
+    </form>
+    <ul id="hits"></ul>
   </section>
 
   <section>
@@ -101,8 +106,7 @@
 
   <p id="status" class="muted"></p>
   <p id="error" class="error"></p>
-  <div class="scroll"><table id="out"></table></div>
-  <div id="left"></div>
+  <div id="rows"></div>
 
   <h2>Not tunable yet</h2>
   <ul>
@@ -130,10 +134,22 @@
 "use strict";
 // Relative to wherever atlas is mounted, with or without a trailing slash.
 const base = location.pathname.replace(/\/+$/, "");
+const root = base.replace(/\/playground$/, "");
 const $ = (id) => document.getElementById(id);
 const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world"];
+// Every row is re-ranked in ONE request (`rows.json`), and only once typing pauses: the relay allows an
+// address a few dozen playground requests a minute, which a request per seed per keystroke would spend in
+// seconds.
+const DEBOUNCE_MS = 300;
 let knobs = [];
 let defaultLimit = 20;
+let defaultSeeds = [];
+let maxSeeds = 12;
+// The seeds shown, as `movie:<id>` / `series:<id>`, in order.
+let seeds = [];
+let timer = 0;
+// Answers can arrive out of order; only the newest request's is drawn.
+let asked = 0;
 
 function fmt(n, d = 3) { return n == null ? "–" : Number(n).toFixed(d); }
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
@@ -151,6 +167,7 @@ function buildKnobs(values) {
     input.value = values[k.name] ?? k.default;
     const mark = () => wrap.classList.toggle("changed", Number(input.value) !== k.default);
     input.addEventListener("input", mark);
+    input.addEventListener("input", schedule);
     mark();
     $("knobs").appendChild(wrap);
   }
@@ -165,25 +182,83 @@ function changed() {
   return out;
 }
 
-async function rank() {
-  const type = $("type").value, id = $("id").value.trim();
-  if (!/^\d+$/.test(id)) { $("error").textContent = "A TMDB id is a number."; return; }
+// The page's state as a query string: the knobs moved, the count, and the seeds. The seed list is written
+// raw — `movie:5723,series:1438` — so the address stays readable; an absent list means the defaults and an
+// empty one means none, which is how "clear" survives a reload.
+function query() {
   const q = new URLSearchParams(changed());
   q.set("limit", $("limit").value || defaultLimit);
-  history.replaceState(null, "", `${base}?type=${type}&id=${id}&${q}`);
-  $("error").textContent = "";
-  $("status").textContent = "Ranking…";
-  const resp = await fetch(`${base}/similar/${type}/${id}.json?${q}`);
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
-  render(body, type);
+  return `${q}&seeds=${seeds.join(",")}`;
 }
 
-function render(a, type) {
-  const seed = a.seed.title ? `${a.seed.title}${a.seed.year ? ` (${a.seed.year})` : ""}` : `${type} ${a.seed.id}`;
-  const tuned = a.changed.length ? `tuned: ${a.changed.join(", ")}` : "production parameters";
-  $("status").textContent = `${seed} — ${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); ` +
-    `${tuned}; spread ${fmt(a.spread, 4)}`;
+function schedule() {
+  clearTimeout(timer);
+  timer = setTimeout(() => refresh().catch(report), DEBOUNCE_MS);
+}
+
+async function refresh() {
+  clearTimeout(timer);
+  const q = query();
+  history.replaceState(null, "", `${base}?${q}`);
+  $("error").textContent = "";
+  if (!seeds.length) { $("status").textContent = "No seeds: add one above."; $("rows").innerHTML = ""; return; }
+  const mine = ++asked;
+  $("status").textContent = "Ranking…";
+  const resp = await fetch(`${base}/rows.json?${q}`);
+  const body = await resp.json().catch(() => ({}));
+  if (mine !== asked) return;
+  if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
+  $("status").textContent = body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters";
+  $("rows").innerHTML = body.rows.map(card).join("");
+}
+
+function remove(key) {
+  seeds = seeds.filter((s) => s !== key);
+  document.querySelector(`[data-card="${key}"]`)?.remove();
+  // Nothing re-ranks when a seed goes, so only the address changes.
+  history.replaceState(null, "", `${base}?${query()}`);
+  if (!seeds.length) $("status").textContent = "No seeds: add one above.";
+}
+
+function add(key) {
+  $("error").textContent = "";
+  if (seeds.includes(key)) return;
+  if (seeds.length >= maxSeeds) { $("error").textContent = `At most ${maxSeeds} seeds.`; return; }
+  seeds.push(key);
+  refresh().catch(report);
+}
+
+async function search() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  $("hits").innerHTML = "<li class=muted>Searching…</li>";
+  const resp = await fetch(`${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`);
+  const body = await resp.json().catch(() => ({}));
+  const hits = (body.hits || []).filter((h) => h.type === "movie" || h.type === "series");
+  $("hits").innerHTML = hits.length
+    ? hits.map((h) => `<li>${esc(h.title || h.id)}${h.year ? ` <span class=muted>(${h.year})</span>` : ""} ` +
+        `<span class=muted>${h.type}</span><button type="button" data-add="${h.type}:${h.id}">Add</button></li>`).join("")
+    : `<li class=muted>${resp.ok ? "Nothing found." : esc(body.detail || body.error || resp.status)}</li>`;
+}
+
+// One seed's card: its row, production's rank beside each title, and what the tuning pushed out.
+function card(a) {
+  const type = a.key.split(":")[0];
+  const seed = a.seed.title ? `${esc(a.seed.title)}${a.seed.year ? ` <span class=muted>(${a.seed.year})</span>` : ""}` : esc(a.key);
+  const counts = a.total
+    ? `${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); spread ${fmt(a.spread, 4)}`
+    : "No row: atlas has no neighbours for this title.";
+  let html = `<section data-card="${esc(a.key)}"><div class="row card-head"><h2>${seed} <span class=muted>${esc(a.key)}</span></h2>` +
+    `<button type="button" data-remove="${esc(a.key)}">Remove</button></div><p class=muted>${counts}</p>`;
+  if (a.titles.length) html += `<div class=scroll><table>${table(a, type)}</table></div>`;
+  if (a.left.length) {
+    html += `<details><summary>Pushed out of the first ${a.titles.length} (${a.left.length})</summary><ul>` +
+      a.left.map((t) => `<li>${esc(t.title || t.id)} — production #${t.production}</li>`).join("") + "</ul></details>";
+  }
+  return html + "</section>";
+}
+
+function table(a, type) {
   const tmdb = type === "movie" ? "movie" : "tv";
   let html = "<thead><tr><th>#</th><th>prod</th><th class=title>title</th><th>score</th><th>base</th>" +
     SIGNALS.map((s) => `<th>${s}</th>`).join("") + "<th class=title>subgenre</th></tr></thead><tbody>";
@@ -202,11 +277,7 @@ function render(a, type) {
       }).join("") +
       `<td class=title>${esc(t.subgenre || "")}${t.held ? " <span class=muted>(held by cap)</span>" : ""}</td></tr>`;
   }
-  $("out").innerHTML = html + "</tbody>";
-  $("left").innerHTML = a.left.length
-    ? `<h2>Pushed out of the first ${a.titles.length}</h2><ul>` +
-      a.left.map((t) => `<li>${esc(t.title || t.id)} — production #${t.production}</li>`).join("") + "</ul>"
-    : "";
+  return html + "</tbody>";
 }
 
 // One half's mean and cases, tuned against production.
@@ -245,26 +316,39 @@ async function start() {
   const p = await resp.json();
   knobs = p.knobs;
   defaultLimit = p.defaultLimit;
+  defaultSeeds = p.defaultSeeds;
+  maxSeeds = p.maxSeeds;
   $("limit").max = p.maxLimit;
   const url = new URLSearchParams(location.search);
   const values = {};
   for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
   buildKnobs(values);
   $("limit").value = url.get("limit") || defaultLimit;
-  if (url.get("type")) $("type").value = url.get("type");
-  if (url.get("id")) { $("id").value = url.get("id"); rank(); }
+  seeds = url.has("seeds") ? url.get("seeds").split(",").filter(Boolean).slice(0, maxSeeds) : [...defaultSeeds];
+  await refresh();
 }
 
-$("seed").addEventListener("submit", (e) => { e.preventDefault(); rank(); });
-$("reset").addEventListener("click", () => { buildKnobs({}); if ($("id").value) rank(); });
+const report = (e) => { $("error").textContent = String(e); };
+$("limit").addEventListener("input", schedule);
+$("reset").addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
+$("defaults").addEventListener("click", () => { seeds = [...defaultSeeds]; refresh().catch(report); });
+$("clear").addEventListener("click", () => { seeds = []; refresh().catch(report); });
+$("add").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const id = $("id").value.trim();
+  if (!/^\d+$/.test(id)) { $("error").textContent = "A TMDB id is a number."; return; }
+  add(`${$("type").value}:${id}`);
+});
+$("search").addEventListener("submit", (e) => { e.preventDefault(); search().catch(report); });
+// Delegated, because the cards and the search results are redrawn.
+document.addEventListener("click", (e) => {
+  const remove_ = e.target.closest("[data-remove]");
+  if (remove_) remove(remove_.dataset.remove);
+  const add_ = e.target.closest("[data-add]");
+  if (add_) add(add_.dataset.add);
+});
 $("judge").addEventListener("click", () => { judge().catch((e) => { $("judged-status").textContent = String(e); }); });
-for (const b of document.querySelectorAll("[data-a]")) {
-  b.addEventListener("click", () => {
-    const [type, id] = b.dataset.a.split("/");
-    $("type").value = type; $("id").value = id; rank();
-  });
-}
-start().catch((e) => { $("error").textContent = `Could not load the parameters: ${e}`; });
+start().catch((e) => { $("error").textContent = `Could not load the playground: ${e}`; });
 </script>
 </body>
 </html>

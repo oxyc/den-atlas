@@ -287,7 +287,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
 }
 
 /// `/playground` (the page), `/playground/params.json` (the knobs and production's values),
-/// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This) and
+/// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This),
+/// `/playground/rows.json?seeds=…&<knob>=…&limit=` (the same for up to twelve seeds in one request) and
 /// `/playground/judged.json?<knob>=…` (those knobs scored against the judged set). All 404 unless
 /// `PLAYGROUND` and `INDEX_QUERIES` are both on (`playground.rs`). Answers are `no-store`: a tuned row is an
 /// experiment, and nothing should keep one where a production row is looked for.
@@ -307,30 +308,44 @@ async fn handle_playground(
     if route == "/playground/params.json" {
         return serve_json(method, headers, crate::playground::params_json(), "no-store", None).await;
     }
-    // `None` is the judged-set score; `Some` one seed's tuned row.
-    let seed = if route == "/playground/judged.json" {
-        None
-    } else {
-        let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json"))
-        else {
-            return not_found();
-        };
-        let Some(seed) = rest
-            .split_once('/')
-            .and_then(|(type_, id)| Some((index_media_type(type_)?, id.parse::<u32>().ok()?)))
-        else {
-            return not_found();
-        };
-        Some(seed)
+    enum Ask {
+        Judged,
+        Similar(den_index::MediaType, u32),
+        Rows(Vec<(den_index::MediaType, u32)>),
+    }
+    let bad_request = |detail: String| {
+        json_response(
+            serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+            StatusCode::BAD_REQUEST,
+        )
     };
-    let (params, limit) = match crate::playground::parse(query) {
-        Ok(parsed) => parsed,
-        Err(detail) => {
-            return json_response(
-                serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
-                StatusCode::BAD_REQUEST,
-            )
+    // Only `rows.json` reads `seeds`; everywhere else it is left in the query, where `parse` refuses it.
+    let (ask, query) = match route {
+        "/playground/judged.json" => (Ask::Judged, query.to_owned()),
+        "/playground/rows.json" => {
+            let (seeds, rest) = crate::playground::take_seeds(query);
+            match crate::playground::parse_seeds(seeds.as_deref()) {
+                Ok(seeds) => (Ask::Rows(seeds), rest),
+                Err(detail) => return bad_request(detail),
+            }
         }
+        _ => {
+            let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json"))
+            else {
+                return not_found();
+            };
+            let Some((media_type, tmdb_id)) = rest
+                .split_once('/')
+                .and_then(|(type_, id)| Some((index_media_type(type_)?, id.parse::<u32>().ok()?)))
+            else {
+                return not_found();
+            };
+            (Ask::Similar(media_type, tmdb_id), query.to_owned())
+        }
+    };
+    let (params, limit) = match crate::playground::parse(&query) {
+        Ok(parsed) => parsed,
+        Err(detail) => return bad_request(detail),
     };
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
@@ -340,11 +355,12 @@ async fn handle_playground(
         }
     };
     let ranking = Instant::now();
-    let answered = tokio::task::spawn_blocking(move || match seed {
-        Some((media_type, tmdb_id)) => {
+    let answered = tokio::task::spawn_blocking(move || match ask {
+        Ask::Similar(media_type, tmdb_id) => {
             crate::playground::answer(&indexes, media_type, tmdb_id, &params, limit).to_string()
         }
-        None => crate::playground::judged(&indexes, &params).to_string(),
+        Ask::Rows(seeds) => crate::playground::rows(&indexes, &seeds, &params, limit).to_string(),
+        Ask::Judged => crate::playground::judged(&indexes, &params).to_string(),
     })
     .await;
     let body = match answered {
@@ -1514,7 +1530,7 @@ fn extra_value(extra: &str, key: &str) -> Option<String> {
 
 /// Decode `%XX` escapes in a path-extra value (a search query arrives encoded); a malformed escape is
 /// kept as written.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(b.len());
@@ -1826,6 +1842,7 @@ mod tests {
             "/playground/similar/movie/1.json",
             "/playground/similar/movie/1.json?w_maker=2",
             "/playground/judged.json",
+            "/playground/rows.json",
         ] {
             assert_eq!(get(&state, path).await.status(), 404, "{path}");
         }
@@ -1890,6 +1907,28 @@ mod tests {
         assert_eq!(moved["changed"], serde_json::json!(["w_maker"]));
         let bad = get(&on, "/playground/judged.json?w_makr=0").await;
         assert_eq!(bad.status(), 400);
+
+        // Several seeds in one request, each row the one `/playground/similar` gives it alone.
+        let rows = get(&on, "/playground/rows.json?seeds=movie:1,series:4&w_maker=0&limit=5").await;
+        assert_eq!(rows.headers()["cache-control"], "no-store");
+        let rows = json(body_of(rows).await);
+        assert_eq!(rows["changed"], serde_json::json!(["w_maker"]));
+        let keys: Vec<&serde_json::Value> =
+            rows["rows"].as_array().unwrap().iter().map(|r| &r["key"]).collect();
+        assert_eq!(serde_json::json!(keys), serde_json::json!(["movie:1", "series:4"]));
+        let alone = json(body_of(get(&on, "/playground/similar/movie/1.json?w_maker=0&limit=5").await).await);
+        assert_eq!(rows["rows"][0]["titles"], alone["titles"]);
+        let defaults = json(body_of(get(&on, "/playground/rows.json").await).await);
+        assert_eq!(defaults["rows"].as_array().unwrap().len(), crate::playground::DEFAULT_SEEDS.len());
+        let none = json(body_of(get(&on, "/playground/rows.json?seeds=").await).await);
+        assert_eq!(none["rows"], serde_json::json!([]));
+        let many = (1..=13).map(|id| format!("movie:{id}")).collect::<Vec<_>>().join(",");
+        for query in [
+            format!("/playground/rows.json?seeds={many}"),
+            "/playground/similar/movie/1.json?seeds=movie:1".into(),
+        ] {
+            assert_eq!(get(&on, &query).await.status(), 400, "{query}");
+        }
 
         // An override on the production route is ignored with the playground on or off.
         for state in [&on, &off] {
