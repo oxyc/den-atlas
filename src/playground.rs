@@ -116,22 +116,81 @@ pub fn answer(
             json!({ "production": at + 1, "id": id, "title": title, "year": year })
         })
         .collect();
-    let defaults = SimilarParams::default();
-    let changed: Vec<&str> = SimilarParams::KNOBS
-        .iter()
-        .map(|k| k.name)
-        .filter(|name| params.get(name) != defaults.get(name))
-        .collect();
     let (title, year) = card(tmdb_id);
     json!({
         "seed": { "id": tmdb_id, "title": title, "year": year },
-        "changed": changed,
+        "changed": changed(params),
         "total": row.len(),
         "productionTotal": production.len(),
         "spread": row.first().map(|s| s.spread),
         "titles": titles,
         "left": left,
     })
+}
+
+/// The knobs moved off production's value, by name.
+fn changed(params: &SimilarParams) -> Vec<&'static str> {
+    let defaults = SimilarParams::default();
+    SimilarParams::KNOBS
+        .iter()
+        .map(|k| k.name)
+        .filter(|name| params.get(name) != defaults.get(name))
+        .collect()
+}
+
+/// `GET /playground/judged.json?<knob>=…` — the knobs scored against the hand-judged set
+/// (`judged/rail.json`), each half's mean beside production's, and every case.
+///
+/// The halves are kept apart because they have different jobs (`raileval.rs`): tune on dev; read test
+/// once, to confirm. A number tuned live against all the cases would be fitted to the half meant to check
+/// it. The page leads with dev and keeps test folded away.
+///
+/// Costs one tuned row per case — 46 rows — when a knob is moved; production's rows are memoised.
+pub fn judged(indexes: &Indexes, params: &SimilarParams) -> Value {
+    use den_index::eval::{mean, score, Scores};
+    let tuned = *params != SimilarParams::default();
+    let as_json = |s: &Scores| {
+        json!({
+            "ndcg": s.ndcg,
+            "condensed": s.condensed,
+            "precision": s.precision,
+            "bad": s.bad,
+            "judged": s.judged,
+        })
+    };
+    let mut halves: Vec<(&str, Vec<Scores>, Vec<Scores>)> =
+        vec![("dev", vec![], vec![]), ("test", vec![], vec![])];
+    let mut cases = Vec::new();
+    for c in crate::raileval::embedded() {
+        let production = score(&indexes.more_like_this(c.id, c.media), &c.grades, crate::raileval::K);
+        let mine = if tuned {
+            let row: Vec<u32> =
+                indexes.more_like_this_scored(c.id, c.media, params).iter().map(|s| s.tmdb_id).collect();
+            score(&row, &c.grades, crate::raileval::K)
+        } else {
+            production
+        };
+        if let Some(half) = halves.iter_mut().find(|h| h.0 == c.case.split) {
+            half.1.push(mine);
+            half.2.push(production);
+        }
+        cases.push(json!({
+            "seed": c.case.seed,
+            "title": c.case.title,
+            "split": c.case.split,
+            "tuned": as_json(&mine),
+            "production": as_json(&production),
+        }));
+    }
+    let mut out = json!({ "k": crate::raileval::K, "changed": changed(params), "cases": cases });
+    for (half, mine, production) in &halves {
+        out[*half] = json!({
+            "n": mine.len(),
+            "tuned": as_json(&mean(mine)),
+            "production": as_json(&mean(production)),
+        });
+    }
+    out
 }
 
 /// Each signal's raw value and the points it added to the score: `spread × weight × value`, negated for

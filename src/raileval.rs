@@ -31,13 +31,20 @@
 //! Every case carries the half den-dataset's `scripts/v2/split.py` assigns its seed, so a title is in the
 //! same half here as in the premise triplets and the co-rating ruler. Tune on dev; read test once, to
 //! confirm. The test in this file re-derives each split, so a case cannot be moved between halves by hand.
+//!
+//! The metrics themselves are `den_index::eval`, which the tuning playground scores with too.
 
 use crate::queries::Indexes;
+use den_index::eval::{mean, score, Grade, Scores};
 use den_index::MediaType;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
-const K: usize = 10;
+pub(crate) const K: usize = 10;
+
+/// The judged set as committed, compiled in so the playground can score against it with no file on the box.
+const EMBEDDED: &str = include_str!("../judged/rail.json");
 
 #[derive(Deserialize)]
 struct Judged {
@@ -46,10 +53,10 @@ struct Judged {
 
 /// Only the fields scoring reads. The file carries more for people — `covers`, `note` — and serde skips them.
 #[derive(Deserialize)]
-struct Case {
-    seed: String,
-    title: String,
-    split: String,
+pub(crate) struct Case {
+    pub(crate) seed: String,
+    pub(crate) title: String,
+    pub(crate) split: String,
     judged: Vec<Judgement>,
 }
 
@@ -57,27 +64,15 @@ struct Case {
 struct Judgement {
     id: String,
     title: String,
+    #[serde(deserialize_with = "grade")]
     grade: Grade,
     /// Why the grade is what it is, by source — see `judged/rail.json`'s `about`.
     basis: String,
 }
 
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "lowercase")]
-enum Grade {
-    Good,
-    Ok,
-    Bad,
-}
-
-impl Grade {
-    fn gain(self) -> f64 {
-        match self {
-            Grade::Good => 2.0,
-            Grade::Ok => 1.0,
-            Grade::Bad => 0.0,
-        }
-    }
+fn grade<'de, D: Deserializer<'de>>(d: D) -> Result<Grade, D::Error> {
+    let name = String::deserialize(d)?;
+    Grade::parse(&name).ok_or_else(|| serde::de::Error::custom(format!("unknown grade {name:?}")))
 }
 
 /// `movie:137` / `series:1438` — the type names atlas emits, as `judged/queries.json` uses them.
@@ -100,58 +95,24 @@ fn dataset_key(media: MediaType, id: u32) -> String {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
-struct Scores {
-    ndcg: f64,
-    condensed: f64,
-    precision: f64,
-    bad: usize,
-    judged: usize,
-}
-
-fn dcg(gains: impl Iterator<Item = f64>) -> f64 {
-    gains.enumerate().map(|(i, g)| g / ((i + 2) as f64).log2()).sum()
-}
-
-/// One row against one case's judgements, at `k`.
-fn score(row: &[u32], grades: &HashMap<u32, Grade>, k: usize) -> Scores {
-    let mut ideal: Vec<f64> = grades.values().map(|g| g.gain()).collect();
-    ideal.sort_by(|a, b| b.total_cmp(a));
-    let idcg = dcg(ideal.into_iter().take(k));
-    let ratio = |d: f64| if idcg > 0.0 { d / idcg } else { 0.0 };
-
-    let top = &row[..row.len().min(k)];
-    let gain = |id: &u32| grades.get(id).map_or(0.0, |g| g.gain());
-    let condensed: Vec<u32> = row.iter().copied().filter(|id| grades.contains_key(id)).take(k).collect();
-    let count =
-        |want: &[Grade]| top.iter().filter(|id| grades.get(id).is_some_and(|g| want.contains(g))).count();
-    Scores {
-        ndcg: ratio(dcg(top.iter().map(gain))),
-        condensed: ratio(dcg(condensed.iter().map(gain))),
-        precision: count(&[Grade::Good, Grade::Ok]) as f64 / k as f64,
-        bad: count(&[Grade::Bad]),
-        judged: top.iter().filter(|id| grades.contains_key(id)).count(),
-    }
-}
-
-/// Means over a set of cases; `bad` and `judged` are summed, since a count per case is what they are.
-fn mean(all: &[Scores]) -> Scores {
-    let n = all.len().max(1) as f64;
-    Scores {
-        ndcg: all.iter().map(|s| s.ndcg).sum::<f64>() / n,
-        condensed: all.iter().map(|s| s.condensed).sum::<f64>() / n,
-        precision: all.iter().map(|s| s.precision).sum::<f64>() / n,
-        bad: all.iter().map(|s| s.bad).sum(),
-        judged: all.iter().map(|s| s.judged).sum(),
-    }
-}
-
 /// A case, resolved: the seed and its grades by id.
-struct Resolved<'a> {
-    case: &'a Case,
-    media: MediaType,
-    id: u32,
-    grades: HashMap<u32, Grade>,
+pub(crate) struct Resolved<'a> {
+    pub(crate) case: &'a Case,
+    pub(crate) media: MediaType,
+    pub(crate) id: u32,
+    pub(crate) grades: HashMap<u32, Grade>,
+}
+
+/// The compiled-in judged set, resolved once. It cannot fail at runtime in a built binary: the test below
+/// resolves the same bytes, so a set that would not resolve fails the build's tests instead.
+pub(crate) fn embedded() -> &'static [Resolved<'static>] {
+    static JUDGED: OnceLock<Judged> = OnceLock::new();
+    static CASES: OnceLock<Vec<Resolved<'static>>> = OnceLock::new();
+    CASES.get_or_init(|| {
+        let judged =
+            JUDGED.get_or_init(|| serde_json::from_str(EMBEDDED).expect("judged/rail.json parses (tested)"));
+        resolve(judged).expect("judged/rail.json resolves (tested)")
+    })
 }
 
 /// Every case's keys parsed and checked. A malformed file is refused whole: scoring the cases that happen
@@ -301,49 +262,14 @@ pub fn run(dir: &std::path::Path) -> i32 {
 mod tests {
     use super::*;
 
-    fn grades(pairs: &[(u32, Grade)]) -> HashMap<u32, Grade> {
-        pairs.iter().copied().collect()
-    }
-
-    #[test]
-    fn the_ideal_order_scores_one_and_its_reverse_does_not() {
-        let g = grades(&[(1, Grade::Good), (2, Grade::Ok), (3, Grade::Bad)]);
-        let best = score(&[1, 2, 3], &g, 10);
-        assert!((best.ndcg - 1.0).abs() < 1e-12 && (best.condensed - 1.0).abs() < 1e-12);
-        let worst = score(&[3, 2, 1], &g, 10);
-        assert!(worst.ndcg < 0.8, "{worst:?}");
-        assert_eq!((worst.bad, worst.judged), (1, 3));
-        assert!((worst.precision - 0.2).abs() < 1e-12, "two of ten are good or ok");
-    }
-
-    /// An unjudged title costs plain nDCG and nothing on the condensed list: it is unknown, not bad.
-    #[test]
-    fn an_unjudged_title_costs_plain_ndcg_only() {
-        let g = grades(&[(1, Grade::Good)]);
-        let s = score(&[99, 1], &g, 10);
-        assert!((s.ndcg - 1.0 / 3f64.log2()).abs() < 1e-12, "{s:?}");
-        assert!((s.condensed - 1.0).abs() < 1e-12, "{s:?}");
-        assert_eq!(s.judged, 1);
-    }
-
-    /// Past k counts for nothing, and a case with only bad judgements has no ideal to reach.
-    #[test]
-    fn only_the_first_k_count() {
-        let g = grades(&[(1, Grade::Good)]);
-        assert_eq!(score(&[5, 6, 1], &g, 2).ndcg, 0.0);
-        assert_eq!(score(&[1], &grades(&[(1, Grade::Bad)]), 10).ndcg, 0.0);
-    }
-
     /// The shipped set parses, every key is one the rail can return, and every case sits in the half
     /// den-dataset's split.py gives its seed — `sha256(SALT|key)[0] & 1`, 1 is test.
     #[test]
     fn the_judged_set_is_well_formed_and_its_split_is_derived() {
         use sha2::{Digest, Sha256};
-        let judged: Judged =
-            serde_json::from_str(include_str!("../judged/rail.json")).expect("rail.json parses");
-        let cases = resolve(&judged).expect("rail.json resolves");
+        let cases = embedded();
         assert!(cases.len() >= 30, "the set is meant to hold 30-50 seeds, has {}", cases.len());
-        for c in &cases {
+        for c in cases {
             let digest = Sha256::digest(format!("den-v2-2026-09-04|{}", dataset_key(c.media, c.id)));
             let half = if digest[0] & 1 == 1 { "test" } else { "dev" };
             assert_eq!(c.case.split, half, "{} is in the wrong half", c.case.seed);

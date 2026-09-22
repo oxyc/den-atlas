@@ -287,8 +287,9 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
 }
 
-/// `/playground` (the page), `/playground/params.json` (the knobs and production's values) and
-/// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This). All 404 unless
+/// `/playground` (the page), `/playground/params.json` (the knobs and production's values),
+/// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This) and
+/// `/playground/judged.json?<knob>=…` (those knobs scored against the judged set). All 404 unless
 /// `PLAYGROUND` and `INDEX_QUERIES` are both on (`playground.rs`). Answers are `no-store`: a tuned row is an
 /// experiment, and nothing should keep one where a production row is looked for.
 async fn handle_playground(
@@ -307,14 +308,21 @@ async fn handle_playground(
     if route == "/playground/params.json" {
         return serve_json(method, headers, crate::playground::params_json(), "no-store", None).await;
     }
-    let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json")) else {
-        return not_found();
-    };
-    let Some((media_type, tmdb_id)) = rest
-        .split_once('/')
-        .and_then(|(type_, id)| Some((index_media_type(type_)?, id.parse::<u32>().ok()?)))
-    else {
-        return not_found();
+    // `None` is the judged-set score; `Some` one seed's tuned row.
+    let seed = if route == "/playground/judged.json" {
+        None
+    } else {
+        let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json"))
+        else {
+            return not_found();
+        };
+        let Some(seed) = rest
+            .split_once('/')
+            .and_then(|(type_, id)| Some((index_media_type(type_)?, id.parse::<u32>().ok()?)))
+        else {
+            return not_found();
+        };
+        Some(seed)
     };
     let (params, limit) = match crate::playground::parse(query) {
         Ok(parsed) => parsed,
@@ -333,8 +341,11 @@ async fn handle_playground(
         }
     };
     let ranking = Instant::now();
-    let answered = tokio::task::spawn_blocking(move || {
-        crate::playground::answer(&indexes, media_type, tmdb_id, &params, limit).to_string()
+    let answered = tokio::task::spawn_blocking(move || match seed {
+        Some((media_type, tmdb_id)) => {
+            crate::playground::answer(&indexes, media_type, tmdb_id, &params, limit).to_string()
+        }
+        None => crate::playground::judged(&indexes, &params).to_string(),
     })
     .await;
     let body = match answered {
@@ -1809,6 +1820,7 @@ mod tests {
             "/playground/params.json",
             "/playground/similar/movie/1.json",
             "/playground/similar/movie/1.json?w_maker=2",
+            "/playground/judged.json",
         ] {
             assert_eq!(get(&state, path).await.status(), 404, "{path}");
         }
@@ -1857,6 +1869,22 @@ mod tests {
             assert_eq!(resp.status(), 400, "{query}");
             assert!(body_of(resp).await.contains(name), "{query}");
         }
+
+        // The judged-set score: every case, split into its halves, production's means beside the tuned ones.
+        let judged = get(&on, "/playground/judged.json").await;
+        assert_eq!(judged.headers()["cache-control"], "no-store");
+        let judged = json(body_of(judged).await);
+        let cases = judged["cases"].as_array().unwrap().len();
+        assert_eq!(cases, crate::raileval::embedded().len());
+        assert_eq!(
+            judged["dev"]["n"].as_u64().unwrap() + judged["test"]["n"].as_u64().unwrap(),
+            cases as u64
+        );
+        assert_eq!(judged["dev"]["tuned"], judged["dev"]["production"], "untuned is production");
+        let moved = json(body_of(get(&on, "/playground/judged.json?w_maker=0").await).await);
+        assert_eq!(moved["changed"], serde_json::json!(["w_maker"]));
+        let bad = get(&on, "/playground/judged.json?w_makr=0").await;
+        assert_eq!(bad.status(), 400);
 
         // An override on the production route is ignored with the playground on or off.
         for state in [&on, &off] {

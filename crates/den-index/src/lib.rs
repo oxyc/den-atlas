@@ -6,6 +6,7 @@
 //! output. The caller reads the dataset blobs and passes the bytes in, so the same crate can run in a
 //! server, in a browser as Wasm, or linked into the tvOS app.
 
+pub mod eval;
 mod facets;
 mod index;
 mod similar;
