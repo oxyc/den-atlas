@@ -8,6 +8,7 @@ mod characters;
 mod config;
 mod dataset;
 mod descriptor;
+mod facetcounts;
 mod facts;
 mod fit;
 mod handler;

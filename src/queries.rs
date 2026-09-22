@@ -15,6 +15,7 @@
 
 use crate::characters::Characters;
 use crate::dataset::Dataset;
+use crate::facetcounts::FacetCounts;
 use crate::facts::Facts;
 use crate::fit::Corpus;
 use crate::plotrows::{cards_from_store, Card, PlotFacets};
@@ -76,6 +77,8 @@ pub struct Indexes {
     /// Corpus aggregates for a critique floor and holds share other than production's, by their bits
     /// (`Indexes::aggregates_for`).
     aggregates: Mutex<HashMap<(u64, u64), Arc<den_index::RailAggregates>>>,
+    /// Every facet value as the titles carrying it (`Indexes::facet_counts`).
+    facet_counts: OnceLock<FacetCounts>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -181,6 +184,12 @@ impl Indexes {
     /// asked for, which the load does, so no billboard waits on it.
     pub fn corpus(&self) -> &Corpus {
         self.corpus.get_or_init(|| Corpus::of(self))
+    }
+
+    /// What `/index/facets/<type>` counts over, built once: the first time it is asked for, which the load
+    /// does, so no request waits on it.
+    pub fn facet_counts(&self) -> &FacetCounts {
+        self.facet_counts.get_or_init(|| FacetCounts::build(self))
     }
 
     /// A title's vote count — what every browse row is ORDERED by.
@@ -718,12 +727,16 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
+        facet_counts: OnceLock::new(),
     };
     eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {
         indexes.corpus();
     });
-    Ok((indexes, format!("{phases}, fit {}", seconds(fit_took))))
+    let (_, counts_took) = timed(|| {
+        indexes.facet_counts();
+    });
+    Ok((indexes, format!("{phases}, fit {}, facet counts {}", seconds(fit_took), seconds(counts_took))))
 }
 
 /// A small, real dataset — twelve titles in one store — written to `dir` and loaded, for route tests.

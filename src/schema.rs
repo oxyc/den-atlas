@@ -483,6 +483,23 @@ fn routes() -> Value {
             "returns": format!("{{facet, titles}}: at most {FACET_LIMIT} titles"),
         },
         {
+            "method": "GET",
+            "path": "/index/facets/{type}.json",
+            "example": "/index/facets/movie.json?sel=country:SE,genre:28",
+            "about": "For every value of every facet kind, the titles of one type carrying the selection and \
+                      that value. Zero counts are left out; a kind whose source did not load is absent.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("sel", "string", "comma-separated <kind>:<id>, sorted by kind then id and each once; \
+                                            kinds genre, language, country, decade, mood, subgenre and every \
+                                            plot-facet axis. Any other spelling is redirected (308) to that one"),
+                    json!({ "max": crate::facetcounts::MAX_SELECTION }),
+                ),
+            ],
+            "returns": "{<kind>: {<id>: count}}",
+        },
+        {
             "method": "GET", "path": "/index/taxonomy.json", "example": "/index/taxonomy.json",
             "about": "The label names alone, kept for the TV app. Use this document instead.",
         },

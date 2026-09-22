@@ -733,6 +733,12 @@ enum IndexQuestion {
     Plot {
         media_type: den_index::MediaType,
     },
+    /// How many titles each facet value leaves under a selection (`facetcounts.rs`). The selection is read
+    /// from the query in `handle_index`, before the load, so a malformed one never pays for it.
+    FacetCounts {
+        media_type: den_index::MediaType,
+        selection: Vec<(&'static str, String)>,
+    },
 }
 
 impl IndexQuestion {
@@ -757,6 +763,9 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
+            ["facets", type_] => {
+                Some(Self::FacetCounts { media_type: index_media_type(type_)?, selection: Vec::new() })
+            }
             ["query"] => Some(Self::Query),
             ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
@@ -854,6 +863,9 @@ impl IndexQuestion {
                     number("skip", 0),
                     number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
                 )
+            }
+            Self::FacetCounts { media_type, selection } => {
+                indexes.facet_counts().answer(*media_type, selection)
             }
             Self::Search | Self::Facets | Self::Query => unreachable!("answered in handle_index"),
         };
@@ -1422,9 +1434,33 @@ async fn handle_index(
     let started = Instant::now();
     let not_found = || json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
     let Some(queries) = state.index.as_ref() else { return not_found() };
-    let Some(question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
+    let Some(mut question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
         return not_found();
     };
+    // The URL is the facet counts' cache key, so a selection spelled any way but the canonical one is sent
+    // to that spelling rather than answered under a second key.
+    if let IndexQuestion::FacetCounts { selection, .. } = &mut question {
+        let parsed = match crate::facetcounts::Selection::parse(query) {
+            Ok(parsed) => parsed,
+            Err(detail) => {
+                return json_response(
+                    serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        };
+        if !parsed.canonical {
+            // Relative to the path asked, so it holds behind a relay's prefix and an install's config segment.
+            let segment = rest.rsplit('/').next().unwrap_or(rest);
+            return Response::builder()
+                .status(StatusCode::PERMANENT_REDIRECT)
+                .header(header::LOCATION, format!("{segment}{}", parsed.query()))
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
+                .body(Body::empty())
+                .unwrap();
+        }
+        *selection = parsed.items;
+    }
     // A search's whole text goes to den-embed at once, while the indexes are got — and loaded, after an idle
     // spell — so a cold den-embed loads its model alongside them, not after (`query_answer`).
     let early = match (&question, &state.embed) {
@@ -2611,6 +2647,49 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Facet counts: every kind's values under a selection, cacheable by URL — a canonical selection is
+    /// answered with an ETag and revalidates to a 304, any other spelling is redirected to the canonical one,
+    /// and a malformed one is a 400 before anything loads.
+    #[tokio::test]
+    async fn facet_counts_answer_by_canonical_url() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let state = index_state("den-atlas-facet-counts");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+
+        let all = get(&state, "/index/facets/movie.json").await;
+        assert_eq!(all.status(), 200);
+        assert!(all.headers()[header::CACHE_CONTROL].to_str().unwrap().starts_with("public"));
+        let etag = all.headers()[header::ETAG].clone();
+        let all = json(body_of(all).await);
+        assert_eq!(all["country"], serde_json::json!({ "DK": 1, "ES": 1, "KR": 2 }));
+        assert_eq!(all["subgenre"]["Heist"], 3);
+
+        let korean =
+            json(body_of(get(&state, "/index/facets/movie.json?sel=country:KR,subgenre:Heist").await).await);
+        assert_eq!(korean["country"], serde_json::json!({ "DK": 1, "KR": 2 }));
+        assert_eq!(korean["mood"], serde_json::json!({ "Tense": 1 }));
+        let series = json(body_of(get(&state, "/index/facets/series?sel=country:KR").await).await);
+        assert_eq!(series["subgenre"], serde_json::json!({ "Heist": 1 }));
+
+        let req = HttpRequest::builder().uri("/index/facets/movie.json").header("if-none-match", etag);
+        let revalidated = handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await;
+        assert_eq!(revalidated.status(), 304);
+
+        let redirect = get(&state, "/index/facets/movie.json?sel=subgenre:Heist,country:kr").await;
+        assert_eq!(redirect.status(), 308);
+        assert_eq!(redirect.headers()[header::LOCATION], "movie.json?sel=country:KR,subgenre:Heist");
+        let emptied = get(&state, "/index/facets/movie?sel=").await;
+        assert_eq!(emptied.headers()[header::LOCATION], "movie");
+
+        for path in ["/index/facets/movie.json?sel=nope:1", "/index/facets/movie.json?sel=genre:action"] {
+            let resp = get(&state, path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+            assert_eq!(json(body_of(resp).await)["error"], "bad_request", "{path}");
+        }
+        assert_eq!(get(&state, "/index/facets/anime.json").await.status(), 404);
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

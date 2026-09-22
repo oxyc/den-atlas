@@ -95,7 +95,7 @@ pub const MERGED_ROWS: &[MergedRow] = &[
 ];
 
 /// The axis a constraint really names, after the alias above.
-fn resolve_axis(axis: &str, value: &str) -> String {
+pub(crate) fn resolve_axis(axis: &str, value: &str) -> String {
     if axis != "structure" {
         return axis.to_owned();
     }
@@ -226,6 +226,13 @@ impl PlotFacets {
             .collect();
         axes.sort_by(|a, b| a.axis.cmp(&b.axis));
         axes
+    }
+
+    /// Every `(axis, value)` and the titles carrying it, for the facet counts (`facetcounts`).
+    pub fn values(&self) -> impl Iterator<Item = (&str, &str, &[(Key, u8)])> {
+        self.by_value.iter().flat_map(|(axis, values)| {
+            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles.as_slice()))
+        })
     }
 
     /// Known-title coverage for one axis.
