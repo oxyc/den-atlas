@@ -81,6 +81,188 @@ const SUBGENRE_CAP: usize = 3;
 /// Labels below this confidence are noise and are not part of what the seed IS.
 const MIN_CONFIDENCE: f64 = 0.55;
 
+/// A noul below this is noise, not a signal: ~75 dimensions per row become ~15. Applied by the `Facets`
+/// implementation (den-atlas `rail.rs`), which reads it from `SimilarParams`.
+pub const NOUL_FLOOR: f64 = 0.20;
+/// Below this a title is simply realist; the distance is not meaningful. Applied like `NOUL_FLOOR`.
+pub const WORLD_FLOOR: f64 = 0.05;
+/// A critique axis at or above this is one of the seed's DEFINING arguments, for coverage.
+pub const DEFINING: f64 = 0.8;
+
+/// Every knob the pooled More Like This scorer reads, in one place.
+///
+/// `Default` is exactly what ships: each field is read from the named constant above it in this file, whose
+/// doc comment says why it has that value. Serving calls `more_like_this_pooled`, which ranks with
+/// `SimilarParams::default()`, so a default here cannot drift from production — changing one IS changing
+/// production. The tuning playground and any offline scorer take the same type and override fields.
+///
+/// Not here, because a request cannot move them cheaply: the critique floor and the idf "holds" share are
+/// baked into corpus-wide aggregates computed once at load (den-atlas `RailAggregates`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SimilarParams {
+    pub pool_k: usize,
+    pub w_premise: f64,
+    pub w_plot: f64,
+    pub w_tone: f64,
+    pub tone_floor: f64,
+    pub min_confidence: f64,
+    pub subgenre_cap: usize,
+    /// How many leading titles the subgenre cap applies to.
+    pub cap_window: usize,
+    pub max_row: usize,
+    pub w_maker: f64,
+    pub w_home: f64,
+    pub w_facet: f64,
+    pub w_world: f64,
+    pub w_noul: f64,
+    pub w_critique: f64,
+    pub w_coverage: f64,
+    /// Never mix animated with live action.
+    pub same_animation: bool,
+    pub noul_floor: f64,
+    pub world_floor: f64,
+    pub defining: f64,
+}
+
+impl Default for SimilarParams {
+    fn default() -> Self {
+        SimilarParams {
+            pool_k: POOL_K,
+            w_premise: W_PREMISE,
+            w_plot: W_PLOT,
+            w_tone: W_TONE,
+            tone_floor: TONE_FLOOR,
+            min_confidence: MIN_CONFIDENCE,
+            subgenre_cap: SUBGENRE_CAP,
+            cap_window: KEEP,
+            max_row: MAX_ROW,
+            w_maker: W_MAKER,
+            w_home: W_HOME,
+            w_facet: W_FACET,
+            w_world: W_WORLD,
+            w_noul: W_NOUL,
+            w_critique: W_CRITIQUE,
+            w_coverage: W_COVERAGE,
+            same_animation: true,
+            noul_floor: NOUL_FLOOR,
+            world_floor: WORLD_FLOOR,
+            defining: DEFINING,
+        }
+    }
+}
+
+/// One knob as a client sees it: its name (the field's), the range a value must fall in, whether it is a
+/// whole number, and one line saying what it does.
+#[derive(Clone, Copy, Debug)]
+pub struct Knob {
+    pub name: &'static str,
+    pub min: f64,
+    pub max: f64,
+    pub integer: bool,
+    pub about: &'static str,
+}
+
+const fn knob(name: &'static str, min: f64, max: f64, integer: bool, about: &'static str) -> Knob {
+    Knob { name, min, max, integer, about }
+}
+
+impl SimilarParams {
+    /// Every field, in the order a form shows them. `get`/`set` answer exactly these names.
+    pub const KNOBS: &'static [Knob] = &[
+        knob("w_premise", 0.0, 10.0, false, "base: weight of the premise-space cosine"),
+        knob("w_plot", 0.0, 10.0, false, "base: weight of the plot-space cosine"),
+        knob("w_maker", 0.0, 10.0, false, "shared director/writer/creator (share of the seed's makers)"),
+        knob("w_home", 0.0, 10.0, false, "shared broadcaster/production company"),
+        knob("w_facet", 0.0, 10.0, false, "agreement on the twelve narrative facet axes, rarity-weighted"),
+        knob("w_world", 0.0, 10.0, false, "penalty for a different world (realist vs fantastical)"),
+        knob("w_noul", 0.0, 10.0, false, "cosine over the taxonomy nouls"),
+        knob("w_critique", 0.0, 10.0, false, "centered cosine over what the works argue about"),
+        knob("w_coverage", 0.0, 10.0, false, "coverage of the seed's defining arguments, idf-weighted"),
+        knob("w_tone", 0.0, 10.0, false, "coverage of the seed's confident subgenres and moods"),
+        knob("tone_floor", 0.0, 1.0, false, "drop a labelled candidate covering less of the seed's labels"),
+        knob("min_confidence", 0.0, 1.0, false, "a label below this confidence is not part of a title"),
+        knob("noul_floor", 0.0, 1.0, false, "a noul below this is ignored"),
+        knob("world_floor", 0.0, 1.0, false, "a world score below this reads as realist (0)"),
+        knob(
+            "defining",
+            0.0,
+            1.0,
+            false,
+            "a critique axis at or above this is one of the seed's defining ones",
+        ),
+        knob("subgenre_cap", 0.0, 200.0, true, "at most this many titles sharing a dominant subgenre ..."),
+        knob("cap_window", 0.0, 1000.0, true, "... within this many leading titles"),
+        knob("pool_k", 1.0, 5000.0, true, "candidates drawn from EACH vector index"),
+        knob("max_row", 1.0, 1000.0, true, "the longest row kept"),
+        knob("same_animation", 0.0, 1.0, true, "1: never mix animated with live action"),
+    ];
+
+    /// A knob's value, as a number.
+    pub fn get(&self, name: &str) -> Option<f64> {
+        Some(match name {
+            "w_premise" => self.w_premise,
+            "w_plot" => self.w_plot,
+            "w_maker" => self.w_maker,
+            "w_home" => self.w_home,
+            "w_facet" => self.w_facet,
+            "w_world" => self.w_world,
+            "w_noul" => self.w_noul,
+            "w_critique" => self.w_critique,
+            "w_coverage" => self.w_coverage,
+            "w_tone" => self.w_tone,
+            "tone_floor" => self.tone_floor,
+            "min_confidence" => self.min_confidence,
+            "noul_floor" => self.noul_floor,
+            "world_floor" => self.world_floor,
+            "defining" => self.defining,
+            "subgenre_cap" => self.subgenre_cap as f64,
+            "cap_window" => self.cap_window as f64,
+            "pool_k" => self.pool_k as f64,
+            "max_row" => self.max_row as f64,
+            "same_animation" => f64::from(u8::from(self.same_animation)),
+            _ => return None,
+        })
+    }
+
+    /// Set a knob, refusing an unknown name, a value outside its range (NaN included) or a fraction where a
+    /// whole number is wanted. The error names the knob.
+    pub fn set(&mut self, name: &str, value: f64) -> Result<(), String> {
+        let knob =
+            Self::KNOBS.iter().find(|k| k.name == name).ok_or_else(|| format!("unknown parameter {name}"))?;
+        if !(value >= knob.min && value <= knob.max) {
+            return Err(format!("{name} must be between {} and {}, got {value}", knob.min, knob.max));
+        }
+        if knob.integer && value.fract() != 0.0 {
+            return Err(format!("{name} must be a whole number, got {value}"));
+        }
+        let whole = value as usize;
+        match name {
+            "w_premise" => self.w_premise = value,
+            "w_plot" => self.w_plot = value,
+            "w_maker" => self.w_maker = value,
+            "w_home" => self.w_home = value,
+            "w_facet" => self.w_facet = value,
+            "w_world" => self.w_world = value,
+            "w_noul" => self.w_noul = value,
+            "w_critique" => self.w_critique = value,
+            "w_coverage" => self.w_coverage = value,
+            "w_tone" => self.w_tone = value,
+            "tone_floor" => self.tone_floor = value,
+            "min_confidence" => self.min_confidence = value,
+            "noul_floor" => self.noul_floor = value,
+            "world_floor" => self.world_floor = value,
+            "defining" => self.defining = value,
+            "subgenre_cap" => self.subgenre_cap = whole,
+            "cap_window" => self.cap_window = whole,
+            "pool_k" => self.pool_k = whole,
+            "max_row" => self.max_row = whole,
+            "same_animation" => self.same_animation = whole == 1,
+            _ => return Err(format!("unknown parameter {name}")),
+        }
+        Ok(())
+    }
+}
+
 /// The seed's confident labels, kept split by family because `tone` judges each family separately.
 struct Seed {
     subgenres: Vec<(String, f64)>,
@@ -94,9 +276,9 @@ struct Seed {
 /// this corpus: mean single-subgenre share rose 15% to 17%, The Corner fell from 10th to 13th in The Wire's
 /// row, and it did not remove the miss it was aimed at (Angel, which carries both of The Wire's moods and
 /// none of its subgenres, held 7th either way). Recorded here so the next person does not re-derive it.
-fn seed_labels(labels: &crate::Labels<'_>) -> Seed {
+fn seed_labels(labels: &crate::Labels<'_>, min_confidence: f64) -> Seed {
     let keep = |pairs: &[(&str, f64)]| -> Vec<(String, f64)> {
-        pairs.iter().filter(|(_, c)| *c >= MIN_CONFIDENCE).map(|(n, c)| ((*n).to_string(), *c)).collect()
+        pairs.iter().filter(|(_, c)| *c >= min_confidence).map(|(n, c)| ((*n).to_string(), *c)).collect()
     };
     Seed { subgenres: keep(&labels.subgenres), moods: keep(&labels.moods) }
 }
@@ -112,14 +294,14 @@ fn seed_labels(labels: &crate::Labels<'_>) -> Seed {
 /// Once and was cut by the floor — punished for missing subgenres it does not have rather than for being
 /// unlike Once. Judged on the family it actually carries it scores 0.50 and survives, which is right: it is
 /// the same director's film about the same thing.
-fn tone(seed: &Seed, theirs: &crate::Labels<'_>) -> f64 {
+fn tone(seed: &Seed, theirs: &crate::Labels<'_>, min_confidence: f64) -> f64 {
     // A family the candidate says nothing in asks nothing of it, and neither does one the seed is silent on.
     let covered = |family: &[(String, f64)], theirs: &[(&str, f64)]| -> Option<f64> {
         let total: f64 = family.iter().map(|(_, c)| c).sum();
-        if total <= 0.0 || !theirs.iter().any(|(_, c)| *c >= MIN_CONFIDENCE) {
+        if total <= 0.0 || !theirs.iter().any(|(_, c)| *c >= min_confidence) {
             return None;
         }
-        let has = |name: &str| theirs.iter().any(|(n, c)| *n == name && *c >= MIN_CONFIDENCE);
+        let has = |name: &str| theirs.iter().any(|(n, c)| *n == name && *c >= min_confidence);
         Some(family.iter().filter(|(n, _)| has(n)).map(|(_, c)| c).sum::<f64>() / total)
     };
     let sub_cov = covered(&seed.subgenres, &theirs.subgenres);
@@ -368,10 +550,57 @@ pub fn more_like_this_pooled(
     authorship: Option<&dyn Authorship>,
     facets: Option<&dyn Facets>,
 ) -> Vec<u32> {
+    let params = SimilarParams::default();
+    more_like_this_scored(plot, premise, tmdb_id, media_type, authorship, facets, &params)
+        .into_iter()
+        .map(|s| s.tmdb_id)
+        .collect()
+}
+
+/// One title in a pooled row, with every signal that placed it there.
+///
+/// The signals are raw, in their own units (a share, a cosine, a distance). What each one added to `score`
+/// is `spread × its weight × it` — negated for `world`, which is a penalty — so a caller holding the
+/// `SimilarParams` it ranked with can show why a title sits where it does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scored {
+    pub tmdb_id: u32,
+    pub score: f64,
+    /// `w_premise × premise + w_plot × plot`, a missing cosine read at that index's pool floor.
+    pub base: f64,
+    pub premise: Option<f64>,
+    pub plot: Option<f64>,
+    /// The pool's own score spread (90th − 10th percentile of `base`): the unit every term is scaled by.
+    pub spread: f64,
+    pub tone: f64,
+    pub noul: f64,
+    pub critique: f64,
+    pub coverage: f64,
+    pub maker: f64,
+    pub home: f64,
+    pub facet: f64,
+    pub world: f64,
+    /// The dominant confident subgenre the cap counts against; empty when there is none.
+    pub subgenre: String,
+    /// Held back by the subgenre cap and placed after the capped window instead of at its score rank.
+    pub held: bool,
+}
+
+/// `more_like_this_pooled` with its knobs as an argument, and every title's signals kept. Serving ranks
+/// through this with `SimilarParams::default()`; the tuning playground with whatever it was asked for.
+pub fn more_like_this_scored(
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    p: &SimilarParams,
+) -> Vec<Scored> {
     let mut pool: Vec<u32> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     for index in [premise, plot].into_iter().flatten() {
-        for n in index.nearest(tmdb_id, media_type, POOL_K) {
+        for n in index.nearest(tmdb_id, media_type, p.pool_k) {
             if seen.insert(n.tmdb_id) {
                 pool.push(n.tmdb_id);
             }
@@ -395,7 +624,7 @@ pub fn more_like_this_pooled(
     else {
         return Vec::new();
     };
-    let seed = seed_labels(&mine);
+    let seed = seed_labels(&mine, p.min_confidence);
     let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
     let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
     let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
@@ -425,51 +654,54 @@ pub fn more_like_this_pooled(
     let premise_floor = floor(raw.iter().filter_map(|&(_, p, _)| p).collect());
     let plot_floor = floor(raw.iter().filter_map(|&(_, _, l)| l).collect());
 
-    let mut scored: Vec<(u32, f64, String)> = Vec::new();
-    for &(id, p, l) in &raw {
+    // (id, base, dominant subgenre, premise cosine, plot cosine) of a candidate past the gates.
+    type Gated = (u32, f64, String, Option<f64>, Option<f64>);
+    let mut scored: Vec<Gated> = Vec::new();
+    for &(id, pc, l) in &raw {
         let Some(theirs) = premise
             .and_then(|x| x.labels(id, media_type))
             .or_else(|| plot.and_then(|x| x.labels(id, media_type)))
         else {
             continue;
         };
-        if theirs.animated != mine.animated {
+        if p.same_animation && theirs.animated != mine.animated {
             continue;
         }
-        let t = tone(&seed, &theirs);
+        let t = tone(&seed, &theirs, p.min_confidence);
         let maker = authorship.map_or(0.0, |a| a.makers(id));
         // The floor is skipped when the candidate carries no confident labels at all — unknown is not none,
         // and filtering on it would silently drop every thinly-labelled title. A shared maker also exempts
         // it: labels are a guess about a title, authorship is a fact about it, and the fact wins.
-        let unlabelled = theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < MIN_CONFIDENCE);
-        if !unlabelled && maker <= 0.0 && t < TONE_FLOOR {
+        let unlabelled =
+            theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < p.min_confidence);
+        if !unlabelled && maker <= 0.0 && t < p.tone_floor {
             continue;
         }
-        let base = W_PREMISE * p.unwrap_or(premise_floor) + W_PLOT * l.unwrap_or(plot_floor);
+        let base = p.w_premise * pc.unwrap_or(premise_floor) + p.w_plot * l.unwrap_or(plot_floor);
         let dominant = theirs
             .subgenres
             .iter()
-            .filter(|(_, c)| *c >= MIN_CONFIDENCE)
+            .filter(|(_, c)| *c >= p.min_confidence)
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(n, _)| (*n).to_string())
             .unwrap_or_default();
-        scored.push((id, base, dominant));
+        scored.push((id, base, dominant, pc, l));
     }
     if scored.is_empty() {
         return Vec::new();
     }
 
     // The tonal term is expressed in the pool's own units so one weight works for every seed.
-    let mut bases: Vec<f64> = scored.iter().map(|&(_, b, _)| b).collect();
+    let mut bases: Vec<f64> = scored.iter().map(|s| s.1).collect();
     bases.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let spread = (bases[bases.len() * 9 / 10] - bases[bases.len() / 10]).max(f64::EPSILON);
-    let mut final_scored: Vec<(u32, f64, String)> = scored
+    let mut final_scored: Vec<Scored> = scored
         .into_iter()
-        .map(|(id, base, dominant)| {
+        .map(|(id, base, dominant, pc, l)| {
             let theirs = premise
                 .and_then(|x| x.labels(id, media_type))
                 .or_else(|| plot.and_then(|x| x.labels(id, media_type)));
-            let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th));
+            let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th, p.min_confidence));
             let maker = authorship.map_or(0.0, |a| a.makers(id));
             let home = authorship.map_or(0.0, |a| a.home(id));
             // A candidate with no facets scores the term at 0 rather than being penalised or exempted: it
@@ -484,38 +716,58 @@ pub fn more_like_this_pooled(
                 facets.and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id))).unwrap_or(0.0);
             let score = base
                 + spread
-                    * (W_TONE * t
-                        + W_NOUL * nc
-                        + W_CRITIQUE * cr
-                        + W_COVERAGE * cov
-                        + W_MAKER * maker
-                        + W_HOME * home
-                        + W_FACET * fa
-                        - W_WORLD * world);
-            (id, score, dominant)
+                    * (p.w_tone * t
+                        + p.w_noul * nc
+                        + p.w_critique * cr
+                        + p.w_coverage * cov
+                        + p.w_maker * maker
+                        + p.w_home * home
+                        + p.w_facet * fa
+                        - p.w_world * world);
+            Scored {
+                tmdb_id: id,
+                score,
+                base,
+                premise: pc,
+                plot: l,
+                spread,
+                tone: t,
+                noul: nc,
+                critique: cr,
+                coverage: cov,
+                maker,
+                home,
+                facet: fa,
+                world,
+                subgenre: dominant,
+                held: false,
+            }
         })
         .collect();
-    final_scored
-        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    final_scored.sort_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.tmdb_id.cmp(&b.tmdb_id))
+    });
 
     // Greedy pick under the per-subgenre cap, then a second pass to fill from what the cap held back rather
     // than reaching further down a worse tail. The cap counts against the first twenty — a row of two
     // hundred should not be three police procedurals and then nothing else from the genre.
-    let mut taken: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut out: Vec<u32> = Vec::new();
-    let mut held: Vec<u32> = Vec::new();
-    for (id, _, dominant) in &final_scored {
-        if out.len() == MAX_ROW {
+    //
+    // Positions into `final_scored`, not ids, so the answer can carry each title's signals.
+    let mut taken: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut out: Vec<usize> = Vec::new();
+    let mut held: Vec<usize> = Vec::new();
+    for (at, s) in final_scored.iter().enumerate() {
+        if out.len() == p.max_row {
             break;
         }
-        let count = taken.entry(dominant.clone()).or_insert(0);
+        let count = taken.entry(s.subgenre.as_str()).or_insert(0);
         // Past the first screenful the cap stops applying: it exists to keep the visible row varied, and
         // beyond that it would start excluding good answers for being the same kind of thing.
-        if dominant.is_empty() || out.len() >= KEEP || *count < SUBGENRE_CAP {
+        if s.subgenre.is_empty() || out.len() >= p.cap_window || *count < p.subgenre_cap {
             *count += 1;
-            out.push(*id);
+            out.push(at);
         } else {
-            held.push(*id);
+            held.push(at);
         }
     }
     // The held items go back in right after the visible screenful, in score order — NOT at the end of the
@@ -524,11 +776,14 @@ pub fn more_like_this_pooled(
     // Homicide: Life on the Street, and a 200-title "more like The Wire" had no Homicide in it.
     //
     // The cap's job is the first twenty. Past that, a held item is simply the next-best answer.
-    let tail = out.split_off(out.len().min(KEEP));
+    let tail = out.split_off(out.len().min(p.cap_window));
+    for &at in &held {
+        final_scored[at].held = true;
+    }
     out.extend(held);
     out.extend(tail);
-    out.truncate(MAX_ROW);
-    out
+    out.truncate(p.max_row);
+    out.into_iter().map(|at| final_scored[at].clone()).collect()
 }
 
 #[cfg(test)]
@@ -705,6 +960,78 @@ mod tests {
             None::<&dyn Facets>
         )
         .contains(&2));
+    }
+
+    /// Every knob `KNOBS` names is one `get` and `set` answer, and setting a knob to its own default
+    /// leaves the parameters exactly as they were — so a form built from `KNOBS` and pre-filled from
+    /// `get` sends production back unchanged.
+    #[test]
+    fn every_knob_round_trips_through_get_and_set() {
+        let defaults = SimilarParams::default();
+        for knob in SimilarParams::KNOBS {
+            let value = defaults.get(knob.name).unwrap_or_else(|| panic!("{} has no getter", knob.name));
+            assert!(
+                value >= knob.min && value <= knob.max,
+                "{}'s default {value} is outside its range",
+                knob.name
+            );
+            let mut p = defaults;
+            p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(p, defaults, "{} did not round-trip", knob.name);
+        }
+        assert_eq!(SimilarParams::KNOBS.len(), 20, "a field was added without a knob, or the reverse");
+    }
+
+    #[test]
+    fn a_bad_value_is_refused_by_name() {
+        let mut p = SimilarParams::default();
+        assert!(p.set("w_maker", 11.0).unwrap_err().contains("w_maker"));
+        assert!(p.set("w_maker", f64::NAN).unwrap_err().contains("w_maker"));
+        assert!(p.set("pool_k", 2.5).unwrap_err().contains("whole number"));
+        assert!(p.set("pool_k", 0.0).unwrap_err().contains("pool_k"));
+        assert!(p.set("w_nope", 1.0).unwrap_err().contains("w_nope"));
+        assert_eq!(p, SimilarParams::default(), "a refused value must change nothing");
+    }
+
+    /// The overrides reach the ranking: the Once case again, with the maker weight at zero, puts the
+    /// closer-but-unrelated title back in front — and each title reports the signals it was ranked on.
+    #[test]
+    fn the_parameters_drive_the_ranking() {
+        let seed_subs: &[(&str, f64)] = &[("Romantic Drama", 0.75)];
+        let seed_moods: &[(&str, f64)] = &[("Feel-good", 0.6)];
+        let premise = fixture(&[
+            (1, "movie", "Romance", false, seed_subs, seed_moods, [100, 0, 0]),
+            (2, "movie", "Romance", false, seed_subs, seed_moods, [95, 0, 0]),
+            (3, "movie", "Drama", false, &[], &[("Feel-good", 0.7)], [60, 0, 0]),
+            (4, "movie", "Romance", false, seed_subs, seed_moods, [88, 0, 0]),
+            (5, "movie", "Romance", false, seed_subs, seed_moods, [40, 0, 0]),
+        ]);
+        struct SameHand;
+        impl Authorship for SameHand {
+            fn nominate(&self) -> Vec<u32> {
+                vec![3]
+            }
+            fn makers(&self, id: u32) -> f64 {
+                f64::from(u8::from(id == 3))
+            }
+        }
+        let rank = |p: &SimilarParams| {
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, Some(&SameHand), None, p)
+        };
+        let shipped = rank(&SimilarParams::default());
+        assert_eq!(shipped[0].tmdb_id, 3);
+        assert_eq!(shipped[0].maker, 1.0);
+        let ids: Vec<u32> = shipped.iter().map(|s| s.tmdb_id).collect();
+        assert_eq!(
+            ids,
+            more_like_this_pooled(None, Some(&premise), 1, MediaType::Movie, Some(&SameHand), None),
+            "the default parameters are what the production entry point ranks with"
+        );
+        let mut off = SimilarParams::default();
+        off.set("w_maker", 0.0).unwrap();
+        assert_eq!(rank(&off)[0].tmdb_id, 2, "without the maker weight the closest vector leads");
+        off.set("max_row", 2.0).unwrap();
+        assert_eq!(rank(&off).len(), 2);
     }
 
     #[test]

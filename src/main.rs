@@ -14,6 +14,7 @@ mod justwatch;
 mod manifest;
 mod metrics;
 mod motn;
+mod playground;
 mod plotrows;
 mod queries;
 mod rail;
@@ -59,6 +60,9 @@ pub struct AppState {
     /// else — the rule every den addon uses). Read once at startup, so with it off the request path pays
     /// a single bool check.
     pub log_requests: bool,
+    /// The tuning playground (env `PLAYGROUND`, same on/off rule as `LOG_REQUESTS`; needs `INDEX_QUERIES`).
+    /// Off — the default — 404s every `/playground…` path (`playground.rs`).
+    pub playground: bool,
     /// The `/health` reason last logged (`ok` when healthy), so a change is logged once rather than by
     /// every request that observes it.
     pub health: std::sync::Mutex<&'static str>,
@@ -118,6 +122,7 @@ impl AppState {
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
             metrics_token: None,
             log_requests: false,
+            playground: false,
             health: std::sync::Mutex::new("ok"),
         }
     }
@@ -356,6 +361,7 @@ async fn main() {
         motn,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
+        playground: std::env::var("PLAYGROUND").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
     if let Some(search) = &state.titles {
@@ -413,7 +419,8 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} motn={}",
+         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} motn={} \
+         playground={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -426,6 +433,7 @@ async fn main() {
         on(state.index.is_some()),
         on(ratings.is_some()),
         on(state.motn.enabled()),
+        on(state.playground && state.index.is_some()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());

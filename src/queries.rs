@@ -95,22 +95,35 @@ impl Indexes {
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
-            // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
-            // the load fails without a store, so there is no arm here that answers without one.
-            let facets = crate::rail::SeedFacets::new(&self.store.view(), &self.store.aggregates, media_type)
-                .expect("MappedStore::check builds this at load, so it cannot fail per request");
-            let authorship =
-                self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
-            den_index::more_like_this_pooled(
-                Some(&self.plot),
-                self.premise.as_ref(),
-                tmdb_id,
-                media_type,
-                authorship.as_ref().map(|a| a as &dyn den_index::Authorship),
-                Some(&facets),
-            )
-            .into()
+            let production = den_index::SimilarParams::default();
+            self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.tmdb_id).collect()
         })
+    }
+
+    /// More Like This ranked with `params`, every title's signals kept, and never memoised — the tuning
+    /// playground's question. `more_like_this` is this with the default parameters, so the two cannot
+    /// build the scorer's inputs differently.
+    pub fn more_like_this_scored(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        params: &den_index::SimilarParams,
+    ) -> Vec<den_index::Scored> {
+        // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
+        // the load fails without a store, so there is no arm here that answers without one.
+        let facets = crate::rail::SeedFacets::new(&self.store.view(), &self.store.aggregates, media_type)
+            .expect("MappedStore::check builds this at load, so it cannot fail per request")
+            .tuned(params);
+        let authorship = self.facts.as_ref().map(|f| crate::rail::SeedAuthorship::of(f, media_type, tmdb_id));
+        den_index::more_like_this_scored(
+            Some(&self.plot),
+            self.premise.as_ref(),
+            tmdb_id,
+            media_type,
+            authorship.as_ref().map(|a| a as &dyn den_index::Authorship),
+            Some(&facets),
+            params,
+        )
     }
 
     /// What a billboard's fit reads off the index as a whole (`fit::Corpus`), worked out once: the first time it is

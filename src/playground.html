@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tuning playground</title>
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #ffffff; --text: #1c1917; --muted: #78716c; --line: #e7e5e4;
+    --accent: #2563eb; --up: #15803d; --down: #b91c1c; --changed: #fef3c7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1917; --panel: #292524; --text: #f5f5f4; --muted: #a8a29e; --line: #44403c;
+      --accent: #60a5fa; --up: #4ade80; --down: #f87171; --changed: #422006;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 24px 0 8px; }
+  p, li { color: var(--muted); }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+            margin-top: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+  input, select, button, textarea { font: inherit; color: var(--text); background: var(--bg);
+         border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .anchors button { font-size: 12px; padding: 3px 8px; }
+  .knobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .knob input { width: 100%; }
+  .knob.changed input { background: var(--changed); }
+  .knob small { font-size: 11px; }
+  .error { color: var(--down); white-space: pre-wrap; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  td.title, th.title { text-align: left; white-space: normal; min-width: 180px; }
+  td.title a { color: var(--text); }
+  .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
+  .neg { color: var(--down); }
+  textarea { width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Tuning playground</h1>
+  <p>More Like This, ranked by the scorer atlas serves, with any of its knobs moved. Every field starts at
+     production's value; only what you change is sent. Points are what each signal added to the score
+     (spread &times; weight &times; value).</p>
+
+  <section>
+    <form id="seed" class="row">
+      <label>Type <select id="type"><option value="series">series</option><option value="movie">movie</option></select></label>
+      <label>TMDB id <input id="id" inputmode="numeric" required size="9"></label>
+      <label>Titles <input id="limit" type="number" min="1" size="5"></label>
+      <button class="primary" type="submit">Rank</button>
+      <button type="button" id="reset">Reset to production</button>
+    </form>
+    <div class="row anchors" style="margin-top:8px">
+      <span class="muted">Anchors:</span>
+      <button type="button" data-a="series/1438">The Wire</button>
+      <button type="button" data-a="movie/5723">Once</button>
+      <button type="button" data-a="series/1399">Game of Thrones</button>
+      <button type="button" data-a="series/3322">Oz</button>
+      <button type="button" data-a="series/46786">Bates Motel</button>
+    </div>
+  </section>
+
+  <section>
+    <div class="knobs" id="knobs"></div>
+  </section>
+
+  <section>
+    <label>I have watched (TMDB ids)
+      <textarea rows="2" disabled placeholder="Not available yet"></textarea></label>
+    <p>Disabled: More Like This takes no viewing history today. The household tilt (den-core's order,
+       <code>tilt.liked</code>/<code>tilt.disliked</code>) runs on browse rows only, and
+       <code>/index/suggest</code> can only exclude titles.</p>
+  </section>
+
+  <p id="status" class="muted"></p>
+  <p id="error" class="error"></p>
+  <div class="scroll"><table id="out"></table></div>
+  <div id="left"></div>
+
+  <h2>Not tunable yet</h2>
+  <ul>
+    <li><b>Per-axis facet weights</b> (era, tone, pacing, ending, …): one <code>w_facet</code> covers all
+        twelve axes, each weighted by its rarity. Needs a weight per axis in <code>SimilarParams</code>,
+        applied in <code>facet_agreement</code>.</li>
+    <li><b>Facet filters</b> (e.g. only <code>tone=bleak</code>): More Like This takes no constraint. Needs
+        the constraint list <code>/index/row</code> already parses, applied as a candidate filter.</li>
+    <li><b>IMDb rating cutoff</b> and <b>IMDb votes floor</b>: the scorer never reads ratings. atlas holds
+        IMDb's daily ratings (<code>Indexes::imdb_rating</code>, <code>Indexes::votes</code>) when
+        <code>IMDB_RATINGS</code> is on; needs them passed into the scorer (a trait like
+        <code>Authorship</code>) as a filter or a term.</li>
+    <li><b>TMDB votes</b>: atlas has no TMDB vote count any more (the store dropped it). Needs a source first;
+        TMDB's own recommendations are merged by the client, not here.</li>
+    <li><b>I have watched</b>: see above. Needs More Like This to take <code>tilt.*</code> and compose
+        den-core's order over its row, as browse rows do, or an exclude list.</li>
+    <li><b>Critique floor</b> (0.10) and the <b>idf holds share</b> (0.7): baked into corpus-wide aggregates
+        built once at load. Needs those aggregates rebuilt (or memoised) per value.</li>
+    <li><b>Pool floor and spread percentiles</b> (10th / 90th): literals in the scorer. Could become knobs.</li>
+    <li><b>You might also like</b> (<code>/index/suggest</code>): pools More Like This per seed; not on this
+        page yet.</li>
+  </ul>
+</main>
+<script>
+"use strict";
+// Relative to wherever atlas is mounted, with or without a trailing slash.
+const base = location.pathname.replace(/\/+$/, "");
+const $ = (id) => document.getElementById(id);
+const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world"];
+let knobs = [];
+let defaultLimit = 20;
+
+function fmt(n, d = 3) { return n == null ? "–" : Number(n).toFixed(d); }
+function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+
+function buildKnobs(values) {
+  $("knobs").innerHTML = "";
+  for (const k of knobs) {
+    const wrap = document.createElement("label");
+    wrap.className = "knob";
+    const step = k.integer ? 1 : 0.05;
+    wrap.innerHTML = `${esc(k.name)} <small>(${k.default})</small>` +
+      `<input type="number" name="${esc(k.name)}" min="${k.min}" max="${k.max}" step="${step}">` +
+      `<small>${esc(k.about)}</small>`;
+    const input = wrap.querySelector("input");
+    input.value = values[k.name] ?? k.default;
+    const mark = () => wrap.classList.toggle("changed", Number(input.value) !== k.default);
+    input.addEventListener("input", mark);
+    mark();
+    $("knobs").appendChild(wrap);
+  }
+}
+
+function changed() {
+  const out = {};
+  for (const k of knobs) {
+    const v = document.querySelector(`input[name="${k.name}"]`).value;
+    if (v !== "" && Number(v) !== k.default) out[k.name] = v;
+  }
+  return out;
+}
+
+async function rank() {
+  const type = $("type").value, id = $("id").value.trim();
+  if (!/^\d+$/.test(id)) { $("error").textContent = "A TMDB id is a number."; return; }
+  const q = new URLSearchParams(changed());
+  q.set("limit", $("limit").value || defaultLimit);
+  history.replaceState(null, "", `${base}?type=${type}&id=${id}&${q}`);
+  $("error").textContent = "";
+  $("status").textContent = "Ranking…";
+  const resp = await fetch(`${base}/similar/${type}/${id}.json?${q}`);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
+  render(body, type);
+}
+
+function render(a, type) {
+  const seed = a.seed.title ? `${a.seed.title}${a.seed.year ? ` (${a.seed.year})` : ""}` : `${type} ${a.seed.id}`;
+  const tuned = a.changed.length ? `tuned: ${a.changed.join(", ")}` : "production parameters";
+  $("status").textContent = `${seed} — ${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); ` +
+    `${tuned}; spread ${fmt(a.spread, 4)}`;
+  const tmdb = type === "movie" ? "movie" : "tv";
+  let html = "<thead><tr><th>#</th><th>prod</th><th class=title>title</th><th>score</th><th>base</th>" +
+    SIGNALS.map((s) => `<th>${s}</th>`).join("") + "<th class=title>subgenre</th></tr></thead><tbody>";
+  for (const t of a.titles) {
+    const moved = t.production == null ? "<span class=up>new</span>"
+      : t.production === t.rank ? `<span class=muted>${t.production}</span>`
+      : `<span class=${t.production > t.rank ? "up" : "down"}>${t.production}</span>`;
+    const name = t.title ? `${esc(t.title)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""}` : t.id;
+    html += `<tr><td>${t.rank}</td><td>${moved}</td>` +
+      `<td class=title><a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">${name}</a></td>` +
+      `<td>${fmt(t.score)}</td><td>${fmt(t.base)}</td>` +
+      SIGNALS.map((s) => {
+        const sig = t.signals[s];
+        const cls = sig.points < 0 ? "neg" : sig.points === 0 ? "muted" : "";
+        return `<td class="${cls}" title="value ${fmt(sig.value)}">${fmt(sig.points)}</td>`;
+      }).join("") +
+      `<td class=title>${esc(t.subgenre || "")}${t.held ? " <span class=muted>(held by cap)</span>" : ""}</td></tr>`;
+  }
+  $("out").innerHTML = html + "</tbody>";
+  $("left").innerHTML = a.left.length
+    ? `<h2>Pushed out of the first ${a.titles.length}</h2><ul>` +
+      a.left.map((t) => `<li>${esc(t.title || t.id)} — production #${t.production}</li>`).join("") + "</ul>"
+    : "";
+}
+
+async function start() {
+  const resp = await fetch(`${base}/params.json`);
+  const p = await resp.json();
+  knobs = p.knobs;
+  defaultLimit = p.defaultLimit;
+  $("limit").max = p.maxLimit;
+  const url = new URLSearchParams(location.search);
+  const values = {};
+  for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
+  buildKnobs(values);
+  $("limit").value = url.get("limit") || defaultLimit;
+  if (url.get("type")) $("type").value = url.get("type");
+  if (url.get("id")) { $("id").value = url.get("id"); rank(); }
+}
+
+$("seed").addEventListener("submit", (e) => { e.preventDefault(); rank(); });
+$("reset").addEventListener("click", () => { buildKnobs({}); if ($("id").value) rank(); });
+for (const b of document.querySelectorAll("[data-a]")) {
+  b.addEventListener("click", () => {
+    const [type, id] = b.dataset.a.split("/");
+    $("type").value = type; $("id").value = id; rank();
+  });
+}
+start().catch((e) => { $("error").textContent = `Could not load the parameters: ${e}`; });
+</script>
+</body>
+</html>

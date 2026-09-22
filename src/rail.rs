@@ -15,30 +15,26 @@
 //! Now every per-title read is an index into a mapped column, and the only owned state is the three
 //! aggregates below, which cannot be columns because they are corpus-wide statistics.
 
-use den_index::{Axis, MediaType, ValueId, Weighted};
+use den_index::{Axis, MediaType, SimilarParams, ValueId, Weighted};
 use den_store::{Row, Store};
 use std::collections::HashMap;
 
 use crate::facts::Facts;
 
-/// Above this, a title is judged to hold that critique axis, for the idf count.
-const DEFINING: f64 = 0.8;
-/// The share of a media type holding an axis, for `ln(N / holders)`.
+/// The share of a media type holding an axis, for `ln(N / holders)`. Read at load into the idf aggregate,
+/// so unlike the knobs in `SimilarParams` a request cannot move it.
 const HOLDS: f64 = 0.7;
 
 // The three floors `build_rail_facets.py` applied when it wrote the JSON blob, re-applied HERE because
 // the store deliberately keeps full fidelity: a value below a floor is real data the store should hold
 // and the scorer should ignore, and baking a ranking decision into the artifact is what made the old
-// blob impossible to re-tune without a rebuild.
+// blob impossible to re-tune without a rebuild. The noul and world floors are per-request knobs in
+// `den_index::SimilarParams`; the critique floor is here because the centering mean is built with it.
 //
 // They are not cosmetic. Dropping the noul floor took the corpus mean noul cosine from 0.38 to 0.51 and
 // changed 5 of The Wire's top 20 — the shared-baseline problem the critique centering exists to avoid,
 // reintroduced in a different term. `world` below its floor made 50% of rows move. Restoring them keeps
 // this migration what it claimed to be: the same ranking, read from a different place.
-/// A noul below this is noise, not a signal: ~75 dimensions per row become ~15.
-const NOUL_FLOOR: f64 = 0.20;
-/// Below this a title is simply realist; the distance is not meaningful.
-const WORLD_FLOOR: f64 = 0.05;
 /// A critique axis below this says nothing about what the work argues.
 const CRITIQUE_FLOOR: f64 = 0.10;
 
@@ -166,9 +162,23 @@ pub struct SeedFacets<'a> {
     noul_names: &'a [u32],
     noul_k: den_store::List<'a, u8>,
     noul_v: den_store::List<'a, u8>,
+    /// The per-request floors, from `SimilarParams` (`tuned`); production's unless overridden.
+    noul_floor: f64,
+    world_floor: f64,
+    defining: f64,
 }
 
 impl<'a> SeedFacets<'a> {
+    /// The same columns, read with the floors of `params` rather than production's.
+    pub fn tuned(self, params: &SimilarParams) -> Self {
+        SeedFacets {
+            noul_floor: params.noul_floor,
+            world_floor: params.world_floor,
+            defining: params.defining,
+            ..self
+        }
+    }
+
     /// Resolve every column the rail reads, once.
     ///
     /// All-or-nothing on purpose: a rail that dropped only the absent signal would score some titles on
@@ -183,7 +193,11 @@ impl<'a> SeedFacets<'a> {
         agg: &'a RailAggregates,
         media: MediaType,
     ) -> Result<Self, den_store::StoreError> {
+        let production = SimilarParams::default();
         Ok(SeedFacets {
+            noul_floor: production.noul_floor,
+            world_floor: production.world_floor,
+            defining: production.defining,
             agg,
             media: media_code(media),
             keys: store.per_row::<u64>("keys")?,
@@ -247,7 +261,7 @@ impl den_index::Facets for SeedFacets<'_> {
     fn world(&self, tmdb_id: u32) -> f64 {
         let Some(row) = self.row(tmdb_id) else { return 0.0 };
         let raw = self.world.get(row.0).map_or(0.0, |&v| f64::from(v) / 100.0);
-        if raw >= WORLD_FLOOR {
+        if raw >= self.world_floor {
             raw
         } else {
             0.0
@@ -261,7 +275,7 @@ impl den_index::Facets for SeedFacets<'_> {
             .zip(vs)
             .filter_map(|(&k, &v)| {
                 let p = f64::from(v) / 100.0;
-                (p >= NOUL_FLOOR).then(|| self.noul_names.get(k as usize).map(|&name| (name, p)))?
+                (p >= self.noul_floor).then(|| self.noul_names.get(k as usize).map(|&name| (name, p)))?
             })
             .collect()
     }
@@ -292,7 +306,7 @@ impl den_index::Facets for SeedFacets<'_> {
         let media = self.media;
         self.critique_raw(tmdb_id)
             .into_iter()
-            .filter(|(_, p)| *p >= DEFINING)
+            .filter(|(_, p)| *p >= self.defining)
             .filter_map(|(name, _)| {
                 let w = self.agg.idf.get(&(media, name)).copied().unwrap_or(0.0);
                 (w > 0.0).then_some((name, w))
@@ -439,9 +453,10 @@ mod tests {
         let loaded = loaded!();
         let movies = seed(&loaded, MediaType::Movie);
 
-        assert!(movies.nouls(1).iter().all(|(_, p)| *p >= NOUL_FLOOR), "every noul clears the floor");
+        let floors = SimilarParams::default();
+        assert!(movies.nouls(1).iter().all(|(_, p)| *p >= floors.noul_floor), "every noul clears the floor");
         let world = movies.world(1);
-        assert!(world == 0.0 || world >= WORLD_FLOOR, "world is floored, got {world}");
+        assert!(world == 0.0 || world >= floors.world_floor, "world is floored, got {world}");
         // A row with nothing at all reads as zero distance, not as a missing value.
         assert_eq!(movies.world(2), 0.0);
     }

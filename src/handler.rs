@@ -281,7 +281,75 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(rest) = route.strip_prefix("/index/") {
         return handle_index(&method, &headers, rest, &query, &state).await;
     }
+    if route == "/playground" || route.starts_with("/playground/") {
+        return handle_playground(&method, &headers, route, &query, &state).await;
+    }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+/// `/playground` (the page), `/playground/params.json` (the knobs and production's values) and
+/// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This). All 404 unless
+/// `PLAYGROUND` and `INDEX_QUERIES` are both on (`playground.rs`). Answers are `no-store`: a tuned row is an
+/// experiment, and nothing should keep one where a production row is looked for.
+async fn handle_playground(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    route: &str,
+    query: &str,
+    state: &Arc<AppState>,
+) -> Response {
+    let started = Instant::now();
+    let not_found = || json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    let (true, Some(queries)) = (state.playground, state.index.as_ref()) else { return not_found() };
+    if route == "/playground" {
+        return serve_html(method, headers, crate::playground::PAGE).await;
+    }
+    if route == "/playground/params.json" {
+        return serve_json(method, headers, crate::playground::params_json(), "no-store", None).await;
+    }
+    let Some(rest) = route.strip_prefix("/playground/similar/").and_then(|r| r.strip_suffix(".json")) else {
+        return not_found();
+    };
+    let Some((media_type, tmdb_id)) = rest
+        .split_once('/')
+        .and_then(|(type_, id)| Some((index_media_type(type_)?, id.parse::<u32>().ok()?)))
+    else {
+        return not_found();
+    };
+    let (params, limit) = match crate::playground::parse(query) {
+        Ok(parsed) => parsed,
+        Err(detail) => {
+            return json_response(
+                serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
+        Ok(got) => got,
+        Err(e) => {
+            eprintln!("index load failed: {e}");
+            return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
+        }
+    };
+    let ranking = Instant::now();
+    let answered = tokio::task::spawn_blocking(move || {
+        crate::playground::answer(&indexes, media_type, tmdb_id, &params, limit).to_string()
+    })
+    .await;
+    let body = match answered {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("playground answer failed: {e}");
+            return json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
+    let resp = serve_json(method, headers, body, "no-store", None).await;
+    with_timing(
+        resp,
+        &format!("{load}rank;dur={}, total;dur={}", ms(ranking.elapsed()), ms(started.elapsed())),
+    )
 }
 
 /// `POST /embed` — the search query-embed proxy. Forwards the JSON body (`{"text":"…"}`) to den-embed and
@@ -1730,6 +1798,72 @@ mod tests {
         let ds = crate::queries::write_fixture(&dir);
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
+    /// Off by default: every playground path is a 404, whatever it carries, exactly like an unknown route.
+    #[tokio::test]
+    async fn the_playground_is_off_unless_enabled() {
+        let state = index_state("den-atlas-playground-off");
+        for path in [
+            "/playground",
+            "/playground/params.json",
+            "/playground/similar/movie/1.json",
+            "/playground/similar/movie/1.json?w_maker=2",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 404, "{path}");
+        }
+        // Enabled without the index routes it is off too: there is nothing to rank with.
+        let bare = Arc::new(AppState { playground: true, ..AppState::for_test(None) });
+        assert_eq!(get(&bare, "/playground").await.status(), 404);
+    }
+
+    /// On, the page and its knobs are served, a tuned row answers `no-store`, and a bad value is a 400
+    /// naming the parameter. The production route never reads an override, on or off.
+    #[tokio::test]
+    async fn the_playground_tunes_only_its_own_route() {
+        let off = index_state("den-atlas-playground-a");
+        let on = {
+            let Ok(mut state) = Arc::try_unwrap(index_state("den-atlas-playground-b")) else {
+                unreachable!()
+            };
+            state.playground = true;
+            Arc::new(state)
+        };
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+
+        let page = get(&on, "/playground").await;
+        assert_eq!(page.status(), 200);
+        assert!(body_of(page).await.contains("Tuning playground"));
+        let knobs = json(body_of(get(&on, "/playground/params.json").await).await);
+        let maker = knobs["knobs"].as_array().unwrap().iter().find(|k| k["name"] == "w_maker").unwrap();
+        assert_eq!(maker["default"], 1.2, "the form is pre-filled with production's value");
+
+        let tuned = get(&on, "/playground/similar/movie/1.json?limit=200").await;
+        assert_eq!(tuned.headers()["cache-control"], "no-store");
+        let tuned = json(body_of(tuned).await);
+        let production = json(body_of(get(&on, "/index/similar/movie/1.json?limit=200").await).await);
+        let ids: Vec<&serde_json::Value> =
+            tuned["titles"].as_array().unwrap().iter().map(|t| &t["id"]).collect();
+        assert_eq!(serde_json::json!(ids), production["ids"], "default parameters are production's row");
+        assert_eq!(tuned["changed"], serde_json::json!([]));
+        assert!(tuned["titles"][0]["signals"]["maker"]["points"].is_number(), "{tuned}");
+
+        let short = json(body_of(get(&on, "/playground/similar/movie/1.json?max_row=1").await).await);
+        assert_eq!(short["titles"].as_array().unwrap().len(), 1);
+        assert_eq!(short["changed"], serde_json::json!(["max_row"]));
+
+        for (query, name) in [("w_maker=11", "w_maker"), ("w_makr=1", "w_makr"), ("pool_k=1.5", "pool_k")] {
+            let resp = get(&on, &format!("/playground/similar/movie/1.json?{query}")).await;
+            assert_eq!(resp.status(), 400, "{query}");
+            assert!(body_of(resp).await.contains(name), "{query}");
+        }
+
+        // An override on the production route is ignored with the playground on or off.
+        for state in [&on, &off] {
+            let plain = body_of(get(state, "/index/similar/movie/1.json").await).await;
+            let asked = body_of(get(state, "/index/similar/movie/1.json?max_row=1&w_maker=0").await).await;
+            assert_eq!(asked, plain);
+        }
     }
 
     /// The taxonomy, label rows (paged, per type, an encoded label) and More Like This, from a real fixture
