@@ -4,6 +4,7 @@
 mod billboardcheck;
 mod cache;
 mod catalog;
+mod characters;
 mod config;
 mod dataset;
 mod descriptor;
@@ -349,7 +350,27 @@ async fn main() {
             built.map_err(|e| eprintln!("imdb ratings disabled (reqwest build failed: {e})")).ok()
         })
         .map(Arc::new);
-    let index = index.map(|queries| Arc::new(queries.with_ratings(ratings.clone())));
+    // IMDb's `title.principals`, filtered to the corpus: which titles share a character (a spin-off, a
+    // sequel). ON unless IMDB_CHARACTERS is empty or 0, like IMDB_RATINGS and only alongside the index
+    // routes for the same reason. Built in the background — nothing waits on it — and weekly after that.
+    let characters_off = std::env::var("IMDB_CHARACTERS").is_ok_and(|v| v.is_empty() || v == "0");
+    let characters = (index.is_some() && !characters_off)
+        .then(|| {
+            dataset.as_ref().map(|ds| {
+                characters::Characters::new(
+                    ds.store.clone(),
+                    characters::PRINCIPALS_URL,
+                    cache_dir.as_deref().map(std::path::Path::new),
+                )
+            })
+        })
+        .flatten()
+        .and_then(|built| {
+            built.map_err(|e| eprintln!("imdb characters disabled (reqwest build failed: {e})")).ok()
+        })
+        .map(Arc::new);
+    let index = index
+        .map(|queries| Arc::new(queries.with_ratings(ratings.clone()).with_characters(characters.clone())));
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
@@ -381,6 +402,9 @@ async fn main() {
         // `atlas-dataset-sync` restarts this process on every publish, so that window is not rare.
         ratings::wait_for_first_join(ratings).await;
         tokio::spawn(ratings::refresh_forever(Arc::clone(ratings)));
+    }
+    if let Some(characters) = &characters {
+        tokio::spawn(characters::refresh_forever(Arc::clone(characters)));
     }
     if state.motn.enabled() {
         tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
@@ -424,8 +448,8 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} motn={} \
-         playground={}",
+         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} \
+         imdb_characters={} motn={} playground={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -437,6 +461,7 @@ async fn main() {
         on(state.titles.is_some()),
         on(state.index.is_some()),
         on(ratings.is_some()),
+        on(characters.is_some()),
         on(state.motn.enabled()),
         on(state.playground && state.index.is_some()),
     );

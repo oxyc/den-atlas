@@ -13,6 +13,7 @@
 //! fewer, and a title missing from one of them lost its row order or its attribute search with nothing
 //! failing. One artifact cannot disagree with itself, which is the whole point of the cut.
 
+use crate::characters::Characters;
 use crate::dataset::Dataset;
 use crate::facts::Facts;
 use crate::fit::Corpus;
@@ -59,6 +60,9 @@ pub struct Indexes {
     /// next row it orders rather than waiting for an idle release. `None` when the fetch is switched off,
     /// and empty until the first one lands — see `votes_of`.
     pub ratings: Option<Arc<Ratings>>,
+    /// Titles that share a character, from IMDb's `title.principals` (`characters`). The live holder, like
+    /// `ratings`; `None` when the fetch is switched off, empty until the first build lands.
+    pub characters: Option<Arc<Characters>>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
@@ -152,6 +156,19 @@ impl Indexes {
     pub fn imdb_rating(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<(u32, f32)> {
         let ratings = self.ratings.as_ref()?.index()?;
         ratings.of(row_of(&self.store, media_type, tmdb_id)?)
+    }
+
+    /// The titles sharing a character with this one, by store row, strongest evidence first. Empty when the
+    /// store does not hold the title, the list has not landed, or the fetch is off.
+    // Read by the billboard's fit and More Like This once #43 wires the list into scoring.
+    #[allow(dead_code)]
+    pub fn character_links(
+        &self,
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    ) -> Vec<crate::characters::CharacterLink> {
+        let Some(index) = self.characters.as_ref().and_then(|c| c.index()) else { return Vec::new() };
+        row_of(&self.store, media_type, tmdb_id).map(|row| index.of(row).to_vec()).unwrap_or_default()
     }
 
     /// Whether the store's own `votes` column holds a count for any row — the fallback source for row
@@ -315,6 +332,8 @@ pub struct IndexQueries {
     store_votes_absent: AtomicBool,
     /// IMDb's ratings, joined onto this store's rows. `None` when `IMDB_RATINGS` is off.
     ratings: Option<Arc<Ratings>>,
+    /// IMDb's character neighbour list over this store's rows. `None` when `IMDB_CHARACTERS` is off.
+    characters: Option<Arc<Characters>>,
 }
 
 impl IndexQueries {
@@ -330,6 +349,7 @@ impl IndexQueries {
             rows_unusable: AtomicBool::new(false),
             store_votes_absent: AtomicBool::new(false),
             ratings: None,
+            characters: None,
         }
     }
 
@@ -337,6 +357,12 @@ impl IndexQueries {
     /// (`IMDB_RATINGS`) and every test that only wants a dataset should not have to name it.
     pub fn with_ratings(mut self, ratings: Option<Arc<Ratings>>) -> Self {
         self.ratings = ratings;
+        self
+    }
+
+    /// The IMDb character neighbour list, for the same reason as `with_ratings` (`IMDB_CHARACTERS`).
+    pub fn with_characters(mut self, characters: Option<Arc<Characters>>) -> Self {
+        self.characters = characters;
         self
     }
 
@@ -386,6 +412,7 @@ impl IndexQueries {
             taxonomy_version: self.taxonomy_version.clone(),
             store: self.store.clone(),
             ratings: self.ratings.clone(),
+            characters: self.characters.clone(),
         };
         let loaded = tokio::task::spawn_blocking(move || load(&sources))
             .await
@@ -466,6 +493,8 @@ struct Sources {
     /// IMDb's ratings, when the fetch is on. The indexes keep the holder — not the index it currently
     /// has — so a refresh that lands between two loads reaches the rows in between.
     ratings: Option<Arc<Ratings>>,
+    /// IMDb's character neighbour list, when the fetch is on; the holder, like `ratings`.
+    characters: Option<Arc<Characters>>,
 }
 
 /// Load the indexes ONCE, synchronously, for a command-line tool.
@@ -482,6 +511,7 @@ pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
         // No ratings fetch for a one-shot tool: it would download 8 MB to rank the run it then exits
         // from. A tool measures row order off the store's own `votes` column, and says so here.
         ratings: None,
+        characters: None,
     };
     load(&sources).map(|(indexes, _phases)| indexes)
 }
@@ -637,6 +667,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         plot_facets,
         store,
         ratings: sources.ratings.clone(),
+        characters: sources.characters.clone(),
         cards,
         display,
         similar: Mutex::new(HashMap::new()),
@@ -950,6 +981,30 @@ mod tests {
         assert_eq!(attended(1, None), (Some(capped), true), "IMDb's 9,000 votes, capped at fully popular");
         assert_eq!(attended(2, Some(7.0)), (Some(7.0), false), "a hint stands");
         assert_eq!(attended(3, None), (None, false), "neither source knows it");
+    }
+
+    /// A title's character neighbours through the indexes: by its store row (movie 1 is row 0), empty for
+    /// a title the store lacks and when there is no list.
+    #[tokio::test]
+    async fn character_links_are_read_by_store_row() {
+        use crate::characters::{Characters, Tier};
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-chars-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let tsv = "tconst\tordering\tnconst\tcategory\tjob\tcharacters\n\
+                   tt0000001\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n\
+                   tt0000002\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n";
+        let rows = HashMap::from([(1, 0), (2, 1)]);
+        let list = crate::characters::build(&rows, 12, std::io::Cursor::new(tsv)).unwrap();
+        let queries = IndexQueries::new(&ds).with_characters(Some(Arc::new(Characters::with_index(list))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        let links = indexes.character_links(Movie, 1);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].row, links[0].tier, links[0].same_actor()), (1, Tier::SameActor, true));
+        assert!(indexes.character_links(Movie, 999).is_empty(), "a title the store does not hold");
+
+        let (bare, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
+        assert!(bare.character_links(Movie, 1).is_empty(), "no list, no links");
     }
 
     /// A one-line `title.ratings` dump naming the fixture's movie 1, joined onto its store.
