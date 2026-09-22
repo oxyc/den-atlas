@@ -148,7 +148,8 @@ pub enum Tier {
     /// One actor, billed in the top three of both, plays the same generic name ("Max"), and the two casts
     /// share at least one other person.
     SameActorGeneric,
-    /// One actor plays a name in one and a longer form of it in the other ("Jesse" / "Jesse Pinkman"): with
+    /// One actor plays a name in one and a longer form of it in the other ("Jesse" / "Jesse Pinkman"), or
+    /// the same name under a different rank or title ("Captain Jean-Luc Picard" / "Jean-Luc Picard"): with
     /// a two-word shorter name, or two actors doing so.
     SameActorSubset,
 }
@@ -786,10 +787,13 @@ fn link(titles: Titles, names: &[String]) -> HashMap<Pair, (Tier, f32)> {
                 }
                 for &(x, wx) in &by_title[&a] {
                     for &(y, wy) in &by_title[&b] {
-                        let (cx, cy) = (&cores[x as usize], &cores[y as usize]);
-                        if cx == cy {
+                        // The same name is the other tiers' evidence. Two names that differ only by a
+                        // rank or title ("Captain Jean-Luc Picard" / "Jean-Luc Picard") have equal cores
+                        // and count here, as a subset of each other.
+                        if x == y {
                             continue;
                         }
+                        let (cx, cy) = (&cores[x as usize], &cores[y as usize]);
                         let ((small, _), (big, w)) =
                             if cx.len() <= cy.len() { ((cx, wx), (cy, wy)) } else { ((cy, wy), (cx, wx)) };
                         if !small.iter().all(|word| big.contains(word)) || !specific(big) {
@@ -1146,6 +1150,18 @@ mod tests {
         let two_words =
             built(&[(1, 1, 100, "Jean-Luc Picard"), (2, 1, 100, "Jean-Luc Picard of the Enterprise")]);
         assert_eq!(tier(&two_words, 1, 2), Some(Tier::SameActorSubset));
+    }
+
+    /// One actor as "Captain Jean-Luc Picard" and as "Jean-Luc Picard": the names differ only by rank, which
+    /// is what this tier is for. A rank in front of a one-word surname is still too little to go on.
+    #[test]
+    fn a_name_that_differs_only_by_rank_links_the_same_actor() {
+        let index = built(&[(1, 1, 100, "Captain Jean-Luc Picard"), (2, 1, 100, "Jean-Luc Picard")]);
+        assert_eq!(tier(&index, 1, 2), Some(Tier::SameActorSubset));
+        let near_miss = built(&[(1, 1, 100, "Detective Jones"), (2, 1, 100, "Sergeant Jones")]);
+        assert_eq!(tier(&near_miss, 1, 2), None, "one surname under two ranks is not a character");
+        let recast = built(&[(1, 1, 100, "Captain Jean-Luc Picard"), (2, 1, 200, "Jean-Luc Picard")]);
+        assert_eq!(tier(&recast, 1, 2), None, "the tier needs the same actor");
     }
 
     /// Holmes and Watson on forty titles each still link two of them, weighted down; a rare name is not.
