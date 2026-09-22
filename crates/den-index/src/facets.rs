@@ -290,8 +290,7 @@ impl FacetQuery {
             }
             if query.country.is_none() {
                 // The pair first: "north korean" is North Korea, not "north" and South Korea.
-                let pair =
-                    tokens.get(at + 1).and_then(|next| lookup(COUNTRIES, &format!("{token} {next}")));
+                let pair = tokens.get(at + 1).and_then(|next| lookup(COUNTRIES, &format!("{token} {next}")));
                 if let Some(country) = pair {
                     query.country = Some(country);
                     claimed = true;
