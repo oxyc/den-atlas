@@ -64,7 +64,7 @@ const TITLE_LANE: usize = 50;
 const FACET_LANE: usize = 500;
 const LANE: usize = 200;
 /// The vote count at which a title counts as fully popular.
-const POPULAR_VOTES: f64 = 5000.0;
+pub(crate) const POPULAR_VOTES: f64 = 5000.0;
 /// Votes a point of TMDB export popularity is worth, for the titles the store has no count for.
 ///
 /// Measured, not chosen: over the 47,547 store rows that have both a vote count and an entry in the
@@ -74,7 +74,7 @@ const POPULAR_VOTES: f64 = 5000.0;
 /// cumulative-forever), and the ratio is not constant across the range — the median falls from ~37 votes
 /// per point below popularity 5 to ~7 above 100. That tail is why `attention` clamps the conversion at
 /// POPULAR_VOTES rather than trusting it to extrapolate.
-const VOTES_PER_POPULARITY: f64 = 39.8;
+pub(crate) const VOTES_PER_POPULARITY: f64 = 39.8;
 pub const PAGE: usize = 40;
 pub const MAX_PAGE: usize = 100;
 

@@ -23,12 +23,13 @@ use crate::fit::{Features, Fit, FitReason, Fitted};
 use crate::queries::Indexes;
 use crate::AppState;
 use den_index::MediaType;
+use den_titlesearch::TitleIndex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Names the scoring rules, so a kept answer can say which rules chose it.
-pub const SCORER: &str = "fit-1";
+pub const SCORER: &str = "fit-2";
 
 type Key = (MediaType, u32);
 
@@ -51,13 +52,46 @@ const CATALOGUE_DAYS: f64 = 730.0;
 const CATALOGUE_ARRIVAL: f64 = 0.25;
 /// What merit, timeliness and buzz can each do to a score. A title with none of one keeps this much of it, so fit —
 /// squared — decides, and the rest choose between titles that fit alike.
-const MERIT_FLOOR: f64 = 0.5;
+///
+/// Merit's floor was 0.5, so the worst-received title kept half its score and a poorly rated release that fit well
+/// led a billboard (four of a horror household's first ten had quality under 0.2). At 0.2 a title nobody liked costs
+/// as much as one nobody is talking about: 5×, the same span as timeliness.
+const MERIT_FLOOR: f64 = 0.2;
 const TIMELY_FLOOR: f64 = 0.2;
 const BUZZ_BONUS: f64 = 0.1;
 /// The slides that must fit at least `LEAD_FIT`: a billboard opens on what this household might want, never on a
 /// title only everyone else is watching.
 const LEAD_SLIDES: usize = 10;
 const LEAD_FIT: f64 = 0.25;
+/// A billboard is assembled `LEAD_SLIDES` at a time, each ten as a set rather than a cut of one score order
+/// (`assemble`): a pure score sort gave an animation household 39 films in 40 slides, and a crime household six old
+/// titles in its first ten, because fit² spans ~35× across a pool and nothing else in the score can outweigh it.
+///
+/// A slide is stale — catalogue, neither new nor newly arrived — when it came out over a year ago (freshness 0.05 is
+/// ~360 days after release) and no "new on" list places it high. At most `STALE_SLIDES` of each ten are: the
+/// household's old favourites still get a place, without the billboard turning into its back catalogue.
+pub const STALE_FRESH: f64 = 0.05;
+pub const STALE_ARRIVAL: f64 = 0.3;
+const STALE_SLIDES: usize = 3;
+/// `quality` under this is a settled rating under 6.4: the band a horror household's poorly received new releases sat
+/// in. At most `POOR_SLIDES` of each ten are, so no rule fills a ten with them either.
+pub const POOR_QUALITY: f64 = 0.2;
+const POOR_SLIDES: usize = 1;
+/// On a surface of both types, each ten holds at least this many of each while the pool has them to give.
+const EACH_TYPE_SLIDES: usize = 3;
+/// Two slides whose plot vectors are at least this close are one interest twice — a sequel, a spin-off, the same
+/// premise again: Dune and Dune: Part Two 0.83, Bosch and Bosch: Legacy 0.77, Friends and How I Met Your Mother 0.69.
+/// Measured over the made-up households' own top 40 (`billboard-check`), which already all suit one taste: the
+/// median pair sits at 0.56–0.60 and this is about the closest 3%. Each ten holds one slide of an interest.
+pub const SAME_INTEREST: f64 = 0.68;
+/// What the mix, catalogue and interest rules may put ahead of a better-scoring slide: one that fits at least
+/// `RULE_FIT` — fit's midpoint, the index's top 2% for this household — and scores at least 1 / `RULE_COST` of the
+/// best slide passed over. Each bound alone let a bad slide through. Without the fit bound the rules filled an
+/// animation household's last places with live-action titles that barely fit (Lanterns, fit 0.26), because the
+/// catalogue they displaced already carried timeliness's 5×; without the score bound, a comedy household's with
+/// three well-fitting releases nobody liked (quality 0, a sixth of the score they displaced).
+const RULE_FIT: f64 = 0.5;
+const RULE_COST: f64 = 3.0;
 /// A title's fit while the library likes nothing yet.
 const NO_TASTE: f64 = 0.5;
 /// Cast members that count as much as a maker. Wikidata's cast is unordered and about ten deep where the web
@@ -321,7 +355,12 @@ pub struct Title<'a> {
     pub votes: Option<f64>,
     /// Whether `votes` is a stand-in for a count nobody gave (JustWatch's IMDb score comes without one).
     pub estimated_votes: bool,
+    /// TMDB's popularity: a client hint's, else TMDB's daily export (`attend`). Both are ~30-day activity scores.
     pub popularity: Option<f64>,
+    /// Whether `popularity` is IMDb's all-time vote count on TMDB's scale (`search::VOTES_PER_POPULARITY`), for a
+    /// title the export doesn't hold. It says how widely a title was seen, never that it is popular now, so it
+    /// counts towards buzz but is never given as the reason.
+    pub popularity_from_votes: bool,
     /// TMDB genre ids, series' own folded into films' (`fold_genre`).
     pub genres: Vec<u16>,
     /// Its original language, which the hide rules read.
@@ -541,6 +580,32 @@ impl<'a> Knowledge<'a> {
     }
 }
 
+/// Popularity for a title no client hint gave one. Hints describe only what a client's own lists fetched, so without
+/// this five to seven of every ten slides scored no buzz at all — every title from atlas's lists and the personal pool.
+///
+/// TMDB's daily export first: the same ~30-day activity score a hint carries, so the two share `buzz`'s scale. Else
+/// IMDb's vote count, on that scale by the factor search measured (`search::VOTES_PER_POPULARITY`) and never above
+/// what search calls fully popular (`search::POPULAR_VOTES`): an all-time count otherwise puts a decades-old classic
+/// far above anything anyone is watching this month, and flattens every other title's buzz under it.
+pub fn attend(indexes: &Indexes, export: Option<&TitleIndex>, candidate: &mut Candidate<'_>) {
+    let title = &mut candidate.title;
+    if title.popularity.is_some() {
+        return;
+    }
+    let (media_type, id) = candidate.key;
+    let kind = match media_type {
+        MediaType::Movie => den_titlesearch::MediaType::Movie,
+        MediaType::Tv => den_titlesearch::MediaType::Tv,
+    };
+    if let Some(popularity) = export.and_then(|e| e.popularity_of(kind, id)) {
+        title.popularity = Some(popularity);
+    } else if let Some((votes, _)) = indexes.imdb_rating(media_type, id) {
+        let votes = f64::from(votes).min(crate::search::POPULAR_VOTES);
+        title.popularity = Some(votes / crate::search::VOTES_PER_POPULARITY);
+        title.popularity_from_votes = true;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Scoring: `billboard.ts`, term for term.
 
@@ -654,7 +719,8 @@ impl Reason {
 const REASON_LIFT: f64 = 0.05;
 
 /// A title's score: its fit squared, so fit decides, then merit, timeliness — new, or newly on a household service —
-/// and buzz. Across a real household's pool fit² spans about 35×, merit 2×, timeliness 5× and buzz 1.1×.
+/// and buzz. Across a real household's pool fit² spans about 35×, merit and timeliness 5× each and buzz 1.1×; what
+/// fit alone can't balance, `assemble` does.
 pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> Why {
     let fresh = freshness(&candidate.title, now);
     let arrived = arrival(candidate, now);
@@ -701,7 +767,9 @@ pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> 
         };
         consider(reason, ((TIMELY_FLOOR + (1.0 - TIMELY_FLOOR) * timely) / TIMELY_FLOOR).ln());
     }
-    if buzz > 0.0 {
+    // "Popular now" only when a ranked list or a current activity score says so, not an all-time vote count.
+    let now_popular = standing(candidate.rank) >= buzz || !candidate.title.popularity_from_votes;
+    if buzz > 0.0 && now_popular {
         consider(Reason::Buzz, (1.0 + BUZZ_BONUS * buzz).ln());
     }
     let reason = strongest.filter(|(_, lift)| *lift >= REASON_LIFT).map(|(reason, _)| reason);
@@ -757,6 +825,12 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         (Some(first), Some(second)) if second.span_days < first.span_days => Some(second),
         (first, second) => first.or(second),
     };
+    // A current activity score over a count converted from all-time votes, whichever copy holds it.
+    let (popularity, popularity_from_votes) = match (x.popularity, y.popularity) {
+        (Some(_), Some(p)) if x.popularity_from_votes && !y.popularity_from_votes => (Some(p), false),
+        (Some(p), _) => (Some(p), x.popularity_from_votes),
+        (None, p) => (p, y.popularity_from_votes),
+    };
     let second_rating = rating_standing(&y) > rating_standing(&x);
     let (rating, votes, estimated_votes) = if second_rating {
         (y.rating, y.votes, y.estimated_votes)
@@ -770,7 +844,8 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
             rating,
             votes,
             estimated_votes,
-            popularity: x.popularity.or(y.popularity),
+            popularity,
+            popularity_from_votes,
             genres: either(x.genres, y.genres),
             original_language: x.original_language.or(y.original_language),
             languages: either(x.languages, y.languages),
@@ -788,14 +863,15 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
     }
 }
 
-/// The slides, best first: deduped, filtered, scored, and only then cut to `slides`. The first `LEAD_SLIDES` go to
-/// titles that fit at least `LEAD_FIT`; the rest follow in score order.
+/// The slides, best first: deduped, filtered, scored, and only then assembled into `slides` (`assemble`). `near` says
+/// whether two titles are one interest (`SAME_INTEREST`).
 pub fn pick<'a>(
     candidates: Vec<Candidate<'a>>,
     now: f64,
     slides: usize,
     keep: impl Fn(&Candidate<'a>) -> bool,
     fit: impl Fn(&Candidate<'a>) -> Fitted,
+    near: impl Fn(&Candidate<'a>, &Candidate<'a>) -> bool,
 ) -> Vec<(Candidate<'a>, Why)> {
     let mut order: Vec<Key> = Vec::new();
     let mut by_key: HashMap<Key, Candidate<'a>> = HashMap::new();
@@ -823,17 +899,77 @@ pub fn pick<'a>(
         .collect();
     // Stable, so equal scores keep the order their sources put them in.
     scored.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
-    let (mut lead, mut rest) = (Vec::new(), Vec::new());
-    for slide in scored {
-        if lead.len() < LEAD_SLIDES && slide.1.fit.fit >= LEAD_FIT {
-            lead.push(slide);
-        } else {
-            rest.push(slide);
-        }
+    assemble(scored, slides, near)
+}
+
+/// Whether a slide is catalogue: neither new nor newly arrived (`STALE_FRESH`, `STALE_ARRIVAL`).
+pub fn stale(why: &Why) -> bool {
+    why.fresh < STALE_FRESH && why.arrived < STALE_ARRIVAL
+}
+
+/// `scored`, best first, as slides: `LEAD_SLIDES` at a time, each ten filled place by place with the best slide that
+/// keeps it a set —
+/// 1. the first ten fit at least `LEAD_FIT`;
+/// 2. at most `POOR_SLIDES` of each ten are poorly rated (`POOR_QUALITY`);
+/// 3. at most `STALE_SLIDES` of each ten are catalogue;
+/// 4. each ten holds `EACH_TYPE_SLIDES` films and series, while the rest of the pool can give them;
+/// 5. no two of each ten are one interest (`near`).
+///
+/// The first rule is kept whenever any slide can keep it. The others are weighed in order: a slide that keeps rule 2
+/// beats any that breaks it, whatever they do for 3–5, so a pool with nothing left but catalogue fills the ten with an
+/// old title people liked before a new one they didn't. And rules 2–5 pass over the best-scoring slide only for one
+/// within `RULE_FIT` and `RULE_COST`, so a title that barely fits, or that nobody liked, never takes a place for the
+/// mix's sake alone.
+fn assemble<'a>(
+    mut scored: Vec<(Candidate<'a>, Why)>,
+    slides: usize,
+    near: impl Fn(&Candidate<'a>, &Candidate<'a>) -> bool,
+) -> Vec<(Candidate<'a>, Why)> {
+    let mut out: Vec<(Candidate<'a>, Why)> = Vec::new();
+    while out.len() < slides && !scored.is_empty() {
+        let first_ten = out.len() < LEAD_SLIDES;
+        let ten = &out[out.len() / LEAD_SLIDES * LEAD_SLIDES..];
+        let open = LEAD_SLIDES - ten.len();
+        let fits = |slide: &(Candidate<'a>, Why)| !first_ten || slide.1.fit.fit >= LEAD_FIT;
+        // What each type is still short of in this ten, where the pool has one to give. Once the open places are no
+        // more than the shortfall, only a type that is short may take one.
+        let short: Vec<(MediaType, usize)> = [MediaType::Movie, MediaType::Tv]
+            .into_iter()
+            .filter(|&kind| scored.iter().any(|s| s.0.key.0 == kind && fits(s)))
+            .map(|kind| {
+                (kind, EACH_TYPE_SLIDES.saturating_sub(ten.iter().filter(|s| s.0.key.0 == kind).count()))
+            })
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        let owed = open <= short.iter().map(|&(_, n)| n).sum();
+        let typed =
+            |slide: &(Candidate<'a>, Why)| !owed || short.iter().any(|&(kind, _)| slide.0.key.0 == kind);
+        let poor_room = ten.iter().filter(|s| s.1.quality < POOR_QUALITY).count() < POOR_SLIDES;
+        let rated = |slide: &(Candidate<'a>, Why)| poor_room || slide.1.quality >= POOR_QUALITY;
+        let stale_room = ten.iter().filter(|s| stale(&s.1)).count() < STALE_SLIDES;
+        let timely = |slide: &(Candidate<'a>, Why)| stale_room || !stale(&slide.1);
+        let apart = |slide: &(Candidate<'a>, Why)| !ten.iter().any(|s| near(&s.0, &slide.0));
+        // The best the ten could have had with only the lead's rule: the others choose over it only within bounds, and
+        // then the slide that keeps the most important of them, the better score between two that keep the same.
+        let at = scored.iter().position(&fits).map_or(0, |first| {
+            let best = scored[first].1.score;
+            let affordable = |slide: &(Candidate<'a>, Why)| {
+                fits(slide) && slide.1.fit.fit >= RULE_FIT && slide.1.score * RULE_COST >= best
+            };
+            let kept =
+                |slide: &(Candidate<'a>, Why)| [rated(slide), timely(slide), typed(slide), apart(slide)];
+            let mut choice = (first, kept(&scored[first]));
+            for (at, slide) in scored.iter().enumerate().skip(first + 1).filter(|(_, s)| affordable(s)) {
+                let keeps = kept(slide);
+                if keeps > choice.1 {
+                    choice = (at, keeps);
+                }
+            }
+            choice.0
+        });
+        out.push(scored.remove(at));
     }
-    lead.extend(rest);
-    lead.truncate(slides);
-    lead
+    out
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -872,7 +1008,13 @@ fn hidden(candidate: &Candidate<'_>, hide: &Hide) -> bool {
 }
 
 /// The answer to a request, given atlas's lists for it.
-pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> serde_json::Value {
+pub fn answer(
+    indexes: &Indexes,
+    export: Option<&TitleIndex>,
+    request: &Request,
+    lists: &Lists,
+    now: f64,
+) -> serde_json::Value {
     let known = Knowledge { indexes };
     let only = request.only();
     let slides = request.limit.unwrap_or(SLIDES).clamp(1, MAX_SLIDES);
@@ -946,6 +1088,14 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     let personal = taste.as_ref().map_or_else(Vec::new, |taste| personal(indexes, &known, taste, now, keep));
     let personal_count = personal.len();
     pool.extend(personal);
+    pool.iter_mut().for_each(|candidate| attend(indexes, export, candidate));
+    let near = |a: &Candidate<'_>, b: &Candidate<'_>| {
+        let row = |c: &Candidate<'_>| indexes.plot.row_of(c.key.1, c.key.0);
+        match (row(a), row(b)) {
+            (Some(a), Some(b)) => indexes.plot.similarity(a, b) >= SAME_INTEREST,
+            _ => false,
+        }
+    };
 
     // Only titles something is known about, when there are enough of them: an unjudged title can't be matched
     // against this library's taste or dropped for missing it, so it competes on attention alone. Judged per title,
@@ -969,6 +1119,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
         UNJUDGED_NAMED,
         keep,
         |_: &Candidate<'_>| Fitted { fit: NO_TASTE, ..Fitted::default() },
+        |_: &Candidate<'_>, _: &Candidate<'_>| false,
     )
     .into_iter()
     .map(|(c, _)| c.key)
@@ -976,7 +1127,7 @@ pub fn answer(indexes: &Indexes, request: &Request, lists: &Lists, now: f64) -> 
     if pool.iter().filter(|c| judged.contains(&c.key)).count() >= JUDGED_ENOUGH {
         pool.retain(|c| judged.contains(&c.key));
     }
-    let picked = pick(pool, now, slides, keep, fitted);
+    let picked = pick(pool, now, slides, keep, fitted, near);
 
     let round = |x: f64| (x * 1000.0).round() / 1000.0;
     let slides: Vec<serde_json::Value> = picked
@@ -1427,6 +1578,114 @@ mod tests {
         Fitted { fit: NO_TASTE, ..Fitted::default() }
     }
 
+    /// No two titles one interest.
+    fn apart(_: &Candidate<'_>, _: &Candidate<'_>) -> bool {
+        false
+    }
+
+    /// Ids below 100 fit `high`, the rest `low`.
+    fn fitting(high: f64, low: f64) -> impl Fn(&Candidate<'_>) -> Fitted {
+        move |c: &Candidate<'_>| Fitted { fit: if c.key.1 < 100 { high } else { low }, ..Fitted::default() }
+    }
+
+    fn rated(released: &str, quality_rating: f64) -> Title<'static> {
+        Title {
+            released: on(released),
+            rating: Some(quality_rating),
+            votes: Some(5000.0),
+            ..Title::default()
+        }
+    }
+
+    #[test]
+    fn at_most_three_of_ten_are_catalogue_when_new_titles_fit_well_enough() {
+        // Twelve old favourites that fit best and outscore seven titles from this year that fit well but less.
+        let mut pool: Vec<Candidate<'static>> = (0..12).map(|i| cand(i, rated("2015-01-01", 8.0))).collect();
+        pool.extend((100..107).map(|i| cand(i, rated("2026-01-01", 8.0))));
+        let picked = pick(pool, now(), 10, all, fitting(0.9, 0.55), apart);
+        let old = picked.iter().filter(|(_, why)| stale(why)).count();
+        assert_eq!(old, STALE_SLIDES, "{:?}", ids(&picked));
+        assert_eq!(ids(&picked)[..2], [0, 1], "the best old favourites still lead");
+    }
+
+    #[test]
+    fn no_rule_puts_a_title_that_barely_fits_ahead_of_one_that_fits() {
+        let mut pool: Vec<Candidate<'static>> = (0..12).map(|i| cand(i, rated("2015-01-01", 8.0))).collect();
+        // New enough to be well within `RULE_COST`: only the fit keeps them out.
+        pool.extend((100..107).map(|i| cand(i, rated("2026-08-01", 8.0))));
+        let picked = pick(pool, now(), 10, all, fitting(0.9, RULE_FIT - 0.1), apart);
+        assert!(picked.iter().all(|(c, _)| c.key.1 < 100), "{:?}", ids(&picked));
+    }
+
+    #[test]
+    fn nor_one_nobody_liked() {
+        let mut pool: Vec<Candidate<'static>> = (0..12).map(|i| cand(i, rated("2015-01-01", 8.0))).collect();
+        pool.extend((100..105).map(|i| cand(i, rated("2026-08-01", 4.0))));
+        let picked = pick(pool, now(), 10, all, fitting(0.9, 0.9), apart);
+        let poor = picked.iter().filter(|(_, why)| why.quality < POOR_QUALITY).count();
+        assert!(poor <= POOR_SLIDES, "{:?}", ids(&picked));
+    }
+
+    #[test]
+    fn each_ten_mixes_films_and_series() {
+        let series = |id| Candidate { key: (MediaType::Tv, id), ..cand(id, rated("2026-08-01", 7.5)) };
+        let mut pool: Vec<Candidate<'static>> = (0..20).map(|i| cand(i, rated("2026-08-01", 8.0))).collect();
+        pool.extend((100..110).map(series));
+        let picked = pick(pool, now(), 20, all, fitting(0.9, 0.8), apart);
+        for ten in picked.chunks(LEAD_SLIDES) {
+            let shows = ten.iter().filter(|(c, _)| c.key.0 == MediaType::Tv).count();
+            assert_eq!(shows, EACH_TYPE_SLIDES, "{:?}", ids(ten));
+        }
+        // A pool of one type fills the ten with it.
+        let films: Vec<Candidate<'static>> = (0..12).map(|i| cand(i, rated("2026-08-01", 8.0))).collect();
+        assert_eq!(pick(films, now(), 10, all, neutral, apart).len(), 10);
+    }
+
+    #[test]
+    fn one_interest_takes_one_place_in_ten() {
+        // Ids 0-4 are one interest (a franchise and its spin-offs); 100-109 are all different.
+        let mut pool: Vec<Candidate<'static>> = (0..5).map(|i| cand(i, rated("2026-08-01", 8.0))).collect();
+        pool.extend((100..110).map(|i| cand(i, rated("2026-08-01", 8.0))));
+        let near = |a: &Candidate<'_>, b: &Candidate<'_>| a.key.1 < 100 && b.key.1 < 100;
+        let picked = pick(pool, now(), 10, all, fitting(0.9, 0.8), near);
+        assert_eq!(picked.iter().filter(|(c, _)| c.key.1 < 100).count(), 1, "{:?}", ids(&picked));
+        assert_eq!(picked[0].0.key.1, 0, "the best of the interest keeps its place");
+    }
+
+    #[test]
+    fn a_title_nobody_liked_costs_as_much_as_one_nobody_is_talking_about() {
+        let fit = Fitted { fit: 0.8, ..Fitted::default() };
+        let liked = cand(1, rated("2026-09-01", 8.5));
+        let disliked = cand(2, rated("2026-09-01", 5.0));
+        let (liked, disliked) = (score(&liked, now(), 0.0, fit), score(&disliked, now(), 0.0, fit));
+        assert!((liked.score / disliked.score - 1.0 / MERIT_FLOOR).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_all_time_vote_count_counts_as_buzz_but_is_never_the_reason() {
+        let seen = |from_votes| {
+            cand(
+                1,
+                Title {
+                    released: on("1997-06-01"),
+                    popularity: Some(100.0),
+                    popularity_from_votes: from_votes,
+                    ..Title::default()
+                },
+            )
+        };
+        let fit = Fitted::default();
+        let (now_popular, widely_seen) =
+            (score(&seen(false), now(), 100.0, fit), score(&seen(true), now(), 100.0, fit));
+        assert_eq!((now_popular.buzz, widely_seen.buzz), (1.0, 1.0));
+        assert_eq!(now_popular.reason, Some(Reason::Buzz));
+        assert_eq!(widely_seen.reason, None);
+        // A current score from another copy of the title wins over the converted count.
+        let current = cand(1, Title { popularity: Some(3.0), ..Title::default() });
+        let (merged, _) = pick(vec![seen(true), current], now(), 40, all, neutral, apart).remove(0);
+        assert_eq!((merged.title.popularity, merged.title.popularity_from_votes), (Some(3.0), false));
+    }
+
     #[test]
     fn freshness_peaks_on_release_day_and_falls_away_faster_before_than_after() {
         let fresh = |date| freshness(&Title { released: on(date), ..Title::default() }, now());
@@ -1471,7 +1730,7 @@ mod tests {
             popularity: Some(popularity),
             ..Title::default()
         };
-        let picked = pick(vec![cand(1, new(2.0)), cand(2, new(900.0))], now(), 40, all, neutral);
+        let picked = pick(vec![cand(1, new(2.0)), cand(2, new(900.0))], now(), 40, all, neutral, apart);
         assert_eq!(ids(&picked), vec![2, 1]);
     }
 
@@ -1520,7 +1779,7 @@ mod tests {
         let theirs = cand(2, Title { released: on("2026-05-01"), ..Title::default() });
         let fit =
             |c: &Candidate<'_>| Fitted { fit: if c.key.1 == 2 { 0.7 } else { 0.3 }, ..Fitted::default() };
-        assert_eq!(ids(&pick(vec![everyone, theirs], now(), 40, all, fit)), vec![2, 1]);
+        assert_eq!(ids(&pick(vec![everyone, theirs], now(), 40, all, fit, apart)), vec![2, 1]);
     }
 
     #[test]
@@ -1534,7 +1793,7 @@ mod tests {
         pool.push(buzzing);
         let fit =
             |c: &Candidate<'_>| Fitted { fit: if c.key.1 == 99 { 0.2 } else { 0.3 }, ..Fitted::default() };
-        let picked = ids(&pick(pool, now(), 40, all, fit));
+        let picked = ids(&pick(pool, now(), 40, all, fit, apart));
         assert_eq!(picked[LEAD_SLIDES], 99, "{picked:?}");
     }
 
@@ -1545,7 +1804,7 @@ mod tests {
             ..cand(1, Title { released: on("1997-06-01"), ..Title::default() })
         };
         let still = cand(2, Title { released: on("1997-06-01"), ..Title::default() });
-        assert_eq!(ids(&pick(vec![still, landed], now(), 40, all, neutral)), vec![1, 2]);
+        assert_eq!(ids(&pick(vec![still, landed], now(), 40, all, neutral, apart)), vec![1, 2]);
         assert_eq!(
             arrival(
                 &Candidate { arrival: Some(Placing { rank: 0.0, of: 0.0 }), ..cand(4, Title::default()) },
@@ -1638,7 +1897,7 @@ mod tests {
             2,
             Title { released: on("2026-09-01"), rating: Some(6.4), votes: Some(200.0), ..Title::default() },
         );
-        assert_eq!(ids(&pick(vec![classic, new], now(), 40, all, neutral)), vec![2, 1]);
+        assert_eq!(ids(&pick(vec![classic, new], now(), 40, all, neutral, apart)), vec![2, 1]);
     }
 
     #[test]
@@ -1662,14 +1921,20 @@ mod tests {
                 ..film(&[CRIME], "sv")
             },
         );
-        assert_eq!(ids(&pick(vec![ranked, described, alone], now(), 40, all, neutral)), vec![5, 6]);
+        assert_eq!(ids(&pick(vec![ranked, described, alone], now(), 40, all, neutral, apart)), vec![5, 6]);
 
         let arriving = |id, rank| Candidate {
             arrival: Some(Placing { rank, of: 100.0 }),
             ..cand(id, film(&[CRIME], ""))
         };
-        let picked =
-            pick(vec![arriving(5, 60.0), arriving(5, 0.0), arriving(6, 30.0)], now(), 40, all, neutral);
+        let picked = pick(
+            vec![arriving(5, 60.0), arriving(5, 0.0), arriving(6, 30.0)],
+            now(),
+            40,
+            all,
+            neutral,
+            apart,
+        );
         assert_eq!(ids(&picked), vec![5, 6]);
     }
 
@@ -1698,14 +1963,14 @@ mod tests {
                 },
             )
         };
-        let (merged, _) = pick(vec![listed(), described(400.0)], now(), 40, all, neutral).remove(0);
+        let (merged, _) = pick(vec![listed(), described(400.0)], now(), 40, all, neutral, apart).remove(0);
         assert_eq!(merged.title.released, on("2026-09-10"));
         assert_eq!((merged.title.rating, merged.title.votes), (Some(7.2), Some(400.0)));
         assert!(!merged.title.estimated_votes);
 
         // Eighteen votes don't outweigh IMDb's score, in either order.
         for pool in [vec![listed(), described(18.0)], vec![described(18.0), listed()]] {
-            let (merged, _) = pick(pool, now(), 40, all, neutral).remove(0);
+            let (merged, _) = pick(pool, now(), 40, all, neutral, apart).remove(0);
             assert_eq!(merged.title.released, on("2026-09-10"));
             assert_eq!(merged.title.rating, Some(5.4));
             assert!(merged.title.estimated_votes);
@@ -1716,7 +1981,7 @@ mod tests {
     fn filters_before_cutting_to_the_slide_count() {
         let pool: Vec<Candidate<'static>> =
             (0..60).map(|i| cand(i, Title { released: on("2026-08-01"), ..Title::default() })).collect();
-        let picked = pick(pool, now(), 20, |c| c.key.1 % 2 == 0, neutral);
+        let picked = pick(pool, now(), 20, |c| c.key.1 % 2 == 0, neutral, apart);
         assert_eq!(picked.len(), 20);
         assert!(picked.iter().all(|(c, _)| c.key.1 % 2 == 0));
     }
@@ -1747,7 +2012,7 @@ mod tests {
             Candidate { arrival: Some(Placing { rank: 0.0, of: 10.0 }), ..cand(7, Title::default()) };
         let described = cand(7, Title { original_language: Some(*b"ta"), ..film(&[DRAMA], "") });
         let other = cand(8, Title { released: on("2026-09-01"), ..Title::default() });
-        let picked = pick(vec![listed, described, other], now(), 40, |c| !hidden(c, &rules), neutral);
+        let picked = pick(vec![listed, described, other], now(), 40, |c| !hidden(c, &rules), neutral, apart);
         assert_eq!(ids(&picked), vec![8]);
     }
 

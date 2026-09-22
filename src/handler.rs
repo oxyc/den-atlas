@@ -1218,6 +1218,8 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
     let listed = listing.elapsed();
     let ranking = Instant::now();
     let version = state.dataset.as_ref().map(|ds| ds.meta.dataset_version.clone());
+    // TMDB's export popularity, for the titles no client hint describes (`TITLE_SEARCH`).
+    let export = state.titles.as_ref().and_then(|t| t.index());
     // More Like This for each seed scans the vectors, so the ranking runs off the request threads.
     let ranked = tokio::task::spawn_blocking(move || {
         let now = request
@@ -1225,7 +1227,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             .as_deref()
             .and_then(crate::recommend::parse_now)
             .unwrap_or_else(crate::recommend::today);
-        let mut answer = crate::recommend::answer(&indexes, &request, &lists, now);
+        let mut answer = crate::recommend::answer(&indexes, export.as_deref(), &request, &lists, now);
         eprintln!("{}{rid}", crate::recommend::summary(&indexes, &request, &answer));
         if let (Some(dir), Some(raw)) = (&fixtures, &raw) {
             crate::recommend::keep_fixture(std::path::Path::new(dir), raw, &lists, now);
@@ -2539,15 +2541,15 @@ mod tests {
             ))
             .unwrap()
         };
-        let channel = answer(&indexes, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now);
+        let channel = answer(&indexes, None, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now);
         assert_eq!(slides(&channel), vec![("series".to_owned(), 4), ("movie".to_owned(), 3)], "{channel}");
         assert_eq!(channel["pool"]["personal"], 0);
 
-        let movies = answer(&indexes, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now);
+        let movies = answer(&indexes, None, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now);
         assert_eq!(slides(&movies), vec![("movie".to_owned(), 3)], "{movies}");
 
         // A service atlas doesn't carry has no lists (`lists` reads none): the client's candidates alone.
-        let unknown = answer(&indexes, &body(r#","service":{"id":283}"#), &Lists::default(), now);
+        let unknown = answer(&indexes, None, &body(r#","service":{"id":283}"#), &Lists::default(), now);
         assert_eq!(slides(&unknown), vec![("series".to_owned(), 4)], "{unknown}");
     }
 
