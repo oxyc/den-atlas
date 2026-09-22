@@ -11,6 +11,11 @@ publish = false
 # mapping, so it compiles for wasm32 like the rest of this crate. Same tag as den-atlas reads with: a
 # binary format contract wants one version per build, not two.
 den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v1.2" }
+# `ln` for the scorer. `f64::ln` calls the platform's libm — macOS's, musl's, the one compiled into a wasm
+# module — which may round differently, so the same row could score differently on the server and in a
+# browser. This is one pure-Rust implementation on every target; without `arch` it takes the same code
+# path everywhere too.
+libm = { version = "0.2.16", default-features = false }
 
 # The index is built from the store; the only JSON left in this crate is the labels-blob reader the
 # store-vs-blob parity tests compare against, so serde is not linked into the serving build at all.

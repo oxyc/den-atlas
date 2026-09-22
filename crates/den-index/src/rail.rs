@@ -137,7 +137,8 @@ impl RailAggregates {
         }
         for ((media, name), n) in &above {
             let total = totals.get(media).copied().unwrap_or(1.0).max(1.0);
-            out.idf.insert((*media, *name), (total / n.max(1.0)).ln().max(0.0));
+            // `libm::log`, not `f64::ln`: see den-index's Cargo.toml.
+            out.idf.insert((*media, *name), libm::log(total / n.max(1.0)).max(0.0));
         }
         for ((media, name), sum) in sums {
             let total = totals.get(&media).copied().unwrap_or(1.0).max(1.0);

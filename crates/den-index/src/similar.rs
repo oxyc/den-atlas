@@ -494,8 +494,9 @@ fn facet_agreement(f: &dyn Facets, seed: &[(Axis, ValueId, f64)], other: u32) ->
     let mut den = 0.0;
     for (axis, value, conf) in seed {
         let Some((_, their_value, their_conf)) = theirs.iter().find(|(a, _, _)| a == axis) else { continue };
-        // ln(1/prevalence): a value the whole corpus shares carries almost no evidence.
-        let weight = conf * (1.0 / f.prevalence(*axis, *value).max(1e-6)).ln().max(0.0);
+        // ln(1/prevalence): a value the whole corpus shares carries almost no evidence. `libm::log`, not
+        // `f64::ln`, so every target rounds it the same way (see den-index's Cargo.toml).
+        let weight = conf * libm::log(1.0 / f.prevalence(*axis, *value).max(1e-6)).max(0.0);
         den += weight;
         if their_value == value {
             num += weight * their_conf;
