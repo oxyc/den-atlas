@@ -208,7 +208,7 @@ pub(crate) fn build(view: &den_store::Store<'_>, gz: &[u8]) -> Result<RatingsInd
 ///
 /// Two rows claiming one IMDb id would be a dataset fault, not something to reconcile here: the FIRST row
 /// keeps the id, so the join is deterministic whatever order the rows are read in.
-fn imdb_rows(view: &den_store::Store<'_>) -> Result<(HashMap<u32, u32>, usize), String> {
+pub(crate) fn imdb_rows(view: &den_store::Store<'_>) -> Result<(HashMap<u32, u32>, usize), String> {
     let err = |e: den_store::StoreError| e.to_string();
     let imdb = view.per_row::<u32>("imdb").map_err(err)?;
     let strings = view.strings().map_err(err)?;
@@ -227,7 +227,7 @@ fn imdb_rows(view: &den_store::Store<'_>) -> Result<(HashMap<u32, u32>, usize), 
 /// The numeric part of an IMDb TITLE id. A non-`tt` id names nothing in this dump — the corpus carries a
 /// person (`nm…`) and an event (`ev…`) id in this column — so it reads as absent rather than being coerced
 /// into whatever digits follow.
-fn tconst(id: &str) -> Option<u32> {
+pub(crate) fn tconst(id: &str) -> Option<u32> {
     let digits = id.strip_prefix("tt")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
