@@ -318,12 +318,12 @@ async function start() {
   defaultLimit = p.defaultLimit;
   defaultSeeds = p.defaultSeeds;
   maxSeeds = p.maxSeeds;
-  $("limit").max = p.maxLimit;
+  $("limit").max = p.maxRowsLimit;
   const url = new URLSearchParams(location.search);
   const values = {};
   for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
   buildKnobs(values);
-  $("limit").value = url.get("limit") || defaultLimit;
+  $("limit").value = Math.min(Number(url.get("limit")) || defaultLimit, p.maxRowsLimit);
   seeds = url.has("seeds") ? url.get("seeds").split(",").filter(Boolean).slice(0, maxSeeds) : [...defaultSeeds];
   await refresh();
 }

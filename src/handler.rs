@@ -347,6 +347,9 @@ async fn handle_playground(
         Ok(parsed) => parsed,
         Err(detail) => return bad_request(detail),
     };
+    if let (Ask::Rows(_), Err(detail)) = (&ask, crate::playground::rows_limit(limit)) {
+        return bad_request(detail);
+    }
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
@@ -1920,12 +1923,15 @@ mod tests {
         assert_eq!(rows["rows"][0]["titles"], alone["titles"]);
         let defaults = json(body_of(get(&on, "/playground/rows.json").await).await);
         assert_eq!(defaults["rows"].as_array().unwrap().len(), crate::playground::DEFAULT_SEEDS.len());
+        assert_eq!(get(&on, "/playground/rows.json?seeds=movie:1&limit=50").await.status(), 200);
         let none = json(body_of(get(&on, "/playground/rows.json?seeds=").await).await);
         assert_eq!(none["rows"], serde_json::json!([]));
         let many = (1..=13).map(|id| format!("movie:{id}")).collect::<Vec<_>>().join(",");
         for query in [
             format!("/playground/rows.json?seeds={many}"),
             "/playground/similar/movie/1.json?seeds=movie:1".into(),
+            // Per seed, rows.json shows at most 50, though one seed's route shows up to 200.
+            "/playground/rows.json?seeds=movie:1&limit=51".into(),
         ] {
             assert_eq!(get(&on, &query).await.status(), 400, "{query}");
         }

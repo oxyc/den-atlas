@@ -39,6 +39,19 @@ pub const DEFAULT_SEEDS: &[(MediaType, u32)] = &[
 /// clamped cost of one row bounds the request.
 pub const MAX_SEEDS: usize = 12;
 
+/// Titles shown per seed in one `/playground/rows.json` answer. Lower than `MAX_LIMIT` because the answer
+/// is up to twelve rows, and every title shown carries its signals: at 200 per seed the worst request was
+/// 1.76 MB.
+pub const MAX_ROWS_LIMIT: usize = 50;
+
+/// `limit` checked against `MAX_ROWS_LIMIT`, after `parse` has held it to `MAX_LIMIT`.
+pub fn rows_limit(limit: usize) -> Result<usize, String> {
+    if limit > MAX_ROWS_LIMIT {
+        return Err(format!("limit must be at most {MAX_ROWS_LIMIT} per seed here, got {limit}"));
+    }
+    Ok(limit)
+}
+
 /// `movie:5723` / `series:1438`: a seed as the page's URL and `rows.json` name it, in the type names
 /// atlas's routes use.
 pub fn seed_key(media: MediaType, id: u32) -> String {
@@ -127,6 +140,7 @@ pub fn params_json() -> String {
         "maxLimit": MAX_LIMIT,
         "defaultSeeds": default_seeds,
         "maxSeeds": MAX_SEEDS,
+        "maxRowsLimit": MAX_ROWS_LIMIT,
     })
     .to_string()
 }
