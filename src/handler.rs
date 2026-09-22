@@ -2173,15 +2173,19 @@ mod tests {
         assert_eq!(ids("/index/row/movie.json?country=KR").await, vec![2, 1]);
         assert_eq!(ids("/index/row/series.json?country=KR").await, vec![4]);
         assert_eq!(ids("/index/row/movie.json?country=ES").await, vec![3]);
-        // The facts list movie 1 as KR *and* DK; the facet index holds the first country per title, so a
-        // co-production is findable under the one Wikidata names first and not under the other.
-        assert!(ids("/index/row/movie.json?country=DK").await.is_empty());
+        // A co-production belongs to every country that made it, not only the one Wikidata names first.
+        // Movie 1 is listed as KR and DK and both rows list it; 18.9% of the corpus names more than one
+        // country, and reading the first alone left the Swedish row at 457 titles of 785.
+        assert_eq!(ids("/index/row/movie.json?country=DK").await, vec![1]);
         assert!(ids("/index/row/movie.json?country=ZZ").await.is_empty());
 
         // Language is its own axis, not a spelling of country: movie 3 is the Spanish-language row and the
         // Spanish row alike here, but over the corpus most Spanish-language films are made elsewhere.
         assert_eq!(ids("/index/row/movie.json?language=ko").await, vec![2, 1]);
         assert_eq!(ids("/index/row/movie.json?language=es").await, vec![3]);
+        // And a title spoken in several is in each of their rows, for the same reason.
+        assert_eq!(ids("/index/row/movie.json?language=da").await, vec![1]);
+        assert_eq!(ids("/index/row/movie.json?subgenre=Heist&country=DK").await, vec![1]);
 
         // Time comes from the release date in the facts, not from the card's year: movie 1's card says
         // 1985 and it was released in 2026, and it belongs to the 2020s.

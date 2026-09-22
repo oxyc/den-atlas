@@ -682,21 +682,30 @@ const FACT_FIELDS: &[&str] = &["country", "language", "decade", "year", "primary
 /// Only a SUPERSET is required — `facts_match` is what decides membership — so this may narrow with
 /// whichever index answers cheapest and need not honour every constraint. An unparseable decade or a
 /// missing facet index therefore costs a wider scan, never a wrong row.
+///
+/// A superset is the whole requirement, and the facet index is one for a decade and NOT one for a country
+/// or a language: it keeps the first code a title lists, so its `KR` bucket has none of the films Wikidata
+/// names Korean second. Narrowing by them put those titles where `facts_match` could never reach them, and
+/// a row that dropped 42% of Swedish cinema is what that cost. They scan the type's rows instead.
 fn fact_candidates(indexes: &Indexes, media_type: MediaType, facts: &[(String, String)]) -> Vec<Key> {
     let value = |field: &str| facts.iter().find(|(f, _)| f == field).map(|(_, v)| v.as_str());
-    let (country, language) = (value("country"), value("language"));
     let decade = value("decade").and_then(|d| d.parse::<u16>().ok());
-    if let (true, Some(index)) =
-        (country.is_some() || language.is_some() || decade.is_some(), indexes.facets.as_ref())
-    {
-        let matched = index.filter_all(Some(media_type), country, language, decade, None, None);
+    if let (Some(decade), Some(index)) = (decade, indexes.facets.as_ref()) {
+        // One release year per title, so the bucket holds every title the row can list.
+        let matched = index.filter_all(Some(media_type), None, None, Some(decade), None, None);
         return matched.into_iter().map(|(id, kind)| (kind, id)).collect();
     }
     if let Some(genre) = value("primaryGenre") {
         let matched = indexes.plot.titles_with_primary_genre(genre, Some(media_type));
         return matched.into_iter().map(|(id, kind)| (kind, id)).collect();
     }
-    // A bare year: the type's whole table, which `facts_match` then cuts to the year asked for.
+    // A country, a language or a bare year: the type's whole table, which `facts_match` then cuts to what
+    // was asked. The facet index enumerates it, because it holds a row for every title the facts describe —
+    // exactly the set `facts_match` can answer a fact for — and the plot index is the fallback without it.
+    if let Some(index) = indexes.facets.as_ref() {
+        let matched = index.filter_all(Some(media_type), None, None, None, None, None);
+        return matched.into_iter().map(|(id, kind)| (kind, id)).collect();
+    }
     indexes.plot.titles().filter(|&(kind, _)| kind == media_type).collect()
 }
 
@@ -712,14 +721,20 @@ fn facts_match(indexes: &Indexes, key: Key, facts: &[(String, String)]) -> bool 
     }
     let (media_type, id) = key;
     let title = indexes.facets.as_ref().and_then(|index| index.title(id, media_type));
-    let code_is = |code: Option<[u8; 2]>, want: &str| {
-        let (Some(code), [a, b]) = (code, want.as_bytes()) else { return false };
-        code[0].eq_ignore_ascii_case(a) && code[1].eq_ignore_ascii_case(b)
+    // Country and language come from the FACTS, which list every code a title carries, rather than from the
+    // facet index, which keeps the first of each. Co-production is how European cinema is funded, so the
+    // several-country title is the normal case there and not a tail: 18.9% of the corpus names more than one
+    // country and 5.9% more than one language, and reading the first alone listed 457 Swedish films of 785
+    // and 2,375 Italian ones of 4,003.
+    let record = indexes.facts.as_ref().and_then(|index| index.get(id, media_type));
+    let among = |codes: &[[u8; 2]], want: &str| {
+        let [a, b] = want.as_bytes() else { return false };
+        codes.iter().any(|code| code[0].eq_ignore_ascii_case(a) && code[1].eq_ignore_ascii_case(b))
     };
     facts.iter().all(|(field, value)| match field.as_str() {
         "primaryGenre" => primary_genre(indexes, key) == Some(value.as_str()),
-        "country" => code_is(title.and_then(|t| t.country), value),
-        "language" => code_is(title.and_then(|t| t.language), value),
+        "country" => among(record.map_or(&[][..], |r| r.countries.as_slice()), value),
+        "language" => among(record.map_or(&[][..], |r| r.languages.as_slice()), value),
         "decade" => {
             let asked = value.parse::<u16>();
             title.and_then(|t| t.year).is_some_and(|y| asked.as_ref() == Ok(&(y / 10 * 10)))

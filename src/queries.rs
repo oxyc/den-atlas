@@ -690,8 +690,11 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             imdb: Some("tt0000001"),
             released: Some((D2026_09_01, 0)),
             genres: vec![80, 18],
+            // A co-production, in both of the ways the corpus has them: two countries and two languages.
+            // The facet index keeps only the first of each, so this title is what proves a row reads the
+            // whole list.
             countries: vec!["KR", "DK"],
-            languages: vec!["ko"],
+            languages: vec!["ko", "da"],
             makers: vec![1, 9],
             cast: vec![2, 3],
             franchise: Some(50),
