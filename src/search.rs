@@ -710,7 +710,75 @@ pub fn answer(
         "people": people,
         "hits": hits,
         "total": total,
+        // Repeated from the schema so a client reading only this answer cannot take `total` for a count of the
+        // corpus: it is the pool the ranking drew from, and a constraint read from words only discounts.
+        "semantics": { "total": "retrievedCandidatesNotCorpusCount", "missing": "unknown" },
+        "coverage": crate::schema::query_coverage(
+            indexes,
+            media_type.or(parsed.facet.media_type),
+            &applied(parsed, media_type),
+        ),
     })
+}
+
+/// Every constraint the query applied, and how: a parameter filters, a constraint read from the words discounts,
+/// and what only lifts a title boosts — the same rules `features` scores by.
+fn applied(parsed: &Parsed, media_type: Option<MediaType>) -> Vec<crate::schema::Applied> {
+    use crate::schema::Applied;
+    use serde_json::json;
+    let kind = |t: MediaType| if t == MediaType::Tv { "series" } else { "movie" };
+    let mut out = Vec::new();
+    let mut push =
+        |field, value, applied, applies_to| out.push(Applied { field, value, applied, applies_to });
+    if let Some(t) = media_type.or(parsed.facet.media_type) {
+        push("mediaType", json!(kind(t)), "filter", None);
+    }
+    if let Some(country) = parsed.facet.country {
+        push("country", json!(country), "discount", None);
+    }
+    if let Some(decade) = parsed.facet.decade {
+        push("decade", json!(decade), "discount", None);
+    }
+    if parsed.facet.year_min.is_some() || parsed.facet.year_max.is_some() {
+        let window = json!({ "min": parsed.facet.year_min, "max": parsed.facet.year_max });
+        push("year", window, if parsed.year_from_param { "filter" } else { "discount" }, None);
+    }
+    if let Some(language) = &parsed.facet.language {
+        push("language", json!(language), "filter", None);
+    }
+    if let Some(minutes) = parsed.runtime_max {
+        // Films on record as longer drop; every series is only discounted, its runtime being per episode.
+        push("runtimeMinutes", json!({ "max": minutes }), "filter", Some(MediaType::Movie));
+    }
+    if let Some(qid) = parsed.broadcaster {
+        // A series with no broadcaster on record drops too; films are not judged at all.
+        push("broadcaster", json!(format!("Q{qid}")), "require", Some(MediaType::Tv));
+    }
+    if parsed.source_kinds != 0 {
+        push("basedOnKind", json!(SourceKinds::names(parsed.source_kinds)), "filter", None);
+    }
+    if !parsed.genres.is_empty() {
+        push("genre", json!(parsed.genres), "boost", None);
+    }
+    for (field, mood) in [("subgenre", false), ("mood", true)] {
+        let names: Vec<&str> =
+            parsed.labels.iter().filter(|(_, m)| *m == mood).map(|(name, _)| name.as_str()).collect();
+        if !names.is_empty() {
+            push(field, json!(names), "boost", None);
+        }
+    }
+    let mut axes: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for &(axis, value) in &parsed.plot {
+        axes.entry(axis).or_default().push(value);
+    }
+    for (axis, values) in axes {
+        push(axis, json!(values), "boost", None);
+    }
+    if !parsed.people.is_empty() {
+        let qids: Vec<String> = parsed.people.iter().map(|qid| format!("Q{qid}")).collect();
+        push("people", json!(qids), "boost", None);
+    }
+    out
 }
 
 /// How popular a title is, 0 to 1: by its votes (the store), else by TMDB's popularity in the daily export, for

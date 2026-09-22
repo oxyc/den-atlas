@@ -82,7 +82,8 @@ TypeScript server is preserved at the `legacy-ts` git tag.)
 
 ## Caching
 Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the body's 64-bit FNV-1a plus its
-length) honoring `If-None-Match` (→ `304`), plus `HEAD` and `Range` (`Accept-Ranges` / `206` / `416`).
+length) honoring `If-None-Match` (→ `304`), plus `HEAD` and `Range` (`Accept-Ranges` / `206` / `416`). A
+JSON answer ignores `Range` and is always sent whole, since the prose guard can only judge a whole body.
 `dataset.json` carries no `Last-Modified`: its body moves with the embed/index flags under an unchanged
 dataset date, so only its ETag can say it changed. Nothing varies on a request header. Sit a CDN in front
 and it caches everything by URL with correct revalidation.
@@ -108,13 +109,13 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
 | `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
 | `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{schema,taxonomyVersion,subgenres,moods}`, each list most-populated first. Label names only, kept for the TV app's browse rows; `schema` points at `/index/schema.json`, which describes the dataset |
-| `GET /index/schema.json` | with `INDEX_QUERIES` on: the self-describing query fields, types, value counts and per-field coverage; every count names both its known-field and full-corpus denominators |
+| `GET /index/schema.json` | with `INDEX_QUERIES` on: the self-describing query fields, types, units and formats, value counts and per-field coverage; every count names both its known-field and full-corpus denominators (a series-only field, `broadcaster`, is out of the series). `semantics` says what each kind of count is out of and how a search applies a constraint (`filter`, `discount`, `boost`, `require`); `routes` lists every public route with its parameters, the field each reads, defaults, limits and a working example, so a client can use the API without reading the code |
 | `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids,total,coverage}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100; `coverage` names the full corpus, selected-type denominator and known-field population |
 | `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours |
 | `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
-| `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total}`. The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
+| `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total,semantics,coverage}`. `total` is the retrieved pool, not a corpus count, and `semantics` says so; `coverage` names every constraint the query applied, its value, how it was applied and how many titles have that field on record out of the titles of the type asked for (the corpus when none was). The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
 | `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the store's facet axes (ending, era, chronology, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
 | …and the same route's **taste tilt**: `&tilt.liked=m550,t1396&tilt.disliked=m176&tilt.era=<center>,<spread>&tilt.w.embedding=&tilt.w.dislike=&tilt.w.era=&tilt.w.square=` | the WHOLE row reordered for one household before the page is cut, so a title the plain order puts on page 3 can lead page 1. Ids are `m`/`t` + TMDB id, at most 500 a list; `tilt.era` is den-core's fitted curve and its presence is what turns the era term on (omit it for a row already fixed to an era). The four `tilt.w.*` levers are den-core's `tilt::Weights`, each independently overridable and defaulting to its shipped value. **Reorder only** — same `total`, same titles, so paging state stays valid; the answer adds `taste`, the fingerprint of the order the page is a slice of. A taste atlas cannot place returns the plain row, never an error. Memoised per (row × taste × weights); a request carrying `tilt.*` is `private`-cached rather than `public`, since its URL names the household's titles |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
@@ -170,11 +171,13 @@ here that looks like a working addon. `/recommend` reads the same dump's `averag
 list scored a title, in place of the flat prior it used to rate those with.
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
-counts must use the field coverage and denominators from `/index/schema.json`; browse rows include the relevant
-coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every JSON
-response is checked at the final HTTP boundary for expressive prose fields, and since nothing is served
-verbatim any more, that boundary is the whole guard. A future MCP/TMDB hydration route therefore fails
-closed instead of re-serving an overview, synopsis, description, tagline, or equivalent prose.
+counts must use the field coverage and denominators from `/index/schema.json`; browse rows and search include
+the relevant coverage inline. Group-by is advertised as unavailable until it can preserve that contract. Every
+response that is or may be JSON (any `+json` type, or none) is checked at the final HTTP boundary for
+expressive prose fields, and since nothing is served verbatim any more, that boundary is the whole guard. Only
+`/manifest.json` and `/dataset.json` are exempt, by exact path: both carry atlas's own `description`. A future
+MCP/TMDB hydration route therefore fails closed wherever it is mounted, instead of re-serving an overview,
+synopsis, description, tagline, or equivalent prose.
 
 `POST /recommend` ranks what a featured surface leads with — the Den web app's billboard — so no client
 ranks. It is the web app's `billboard.ts` ported: what is new in the world and new to this library, with

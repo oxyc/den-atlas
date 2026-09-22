@@ -51,7 +51,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let log = state.log_requests.then(|| {
         (std::time::Instant::now(), req.method().clone(), loggable_path(req.uri()), request_id(req.headers()))
     });
-    let mut resp = crate::tos::guard_response(route(State(state), req).await).await;
+    let exempt = crate::tos::exempt(&split_config(req.uri().path()).1);
+    let mut resp = crate::tos::guard_response(route(State(state), req).await, exempt).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
@@ -243,19 +244,17 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return json_response(body, status);
     }
     if route == "/manifest.json" {
-        return crate::tos::trusted(
-            serve_json(
-                &method,
-                &headers,
-                manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
-                "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
-                None,
-            )
-            .await,
-        );
+        return serve_json(
+            &method,
+            &headers,
+            manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
+            "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
+            None,
+        )
+        .await;
     }
     if route == "/dataset.json" {
-        return crate::tos::trusted(match ds {
+        return match ds {
             Some(ds) => {
                 // No Last-Modified. The dataset's date is not this body's date: the embed/index flags
                 // change the body under the same date, so a client revalidating with If-Modified-Since
@@ -273,10 +272,10 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 r#"{"error":"dataset_unavailable","detail":"the dataset failed to load (missing/old dataset.meta.json); refresh it with scripts/fetch-dataset.sh"}"#,
                 RELOAD_WAIT,
             ),
-        });
+        };
     }
     if let Some(rest) = route.strip_prefix("/catalog/") {
-        return crate::tos::trusted(handle_catalog(&method, &headers, rest, &config, &state).await);
+        return handle_catalog(&method, &headers, rest, &config, &state).await;
     }
     if let Some(rest) = route.strip_prefix("/index/") {
         return handle_index(&method, &headers, rest, &query, &state).await;
@@ -613,8 +612,8 @@ async fn handle_catalog(
 }
 
 /// A label row's page size when the caller doesn't say, and the most one page returns.
-const ROW_PAGE: usize = 24;
-const MAX_ROW_PAGE: usize = 100;
+pub(crate) const ROW_PAGE: usize = 24;
+pub(crate) const MAX_ROW_PAGE: usize = 100;
 
 /// One `/index/…` question, parsed before the index loads, so a malformed path never pays for a load.
 enum IndexQuestion {
@@ -782,16 +781,16 @@ fn index_media_type(type_: &str) -> Option<den_index::MediaType> {
 
 /// How many titles semantic search returns (the tvOS app's own `k`); plain neighbours by default and at most;
 /// the facet lane's cap; pooled suggestions by default.
-const SEMANTIC_K: usize = 24;
-const NEIGHBOUR_K: usize = 12;
+pub(crate) const SEMANTIC_K: usize = 24;
+pub(crate) const NEIGHBOUR_K: usize = 12;
 /// One screenful of More Like This, when the caller asks for no page.
-const SIMILAR_PAGE: usize = 20;
-const MAX_NEIGHBOUR_K: usize = 50;
-const FACET_LIMIT: usize = 50;
+pub(crate) const SIMILAR_PAGE: usize = 20;
+pub(crate) const MAX_NEIGHBOUR_K: usize = 50;
+pub(crate) const FACET_LIMIT: usize = 50;
 const SUGGEST_LIMIT: usize = 20;
 /// The most titles one POST may name, and the most seeds a suggestion takes (the tvOS app's own cap).
-const MAX_TITLES: usize = 500;
-const MAX_SEEDS: usize = 8;
+pub(crate) const MAX_TITLES: usize = 500;
+pub(crate) const MAX_SEEDS: usize = 8;
 
 fn stremio_type(media_type: den_index::MediaType) -> &'static str {
     match media_type {
@@ -1446,6 +1445,8 @@ async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'st
     .await
 }
 
+/// A JSON answer, always whole: a `Range` is ignored (RFC 9110 lets a server answer it with a 200), because the
+/// prose guard can only judge a whole body and refuses a slice of one (`tos::guard_response`).
 async fn serve_json(
     method: &Method,
     headers: &axum::http::HeaderMap,
@@ -1453,9 +1454,11 @@ async fn serve_json(
     cache_control: &str,
     last_modified: Option<String>,
 ) -> Response {
+    let mut headers = headers.clone();
+    headers.remove(header::RANGE);
     serve(
         method,
-        headers,
+        &headers,
         Servable {
             etag_base: fnv1a(&body),
             content_type: "application/json".to_owned(),
@@ -2192,6 +2195,78 @@ mod tests {
         assert_eq!((&first["type"], &first["id"]), (&serde_json::json!("movie"), &serde_json::json!(3)));
         assert!(first["f"]["semPlot"].as_f64().unwrap() > 0.0, "{plot_only}");
         assert_eq!(first["f"]["semPremise"], 0.0);
+    }
+
+    /// A search's `total` is a retrieval pool, and the answer itself must say so and say how much of the corpus
+    /// could answer each constraint: a parameter filters, a word read as a country only discounts, a plot facet
+    /// only lifts — each out of the titles of the type asked for, and a series-only fact out of the series.
+    #[tokio::test]
+    async fn a_search_reports_each_constraint_and_what_its_coverage_is_out_of() {
+        let state = index_state("den-atlas-query-coverage");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let answer = json(
+            body_of(
+                get(
+                    &state,
+                    "/index/query.json?q=bleak+korean+movies&language=ko&runtime_max=90&broadcaster=Q7",
+                )
+                .await,
+            )
+            .await,
+        );
+        assert_eq!(answer["semantics"]["total"], "retrievedCandidatesNotCorpusCount", "{answer}");
+        let coverage = &answer["coverage"];
+        assert_eq!(coverage["population"], 12);
+        assert_eq!(coverage["mediaType"], "movie");
+        assert_eq!(coverage["denominator"], 3, "the fixture's three films");
+        let field = |name: &str| &coverage["fields"][name];
+        assert_eq!(field("country")["value"], "KR");
+        assert_eq!(field("country")["applied"], "discount");
+        assert_eq!((&field("country")["count"], &field("country")["denominator"]), (&3.into(), &3.into()));
+        assert_eq!(field("language")["applied"], "filter");
+        assert_eq!(field("mediaType")["applied"], "filter");
+        assert_eq!(field("tone")["value"], serde_json::json!(["bleak"]));
+        assert_eq!(field("tone")["applied"], "boost");
+        assert_eq!(field("tone")["count"], 3, "every film has a tone on record");
+        assert_eq!(field("runtimeMinutes")["appliesTo"], "movie");
+        assert_eq!(field("broadcaster")["applied"], "require");
+        assert_eq!(field("broadcaster")["denominator"], 9, "out of the series, whatever type was asked for");
+
+        // Nothing named: no constraint, and the whole corpus is the denominator.
+        let plain = json(body_of(get(&state, "/index/query.json?q=zzzz").await).await);
+        assert_eq!(plain["coverage"]["fields"], serde_json::json!({}));
+        assert_eq!(plain["coverage"]["denominator"], 12);
+        assert_eq!(plain["coverage"]["mediaType"], serde_json::Value::Null);
+    }
+
+    /// Every route the schema lists with an example resolves, so the document cannot advertise a path the router
+    /// does not answer.
+    #[tokio::test]
+    async fn every_route_the_schema_lists_resolves() {
+        let state = index_state("den-atlas-schema-routes");
+        let schema: serde_json::Value =
+            serde_json::from_str(&body_of(get(&state, "/index/schema.json").await).await).unwrap();
+        let examples: Vec<&str> =
+            schema["routes"].as_array().unwrap().iter().filter_map(|r| r["example"].as_str()).collect();
+        assert!(examples.len() >= 8, "{examples:?}");
+        for example in examples {
+            let status = get(&state, example).await.status();
+            // Semantic search answers 503 without den-embed, which this state has none of: routed, not missing.
+            assert!(status == 200 || status == 503, "{example} answered {status}");
+        }
+    }
+
+    /// A JSON answer is always whole. A slice of one cannot be audited for prose, so a Range is answered with
+    /// the full body rather than a 206 the guard would have to refuse.
+    #[tokio::test]
+    async fn a_range_on_a_json_route_answers_the_whole_body() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let state = index_state("den-atlas-json-range");
+        let req = HttpRequest::builder().uri("/index/schema.json").header("range", "bytes=0-9");
+        let resp = handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await;
+        assert_eq!(resp.status(), 200);
+        assert!(serde_json::from_str::<serde_json::Value>(&body_of(resp).await).is_ok());
     }
 
     /// A word may be both a facet and a title. Reading `brazil` as country BR must not multiply the exact

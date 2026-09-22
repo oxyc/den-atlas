@@ -1,9 +1,79 @@
 //! The self-describing query schema. Every population count carries both the number of titles for which the
 //! field is known and the full corpus denominator; partial classification must never read as a census.
 
+use crate::facts::{Record, SourceKinds};
 use crate::queries::Indexes;
 use den_index::{MediaType, DISPLAY_CONFIDENCE_FLOOR};
 use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashSet};
+
+type Key = (MediaType, u32);
+
+fn type_name(media_type: MediaType) -> &'static str {
+    if media_type == MediaType::Tv {
+        "series"
+    } else {
+        "movie"
+    }
+}
+
+/// The titles a scoped count is out of: the whole corpus, or the titles of one type.
+pub fn population(indexes: &Indexes, scope: Option<MediaType>) -> usize {
+    let Some(media_type) = scope else { return indexes.population };
+    indexes
+        .facets
+        .as_ref()
+        .map(|facets| facets.coverage_for("mediaType", Some(media_type)))
+        .filter(|&n| n > 0)
+        .or_else(|| {
+            indexes.plot.media_type_counts().into_iter().find(|(kind, _)| *kind == media_type).map(|x| x.1)
+        })
+        .unwrap_or(0)
+}
+
+/// Titles whose facts record passes `on_record`, among the titles of `scope`.
+fn on_record(indexes: &Indexes, scope: Option<MediaType>, on_record: impl Fn(&Record) -> bool) -> usize {
+    indexes.facts.as_ref().map_or(0, |facts| {
+        facts
+            .keys()
+            .filter(|(kind, _)| scope.is_none_or(|want| *kind == want))
+            .filter(|&(kind, id)| facts.get(id, kind).is_some_and(&on_record))
+            .count()
+    })
+}
+
+/// Every title anything gives a genre for, as `plotrows::genres` reads them: the labels and the facts.
+fn genre_keys(indexes: &Indexes, scope: Option<MediaType>) -> HashSet<Key> {
+    let facts = indexes.facts.as_ref().into_iter().flat_map(crate::facts::Facts::keys);
+    indexes
+        .plot
+        .titles()
+        .chain(facts)
+        .filter(|(kind, _)| scope.is_none_or(|want| *kind == want))
+        .filter(|&key| !crate::plotrows::genres(indexes, key).is_empty())
+        .collect()
+}
+
+/// How many titles of `scope` have `field` on record — the one definition of "known" behind every coverage figure
+/// atlas reports, in the schema, on a browse row and on a search. A title without it is unknown, never a
+/// mismatch, so this is the most any count over the field can reach.
+pub fn known(indexes: &Indexes, field: &str, scope: Option<MediaType>) -> usize {
+    let floor = DISPLAY_CONFIDENCE_FLOOR;
+    match field {
+        "mediaType" => population(indexes, scope),
+        "country" | "language" | "year" | "decade" => {
+            indexes.facets.as_ref().map_or(0, |facets| facets.coverage_for(field, scope))
+        }
+        "subgenre" => indexes.plot.subgenre_coverage_for(scope, floor),
+        "mood" => indexes.plot.mood_coverage_for(scope, floor),
+        "runtimeMinutes" => on_record(indexes, scope, |r| r.runtime_minutes.is_some()),
+        "basedOnKind" => on_record(indexes, scope, |r| !r.source_kinds.is_empty()),
+        "broadcaster" => on_record(indexes, scope, |r| !r.broadcasters.is_empty()),
+        "people" => on_record(indexes, scope, |r| !r.makers.is_empty() || !r.cast.is_empty()),
+        "genre" => genre_keys(indexes, scope).len(),
+        axis => indexes.plot_facets.as_ref().map_or(0, |facets| facets.coverage_for(axis, scope)),
+    }
+}
 
 fn coverage(known: usize, population: usize) -> Value {
     json!({
@@ -125,8 +195,75 @@ pub fn document(indexes: &Indexes) -> Value {
     );
     fields.insert(
         "people".to_owned(),
-        field("entity", true, indexes.facts.as_ref().map_or(0, crate::facts::Facts::len), population, vec![]),
+        field("entity", true, known(indexes, "people", None), population, vec![]),
     );
+
+    // The facts `/index/query` reads that the fields above did not name.
+    fields.insert(
+        "runtimeMinutes".to_owned(),
+        field("integer", true, known(indexes, "runtimeMinutes", None), population, vec![]),
+    );
+    let kinds = named(
+        SourceKinds::names(u16::MAX)
+            .into_iter()
+            .map(|name| {
+                let bit = SourceKinds::parse(name).unwrap_or(0);
+                (name, on_record(indexes, None, |r| r.source_kinds.contains(bit)))
+            })
+            .filter(|&(_, count)| count > 0)
+            .collect(),
+    );
+    fields.insert(
+        "basedOnKind".to_owned(),
+        field("enum", true, known(indexes, "basedOnKind", None), population, sorted(kinds)),
+    );
+    let series = self::population(indexes, Some(MediaType::Tv));
+    fields.insert(
+        "broadcaster".to_owned(),
+        field("entity", true, known(indexes, "broadcaster", Some(MediaType::Tv)), series, vec![]),
+    );
+    let genre_titles = genre_keys(indexes, None);
+    let mut genres: BTreeMap<u16, usize> = BTreeMap::new();
+    for &key in &genre_titles {
+        for genre in crate::plotrows::genres(indexes, key) {
+            *genres.entry(genre).or_default() += 1;
+        }
+    }
+    let genres = genres.into_iter().map(|(id, count)| (id.to_string(), count)).collect();
+    fields.insert("genre".to_owned(), field("enum", true, genre_titles.len(), population, sorted(genres)));
+
+    for (name, about) in [
+        ("mediaType", json!({ "parameter": "type" })),
+        ("primaryGenre", json!({ "format": "label name" })),
+        ("subgenre", json!({ "format": "label name", "minConfidence": DISPLAY_CONFIDENCE_FLOOR })),
+        ("mood", json!({ "format": "label name", "minConfidence": DISPLAY_CONFIDENCE_FLOOR })),
+        ("country", json!({ "format": "ISO 3166-1 alpha-2", "of": "country of origin" })),
+        ("language", json!({ "format": "ISO 639-1", "of": "original language", "parameter": "language" })),
+        ("year", json!({ "unit": "calendar year", "of": "release", "parameter": ["year_min", "year_max"] })),
+        (
+            "decade",
+            json!({ "unit": "calendar year", "format": "the decade's first year: 1980 is 1980-1989" }),
+        ),
+        (
+            "runtimeMinutes",
+            json!({ "unit": "minutes", "parameter": "runtime_max",
+                    "note": "a series' runtime is per episode, so runtime_max drops films only" }),
+        ),
+        (
+            "broadcaster",
+            json!({ "format": "Wikidata Q-id", "of": "network or service a series first aired on",
+                    "appliesTo": "series", "parameter": "broadcaster" }),
+        ),
+        ("genre", json!({ "format": "TMDB genre id" })),
+        ("people", json!({ "format": "Wikidata Q-id", "of": "directors, creators, writers and cast" })),
+        ("plotSemantic", json!({ "parameter": "q" })),
+        ("premiseSemantic", json!({ "parameter": "q" })),
+        ("title", json!({ "parameter": "q" })),
+    ] {
+        if let (Some(Value::Object(target)), Value::Object(about)) = (fields.get_mut(name), about) {
+            target.extend(about);
+        }
+    }
 
     json!({
         "schemaVersion": 1,
@@ -138,29 +275,240 @@ pub fn document(indexes: &Indexes) -> Value {
             "missing": "unknown",
             "resultTotal": "retrievedCandidatesNotCorpusCount",
             "groupBy": false,
+            "counts": {
+                "coverage": "count: titles with the field on record; denominator: the titles it is out of (the \
+                             corpus, or the media type the field or route is scoped to); ratio: count / \
+                             denominator",
+                "valueCount": "matched: titles with this value; known: titles with the field on record; \
+                               population: the titles the field is out of",
+                "rowTotal": "titles carrying every constraint among those with each constraint's field on \
+                             record, which is at most coverage.fields.<field>.count",
+                "resultTotal": "candidates the search retrieved and scored above zero: a pool the ranking \
+                                drew from, not a corpus count",
+            },
+            "applied": {
+                "filter": "drops a title on record as not matching; keeps one with no record, ranked lower",
+                "discount": "read from the query's words, so it ranks a title on record as not matching far \
+                             lower but never drops it",
+                "boost": "raises a title that carries it; never lowers or drops one that does not",
+                "require": "drops every title not on record as matching, unknown included",
+            },
         },
+        "routes": routes(),
     })
+}
+
+fn sorted(mut values: Vec<(String, usize)>) -> Vec<(String, usize)> {
+    values.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    values
+}
+
+fn param(name: &str, kind: &str, about: &str) -> Value {
+    json!({ "name": name, "type": kind, "about": about })
+}
+
+fn with(mut value: Value, extra: Value) -> Value {
+    if let (Value::Object(target), Value::Object(extra)) = (&mut value, extra) {
+        target.extend(extra);
+    }
+    value
+}
+
+fn paging(default: usize, max: usize) -> [Value; 2] {
+    [
+        with(param("skip", "integer", "titles to skip before the page"), json!({ "default": 0 })),
+        with(param("limit", "integer", "titles in the page"), json!({ "default": default, "max": max })),
+    ]
+}
+
+/// Every public route an agent can call, with its parameters, what it returns and what its counts are out of —
+/// enough to use the API without reading this code. `/metrics` (a token) and `/playground` (off in production)
+/// are left out. `example` is a request that resolves, and the route tests call each one.
+fn routes() -> Value {
+    let floor = DISPLAY_CONFIDENCE_FLOOR;
+    let [skip, limit] = paging(crate::search::PAGE, crate::search::MAX_PAGE);
+    let query = json!({
+        "method": "GET",
+        "path": "/index/query.json",
+        "example": "/index/query.json?q=bleak%20finnish%201980s%20films",
+        "about": "Search in one request: the query is read for what it names (country, decade, type, genre, \
+                  label, plot facet, person, adaptation source) and every candidate is scored on every signal.",
+        "parameters": [
+            param("q", "string", "the query; words it does not read as a constraint are in parse.leftover and \
+                                  are matched as prose"),
+            with(param("type", "enum", "movie or series"), json!({ "field": "mediaType" })),
+            skip,
+            limit,
+            with(param("year_min", "integer", "earliest release year, inclusive"), json!({ "field": "year" })),
+            with(param("year_max", "integer", "latest release year, inclusive"), json!({ "field": "year" })),
+            with(param("language", "string", "original language"), json!({ "field": "language" })),
+            with(param("runtime_max", "integer", "longest runtime"), json!({ "field": "runtimeMinutes" })),
+            with(param("broadcaster", "string", "Q-id, with or without the Q"), json!({ "field": "broadcaster" })),
+        ],
+        "returns": "{parse, people, hits, total, semantics, coverage}",
+        "counts": {
+            "total": "resultTotal",
+            "coverage": "each constraint the query applied, how it was applied, and how many titles have its \
+                         field on record out of the titles of the type asked for",
+            "people[].credits": "that person's titles in the corpus",
+        },
+    });
+    use crate::handler::{
+        FACET_LIMIT, MAX_NEIGHBOUR_K, MAX_ROW_PAGE, MAX_SEEDS, MAX_TITLES, NEIGHBOUR_K, ROW_PAGE, SEMANTIC_K,
+        SIMILAR_PAGE,
+    };
+    let [row_skip, row_limit] = paging(ROW_PAGE, MAX_ROW_PAGE);
+    json!([
+        {
+            "method": "GET", "path": "/index/schema.json", "example": "/index/schema.json",
+            "about": "This document: fields, value vocabularies with counts, coverage, semantics and routes.",
+        },
+        query,
+        {
+            "method": "GET",
+            "path": "/index/row/{type}.json",
+            "example": "/index/row/movie.json?tone=bleak",
+            "alias": "/index/plot/{type}.json",
+            "about": "A browse row: the titles of one type carrying every constraint, most confident then most \
+                      voted. The rows that count.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("{axis}", "string", "a plot-facet axis and one of its values, e.g. tone=bleak; \
+                                               repeatable, one per axis"),
+                    json!({ "field": "any enum field of fields whose name is a plot-facet axis" }),
+                ),
+                with(param("subgenre", "string", "a subgenre label"), json!({ "field": "subgenre" })),
+                with(param("mood", "string", "a mood label"), json!({ "field": "mood" })),
+                row_skip.clone(),
+                row_limit.clone(),
+                param("tilt.liked", "string", "reorders for a household: comma-separated m<id>/t<id>, at most \
+                                               500 (tilt.w.embedding, tilt.w.dislike, tilt.w.era and \
+                                               tilt.w.square weigh it); never changes total"),
+                param("tilt.disliked", "string", "as tilt.liked"),
+                param("tilt.era", "string", "<center>,<spread> in calendar years"),
+            ],
+            "returns": "{titles, total, coverage}",
+            "counts": { "total": "rowTotal", "coverage": "per field, out of the titles of {type}" },
+        },
+        {
+            "method": "GET",
+            "path": "/index/rows/{type}/{family}/{label}.json",
+            "example": "/index/rows/movie/subgenre/Heist.json",
+            "about": format!("The titles of one type carrying a label at confidence {floor} or more."),
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(param("family", "enum", "subgenre or mood"), json!({ "in": "path" })),
+                with(param("label", "string", "the label, percent-encoded"), json!({ "in": "path" })),
+                row_skip,
+                row_limit,
+            ],
+            "returns": "{ids, total, coverage}",
+            "counts": { "total": "rowTotal", "coverage": "the label family, out of the titles of {type}" },
+        },
+        {
+            "method": "GET",
+            "path": "/index/similar/{type}/{tmdbId}.json",
+            "example": "/index/similar/movie/1.json",
+            "about": "More Like This for one title, best first.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+                with(param("skip", "integer", "titles to skip"), json!({ "default": 0 })),
+                with(param("limit", "integer", "titles in the page"),
+                     json!({ "default": SIMILAR_PAGE, "max": den_index::MAX_ROW })),
+            ],
+            "returns": "{ids, total}",
+            "counts": { "total": format!("the length of the ranked list, at most {}", den_index::MAX_ROW) },
+        },
+        {
+            "method": "GET",
+            "path": "/index/neighbours/{type}/{tmdbId}.json",
+            "example": "/index/neighbours/movie/1.json",
+            "about": "The plain plot-vector neighbours of one title.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+                with(param("k", "integer", "neighbours"),
+                     json!({ "default": NEIGHBOUR_K, "max": MAX_NEIGHBOUR_K })),
+            ],
+            "returns": "{ids}",
+        },
+        {
+            "method": "GET",
+            "path": "/index/search.json",
+            "example": "/index/search.json?q=heist",
+            "about": "Semantic search alone: the plot vectors nearest to the query. 503 without the embedder.",
+            "parameters": [
+                param("q", "string", "the query"),
+                with(param("type", "enum", "movie or series"), json!({ "field": "mediaType" })),
+            ],
+            "returns": format!("{{titles:[{{type,id,score}}], mean, sd}}: the {SEMANTIC_K} nearest, with the \
+                                scan's mean and standard deviation"),
+        },
+        {
+            "method": "GET",
+            "path": "/index/facets.json",
+            "example": "/index/facets.json?q=korean%20heist",
+            "about": "The titles matching the country, decade and type the query names, most voted first.",
+            "parameters": [param("q", "string", "the query")],
+            "returns": format!("{{facet, titles}}: at most {FACET_LIMIT} titles"),
+        },
+        {
+            "method": "GET", "path": "/index/taxonomy.json", "example": "/index/taxonomy.json",
+            "about": "The label names alone, kept for the TV app. Use this document instead.",
+        },
+        {
+            "method": "POST",
+            "path": "/index/labels.json",
+            "about": "Each named title's labels, or null.",
+            "body": format!("{{titles:[{{type,id}}]}}, at most {MAX_TITLES}"),
+            "returns": "{labels}",
+        },
+        {
+            "method": "POST",
+            "path": "/index/score.json",
+            "about": "Each candidate's closeness to the liked and disliked titles' centroids.",
+            "body": format!("{{space?: plot|premise, liked, disliked, candidates}}, each at most {MAX_TITLES} \
+                             {{type,id}}"),
+            "returns": "{space, scores:[{taste,dislike}]}: cosine, clamped at 0",
+        },
+        {
+            "method": "POST",
+            "path": "/index/suggest.json",
+            "about": format!("More Like This for up to {MAX_SEEDS} seeds, per seed and pooled in seed order."),
+            "body": "{seeds, exclude?, limit?}",
+            "returns": "{perSeed:[{seed,ids}], pooled}",
+        },
+        {
+            "method": "POST",
+            "path": "/recommend",
+            "about": "The titles a featured surface leads with, for one household.",
+            "body": "{surface?, service?, now?, services?, library, owned, hide?, candidates?, limit?}",
+            "returns": "{slides, unjudged, unjudgedCount, libraryUnjudged, facts, scorer, datasetVersion}",
+        },
+        {
+            "method": "GET",
+            "path": "/catalog/{type}/{id}.json",
+            "about": "Stremio catalog rows of the streaming services' most popular titles, and title search \
+                      as the den-titles catalog (/catalog/{type}/den-titles/search={q}.json).",
+            "returns": "{metas}",
+        },
+        { "method": "GET", "path": "/dataset.json", "about": "What the dataset is: versions, model, count." },
+        { "method": "GET", "path": "/health", "about": "Always 200; status ok, or degraded with a reason." },
+        { "method": "GET", "path": "/ready", "about": "503 when a whole feature is off." },
+    ])
 }
 
 /// Coverage attached to a browse-row count. Each filtered field is reported separately because the intersection
 /// may not be missing at random, and a single blended percentage would hide which axis is thin.
 pub fn row_coverage(indexes: &Indexes, media_type: MediaType, constraints: &[(String, String)]) -> Value {
     let mut fields = Map::new();
-    let scoped = indexes
-        .facets
-        .as_ref()
-        .and_then(|facets| {
-            let wanted = if media_type == MediaType::Tv { "series" } else { "movie" };
-            facets.value_counts("mediaType").into_iter().find(|(value, _)| value == wanted).map(|(_, n)| n)
-        })
-        .or_else(|| {
-            indexes.plot.media_type_counts().into_iter().find(|(kind, _)| *kind == media_type).map(|x| x.1)
-        })
-        .unwrap_or(0);
+    let scoped = population(indexes, Some(media_type));
     for (name, _) in constraints {
+        // A row reads every other name as a plot-facet axis, and one the store does not have matches nothing.
         let known = match name.as_str() {
-            "subgenre" => indexes.plot.subgenre_coverage_for(Some(media_type), DISPLAY_CONFIDENCE_FLOOR),
-            "mood" => indexes.plot.mood_coverage_for(Some(media_type), DISPLAY_CONFIDENCE_FLOOR),
+            "subgenre" | "mood" => known(indexes, name, Some(media_type)),
             axis => {
                 indexes.plot_facets.as_ref().map_or(0, |facets| facets.coverage_for(axis, Some(media_type)))
             }
@@ -169,8 +517,40 @@ pub fn row_coverage(indexes: &Indexes, media_type: MediaType, constraints: &[(St
     }
     json!({
         "population": indexes.population,
-        "mediaType": if media_type == MediaType::Tv { "series" } else { "movie" },
+        "mediaType": type_name(media_type),
         "denominator": scoped,
+        "fields": fields,
+    })
+}
+
+/// How a search applied one constraint: `filter`, `discount` or `boost` (`semantics.applied` in the schema).
+pub struct Applied {
+    pub field: &'static str,
+    pub value: Value,
+    pub applied: &'static str,
+    /// The one media type the constraint judges, when it judges only one: its coverage is out of that type.
+    pub applies_to: Option<MediaType>,
+}
+
+/// Coverage for a search: the same shape as a row's, with each constraint's value and how it was applied, so a
+/// client can tell a filter from a nudge and see how much of the corpus could answer either. Out of the titles
+/// of the type asked for, or the corpus when none was.
+pub fn query_coverage(indexes: &Indexes, scope: Option<MediaType>, constraints: &[Applied]) -> Value {
+    let mut fields = Map::new();
+    for constraint in constraints {
+        let scope = constraint.applies_to.or(scope);
+        let mut entry = coverage(known(indexes, constraint.field, scope), population(indexes, scope));
+        entry["value"] = constraint.value.clone();
+        entry["applied"] = json!(constraint.applied);
+        if let Some(only) = constraint.applies_to {
+            entry["appliesTo"] = json!(type_name(only));
+        }
+        fields.insert(constraint.field.to_owned(), entry);
+    }
+    json!({
+        "population": indexes.population,
+        "mediaType": scope.map(type_name),
+        "denominator": population(indexes, scope),
         "fields": fields,
     })
 }
@@ -195,5 +575,60 @@ mod tests {
         assert_eq!(schema["fields"]["tone"]["coverage"]["count"], 3);
         assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 12);
         assert_eq!(schema["semantics"]["groupBy"], false);
+    }
+
+    /// An agent reading only this document must find every constraint `/index/query` accepts, in what unit,
+    /// and out of how many titles — and each route's parameters must name fields the document describes.
+    #[tokio::test]
+    async fn the_schema_describes_every_field_and_route_a_client_can_use() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-schema-routes-{}", std::process::id()));
+        let queries = crate::queries::IndexQueries::new(&crate::queries::write_fixture(&dir));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        let schema = document(&indexes);
+        let fields = &schema["fields"];
+
+        // Movie 1 alone is on record as adapted, from a book and a play: 1 of 12, and each kind counted.
+        assert_eq!(fields["basedOnKind"]["coverage"]["count"], 1);
+        assert_eq!(fields["basedOnKind"]["coverage"]["denominator"], 12);
+        let kinds: Vec<(&str, u64)> = fields["basedOnKind"]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["value"].as_str().unwrap(), v["count"]["matched"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(kinds, [("book", 1), ("play", 1)]);
+        // A broadcaster is a series' fact, so it is out of the 9 series, not the 12 titles.
+        assert_eq!(fields["broadcaster"]["coverage"]["denominator"], 9);
+        assert_eq!(fields["broadcaster"]["appliesTo"], "series");
+        assert_eq!(fields["runtimeMinutes"]["unit"], "minutes");
+        assert_eq!(fields["runtimeMinutes"]["coverage"]["denominator"], 12);
+        assert_eq!(fields["year"]["unit"], "calendar year");
+        assert_eq!(fields["country"]["format"], "ISO 3166-1 alpha-2");
+        // Crime (80) is movie 1's alone, from its facts.
+        let crime =
+            fields["genre"]["values"].as_array().unwrap().iter().find(|v| v["value"] == "80").unwrap();
+        assert_eq!(crime["count"]["matched"], 1);
+        assert!(schema["semantics"]["applied"]["filter"].is_string());
+
+        let routes = schema["routes"].as_array().unwrap();
+        let query = routes.iter().find(|r| r["path"] == "/index/query.json").expect("the query route");
+        let names: Vec<&str> =
+            query["parameters"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        for name in
+            ["q", "type", "skip", "limit", "year_min", "year_max", "language", "runtime_max", "broadcaster"]
+        {
+            assert!(names.contains(&name), "/index/query.json does not declare {name}");
+        }
+        for route in routes {
+            for parameter in route["parameters"].as_array().into_iter().flatten() {
+                if let Some(field) = parameter["field"].as_str().filter(|f| !f.contains(' ')) {
+                    assert!(
+                        fields.get(field).is_some(),
+                        "{} names an undescribed field {field}",
+                        route["path"]
+                    );
+                }
+            }
+        }
     }
 }
