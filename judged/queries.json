@@ -302,11 +302,400 @@
       "q": "horror but not gory",
       "split": "dev",
       "lane": "negation",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 10,
+        "not_in_top": {
+          "movie:15135": 40,
+          "movie:36073": 40,
+          "movie:42610": 40,
+          "movie:420634": 40,
+          "movie:1690": 40,
+          "movie:37169": 40,
+          "movie:763": 40
+        }
+      },
+      "note": "The judged exclusion list: splatter films nobody would call anything but gory — Feast III, Guinea Pig 2, Night of the Bloody Apes, Terrifier, Hostel, The Human Centipede, Braindead. Observed 2026-09-22: `but not gory` was embedded whole, and Feast III sat at #9. The store has no gore label and the plot vectors barely know the word (`gory` lands on Thor: Love and Thunder, for Gorr), so a negated word that names nothing can only be kept OUT of the vectors, not turned into an exclusion."
+    },
+    {
+      "q": "horror without gore",
+      "split": "test",
+      "lane": "negation",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 10,
+        "not_in_top": {
+          "movie:15135": 40,
+          "movie:36073": 40,
+          "movie:42610": 40,
+          "movie:420634": 40,
+          "movie:1690": 40,
+          "movie:37169": 40,
+          "movie:763": 40
+        }
+      },
+      "note": "Same exclusion list as `horror but not gory`, other wording. Observed 2026-09-22: Terrifier at #32."
+    },
+    {
+      "q": "funny movies not romance",
+      "split": "dev",
+      "lane": "negation-genre",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:603661": 20,
+          "movie:953233": 20,
+          "movie:289523": 20,
+          "movie:437029": 20,
+          "movie:489929": 20
+        }
+      },
+      "note": "Observed 2026-09-22: `romance` was read as a GENRE BOOST, so every one of the top 15 is a romance (The Hating Game, The Taming of the Shrewd, Midnight Masquerade, The Laws of Thermodynamics, Destination Wedding). The negation made the query ask for exactly what it excluded."
+    },
+    {
+      "q": "thriller not horror",
+      "split": "dev",
+      "lane": "negation-genre",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:60366": 20,
+          "movie:377": 20,
+          "movie:35683": 20,
+          "movie:12597": 20,
+          "movie:71550": 20,
+          "movie:258255": 20
+        }
+      },
+      "note": "Observed: both genres read as boosts; ThanksKilling, A Nightmare on Elm Street and Hellraiser: Inferno in the top 11."
+    },
+    {
+      "q": "zombie movies not comedy",
+      "split": "dev",
+      "lane": "negation-genre",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 10,
+        "not_in_top": {
+          "movie:747": 20,
+          "movie:90118": 20,
+          "movie:118248": 20,
+          "movie:402976": 20,
+          "movie:19908": 20,
+          "movie:535581": 20
+        }
+      },
+      "note": "Observed: Shaun of the Dead #1, then A Little Bit Zombie, Night of the Living Carrots — zombie COMEDIES, because `comedy` was a boost."
+    },
+    {
+      "q": "korean movies not horror",
+      "split": "test",
+      "lane": "negation-genre",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:508642": 20,
+          "movie:1194963": 20,
+          "movie:602508": 20,
+          "movie:4552": 20,
+          "movie:396535": 20,
+          "movie:293670": 20
+        }
+      },
+      "note": "Observed: the first 20 Korean films are ALL horror — Gonjiam, Noise, A Tale of Two Sisters, Train to Busan, The Wailing."
+    },
+    {
+      "q": "animated movies not anime",
+      "split": "dev",
+      "lane": "negation-label",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:12613": 20,
+          "movie:21712": 20,
+          "movie:887870": 20,
+          "movie:25078": 20
+        }
+      },
+      "note": "`anime` is a subgenre label. Observed: Street Fighter II: The Animated Movie #2, Mind Game, Blue Giant and Cat Soup in the top 20 — all Japanese anime."
+    },
+    {
+      "q": "comedies not american",
+      "split": "dev",
+      "lane": "negation-country",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "series:10283": 20,
+          "series:60839": 20,
+          "movie:243938": 20,
+          "movie:27295": 20,
+          "series:32694": 20,
+          "series:81983": 20
+        }
+      },
+      "note": "Observed: `american` fell through to the vectors as prose (it did not even parse as a country), and Archer, Broad City, Hot Tub Time Machine 2 and Paradise PD — all American — made the top 12."
+    },
+    {
+      "q": "crime series not british",
+      "split": "test",
+      "lane": "negation-country",
+      "observed": "FAIL",
+      "assert": {
+        "all_type": "series",
+        "min_scored": 20,
+        "not_in_top": {
+          "series:96954": 20,
+          "series:194632": 20
+        }
+      },
+      "note": "Observed: the negated demonym parsed as `country: GB` — White House Farm and A Town Called Malice are #1 and #3. The query answered with the one country it ruled out."
+    },
+    {
+      "q": "horror movies not from the 80s",
+      "split": "dev",
+      "lane": "negation-decade",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:85002": 20,
+          "movie:85198": 20,
+          "movie:16281": 20
+        }
+      },
+      "note": "Observed: parsed `decade: 1980`, so the top three are Cemetery of Terror (1985), Frightmare (1983) and Creepshow (1982)."
+    },
+    {
+      "q": "sci fi movies not based on a book",
+      "split": "dev",
+      "lane": "negation-source",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:1062722": 20,
+          "movie:9306": 20,
+          "movie:2103": 20,
+          "movie:10153": 20
+        }
+      },
+      "note": "Observed: parsed `basedOnKind: book` as a FILTER, so only adaptations came back — Frankenstein, The Island of Dr. Moreau, Solaris, Sphere. (I, Robot at #1 is left unasserted: it credits Asimov, but is not an adaptation of the book.)"
+    },
+    {
+      "q": "christopher nolan movies without batman",
+      "split": "dev",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "in_top": {
+          "movie:27205": 10
+        },
+        "not_in_top": {
+          "movie:272": 40,
+          "movie:155": 40,
+          "movie:49026": 40
+        }
+      },
+      "note": "Observed: the Dark Knight trilogy is #1-#3. Batman Begins names Batman in its title; The Dark Knight and The Dark Knight Rises do not, and are the same trilogy."
+    },
+    {
+      "q": "tom hanks movies without meg ryan",
+      "split": "dev",
+      "lane": "negation-person",
+      "observed": "FAIL",
+      "assert": {
+        "in_top": {
+          "movie:13": 5
+        },
+        "not_in_top": {
+          "movie:858": 40,
+          "movie:9489": 40,
+          "movie:2565": 40
+        }
+      },
+      "note": "The three films the two made together. Observed: `meg ryan` was read as a second PERSON TO FIND, so the answer is Hanks's filmography with hers mixed in."
+    },
+    {
+      "q": "space films not star wars",
+      "split": "dev",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:81234": 40,
+          "movie:11": 40,
+          "movie:1891": 40,
+          "movie:1892": 40,
+          "movie:1893": 40,
+          "movie:1894": 40,
+          "movie:1895": 40,
+          "movie:140607": 40,
+          "movie:181808": 40,
+          "movie:181812": 40,
+          "movie:330459": 40,
+          "movie:348350": 40
+        }
+      },
+      "note": "Observed: `star wars` embedded as prose, so Lego Star Wars: Revenge of the Brick is #1. Every live-action saga film is listed, whether its title says Star Wars or not."
+    },
+    {
+      "q": "dinosaur movies not jurassic park",
+      "split": "test",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 10,
+        "not_in_top": {
+          "movie:329": 40,
+          "movie:330": 40,
+          "movie:331": 40
+        }
+      },
+      "note": "Observed: Jurassic Park #1, Jurassic World #2. Only the three films CALLED Jurassic Park are asserted; whether the Jurassic World films are excluded too is a reading of the franchise, not of the words."
+    },
+    {
+      "q": "vampire movies not twilight",
+      "split": "test",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:8966": 40,
+          "movie:18239": 40,
+          "movie:24021": 40,
+          "movie:50619": 40,
+          "movie:50620": 40
+        }
+      },
+      "note": "The five Twilight Saga films. Observed 2026-09-22: Breaking Dawn – Part 2 at #37."
+    },
+    {
+      "q": "fantasy movies not harry potter",
+      "split": "dev",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:671": 40,
+          "movie:672": 40,
+          "movie:673": 40,
+          "movie:674": 40,
+          "movie:675": 40,
+          "movie:767": 40,
+          "movie:12444": 40,
+          "movie:12445": 40
+        }
+      },
+      "note": "The eight Harry Potter films. Observed: the Philosopher's Stone #1, Order of the Phoenix #5, Prisoner of Azkaban #11. Fantastic Beasts is left unasserted — same world, not what the words name."
+    },
+    {
+      "q": "superhero movies not marvel",
+      "split": "test",
+      "lane": "negation-franchise",
+      "observed": "FAIL",
+      "assert": {
+        "min_scored": 20,
+        "not_in_top": {
+          "movie:76122": 20,
+          "movie:68721": 20,
+          "movie:99861": 20,
+          "movie:271110": 20,
+          "movie:315635": 20
+        }
+      },
+      "note": "Observed: Marvel One-Shot #1, then Spider-Man: Homecoming, Iron Man 3, Age of Ultron, Captain America: Civil War in the top 20. Only the One-Shot says Marvel in its title; the rest need a studio or universe fact the store does not carry by name."
+    },
+    {
+      "q": "detective series not sherlock",
+      "split": "test",
+      "lane": "negation-title",
+      "observed": "FAIL",
+      "assert": {
+        "all_type": "series",
+        "not_in_top": {
+          "series:19885": 20,
+          "series:23027": 20,
+          "series:799": 20
+        }
+      },
+      "note": "Observed: two series called Sherlock Holmes at #3 and #12."
+    },
+    {
+      "q": "no time to die",
+      "split": "dev",
+      "lane": "negation-guard",
       "observed": "pass",
       "assert": {
-        "min_scored": 10
+        "rank_at_most": {
+          "movie:370172": 1
+        }
       },
-      "note": "Negation is unparsed anywhere, and a dense retriever encodes `gory` as similarity to gore, so this returns more of what was excluded. A proper assertion needs a judged exclusion list, which needs somebody to name gory titles; min_scored is a placeholder that at least fails when the query returns nothing real. Fill in when den-atlas#11's negation work starts."
+      "note": "A title that starts with a negation word. Negation must never eat a title."
+    },
+    {
+      "q": "no country for old men",
+      "split": "test",
+      "lane": "negation-guard",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:6977": 1
+        }
+      }
+    },
+    {
+      "q": "not another teen movie",
+      "split": "dev",
+      "lane": "negation-guard",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:11397": 1
+        }
+      }
+    },
+    {
+      "q": "do not disturb",
+      "split": "dev",
+      "lane": "negation-guard",
+      "observed": "pass",
+      "assert": {
+        "in_top": {
+          "movie:298614": 3
+        }
+      },
+      "note": "The negation word is in the MIDDLE of the title, with words either side."
+    },
+    {
+      "q": "ready or not",
+      "split": "test",
+      "lane": "negation-guard",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:567609": 1
+        }
+      }
+    },
+    {
+      "q": "without remorse",
+      "split": "dev",
+      "lane": "negation-guard",
+      "observed": "pass",
+      "assert": {
+        "rank_at_most": {
+          "movie:567189": 1
+        }
+      }
     }
   ]
 }

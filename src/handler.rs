@@ -1076,12 +1076,27 @@ async fn query_answer(
 /// most-voted first, with any leftover words ranked semantically to the front. `facet` is null when the query
 /// names none. Without den-embed the matches still come back, unranked, and the flag says the ranking was skipped.
 async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> (String, bool) {
-    let facet = den_index::FacetQuery::parse(&query_text(query, "q"));
+    // A ruled-out word is neither a facet nor a theme: "crime series not british" read `country: GB`, and
+    // `not horror` ranked the facet's horror first.
+    let negation = den_index::split_negation(&query_text(query, "q"));
+    let facet = den_index::FacetQuery::parse(&negation.kept);
     let (Some(facets), true) = (indexes.facets.as_ref(), facet.has_facet()) else {
         return (serde_json::json!({ "facet": null, "titles": [] }).to_string(), false);
     };
     let mut unranked = false;
     let mut titles = facets.filter(facet.media_type, facet.country, facet.decade);
+    let ruled_out: Vec<den_index::FacetQuery> =
+        negation.excluded.iter().map(|phrase| den_index::FacetQuery::parse(phrase)).collect();
+    titles.retain(|&(id, kind)| {
+        let known = facets.title(id, kind);
+        !ruled_out.iter().any(|out| {
+            out.media_type == Some(kind)
+                || out
+                    .country
+                    .is_some_and(|c| known.and_then(|t| t.country).is_some_and(|k| c.as_bytes() == k))
+                || out.decade.is_some_and(|d| known.and_then(|t| t.year).is_some_and(|y| y / 10 * 10 == d))
+        })
+    });
     if !facet.leftover.is_empty() && !titles.is_empty() {
         match embed_query(state, &facet.leftover).await {
             Ok(vector) => {
