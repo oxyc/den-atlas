@@ -121,6 +121,7 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
 | `POST /recommend` | with `INDEX_QUERIES` on: `{surface?,service?,now?,services?,library,owned,hide?,candidates?,limit?}` → `{slides:[{type,id,imdbId?,why}],unjudged:[{type,id}],unjudgedCount,libraryUnjudged,facts,scorer,datasetVersion}`, the titles a featured surface leads with (40 by default); `no-store` |
+| `GET /playground` | with `PLAYGROUND` and `INDEX_QUERIES` on: the tuning page. `/playground/params.json` lists every More Like This knob (`den_index::SimilarParams`) with its range and production value; `/playground/similar/<movie\|series>/<tmdbId>.json?<knob>=…&limit=` ranks with those overrides and returns each title's score, production rank and per-signal points. An unknown knob or out-of-range value is a `400` naming it; `no-store`; off ⇒ `404` |
 | `POST /embed` | a search query (`{"text":…}`) embedded by den-embed; `503` when `EMBED_URL` is unset |
 | `GET /metrics` | Prometheus text for `Authorization: Bearer $METRICS_TOKEN`; `404` when the token is unset or wrong |
 
@@ -233,6 +234,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json` (a service channel's as `<surface>-service-<id>[-<country>].json`): the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
+| `PLAYGROUND` | off | `1` turns on the `/playground` tuning routes (only alongside `INDEX_QUERIES`); computed per request, so enable it only where anyone reaching atlas may spend that. `/index/similar` never reads an override |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |
 
 ## Run
