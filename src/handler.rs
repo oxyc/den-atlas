@@ -614,7 +614,12 @@ impl IndexQuestion {
     ) -> String {
         let plot = &indexes.plot;
         let body = match self {
+            // The label names only, in the order the TV app builds its browse rows from; it decodes exactly
+            // these three fields, so the route keeps its shape. It carries no counts, no coverage and none
+            // of the plot-facet axes: `schema` names the route that describes the dataset, so a client that
+            // finds this one first is sent there rather than taking a name list for the vocabulary.
             Self::Taxonomy => serde_json::json!({
+                "schema": "/index/schema.json",
                 "taxonomyVersion": plot.taxonomy_version(),
                 "subgenres": plot.subgenre_labels(),
                 "moods": plot.mood_labels(),
@@ -1741,7 +1746,11 @@ mod tests {
         // The labelling pass's version is NOT in the store; both routes that name it read it off the
         // index, which the load stamps from the manifest. Miss that and these answer "".
         assert_eq!(taxonomy["taxonomyVersion"], "t02", "{taxonomy}");
-        let schema = json(body_of(get(&state, "/index/schema.json").await).await);
+        // A bare name list is not the dataset's description; it points at the route that is.
+        let pointer = taxonomy["schema"].as_str().expect("taxonomy names the schema route");
+        let schema = get(&state, pointer).await;
+        assert_eq!(schema.status(), 200, "{pointer}");
+        let schema = json(body_of(schema).await);
         assert_eq!(schema["taxonomyVersion"], "t02", "{schema}");
         // 12 titles, 8 of them unlabelled: `count` and `denominator` must differ, or a client reports a
         // fraction of the corpus as though it were the whole of it.

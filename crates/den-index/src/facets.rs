@@ -280,9 +280,23 @@ impl FacetQuery {
         let mut query = FacetQuery::default();
         let mut leftover: Vec<&str> = Vec::new();
         let lowered = text.to_lowercase();
-        for (at, token) in lowered.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).enumerate()
-        {
+        let tokens: Vec<&str> =
+            lowered.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).collect();
+        // Set when a two-word country name was read, so its second word is not read again.
+        let mut claimed = false;
+        for (at, &token) in tokens.iter().enumerate() {
+            if std::mem::take(&mut claimed) {
+                continue;
+            }
             if query.country.is_none() {
+                // The pair first: "north korean" is North Korea, not "north" and South Korea.
+                let pair =
+                    tokens.get(at + 1).and_then(|next| lookup(COUNTRIES, &format!("{token} {next}")));
+                if let Some(country) = pair {
+                    query.country = Some(country);
+                    claimed = true;
+                    continue;
+                }
                 if let Some(country) = lookup(COUNTRIES, token) {
                     query.country = Some(country);
                     continue;
@@ -395,59 +409,301 @@ const DECADES: &[(&str, u16)] = &[
     ("2020s", 2020),
 ];
 
-/// Demonym or place → ISO 3166-1 alpha-2, the tvOS app's curated set of common film and TV origins.
+/// Demonym or place → ISO 3166-1 alpha-2, for every country the corpus records a title as made in
+/// (`CORPUS_COUNTRIES` in the tests holds this to that list). An entry of two words is matched as a pair
+/// before either word alone.
+///
+/// Left out on purpose, because their usual reading in a query is something else and a country read from
+/// the words discounts every title not made there: "english" (a language — most English-language titles are
+/// American), "georgia" and "georgian" (a US state; a period), "jordan", "chad" and "cuba" (people's names),
+/// "guinea", and "kong" (King Kong). Their demonyms or full names are here instead.
 const COUNTRIES: &[(&str, &str)] = &[
-    ("spanish", "ES"),
-    ("spain", "ES"),
-    ("mexican", "MX"),
-    ("mexico", "MX"),
-    ("argentine", "AR"),
-    ("argentinian", "AR"),
-    ("argentina", "AR"),
-    ("korean", "KR"),
-    ("korea", "KR"),
-    ("japanese", "JP"),
-    ("japan", "JP"),
+    ("american", "US"),
+    ("america", "US"),
+    ("usa", "US"),
+    ("united states", "US"),
+    ("british", "GB"),
+    ("britain", "GB"),
+    ("great britain", "GB"),
+    ("uk", "GB"),
+    ("united kingdom", "GB"),
+    ("england", "GB"),
+    ("scottish", "GB"),
+    ("scotland", "GB"),
+    ("welsh", "GB"),
+    ("wales", "GB"),
     ("french", "FR"),
     ("france", "FR"),
+    ("east german", "DD"),
+    ("east germany", "DD"),
     ("german", "DE"),
     ("germany", "DE"),
     ("italian", "IT"),
     ("italy", "IT"),
-    ("british", "GB"),
-    ("uk", "GB"),
-    ("usa", "US"),
+    ("canadian", "CA"),
+    ("canada", "CA"),
+    ("spanish", "ES"),
+    ("spain", "ES"),
+    ("australian", "AU"),
+    ("australia", "AU"),
+    ("north korean", "KP"),
+    ("north korea", "KP"),
+    ("south korean", "KR"),
+    ("south korea", "KR"),
+    ("korean", "KR"),
+    ("korea", "KR"),
     ("indian", "IN"),
     ("india", "IN"),
     ("bollywood", "IN"),
+    ("japanese", "JP"),
+    ("japan", "JP"),
+    ("belgian", "BE"),
+    ("belgium", "BE"),
+    ("mexican", "MX"),
+    ("mexico", "MX"),
     ("chinese", "CN"),
     ("china", "CN"),
     ("brazilian", "BR"),
     ("brazil", "BR"),
+    ("argentine", "AR"),
+    ("argentinian", "AR"),
+    ("argentina", "AR"),
+    ("hong kong", "HK"),
+    ("hongkong", "HK"),
     ("swedish", "SE"),
     ("sweden", "SE"),
-    ("norwegian", "NO"),
-    ("norway", "NO"),
     ("danish", "DK"),
     ("denmark", "DK"),
-    ("dutch", "NL"),
-    ("netherlands", "NL"),
     ("russian", "RU"),
     ("russia", "RU"),
-    ("turkish", "TR"),
-    ("turkey", "TR"),
-    ("thai", "TH"),
-    ("thailand", "TH"),
-    ("filipino", "PH"),
-    ("philippines", "PH"),
-    ("canadian", "CA"),
-    ("canada", "CA"),
-    ("australian", "AU"),
-    ("australia", "AU"),
-    ("irish", "IE"),
-    ("ireland", "IE"),
     ("polish", "PL"),
     ("poland", "PL"),
+    ("swiss", "CH"),
+    ("switzerland", "CH"),
+    ("austrian", "AT"),
+    ("austria", "AT"),
+    ("dutch", "NL"),
+    ("netherlands", "NL"),
+    ("holland", "NL"),
+    ("turkish", "TR"),
+    ("turkey", "TR"),
+    ("czech", "CZ"),
+    ("czechia", "CZ"),
+    ("finnish", "FI"),
+    ("finland", "FI"),
+    ("norwegian", "NO"),
+    ("norway", "NO"),
+    ("irish", "IE"),
+    ("ireland", "IE"),
+    ("colombian", "CO"),
+    ("colombia", "CO"),
+    ("new zealand", "NZ"),
+    ("new zealander", "NZ"),
+    ("chilean", "CL"),
+    ("chile", "CL"),
+    ("greek", "GR"),
+    ("greece", "GR"),
+    ("thai", "TH"),
+    ("thailand", "TH"),
+    ("hungarian", "HU"),
+    ("hungary", "HU"),
+    ("taiwanese", "TW"),
+    ("taiwan", "TW"),
+    ("romanian", "RO"),
+    ("romania", "RO"),
+    ("indonesian", "ID"),
+    ("indonesia", "ID"),
+    ("icelandic", "IS"),
+    ("iceland", "IS"),
+    ("iranian", "IR"),
+    ("iran", "IR"),
+    ("peruvian", "PE"),
+    ("peru", "PE"),
+    ("portuguese", "PT"),
+    ("portugal", "PT"),
+    ("israeli", "IL"),
+    ("israel", "IL"),
+    ("bulgarian", "BG"),
+    ("bulgaria", "BG"),
+    ("south african", "ZA"),
+    ("south africa", "ZA"),
+    ("venezuelan", "VE"),
+    ("venezuela", "VE"),
+    ("emirati", "AE"),
+    ("uae", "AE"),
+    ("filipino", "PH"),
+    ("philippines", "PH"),
+    ("egyptian", "EG"),
+    ("egypt", "EG"),
+    ("cuban", "CU"),
+    ("ukrainian", "UA"),
+    ("ukraine", "UA"),
+    ("nigerian", "NG"),
+    ("nigeria", "NG"),
+    ("nollywood", "NG"),
+    ("serbian", "RS"),
+    ("serbia", "RS"),
+    ("estonian", "EE"),
+    ("estonia", "EE"),
+    ("cypriot", "CY"),
+    ("cyprus", "CY"),
+    ("algerian", "DZ"),
+    ("algeria", "DZ"),
+    ("uruguayan", "UY"),
+    ("uruguay", "UY"),
+    ("luxembourgish", "LU"),
+    ("luxembourg", "LU"),
+    ("dominican", "DO"),
+    ("dominican republic", "DO"),
+    ("afghan", "AF"),
+    ("afghanistan", "AF"),
+    ("belarusian", "BY"),
+    ("belarus", "BY"),
+    ("bolivian", "BO"),
+    ("bolivia", "BO"),
+    ("croatian", "HR"),
+    ("croatia", "HR"),
+    ("lithuanian", "LT"),
+    ("lithuania", "LT"),
+    ("bosnian", "BA"),
+    ("bosnia", "BA"),
+    ("yugoslav", "YU"),
+    ("yugoslavian", "YU"),
+    ("yugoslavia", "YU"),
+    ("pakistani", "PK"),
+    ("pakistan", "PK"),
+    ("albanian", "AL"),
+    ("albania", "AL"),
+    ("vietnamese", "VN"),
+    ("vietnam", "VN"),
+    ("jamaican", "JM"),
+    ("jamaica", "JM"),
+    ("burkinabe", "BF"),
+    ("burkina faso", "BF"),
+    ("malaysian", "MY"),
+    ("malaysia", "MY"),
+    ("palestinian", "PS"),
+    ("palestine", "PS"),
+    ("lebanese", "LB"),
+    ("lebanon", "LB"),
+    ("jordanian", "JO"),
+    ("azerbaijani", "AZ"),
+    ("azerbaijan", "AZ"),
+    ("botswana", "BW"),
+    ("ecuadorian", "EC"),
+    ("ecuador", "EC"),
+    ("armenian", "AM"),
+    ("armenia", "AM"),
+    ("congolese", "CD"),
+    ("congo", "CD"),
+    ("kazakh", "KZ"),
+    ("kazakhstan", "KZ"),
+    ("sri lankan", "LK"),
+    ("sri lanka", "LK"),
+    ("ivorian", "CI"),
+    ("ivory coast", "CI"),
+    ("senegalese", "SN"),
+    ("senegal", "SN"),
+    ("paraguayan", "PY"),
+    ("paraguay", "PY"),
+    ("singaporean", "SG"),
+    ("singapore", "SG"),
+    ("bangladeshi", "BD"),
+    ("bangladesh", "BD"),
+    ("cambodian", "KH"),
+    ("cambodia", "KH"),
+    ("maltese", "MT"),
+    ("malta", "MT"),
+    ("latvian", "LV"),
+    ("latvia", "LV"),
+    ("iraqi", "IQ"),
+    ("iraq", "IQ"),
+    ("bhutanese", "BT"),
+    ("bhutan", "BT"),
+    ("moroccan", "MA"),
+    ("morocco", "MA"),
+    ("libyan", "LY"),
+    ("libya", "LY"),
+    ("bahamian", "BS"),
+    ("bahamas", "BS"),
+    ("burmese", "MM"),
+    ("burma", "MM"),
+    ("myanmar", "MM"),
+    ("guatemalan", "GT"),
+    ("guatemala", "GT"),
+    ("ethiopian", "ET"),
+    ("ethiopia", "ET"),
+    ("montenegrin", "ME"),
+    ("montenegro", "ME"),
+    ("ugandan", "UG"),
+    ("uganda", "UG"),
+    ("panamanian", "PA"),
+    ("panama", "PA"),
+    ("kenyan", "KE"),
+    ("kenya", "KE"),
+    ("kyrgyz", "KG"),
+    ("kyrgyzstan", "KG"),
+    ("macedonian", "MK"),
+    ("macedonia", "MK"),
+    ("mozambican", "MZ"),
+    ("mozambique", "MZ"),
+    ("mauritian", "MU"),
+    ("mauritius", "MU"),
+    ("rwandan", "RW"),
+    ("rwanda", "RW"),
+    ("andorran", "AD"),
+    ("andorra", "AD"),
+    ("sudanese", "SD"),
+    ("sudan", "SD"),
+    ("ghanaian", "GH"),
+    ("ghana", "GH"),
+    ("cameroonian", "CM"),
+    ("cameroon", "CM"),
+    ("costa rican", "CR"),
+    ("costa rica", "CR"),
+    ("gambian", "GM"),
+    ("gambia", "GM"),
+    ("guinean", "GN"),
+    ("haitian", "HT"),
+    ("haiti", "HT"),
+    ("liechtenstein", "LI"),
+    ("monegasque", "MC"),
+    ("monaco", "MC"),
+    ("malian", "ML"),
+    ("mali", "ML"),
+    ("mongolian", "MN"),
+    ("mongolia", "MN"),
+    ("mauritanian", "MR"),
+    ("mauritania", "MR"),
+    ("nepali", "NP"),
+    ("nepalese", "NP"),
+    ("nepal", "NP"),
+    ("papua", "PG"),
+    ("papuan", "PG"),
+    ("puerto rican", "PR"),
+    ("puerto rico", "PR"),
+    ("qatari", "QA"),
+    ("qatar", "QA"),
+    ("saudi", "SA"),
+    ("saudi arabia", "SA"),
+    ("slovenian", "SI"),
+    ("slovene", "SI"),
+    ("slovenia", "SI"),
+    ("slovak", "SK"),
+    ("slovakia", "SK"),
+    ("syrian", "SY"),
+    ("syria", "SY"),
+    ("chadian", "TD"),
+    ("tajik", "TJ"),
+    ("tajikistan", "TJ"),
+    ("tunisian", "TN"),
+    ("tunisia", "TN"),
+    ("vatican", "VA"),
+    ("vanuatu", "VU"),
+    ("kosovar", "XK"),
+    ("kosovo", "XK"),
+    ("zambian", "ZM"),
+    ("zambia", "ZM"),
 ];
 
 #[cfg(test)]
@@ -546,6 +802,67 @@ mod tests {
         assert!(q.has_strong_facet());
         let q = FacetQuery::parse("batman movies");
         assert!(q.has_facet() && !q.has_strong_facet(), "a bare type is not a strong facet");
+    }
+
+    /// Every country code the corpus records a title as made in: the `countries` of the 38,669 records in
+    /// den-dataset's published facts file (`facts-c85c707b0b18.json`), first-listed and co-producers alike.
+    /// `DD` and `YU` are East Germany and Yugoslavia, which Wikidata keeps as their own countries.
+    const CORPUS_COUNTRIES: &[&str] = &[
+        "AD", "AE", "AF", "AL", "AM", "AR", "AT", "AU", "AZ", "BA", "BD", "BE", "BF", "BG", "BO", "BR", "BS",
+        "BT", "BW", "BY", "CA", "CD", "CH", "CI", "CL", "CM", "CN", "CO", "CR", "CU", "CY", "CZ", "DD", "DE",
+        "DK", "DO", "DZ", "EC", "EE", "EG", "ES", "ET", "FI", "FR", "GB", "GE", "GH", "GM", "GN", "GR", "GT",
+        "HK", "HR", "HT", "HU", "ID", "IE", "IL", "IN", "IQ", "IR", "IS", "IT", "JM", "JO", "JP", "KE", "KG",
+        "KH", "KP", "KR", "KZ", "LB", "LI", "LK", "LT", "LU", "LV", "LY", "MA", "MC", "ME", "MK", "ML", "MM",
+        "MN", "MR", "MT", "MU", "MX", "MY", "MZ", "NG", "NL", "NO", "NP", "NZ", "PA", "PE", "PG", "PH", "PK",
+        "PL", "PR", "PS", "PT", "PY", "QA", "RO", "RS", "RU", "RW", "SA", "SD", "SE", "SG", "SI", "SK", "SN",
+        "SY", "TD", "TH", "TJ", "TN", "TR", "TW", "UA", "UG", "US", "UY", "VA", "VE", "VN", "VU", "XK", "YU",
+        "ZA", "ZM",
+    ];
+
+    /// "bleak finnish 1980s films" dropped Finland: the table held 28 countries, so `finnish` went to the
+    /// plot vectors as prose. Every country a title can be recorded under must be sayable.
+    #[test]
+    fn every_corpus_country_can_be_named() {
+        // Georgia alone has no word: both of its names read as something else first.
+        let unnamed: Vec<&str> = CORPUS_COUNTRIES
+            .iter()
+            .copied()
+            .filter(|code| !COUNTRIES.iter().any(|(_, c)| c == code))
+            .collect();
+        assert_eq!(unnamed, vec!["GE"]);
+        for (word, code) in COUNTRIES {
+            assert!(CORPUS_COUNTRIES.contains(code), "{word} names {code}, which no title is made in");
+            assert!(COUNTRIES.iter().filter(|(w, _)| w == word).count() == 1, "{word} is listed twice");
+            assert_eq!(FacetQuery::parse(word).country, Some(*code), "{word}");
+            assert_eq!(FacetQuery::parse(word).leftover, "", "{word} is claimed whole");
+        }
+    }
+
+    #[test]
+    fn reads_demonyms_and_two_word_names() {
+        let q = FacetQuery::parse("bleak finnish 1980s films");
+        assert_eq!(
+            (q.country, q.decade, q.media_type, q.leftover.as_str()),
+            (Some("FI"), Some(1980), Some(MediaType::Movie), "bleak")
+        );
+        let country = |text: &str| {
+            let q = FacetQuery::parse(text);
+            (q.country, q.leftover)
+        };
+        // The pair wins over its second word, which alone names another country.
+        assert_eq!(country("north korean propaganda"), (Some("KP"), "propaganda".to_owned()));
+        assert_eq!(country("east german spy"), (Some("DD"), "spy".to_owned()));
+        assert_eq!(country("south korean thriller"), (Some("KR"), "thriller".to_owned()));
+        assert_eq!(country("hong kong action"), (Some("HK"), "action".to_owned()));
+        assert_eq!(country("films from new zealand"), (Some("NZ"), "from".to_owned()));
+        // A first word with no pair is still read on its own.
+        assert_eq!(country("south park"), (None, "south park".to_owned()));
+        assert_eq!(country("korean south"), (Some("KR"), "south".to_owned()));
+        // Words whose usual reading is not a country stay prose.
+        for word in ["english", "georgia", "georgian", "jordan", "chad", "cuba", "guinea", "kong"] {
+            assert_eq!(country(word), (None, word.to_owned()), "{word}");
+        }
+        assert_eq!(country("king kong"), (None, "king kong".to_owned()));
     }
 
     #[test]

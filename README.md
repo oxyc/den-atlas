@@ -107,7 +107,7 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /dataset.json` | the descriptor — what the dataset IS (`datasetVersion`, `taxonomyVersion`, `embeddingModel`, `dims`, `count`, `quantization`, `signature`, the `embed`/`queries` capability flags). It names no files to download; `503` when the dataset did not load |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
 | `GET /catalog/<movie\|series>/den-titles/search=<q>.json` | with `TITLE_SEARCH` on: fuzzy, typo-tolerant title search, `{id:"tmdb:<id>",type,name,moviedb_id}` metas, best 30 |
-| `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{taxonomyVersion,subgenres,moods}`, each list most-populated first |
+| `GET /index/taxonomy.json` | with `INDEX_QUERIES` on: `{schema,taxonomyVersion,subgenres,moods}`, each list most-populated first. Label names only, kept for the TV app's browse rows; `schema` points at `/index/schema.json`, which describes the dataset |
 | `GET /index/schema.json` | with `INDEX_QUERIES` on: the self-describing query fields, types, value counts and per-field coverage; every count names both its known-field and full-corpus denominators |
 | `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids,total,coverage}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100; `coverage` names the full corpus, selected-type denominator and known-field population |
 | `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours |
