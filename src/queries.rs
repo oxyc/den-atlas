@@ -911,6 +911,36 @@ mod tests {
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(7.0), Some(9000.0), false));
     }
 
+    /// `/recommend` read popularity from client hints alone, so every title from atlas's own lists scored no buzz.
+    /// TMDB's export fills it where it holds the title, IMDb's count (capped, and marked) where only that does, and a
+    /// hint is never overwritten.
+    #[tokio::test]
+    async fn recommend_reads_popularity_from_the_export_then_imdb_s_count() {
+        use crate::recommend::{attend, Candidate, Title};
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-attend-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        let export = TitleIndex::build(vec![TitleRecord {
+            tmdb_id: 2,
+            media_type: den_titlesearch::MediaType::Movie,
+            title: "Two".to_owned(),
+            popularity: 42.0,
+        }]);
+        let attended = |id, popularity| {
+            let title = Title { popularity, ..Title::default() };
+            let mut candidate = Candidate { key: (Movie, id), title, rank: None, arrival: None };
+            attend(&indexes, Some(&export), &mut candidate);
+            (candidate.title.popularity, candidate.title.popularity_from_votes)
+        };
+        assert_eq!(attended(2, None), (Some(42.0), false), "the export's own score");
+        let capped = crate::search::POPULAR_VOTES / crate::search::VOTES_PER_POPULARITY;
+        assert_eq!(attended(1, None), (Some(capped), true), "IMDb's 9,000 votes, capped at fully popular");
+        assert_eq!(attended(2, Some(7.0)), (Some(7.0), false), "a hint stands");
+        assert_eq!(attended(3, None), (None, false), "neither source knows it");
+    }
+
     /// A one-line `title.ratings` dump naming the fixture's movie 1, joined onto its store.
     fn dump(ds: &Dataset) -> crate::ratings::RatingsIndex {
         let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");

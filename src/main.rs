@@ -1,6 +1,7 @@
 //! den-atlas — the Rust serving layer (RUST-1). Streams the derived dataset from disk with the full caching
 //! layer (ETag / Range / gzip / conditional). Data is mounted at `DATA_DIR` (default `data/`).
 
+mod billboardcheck;
 mod cache;
 mod catalog;
 mod config;
@@ -254,6 +255,9 @@ async fn main() {
         if command == "rail-eval" {
             std::process::exit(raileval::run(std::path::Path::new(path)));
         }
+        if command == "billboard-check" {
+            std::process::exit(billboardcheck::run(std::path::Path::new(path)).await);
+        }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
     // dataset.meta.json must not crash-loop the addon. Keep serving; the dataset routes report 503 and
@@ -465,7 +469,8 @@ async fn replay(dir: &str, path: &str) -> i32 {
         Ok((indexes, _)) => indexes,
         Err(e) => return fail(format!("indexes: {e}")),
     };
-    let answer = recommend::answer(&indexes, &request, &lists, now);
+    // Without TMDB's export or IMDb's ratings, which serving downloads: `billboard-check` fetches both.
+    let answer = recommend::answer(&indexes, None, &request, &lists, now);
     println!("{}", recommend::summary(&indexes, &request, &answer));
     for (at, slide) in answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
         println!("{:>3}. {}", at + 1, recommend::describe(&indexes, slide));
