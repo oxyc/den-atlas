@@ -8,6 +8,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
+# Compiled in (`raileval.rs`): the playground scores its knobs against the judged set.
+COPY judged/rail.json ./judged/rail.json
 # rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
 RUN cargo build --release --locked
 

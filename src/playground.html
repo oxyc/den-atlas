@@ -84,6 +84,21 @@
        <code>/index/suggest</code> can only exclude titles.</p>
   </section>
 
+  <section>
+    <div class="row">
+      <button type="button" id="judge">Score on the judged set</button>
+      <span id="judged-status" class="muted"></span>
+    </div>
+    <p>These knobs against the hand-judged cases (<code>judged/rail.json</code>), at k = 10, beside production.
+       The headline is the <b>dev</b> half: tune on it. The test half exists to confirm a change once, when
+       you are done — read it every time and you are tuning on it too.</p>
+    <div id="judged"></div>
+    <details id="test-half">
+      <summary>Test half — read once</summary>
+      <div id="judged-test"></div>
+    </details>
+  </section>
+
   <p id="status" class="muted"></p>
   <p id="error" class="error"></p>
   <div class="scroll"><table id="out"></table></div>
@@ -194,6 +209,37 @@ function render(a, type) {
     : "";
 }
 
+// One half's mean and cases, tuned against production.
+function halfHtml(j, half) {
+  const m = j[half];
+  const delta = (t, p) => {
+    const d = t - p;
+    return d === 0 ? "" : ` <span class=${d > 0 ? "up" : "down"}>${d > 0 ? "+" : ""}${fmt(d)}</span>`;
+  };
+  let html = `<p><b>${half} nDCG@${j.k} ${fmt(m.tuned.ndcg)}</b>${delta(m.tuned.ndcg, m.production.ndcg)} ` +
+    `<span class=muted>(production ${fmt(m.production.ndcg)}; n=${m.n})</span> · ` +
+    `nDCG' ${fmt(m.tuned.condensed)}${delta(m.tuned.condensed, m.production.condensed)} · ` +
+    `P ${fmt(m.tuned.precision, 2)} · bad ${m.tuned.bad} <span class=muted>(production ${m.production.bad})</span></p>`;
+  html += "<div class=scroll><table><thead><tr><th class=title>seed</th><th>nDCG</th><th>prod</th>" +
+    "<th>nDCG'</th><th>P</th><th>bad</th><th>judged</th></tr></thead><tbody>";
+  for (const c of j.cases.filter((c) => c.split === half)) {
+    html += `<tr><td class=title>${esc(c.title)}</td><td>${fmt(c.tuned.ndcg)}${delta(c.tuned.ndcg, c.production.ndcg)}</td>` +
+      `<td class=muted>${fmt(c.production.ndcg)}</td><td>${fmt(c.tuned.condensed)}</td>` +
+      `<td>${fmt(c.tuned.precision, 2)}</td><td>${c.tuned.bad}</td><td>${c.tuned.judged}</td></tr>`;
+  }
+  return html + "</tbody></table></div>";
+}
+
+async function judge() {
+  $("judged-status").textContent = "Scoring…";
+  const resp = await fetch(`${base}/judged.json?${new URLSearchParams(changed())}`);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) { $("judged-status").textContent = body.detail || body.error || resp.status; return; }
+  $("judged-status").textContent = body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters";
+  $("judged").innerHTML = halfHtml(body, "dev");
+  $("judged-test").innerHTML = halfHtml(body, "test");
+}
+
 async function start() {
   const resp = await fetch(`${base}/params.json`);
   const p = await resp.json();
@@ -211,6 +257,7 @@ async function start() {
 
 $("seed").addEventListener("submit", (e) => { e.preventDefault(); rank(); });
 $("reset").addEventListener("click", () => { buildKnobs({}); if ($("id").value) rank(); });
+$("judge").addEventListener("click", () => { judge().catch((e) => { $("judged-status").textContent = String(e); }); });
 for (const b of document.querySelectorAll("[data-a]")) {
   b.addEventListener("click", () => {
     const [type, id] = b.dataset.a.split("/");
