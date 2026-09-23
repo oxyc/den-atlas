@@ -1110,6 +1110,7 @@ async fn query_answer(
     {
         parsed.set_broadcaster(qid);
     }
+    let (ignored, unknown) = query_unapplied(&indexes, query);
     let parsed_in = parsing.elapsed();
     let embedding = Instant::now();
     let unembedded = |e: String| eprintln!("search query left unembedded: {e}");
@@ -1125,7 +1126,7 @@ async fn query_answer(
     let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());
     let body = tokio::task::spawn_blocking(move || {
-        crate::search::answer(
+        let mut answer = crate::search::answer(
             &indexes,
             titles.as_deref(),
             &parsed,
@@ -1133,8 +1134,12 @@ async fn query_answer(
             vector.as_deref(),
             skip,
             limit,
-        )
-        .to_string()
+        );
+        answer["ignored"] = serde_json::json!(ignored);
+        if !unknown.is_empty() {
+            answer["unknownValues"] = serde_json::json!(unknown);
+        }
+        answer.to_string()
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1145,6 +1150,55 @@ async fn query_answer(
         ms(answering.elapsed())
     );
     Ok((body, timing, unembedded))
+}
+
+/// Every parameter `/index/query.json` reads.
+const QUERY_PARAMS: [&str; 9] =
+    ["q", "type", "skip", "limit", "year_min", "year_max", "language", "runtime_max", "broadcaster"];
+
+/// What a query's parameters asked for and the answer does not reflect, as the filter routes report it:
+/// `ignored` names each parameter the route does not read or could not read (`country=FI`, `type=film`,
+/// `year_min=soon`, a three-letter `language`), and `unknownValues` a language no title is in, which still
+/// filters and so leaves only the titles with no language on record. Without these a caller that sent
+/// `country=FI` gets an answer that looks like Finland's.
+fn query_unapplied(indexes: &crate::queries::Indexes, query: &str) -> (Vec<String>, Vec<String>) {
+    let mut ignored: Vec<String> = Vec::new();
+    let mut ignore = |key: &str| {
+        if !ignored.iter().any(|k| k == key) {
+            ignored.push(key.to_owned());
+        }
+    };
+    for key in query.split('&').filter(|kv| !kv.is_empty()).map(|kv| kv.split('=').next().unwrap_or(kv)) {
+        if !QUERY_PARAMS.contains(&key) {
+            ignore(key);
+        }
+    }
+    let unread = |key: &str, reads: fn(&str) -> bool| query_param(query, key).is_some_and(|v| !reads(&v));
+    let number = |v: &str| v.parse::<u64>().is_ok();
+    for (key, reads) in [
+        ("type", (|v: &str| index_media_type(v).is_some()) as fn(&str) -> bool),
+        ("skip", number),
+        ("limit", number),
+        ("year_min", |v| v.parse::<u16>().is_ok()),
+        ("year_max", |v| v.parse::<u16>().is_ok()),
+        ("language", |v| v.len() == 2),
+        ("runtime_max", |v| v.parse::<u32>().is_ok()),
+        ("broadcaster", |v| v.trim_start_matches(['Q', 'q']).parse::<u32>().is_ok()),
+    ] {
+        if unread(key, reads) {
+            ignore(key);
+        }
+    }
+    let mut unknown = Vec::new();
+    if let (Some(code), Some(facets)) =
+        (query_param(query, "language").filter(|c| c.len() == 2), indexes.facets.as_ref())
+    {
+        let code = code.to_ascii_lowercase();
+        if !facets.value_counts("language").iter().any(|(language, _)| *language == code) {
+            unknown.push(format!("language:{code}"));
+        }
+    }
+    (ignored, unknown)
 }
 
 /// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
@@ -2733,6 +2787,66 @@ mod tests {
         assert_eq!(plain["coverage"]["fields"], serde_json::json!({}));
         assert_eq!(plain["coverage"]["denominator"], 12);
         assert_eq!(plain["coverage"]["mediaType"], serde_json::Value::Null);
+        assert_eq!(plain["ignored"], serde_json::json!([]));
+        assert!(plain.get("unknownValues").is_none(), "{plain}");
+    }
+
+    /// A parameter the route does not read, or one whose value it cannot use, is named rather than dropped in
+    /// silence: `country=FI` is not a parameter, and an answer that looked like Finland's would be wrong. A
+    /// language no title is in still filters, so it is named too: what is left is the titles with none on record.
+    #[tokio::test]
+    async fn a_search_names_the_parameters_it_did_not_apply() {
+        let state = index_state("den-atlas-query-ignored");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let unread = json(
+            body_of(
+                get(
+                    &state,
+                    "/index/query.json?q=zzzz&country=FI&decade=1980&type=film&year_min=soon&language=fin",
+                )
+                .await,
+            )
+            .await,
+        );
+        assert_eq!(
+            unread["ignored"],
+            serde_json::json!(["country", "decade", "type", "year_min", "language"])
+        );
+        assert!(unread.get("unknownValues").is_none(), "{unread}");
+
+        let nowhere = json(body_of(get(&state, "/index/query.json?q=zzzz&language=ZZ&limit=5").await).await);
+        assert_eq!(nowhere["ignored"], serde_json::json!([]));
+        assert_eq!(nowhere["unknownValues"], serde_json::json!(["language:zz"]));
+        assert_eq!(
+            nowhere["coverage"]["fields"]["language"]["applied"], "filter",
+            "still applied, and named"
+        );
+    }
+
+    /// A hit the corpus has no card for is named from TMDB's export, and says so; a carded hit does not.
+    #[tokio::test]
+    async fn a_search_hit_named_by_tmdb_says_so() {
+        use den_titlesearch::{MediaType, TitleIndex, TitleRecord};
+        let Ok(mut state) = Arc::try_unwrap(index_state("den-atlas-query-title-from")) else {
+            unreachable!()
+        };
+        let record = |tmdb_id, title: &str| TitleRecord {
+            tmdb_id,
+            media_type: MediaType::Movie,
+            title: title.into(),
+            popularity: 50.0,
+        };
+        let index = TitleIndex::build(vec![record(1, "One"), record(999, "Zanzibar Zephyr")]);
+        state.titles = Some(Arc::new(crate::titles::TitleSearch::with_index(index)));
+        let state = Arc::new(state);
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let answer = json(body_of(get(&state, "/index/query.json?q=zanzibar+zephyr").await).await);
+        let hits = answer["hits"].as_array().unwrap();
+        let named = hits.iter().find(|h| h["id"] == 999).unwrap_or_else(|| panic!("{answer}"));
+        assert_eq!((&named["title"], &named["titleFrom"]), (&"Zanzibar Zephyr".into(), &"tmdb".into()));
+        let carded = json(body_of(get(&state, "/index/query.json?q=one").await).await);
+        let one = carded["hits"].as_array().unwrap().iter().find(|h| h["id"] == 1).unwrap();
+        assert!(one.get("titleFrom").is_none(), "{one}");
     }
 
     /// Every route the schema lists with an example resolves, so the document cannot advertise a path the router

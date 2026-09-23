@@ -196,6 +196,17 @@ impl Spec {
             VALUES_LIMIT
         }
     }
+
+    /// Whether its values are TMDB's (`tmdb.rs`): the rating provider's averages and the credits' character
+    /// names, which may filter and sort here but may not reach a model.
+    fn tmdbs(&self) -> bool {
+        matches!(self.data, Data::Rating | Data::Character)
+    }
+}
+
+/// The kinds whose values are TMDB's, as the schema's `tmdb` names them.
+pub fn tmdb_kinds() -> Vec<&'static str> {
+    SPECS.iter().filter(|spec| spec.tmdbs()).map(|spec| spec.name).collect()
 }
 
 /// An entity kind: the store's entity-list sections it reads, the fewest titles a value needs to be listed,
@@ -753,6 +764,10 @@ fn has(bits: &[u64], row: usize) -> bool {
 
 fn and_count(a: &[u64], b: &[u64]) -> usize {
     a.iter().zip(b).map(|(x, y)| (x & y).count_ones() as usize).sum()
+}
+
+fn popcount(bits: &[u64]) -> usize {
+    bits.iter().map(|w| w.count_ones() as usize).sum()
 }
 
 fn ones(bits: &[u64]) -> impl Iterator<Item = usize> + '_ {
@@ -1432,9 +1447,14 @@ impl<'a> Context<'a> {
         matched
     }
 
+    /// The titles of the route's type (of both, under `all`): what `total` and every coverage is out of.
+    fn population(&self) -> usize {
+        popcount(&self.filter.types[self.t()])
+    }
+
     /// How much of the route type each applied kind is known for.
     fn coverage(&self, applied: &[(&'static Spec, &Item)]) -> Value {
-        let population = self.filter.types[self.t()].iter().map(|w| w.count_ones() as usize).sum::<usize>();
+        let population = self.population();
         let mut out = Map::new();
         for (spec, item) in applied {
             if out.contains_key(spec.name) {
@@ -1552,7 +1572,11 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        let mut answer = json!({ "mode": spec.mode.name(), "complete": complete, "values": values });
+        // What the values are counted out of: the selection, or for a one-pick kind with its pick made, the
+        // selection without that pick — so `tone.values.comic` may exceed `total`.
+        let mut answer = json!({
+            "mode": spec.mode.name(), "complete": complete, "values": values, "denominator": popcount(base),
+        });
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
         }
@@ -1636,7 +1660,9 @@ impl<'a> Context<'a> {
     pub fn counts(&self, request: &Request) -> (Value, bool) {
         let (applied, ignored) = self.split(&request.items);
         let (kinds, total) = self.kinds(&applied);
-        let mut answer = json!({ "total": total, "kinds": kinds, "coverage": self.coverage(&applied) });
+        let mut answer = json!({
+            "total": total, "denominator": self.population(), "kinds": kinds, "coverage": self.coverage(&applied),
+        });
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
@@ -1669,7 +1695,8 @@ impl<'a> Context<'a> {
             None => Vec::new(),
         };
         let mut answer = json!({
-            "titles": titles, "total": total, "order": order_id, "coverage": self.coverage(&applied),
+            "titles": titles, "total": total, "denominator": self.population(), "order": order_id,
+            "coverage": self.coverage(&applied),
         });
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
@@ -1785,8 +1812,10 @@ impl<'a> Context<'a> {
                 value
             })
             .collect();
-        let mut answer =
-            json!({ "kind": spec.name, "mode": spec.mode.name(), "values": values, "complete": complete });
+        let mut answer = json!({
+            "kind": spec.name, "mode": spec.mode.name(), "values": values, "complete": complete,
+            "denominator": popcount(&base),
+        });
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
@@ -1819,6 +1848,9 @@ pub fn schema() -> Value {
             if spec.data == Data::Character {
                 about["minPrefix"] = json!(CHARACTER_MIN_PREFIX);
                 about["maxResults"] = json!(CHARACTER_LIMIT);
+            }
+            if spec.tmdbs() {
+                about["source"] = json!("tmdb");
             }
             (spec.name.to_owned(), about)
         })
@@ -1947,6 +1979,28 @@ mod tests {
         assert_eq!(picked["kinds"]["decade"]["selected"], json!(["1980"]));
         // An AND kind counts under the whole selection.
         assert_eq!(picked["kinds"]["country"]["values"], json!({ "DK": 1, "KR": 1 }));
+        // Each count is out of the titles it was counted among, which the answer names: the decade's out of
+        // the two Korean films, everything else out of the one Korean film of the 1980s, and total out of the
+        // three films.
+        assert_eq!(picked["kinds"]["decade"]["denominator"], 2);
+        assert_eq!(picked["kinds"]["country"]["denominator"], 1);
+        assert_eq!(picked["denominator"], 3);
+    }
+
+    /// Every filter answer names what its counts are out of, the empty selection's too, where no coverage would.
+    #[test]
+    fn every_filter_answer_names_its_denominator() {
+        let indexes = fixture("denominator");
+        let context = Context::new(&indexes, Scope::Type(Movie), None);
+        let empty = counts(&indexes, Movie, "");
+        assert_eq!((&empty["denominator"], &empty["coverage"]), (&3.into(), &json!({})));
+        assert_eq!(empty["kinds"]["country"]["denominator"], 3);
+        let titles = context.titles(&request(Route::Titles, "sel=country:KR")).0;
+        assert_eq!((&titles["total"], &titles["denominator"]), (&2.into(), &3.into()));
+        let spec = spec("country").unwrap();
+        let values = context.values(spec, &request(Route::Values(spec), "sel=decade:1980")).0;
+        assert_eq!(values["denominator"], 2, "the two films of the 1980s");
+        assert_eq!(counts(&indexes, Tv, "")["denominator"], 1, "the one series with a card");
     }
 
     /// An exclusion keeps the titles KNOWN not to carry the value, and every answer says how much of the
