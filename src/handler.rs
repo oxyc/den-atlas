@@ -858,22 +858,7 @@ impl IndexQuestion {
                     "coverage": crate::schema::row_coverage(indexes, *media_type, &constraints),
                 })
             }
-            Self::Similar { media_type, tmdb_id } => {
-                // The row is computed once and memoised, so a later page is a slice rather than a rescore.
-                // `skip`/`limit` because the rail is scrolled: a fixed twenty where hundreds exist reads as
-                // broken. Absent both, the answer is the first screenful, which is what every existing
-                // caller already expects.
-                // Typed, as `/index/search` answers: a row may mix films and series.
-                let row = indexes.more_like_this(*tmdb_id, *media_type);
-                let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
-                let limit = query_param(query, "limit")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(SIMILAR_PAGE)
-                    .min(den_index::MAX_ROW);
-                let page: Vec<(u32, den_index::MediaType)> =
-                    row.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
-                serde_json::json!({"titles": titles_json(&page), "total": row.len()})
-            }
+            Self::Similar { media_type, tmdb_id } => similar_json(indexes, *media_type, *tmdb_id, query),
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
                 let k = query_param(query, "k")
@@ -914,6 +899,38 @@ impl IndexQuestion {
         };
         body.to_string()
     }
+}
+
+/// `/index/similar`'s answer. The row is computed once and memoised, so a later page is a slice rather than
+/// a rescore. `skip`/`limit` because the rail is scrolled: a fixed twenty where hundreds exist reads as
+/// broken. Absent both, the answer is the first screenful, which is what every existing caller already
+/// expects.
+///
+/// `ids` and `total` are the seed type's row, exactly as they have always been, and every client reads them.
+/// `mixed` and `mixedTotal` sit beside them, never instead: the row with films and series mixed, typed, paged
+/// the same way.
+pub(crate) fn similar_json(
+    indexes: &crate::queries::Indexes,
+    media_type: den_index::MediaType,
+    tmdb_id: u32,
+    query: &str,
+) -> serde_json::Value {
+    let row = indexes.more_like_this(tmdb_id, media_type);
+    let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = query_param(query, "limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SIMILAR_PAGE)
+        .min(den_index::MAX_ROW);
+    let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
+    let mixed = indexes.more_like_this_mixed(tmdb_id, media_type);
+    let mixed_page: Vec<(u32, den_index::MediaType)> =
+        mixed.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
+    serde_json::json!({
+        "ids": page,
+        "total": row.len(),
+        "mixed": titles_json(&mixed_page),
+        "mixedTotal": mixed.len(),
+    })
 }
 
 /// A Stremio type in a path, as the index names it.
@@ -1288,9 +1305,9 @@ fn answer_score(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_
     Ok(serde_json::json!({ "space": space, "scores": scores }))
 }
 
-/// `{"seeds","exclude"?,"limit"?}` → More Like This for each seed (typed titles, films and series alike), minus
-/// the seeds and the excluded titles, and those lists pooled in seed order — the atlas half of Because you
-/// watched and You Might Also Like; the client blends in TMDB's.
+/// `{"seeds","exclude"?,"limit"?}` → More Like This for each seed (ids of the seed's type), minus the seeds and
+/// the excluded titles, and those lists pooled in seed order — the atlas half of Because you watched and You
+/// Might Also Like; the client blends in TMDB's.
 fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_json::Value, String> {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -1308,30 +1325,38 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     excluded.extend(seeds.iter().copied());
     let limit = body.limit.unwrap_or(SUGGEST_LIMIT).min(MAX_TITLES);
     let (per_seed, pooled) = suggest_pool(&seeds, &excluded, limit, |id, media_type| {
-        indexes.more_like_this(id, media_type).iter().map(|&(media, id)| (id, media)).collect()
+        indexes.more_like_this(id, media_type).to_vec()
+    });
+    // Beside the fields every client reads, never instead of them: the same pooling over the rows that mix
+    // films and series.
+    let (mixed, pooled_mixed) = suggest_pool_mixed(&seeds, &excluded, limit, |id, media_type| {
+        indexes.more_like_this_mixed(id, media_type).iter().map(|&(media, id)| (id, media)).collect()
     });
     let per_seed: Vec<serde_json::Value> = per_seed
         .iter()
-        .map(|(seed, titles)| {
-            serde_json::json!({ "seed": titles_json(&[*seed])[0], "titles": titles_json(titles) })
+        .zip(&mixed)
+        .map(|((seed, ids), (_, mixed))| {
+            serde_json::json!({ "seed": titles_json(&[*seed])[0], "ids": ids, "mixed": titles_json(mixed) })
         })
         .collect();
-    Ok(serde_json::json!({ "perSeed": per_seed, "pooled": titles_json(&pooled) }))
+    Ok(serde_json::json!({
+        "perSeed": per_seed,
+        "pooled": titles_json(&pooled),
+        "pooledMixed": titles_json(&pooled_mixed),
+    }))
 }
 
 /// A title as a request names it: its TMDB id and type.
 type TitleKey = (u32, den_index::MediaType);
 
-/// Each seed's More Like This (`row`) minus the excluded titles, and those rows pooled in seed order up to
-/// `limit` — You Might Also Like. The playground pools its tuned rows through this too.
-pub(crate) type SuggestPool = (Vec<(TitleKey, Vec<TitleKey>)>, Vec<TitleKey>);
-
-pub(crate) fn suggest_pool(
+/// `suggest_pool` over rows that may mix films and series: each seed's row minus the excluded titles, and
+/// those rows pooled in seed order up to `limit`.
+pub(crate) fn suggest_pool_mixed(
     seeds: &[TitleKey],
     excluded: &std::collections::HashSet<TitleKey>,
     limit: usize,
     row: impl Fn(u32, den_index::MediaType) -> Vec<TitleKey>,
-) -> SuggestPool {
+) -> (Vec<(TitleKey, Vec<TitleKey>)>, Vec<TitleKey>) {
     let per_seed: Vec<(TitleKey, Vec<TitleKey>)> = seeds
         .iter()
         .map(|&(id, media_type)| {
@@ -1340,11 +1365,40 @@ pub(crate) fn suggest_pool(
         })
         .collect();
     let mut seen = std::collections::HashSet::new();
+    let pooled: Vec<TitleKey> = per_seed
+        .iter()
+        .flat_map(|(_, titles)| titles)
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .take(limit)
+        .collect();
+    (per_seed, pooled)
+}
+
+/// Each seed's More Like This (`row`) minus the excluded titles, and those rows pooled in seed order up to
+/// `limit` — You Might Also Like. The playground pools its tuned rows through this too.
+pub(crate) type SuggestPool =
+    (Vec<((u32, den_index::MediaType), Vec<u32>)>, Vec<(u32, den_index::MediaType)>);
+
+pub(crate) fn suggest_pool(
+    seeds: &[(u32, den_index::MediaType)],
+    excluded: &std::collections::HashSet<(u32, den_index::MediaType)>,
+    limit: usize,
+    row: impl Fn(u32, den_index::MediaType) -> Vec<u32>,
+) -> SuggestPool {
+    let per_seed: Vec<((u32, den_index::MediaType), Vec<u32>)> = seeds
+        .iter()
+        .map(|&(id, media_type)| {
+            let ids = row(id, media_type).into_iter().filter(|&n| !excluded.contains(&(n, media_type)));
+            ((id, media_type), ids.collect())
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
     let mut pooled = Vec::new();
-    'pool: for (_, titles) in &per_seed {
-        for &title in titles {
-            if seen.insert(title) {
-                pooled.push(title);
+    'pool: for &((_, media_type), ref ids) in &per_seed {
+        for &id in ids {
+            if seen.insert((id, media_type)) {
+                pooled.push((id, media_type));
                 if pooled.len() == limit {
                     break 'pool;
                 }
@@ -2142,9 +2196,10 @@ mod tests {
         assert_eq!(tuned.headers()["cache-control"], "no-store");
         let tuned = json(body_of(tuned).await);
         let production = json(body_of(get(&on, "/index/similar/movie/1.json?limit=200").await).await);
+        // The playground ranks the mixed row, as `mixed` serves it.
         let keys: Vec<&serde_json::Value> =
             tuned["titles"].as_array().unwrap().iter().map(|t| &t["key"]).collect();
-        let served: Vec<String> = production["titles"]
+        let served: Vec<String> = production["mixed"]
             .as_array()
             .unwrap()
             .iter()
@@ -2303,42 +2358,52 @@ mod tests {
             ("/index/rows/series/subgenre/Heist.json", serde_json::json!([4])),
             ("/index/rows/movie/subgenre/Campy%2FCult.json", serde_json::json!([3])),
             ("/index/rows/movie/mood/Tense.json", serde_json::json!([1])),
+            // The POOLED scorer, which is the only one now: the store is the dataset, so there is no
+            // store-less arm left for a fixture to fall into. Movie 2 leads — it is a strong PLOT
+            // neighbour (90,10,0 against 100,0,0) and shares movie 1's Drama, where movie 3 is a premise
+            // neighbour in another genre. Drawing candidates from both spaces is the whole point of
+            // pooling; the pre-pooled scorer drew them from the premise index alone and answered 3, 2.
+            ("/index/similar/movie/1.json", serde_json::json!([2, 3])),
+            // The rail is scrolled, so it pages. Absent both params it answers the first screenful, which
+            // is what every existing caller expects.
+            ("/index/similar/movie/1.json?skip=1", serde_json::json!([3])),
+            ("/index/similar/movie/1.json?limit=1", serde_json::json!([2])),
+            ("/index/similar/movie/1.json?skip=1&limit=1", serde_json::json!([3])),
+            ("/index/similar/movie/1.json?skip=99", serde_json::json!([])),
         ] {
             let answer = json(body_of(get(&state, path).await).await);
             assert_eq!(answer["ids"], want, "{path}");
-            // Titles of that type in the CORPUS: three movies, nine series. It used to read 1 for series,
-            // because the denominator came from `facets.bin` and that blob described four of the twelve
-            // titles — so "1 of 1 series is a heist" where the honest answer is 1 of 9.
-            let denominator = if path.contains("/series/") { 9 } else { 3 };
-            assert_eq!(answer["coverage"]["denominator"], denominator, "{path}");
+            if path.starts_with("/index/similar/") {
+                // `total` is the whole row, not the page, so a client knows whether to keep scrolling.
+                assert_eq!(answer["total"], 2, "{path}");
+            }
+            if path.starts_with("/index/rows/") {
+                // Titles of that type in the CORPUS: three movies, nine series. It used to read 1 for
+                // series, because the denominator came from `facets.bin` and that blob described four of
+                // the twelve titles — so "1 of 1 series is a heist" where the honest answer is 1 of 9.
+                let denominator = if path.contains("/series/") { 9 } else { 3 };
+                assert_eq!(answer["coverage"]["denominator"], denominator, "{path}");
+            }
         }
 
-        // The POOLED scorer, which is the only one now: the store is the dataset, so there is no store-less
-        // arm left for a fixture to fall into. Movie 2 leads movie 3 — it is a strong PLOT neighbour
-        // (90,10,0 against 100,0,0) and shares movie 1's Drama, where movie 3 is a premise neighbour in
-        // another genre; the pre-pooled scorer drew from the premise index alone and answered 3, 2. The row
-        // mixes films and series and says which each is: series 4 has movie 1's own vectors, and the eight
-        // blank series carry no labels to gate them on.
+        // Beside `ids`, the row mixing films and series, typed and paged the same way: series 4 has movie 1's
+        // own vectors, and the eight blank series carry no labels to gate them on. Its films keep the order
+        // `ids` gives them.
         let typed = |keys: &[(&str, u32)]| -> serde_json::Value {
             keys.iter().map(|&(kind, id)| serde_json::json!({ "type": kind, "id": id })).collect()
         };
-        let row: Vec<(&str, u32)> = [("series", 4), ("movie", 2), ("movie", 3)]
+        let mixed: Vec<(&str, u32)> = [("series", 4), ("movie", 2), ("movie", 3)]
             .into_iter()
             .chain((101..=108).map(|id| ("series", id)))
             .collect();
         for (path, want) in [
-            ("/index/similar/movie/1.json", &row[..]),
-            // The rail is scrolled, so it pages. Absent both params it answers the first screenful, which is
-            // what every existing caller expects.
-            ("/index/similar/movie/1.json?skip=1", &row[1..]),
-            ("/index/similar/movie/1.json?limit=1", &row[..1]),
-            ("/index/similar/movie/1.json?skip=1&limit=1", &row[1..2]),
+            ("/index/similar/movie/1.json", &mixed[..]),
+            ("/index/similar/movie/1.json?skip=1&limit=1", &mixed[1..2]),
             ("/index/similar/movie/1.json?skip=99", &[][..]),
         ] {
             let answer = json(body_of(get(&state, path).await).await);
-            assert_eq!(answer["titles"], typed(want), "{path}");
-            // `total` is the whole row, not the page, so a client knows whether to keep scrolling.
-            assert_eq!(answer["total"], row.len(), "{path}");
+            assert_eq!(answer["mixed"], typed(want), "{path}");
+            assert_eq!(answer["mixedTotal"], mixed.len(), "{path}");
         }
         assert!(body_of(get(&state, "/dataset.json").await).await.contains(r#""queries":true"#));
     }
@@ -2940,17 +3005,10 @@ mod tests {
         let top = json(body_of(get(&state, "/index/filter/movie/titles.json").await).await);
         assert_eq!(ids(&top), vec![2, 1, 3], "no selection: most voted first");
 
-        // More like movie 1, in its own order and of the route's type only, and within it only the comedy.
+        // More like movie 1, in its own order, and within it only the comedy.
         let like = json(body_of(get(&state, "/index/filter/movie/titles.json?sel=like:1").await).await);
         let similar = json(body_of(get(&state, "/index/similar/movie/1.json?limit=200").await).await);
-        let films: Vec<&serde_json::Value> = similar["titles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|t| t["type"] == "movie")
-            .map(|t| &t["id"])
-            .collect();
-        assert_eq!(serde_json::json!(ids(&like)), serde_json::json!(films), "the similar set, in its order");
+        assert_eq!(serde_json::json!(ids(&like)), similar["ids"], "the similar set, in similarity order");
         assert_eq!(like["order"], "like:1");
         let comedy =
             json(body_of(get(&state, "/index/filter/movie/titles.json?sel=genre:35,like:1").await).await);
@@ -3312,18 +3370,19 @@ mod tests {
         );
         assert_eq!(premise["space"], "premise");
 
-        // Typed, since a row mixes films and series; the excluded titles are gone whatever their type.
-        let suggest = r#"{"seeds":[{"type":"movie","id":1}],
-                          "exclude":[{"type":"movie","id":2},{"type":"series","id":4}],"limit":2}"#;
+        let suggest = r#"{"seeds":[{"type":"movie","id":1}],"exclude":[{"type":"movie","id":2}]}"#;
         let suggest = json(body_of(post(&state, "/index/suggest.json", suggest).await).await);
         assert_eq!(suggest["perSeed"][0]["seed"], serde_json::json!({"type": "movie", "id": 1}));
-        let titles = suggest["perSeed"][0]["titles"].as_array().unwrap();
-        assert_eq!(titles[0], serde_json::json!({"type": "movie", "id": 3}));
-        assert!(!titles.iter().any(|t| t["id"] == 2 || t["id"] == 4), "{titles:?}");
+        assert_eq!(suggest["perSeed"][0]["ids"], serde_json::json!([3]));
+        assert_eq!(suggest["pooled"], serde_json::json!([{"type": "movie", "id": 3}]));
+        // Beside them, the mixed rows: series too, the excluded title still gone.
+        let mixed = suggest["perSeed"][0]["mixed"].as_array().unwrap();
         assert_eq!(
-            suggest["pooled"],
-            serde_json::json!([{"type": "movie", "id": 3}, {"type": "series", "id": 101}])
+            mixed[..2],
+            [serde_json::json!({"type": "series", "id": 4}), serde_json::json!({"type": "movie", "id": 3})]
         );
+        assert!(!mixed.iter().any(|t| t["type"] == "movie" && t["id"] == 2), "{mixed:?}");
+        assert_eq!(suggest["pooledMixed"][0], serde_json::json!({"type": "series", "id": 4}));
 
         assert_eq!(post(&state, "/index/labels.json", "not json").await.status(), 400);
         assert_eq!(post(&state, "/index/score.json", r#"{"space":"x","candidates":[]}"#).await.status(), 400);
