@@ -68,7 +68,7 @@ pub struct Indexes {
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
     pub display: Option<TitleIndex>,
     /// More Like This answers already worked out, by title (`Indexes::more_like_this`).
-    similar: Mutex<HashMap<Key, Arc<[u32]>>>,
+    similar: Mutex<HashMap<Key, Arc<[Key]>>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -107,10 +107,12 @@ impl Indexes {
     /// not small variations of each other: the original draws candidates from the premise index alone, so a
     /// plot neighbour can never enter the row — measured on The Wire, its plot top-20 and premise top-40 do
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
-    pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
+    ///
+    /// Typed: a row may mix films and series (`SimilarParams::mix_types`).
+    pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
         memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
             let production = den_index::SimilarParams::default();
-            self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.tmdb_id).collect()
+            self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
         })
     }
 
@@ -144,12 +146,7 @@ impl Indexes {
             .tuned(params);
         // Without the credit lists the rail ranks without authorship. The facts read the same lists, so a
         // store missing them also reaches `/health` as `facts_unusable`.
-        let characters: Vec<(u32, f64)> = self
-            .character_links(media_type, tmdb_id)
-            .into_iter()
-            .filter(|&((media, _), _)| media == media_type)
-            .map(|((_, id), strength)| (id, strength))
-            .collect();
+        let characters = self.character_links(media_type, tmdb_id);
         let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
             .ok()
             .map(|authorship| authorship.with_characters(characters));
@@ -1166,24 +1163,26 @@ mod tests {
         let (mut seeds, mut shares, mut nominated) = (0, 0, 0);
         for &(media, id, seed) in records.iter().step_by(100) {
             let columns = den_index::SeedAuthorship::of(&view, media, id).expect("the credit lists read");
-            let siblings: Vec<u32> = records
+            // Siblings of either type: a mixed row nominates both.
+            let siblings: Vec<Key> = records
                 .iter()
-                .filter(|&&(m, _, r)| m == media && r.makers.iter().any(|q| seed.makers.contains(q)))
-                .map(|&(_, other, _)| other)
+                .filter(|&&(_, _, r)| r.makers.iter().any(|q| seed.makers.contains(q)))
+                .map(|&(m, other, _)| (m, other))
                 .collect();
             assert_eq!(columns.nominate(), siblings, "{media:?} {id}: nominations");
-            let neighbours = indexes.plot.nearest(id, media, 50).into_iter().map(|n| n.tmdb_id);
+            let neighbours =
+                indexes.plot.nearest(id, media, 50).into_iter().map(|n| (n.media_type, n.tmdb_id));
             for other in siblings.iter().copied().chain(neighbours) {
-                let theirs = facts.get(other, media).cloned().unwrap_or_default();
+                let theirs = facts.get(other.1, other.0).cloned().unwrap_or_default();
                 assert_eq!(
                     columns.makers(other),
                     share(&seed.makers, &theirs.makers),
-                    "{id} -> {other}: makers"
+                    "{id} -> {other:?}: makers"
                 );
                 assert_eq!(
                     columns.home(other),
                     share(&seed.broadcasters, &theirs.broadcasters),
-                    "{id} -> {other}: home"
+                    "{id} -> {other:?}: home"
                 );
                 shares += 2;
             }

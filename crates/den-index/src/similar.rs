@@ -1,8 +1,8 @@
 //! More Like This — the index half of the tvOS app's `refineMoreLikeThis`. Merging with TMDB's own
 //! recommendations and the theme rerank stay with the client, which holds those.
 
-use crate::{Index, MediaType};
-use std::collections::HashSet;
+use crate::{Index, Key, MediaType, ScanStats};
+use std::collections::{HashMap, HashSet};
 
 /// Plot neighbours asked for, and the premise candidates weighed before keeping the best of them.
 const PLOT_K: usize = 20;
@@ -80,6 +80,22 @@ const TONE_FLOOR: f64 = 0.35;
 const SUBGENRE_CAP: usize = 3;
 /// Labels below this confidence are noise and are not part of what the seed IS.
 const MIN_CONFIDENCE: f64 = 0.55;
+/// Whether a row mixes films and series (oxyc/den-atlas#49): Breaking Bad leads to El Camino, The Next
+/// Generation to First Contact, Twin Peaks to Fire Walk with Me.
+///
+/// Chosen with `den-atlas rail-eval` over both judged files (the ideal counts both types' goods, so a row of
+/// one type is read against the same ideal as a mixed one):
+///
+/// ```text
+///               dev nDCG   dev nDCG'   dev bad   test nDCG   test nDCG'   test bad
+///   one type     0.765      0.775        27        0.703       0.744         33
+///   mixed        0.792      0.794        26        0.711       0.745         29
+/// ```
+///
+/// The seed type's own titles keep exactly the order a row of that type alone gives them (`rank_pool`).
+const MIX_TYPES: bool = true;
+/// A title of the other type this near the seed in its own type's plot neighbours skips the tonal floor.
+const CROSS_TOP: u32 = 3;
 
 /// A noul below this is noise, not a signal: ~75 dimensions per row become ~15. Applied by the `Facets`
 /// implementation (`rail.rs`), which reads it from `SimilarParams`.
@@ -123,6 +139,9 @@ pub struct SimilarParams {
     pub w_coverage: f64,
     /// Never mix animated with live action.
     pub same_animation: bool,
+    /// Mix films and series in one row: both types pooled, the other type's cosines read on the seed
+    /// type's scale (`z_map`).
+    pub mix_types: bool,
     pub noul_floor: f64,
     pub world_floor: f64,
     pub defining: f64,
@@ -223,6 +242,7 @@ impl Default for SimilarParams {
             w_critique: W_CRITIQUE,
             w_coverage: W_COVERAGE,
             same_animation: true,
+            mix_types: MIX_TYPES,
             noul_floor: NOUL_FLOOR,
             world_floor: WORLD_FLOOR,
             defining: DEFINING,
@@ -364,6 +384,7 @@ impl SimilarParams {
         knob("holds", "floors", 0.0, 1.0, false, "critique idf: ln(titles / titles at or above this)"),
         knob("year_halflife", "floors", 1.0, 100.0, false, "years apart at which the year term halves"),
         knob("same_animation", "filters", 0.0, 1.0, true, "1: never mix animated with live action"),
+        knob("mix_types", "filters", 0.0, 1.0, true, "1: mix films and series in one row"),
         knob("tone_floor", "filters", 0.0, 1.0, false, "drop a labelled candidate covering less of the seed"),
         knob("min_rating", "filters", 0.0, 10.0, false, "drop below this TMDB rating (unrated kept)"),
         knob("min_votes", "filters", 0.0, 100_000.0, true, "drop below this many TMDB votes"),
@@ -411,6 +432,7 @@ impl SimilarParams {
             "pool_k" => self.pool_k as f64,
             "max_row" => self.max_row as f64,
             "same_animation" => f64::from(u8::from(self.same_animation)),
+            "mix_types" => f64::from(u8::from(self.mix_types)),
             "w_year" => self.w_year,
             "year_halflife" => self.year_halflife,
             "min_rating" => self.min_rating,
@@ -460,6 +482,7 @@ impl SimilarParams {
             "pool_k" => self.pool_k = whole,
             "max_row" => self.max_row = whole,
             "same_animation" => self.same_animation = whole == 1,
+            "mix_types" => self.mix_types = whole == 1,
             "w_year" => self.w_year = value,
             "year_halflife" => self.year_halflife = value,
             "min_rating" => self.min_rating = value,
@@ -685,42 +708,43 @@ pub type Weighted = (ValueId, f64);
 /// are `Copy`, compare by equality exactly as the strings did, and the caller resolves a name only when
 /// something is actually rendered.
 pub trait Facets {
-    fn facets(&self, tmdb_id: u32) -> Vec<(Axis, ValueId, f64)>;
+    fn facets(&self, key: Key) -> Vec<(Axis, ValueId, f64)>;
     /// The seed's DEFINING arguments — axes it reads >= 0.8 on — each with its idf weight, and a
     /// candidate's raw probability on them. Coverage of these, not cosine over all seventeen.
-    fn critique_defining(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let _ = tmdb_id;
+    fn critique_defining(&self, key: Key) -> Vec<Weighted> {
+        let _ = key;
         Vec::new()
     }
     /// A candidate's raw (uncentered) critique probabilities, for coverage.
-    fn critique_raw(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let _ = tmdb_id;
+    fn critique_raw(&self, key: Key) -> Vec<Weighted> {
+        let _ = key;
         Vec::new()
     }
     /// The critique profile — what the work argues about — CENTERED on the corpus mean per axis, so the
     /// caller does the centering once rather than every comparison.
-    fn critique(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let _ = tmdb_id;
+    fn critique(&self, key: Key) -> Vec<Weighted> {
+        let _ = key;
         Vec::new()
     }
     /// The 75 taxonomy nouls with their probabilities, for the cosine term.
-    fn nouls(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let _ = tmdb_id;
+    fn nouls(&self, key: Key) -> Vec<Weighted> {
+        let _ = key;
         Vec::new()
     }
     /// How far this title is from a realist world: vampires, superheroes, time travel, the apocalypse.
     /// 0 for The Wire, 0.97 for Angel.
-    fn world(&self, tmdb_id: u32) -> f64 {
-        let _ = tmdb_id;
+    fn world(&self, key: Key) -> f64 {
+        let _ = key;
         0.0
     }
     /// The year the title was released, when known.
-    fn year(&self, tmdb_id: u32) -> Option<f64> {
-        let _ = tmdb_id;
+    fn year(&self, key: Key) -> Option<f64> {
+        let _ = key;
         None
     }
-    /// Share of the corpus carrying this axis value, for rarity weighting. A shared `chronology = linear`
-    /// is worth almost nothing (76% of titles) where a shared `conflict = person-vs-system` is worth a lot.
+    /// Share of the SEED's type carrying this axis value, for rarity weighting — read from the seed's type
+    /// for a candidate of either. A shared `chronology = linear` is worth almost nothing (76% of titles)
+    /// where a shared `conflict = person-vs-system` is worth a lot.
     fn prevalence(&self, axis: Axis, value: ValueId) -> f64;
 }
 
@@ -733,7 +757,7 @@ pub trait Facets {
 fn facet_agreement(
     f: &dyn Facets,
     seed: &[(Axis, ValueId, f64)],
-    other: u32,
+    other: Key,
     axis_weight: &[f64; 12],
 ) -> Option<f64> {
     let theirs = f.facets(other);
@@ -765,18 +789,19 @@ fn facet_agreement(
 /// Oz is plot rank 1,134, far outside any sane pool. `nominate` lets authorship put a title into the pool on
 /// its own evidence, where the rest of the scorer then judges it like anything else.
 pub trait Authorship {
-    /// Ids that share a maker or a home with the seed, whatever the vectors think of them.
-    fn nominate(&self) -> Vec<u32>;
+    /// Titles of either type that share a maker with the seed, whatever the vectors think of them. The
+    /// scorer keeps the other type's only while `mix_types` is on.
+    fn nominate(&self) -> Vec<Key>;
     /// Share of the seed's makers this candidate shares, 0..=1.
-    fn makers(&self, tmdb_id: u32) -> f64;
+    fn makers(&self, key: Key) -> f64;
     /// Share of the seed's broadcasters/production companies this candidate shares, 0..=1.
-    fn home(&self, tmdb_id: u32) -> f64 {
-        let _ = tmdb_id;
+    fn home(&self, key: Key) -> f64 {
+        let _ = key;
         0.0
     }
-    /// The titles of the seed's type sharing a character with it, each with how strongly the link says the
-    /// two are one franchise, 0..=1 — a spin-off or a sequel the vectors may rank nowhere.
-    fn characters(&self) -> &[(u32, f64)] {
+    /// The titles of either type sharing a character with the seed, each with how strongly the link says
+    /// the two are one franchise, 0..=1 — a spin-off or a sequel the vectors may rank nowhere.
+    fn characters(&self) -> &[(Key, f64)] {
         &[]
     }
 }
@@ -807,11 +832,11 @@ pub fn more_like_this_pooled(
     media_type: MediaType,
     authorship: Option<&dyn Authorship>,
     facets: Option<&dyn Facets>,
-) -> Vec<u32> {
+) -> Vec<Key> {
     let params = SimilarParams::default();
     more_like_this_scored(plot, premise, tmdb_id, media_type, authorship, facets, &params)
         .into_iter()
-        .map(|s| s.tmdb_id)
+        .map(|s| s.key())
         .collect()
 }
 
@@ -822,13 +847,16 @@ pub fn more_like_this_pooled(
 /// `SimilarParams` it ranked with can show why a title sits where it does.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scored {
+    pub media_type: MediaType,
     pub tmdb_id: u32,
     pub score: f64,
     /// `w_premise × premise + w_plot × plot`, a missing cosine read at that index's pool floor.
     pub base: f64,
+    /// The cosines to the seed; for a title of the other type, mapped onto the seed type's scale
+    /// (`z_map`).
     pub premise: Option<f64>,
     pub plot: Option<f64>,
-    /// The pool's own score spread (90th − 10th percentile of `base`): the unit every term is scaled by.
+    /// The seed type's score spread (90th − 10th percentile of `base`): the unit every term is scaled by.
     pub spread: f64,
     pub tone: f64,
     pub noul: f64,
@@ -850,14 +878,20 @@ pub struct Scored {
     pub held: bool,
 }
 
+impl Scored {
+    pub fn key(&self) -> Key {
+        (self.media_type, self.tmdb_id)
+    }
+}
+
 /// What viewers make of a title — its rating and vote count, TMDB's popularity — for the filters and the
 /// popularity term. Supplied by the caller for the same reason as `Authorship`: `den-index` does not know
 /// where a rating comes from. `None` is unknown, and an unknown title is kept by every filter.
 pub trait Audience {
     /// (rating, vote count).
-    fn rating(&self, tmdb_id: u32) -> Option<(f64, f64)>;
+    fn rating(&self, key: Key) -> Option<(f64, f64)>;
     /// TMDB's popularity in its daily export: unbounded, most titles under 50.
-    fn popularity(&self, tmdb_id: u32) -> Option<f64>;
+    fn popularity(&self, key: Key) -> Option<f64>;
 }
 
 /// What a request adds beyond the corpus: who watches, and which candidates it will consider at all.
@@ -867,7 +901,7 @@ pub struct Extras<'a> {
     /// A candidate this answers `false` for is dropped before anything is scored (a facet filter, titles
     /// already watched). Before, so the pool's own statistics — its floors and spread — are over what the
     /// row can actually hold.
-    pub keep: Option<&'a dyn Fn(u32) -> bool>,
+    pub keep: Option<&'a dyn Fn(Key) -> bool>,
 }
 
 /// `more_like_this_pooled` with its knobs as an argument, and every title's signals kept. Serving ranks
@@ -896,28 +930,51 @@ pub fn more_like_this_with(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
-    let mut pool: Vec<u32> = Vec::new();
-    let mut seen: HashSet<u32> = HashSet::new();
-    for index in [premise, plot].into_iter().flatten() {
-        for n in index.nearest(tmdb_id, media_type, p.pool_k) {
-            if seen.insert(n.tmdb_id) {
-                pool.push(n.tmdb_id);
+    let seed: Key = (media_type, tmdb_id);
+    let wanted = |key: Key| key != seed && (p.mix_types || key.0 == media_type);
+    let mut pool: Vec<Key> = Vec::new();
+    let mut seen: HashSet<Key> = HashSet::new();
+    // Per index, the seed's own type's cosines and the other type's, for `z_map`; and each other-type
+    // title's rank in its own type's plot neighbours, for the tonal floor.
+    let mut scales: [Option<(ScanStats, ScanStats)>; 2] = [None, None];
+    let mut plot_ranks: HashMap<Key, u32> = HashMap::new();
+    for (at, index) in [premise, plot].into_iter().enumerate() {
+        let Some(index) = index else { continue };
+        if !p.mix_types {
+            for n in index.nearest(tmdb_id, media_type, p.pool_k) {
+                if seen.insert((n.media_type, n.tmdb_id)) {
+                    pool.push((n.media_type, n.tmdb_id));
+                }
+            }
+            continue;
+        }
+        // `pool_k` of each type, in one scan; the seed's own type's list is exactly `nearest`'s.
+        let by_type = index.nearest_by_type(tmdb_id, media_type, p.pool_k);
+        if let [own, other] = by_type.as_slice() {
+            scales[at] = Some((own.stats, other.stats));
+            if at == 1 {
+                plot_ranks.extend(other.nearest.iter().zip(0..).map(|(n, r)| ((n.media_type, n.tmdb_id), r)));
+            }
+        }
+        for n in by_type.iter().flat_map(|t| &t.nearest) {
+            if seen.insert((n.media_type, n.tmdb_id)) {
+                pool.push((n.media_type, n.tmdb_id));
             }
         }
     }
     // Facts nominate too. Without this a shared maker can only re-order what the vectors already found, and
     // the vectors do not find a seed's own siblings.
-    for id in authorship.map(Authorship::nominate).unwrap_or_default() {
-        if id != tmdb_id && seen.insert(id) {
-            pool.push(id);
+    for key in authorship.map(Authorship::nominate).unwrap_or_default() {
+        if wanted(key) && seen.insert(key) {
+            pool.push(key);
         }
     }
     // So do shared characters, while they are weighed at all: at `w_character = 0` the pool is exactly
     // what it was before they were read.
     if p.w_character > 0.0 {
-        for &(id, _) in authorship.map(Authorship::characters).unwrap_or_default() {
-            if id != tmdb_id && seen.insert(id) {
-                pool.push(id);
+        for &(key, _) in authorship.map(Authorship::characters).unwrap_or_default() {
+            if wanted(key) && seen.insert(key) {
+                pool.push(key);
             }
         }
     }
@@ -925,31 +982,58 @@ pub fn more_like_this_with(
         return Vec::new();
     }
 
-    // One index's cosine between the seed and a candidate, when that index holds both.
-    let sim = |index: Option<&Index>, other: u32| -> Option<f64> {
+    // One index's cosine between the seed and a candidate, when that index holds both — on the seed type's
+    // scale for a candidate of the other type.
+    let sim = |at: usize, index: Option<&Index>, (kind, id): Key| -> Option<f64> {
         let index = index?;
         let a = index.row_of(tmdb_id, media_type)?;
-        let b = index.row_of(other, media_type)?;
-        Some(index.similarity(a, b))
+        let b = index.row_of(id, kind)?;
+        let cosine = index.similarity(a, b);
+        match scales[at] {
+            Some((own, other)) if kind != media_type => Some(z_map(cosine, own, other)),
+            _ => Some(cosine),
+        }
     };
     let pool: Vec<Candidate> = pool
         .iter()
-        .map(|&id| Candidate { tmdb_id: id, premise: sim(premise, id), plot: sim(plot, id) })
+        .map(|&key| Candidate {
+            key,
+            premise: sim(0, premise, key),
+            plot: sim(1, plot, key),
+            plot_rank: plot_ranks.get(&key).copied(),
+        })
         .collect();
     // Labels come from whichever index holds the title; both carry the same label set.
-    let labels = |id: u32| {
-        premise.and_then(|x| x.labels(id, media_type)).or_else(|| plot.and_then(|x| x.labels(id, media_type)))
+    let labels = |(kind, id): Key| {
+        premise.and_then(|x| x.labels(id, kind)).or_else(|| plot.and_then(|x| x.labels(id, kind)))
     };
-    rank_pool(&pool, tmdb_id, &labels, authorship, facets, extras, p)
+    rank_pool(&pool, seed, &labels, authorship, facets, extras, p)
+}
+
+/// A cosine to a title of the other type, read on the seed type's scale: `μ_S + σ_S·(c − μ_C)/σ_C`, with
+/// μ and σ the seed's cosines to every title of its own type (S) and of the other (C) in that index.
+///
+/// Measured on store 5b1c3213b6a1 (oxyc/den-atlas#49): the plot index puts films closer to films (random
+/// pairs 0.555) than to series (0.510), because series articles read as premises and film articles as whole
+/// stories, so raw cosines would rank every film above every series for a film seed. Standardised per
+/// type, the nearest-neighbour tails line up almost exactly. The premise index has no such gap, and the map
+/// is then close to the identity.
+fn z_map(cosine: f64, own: ScanStats, other: ScanStats) -> f64 {
+    if other.sd <= 0.0 {
+        return cosine;
+    }
+    own.mean + own.sd * (cosine - other.mean) / other.sd
 }
 
 /// One member of a seed's candidate pool, with its cosine to the seed in each space (`None` where that
-/// space does not hold both titles).
+/// space does not hold both titles; on the seed type's scale for the other type, `z_map`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Candidate {
-    pub tmdb_id: u32,
+    pub key: Key,
     pub premise: Option<f64>,
     pub plot: Option<f64>,
+    /// For a title of the other type, its rank among that type's plot neighbours of the seed, from 0.
+    pub plot_rank: Option<u32>,
 }
 
 /// Everything More Like This does after retrieval: gate, score and order a pool that is already drawn.
@@ -961,30 +1045,35 @@ pub struct Candidate {
 /// deduplicated in that order) followed by this.
 pub fn rank_pool<'l>(
     pool: &[Candidate],
-    tmdb_id: u32,
-    labels: &dyn Fn(u32) -> Option<crate::Labels<'l>>,
+    seed_key: Key,
+    labels: &dyn Fn(Key) -> Option<crate::Labels<'l>>,
     authorship: Option<&dyn Authorship>,
     facets: Option<&dyn Facets>,
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
-    let Some(mine) = labels(tmdb_id) else {
+    let Some(mine) = labels(seed_key) else {
         return Vec::new();
     };
+    let own_type = |key: Key| key.0 == seed_key.0;
     let seed = seed_labels(&mine, p.min_confidence);
-    let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(tmdb_id)).unwrap_or_default();
-    let seed_world = facets.map_or(0.0, |f| f.world(tmdb_id));
-    let seed_year = facets.and_then(|f| f.year(tmdb_id));
-    let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
-    let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
-    let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
-    let characters: &[(u32, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
-    let character = |id: u32| characters.iter().find(|&&(c, _)| c == id).map_or(0.0, |&(_, s)| s);
+    let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(seed_key)).unwrap_or_default();
+    let seed_world = facets.map_or(0.0, |f| f.world(seed_key));
+    let seed_year = facets.and_then(|f| f.year(seed_key));
+    let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(seed_key)).unwrap_or_default();
+    let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(seed_key)).unwrap_or_default();
+    let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(seed_key)).unwrap_or_default();
+    let characters: &[(Key, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
+    let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
 
     let audience = extras.audience;
     // The request's filters. Each is skipped outright at its production value, so production's pool is
     // never even asked about them. Unknown passes: a title nobody has rated is not a badly rated one.
-    let admitted = |id: u32| -> bool {
+    // The other type is kept only while `mix_types` is on.
+    let admitted = |id: Key| -> bool {
+        if !p.mix_types && !own_type(id) {
+            return false;
+        }
         if extras.keep.is_some_and(|keep| !keep(id)) {
             return false;
         }
@@ -1004,10 +1093,11 @@ pub fn rank_pool<'l>(
         }
         true
     };
-    let raw: Vec<(u32, Option<f64>, Option<f64>)> =
-        pool.iter().filter(|c| admitted(c.tmdb_id)).map(|c| (c.tmdb_id, c.premise, c.plot)).collect();
+    let raw: Vec<&Candidate> = pool.iter().filter(|c| admitted(c.key)).collect();
     // A candidate one index has never seen is scored at that index's pool floor rather than zero, so a
-    // missing vector costs it a little and does not disqualify it.
+    // missing vector costs it a little and does not disqualify it. The floor, like the spread below, is the
+    // SEED'S type's ("anchoring"): read over both, the other type's cosines would move the seed type's own
+    // order, which a mixed row must not.
     let floor = |values: Vec<f64>| -> f64 {
         let mut v = values;
         if v.is_empty() {
@@ -1016,13 +1106,15 @@ pub fn rank_pool<'l>(
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         v[percentile_at(v.len(), p.pool_floor_pct)]
     };
-    let premise_floor = floor(raw.iter().filter_map(|&(_, p, _)| p).collect());
-    let plot_floor = floor(raw.iter().filter_map(|&(_, _, l)| l).collect());
+    let anchors: Vec<&&Candidate> = raw.iter().filter(|c| own_type(c.key)).collect();
+    let premise_floor = floor(anchors.iter().filter_map(|c| c.premise).collect());
+    let plot_floor = floor(anchors.iter().filter_map(|c| c.plot).collect());
 
-    // (id, base, dominant subgenre, premise cosine, plot cosine) of a candidate past the gates.
-    type Gated = (u32, f64, String, Option<f64>, Option<f64>);
+    // (key, base, dominant subgenre, premise cosine, plot cosine) of a candidate past the gates.
+    type Gated = (Key, f64, String, Option<f64>, Option<f64>);
     let mut scored: Vec<Gated> = Vec::new();
-    for &(id, pc, l) in &raw {
+    for c in &raw {
+        let (id, pc, l) = (c.key, c.premise, c.plot);
         let Some(theirs) = labels(id) else {
             continue;
         };
@@ -1036,9 +1128,14 @@ pub fn rank_pool<'l>(
         // it: labels are a guess about a title, authorship is a fact about it, and the fact wins. A shared
         // character does NOT (`W_CHARACTER`): the Star Wars Holiday Special has every character of the seed
         // and none of the film, and the floor is what keeps it out.
+        //
+        // Nor does a title of the other type in that type's plot top three: labels describe a film and a
+        // series differently (Bingeable is a format), and the nearest few across the line are the titles a
+        // mixed row exists for — El Camino for Breaking Bad.
         let unlabelled =
             theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < p.min_confidence);
-        if !unlabelled && maker <= 0.0 && t < p.tone_floor {
+        let across = !own_type(id) && c.plot_rank.is_some_and(|rank| rank < CROSS_TOP);
+        if !unlabelled && maker <= 0.0 && !across && t < p.tone_floor {
             continue;
         }
         let base = p.w_premise * pc.unwrap_or(premise_floor) + p.w_plot * l.unwrap_or(plot_floor);
@@ -1055,8 +1152,11 @@ pub fn rank_pool<'l>(
         return Vec::new();
     }
 
-    // The tonal term is expressed in the pool's own units so one weight works for every seed.
-    let mut bases: Vec<f64> = scored.iter().map(|s| s.1).collect();
+    // The tonal term is expressed in the pool's own units so one weight works for every seed: the seed
+    // type's pool, like the floors, unless nothing of that type passed the gates.
+    let anchored: Vec<f64> = scored.iter().filter(|s| own_type(s.0)).map(|s| s.1).collect();
+    let mut bases: Vec<f64> =
+        if anchored.is_empty() { scored.iter().map(|s| s.1).collect() } else { anchored };
     bases.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let spread = (bases[percentile_at(bases.len(), p.spread_high_pct)]
         - bases[percentile_at(bases.len(), p.spread_low_pct)])
@@ -1065,7 +1165,7 @@ pub fn rank_pool<'l>(
     // so linear would make one blockbuster the only title that scores.
     let most_popular =
         scored.iter().filter_map(|s| audience.and_then(|a| a.popularity(s.0))).fold(0.0f64, f64::max);
-    let popularity_of = |id: u32| -> f64 {
+    let popularity_of = |id: Key| -> f64 {
         match audience.and_then(|a| a.popularity(id)) {
             Some(popularity) if most_popular > 0.0 => {
                 libm::log1p(popularity.max(0.0)) / libm::log1p(most_popular)
@@ -1114,7 +1214,8 @@ pub fn rank_pool<'l>(
                         + p.w_popularity * popularity
                         + p.w_character * ch);
             Scored {
-                tmdb_id: id,
+                media_type: id.0,
+                tmdb_id: id.1,
                 score,
                 base,
                 premise: pc,
@@ -1140,15 +1241,36 @@ pub fn rank_pool<'l>(
         b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.tmdb_id.cmp(&b.tmdb_id))
     });
 
-    // Greedy pick under the per-subgenre cap, then a second pass to fill from what the cap held back rather
-    // than reaching further down a worse tail. The cap counts against the first twenty — a row of two
-    // hundred should not be three police procedurals and then nothing else from the genre.
-    //
-    // Positions into `final_scored`, not ids, so the answer can carry each title's signals.
-    let mut taken: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // Each type is picked on its own — the cap keyed by (type, subgenre), its window counted in that type's
+    // titles — and the two are then merged by score. So the seed type's titles come out in exactly the order
+    // a row of that type alone would put them in, and a mixed row only adds the other type between them.
+    let (own, other): (Vec<Scored>, Vec<Scored>) = final_scored.into_iter().partition(|s| own_type(s.key()));
+    let (own, other) = (capped(own, p), capped(other, p));
+    let mut row = Vec::with_capacity(p.max_row.min(own.len() + other.len()));
+    let (mut own, mut other) = (own.into_iter().peekable(), other.into_iter().peekable());
+    while row.len() < p.max_row {
+        let take_own = match (own.peek(), other.peek()) {
+            (Some(a), Some(b)) => a.score >= b.score,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        row.extend(if take_own { own.next() } else { other.next() });
+    }
+    row
+}
+
+/// The titles of one type in score order, under the per-subgenre cap, at most `max_row` of them.
+///
+/// Greedy pick under the cap, then a second pass to fill from what the cap held back rather than reaching
+/// further down a worse tail. The cap counts against the first twenty — a row of two hundred should not be
+/// three police procedurals and then nothing else from the genre.
+fn capped(mut sorted: Vec<Scored>, p: &SimilarParams) -> Vec<Scored> {
+    // Positions into `sorted`, not ids, so the answer can carry each title's signals.
+    let mut taken: HashMap<&str, usize> = HashMap::new();
     let mut out: Vec<usize> = Vec::new();
     let mut held: Vec<usize> = Vec::new();
-    for (at, s) in final_scored.iter().enumerate() {
+    for (at, s) in sorted.iter().enumerate() {
         if out.len() == p.max_row {
             break;
         }
@@ -1170,18 +1292,26 @@ pub fn rank_pool<'l>(
     // The cap's job is the first twenty. Past that, a held item is simply the next-best answer.
     let tail = out.split_off(out.len().min(p.cap_window));
     for &at in &held {
-        final_scored[at].held = true;
+        sorted[at].held = true;
     }
     out.extend(held);
     out.extend(tail);
     out.truncate(p.max_row);
-    out.into_iter().map(|at| final_scored[at].clone()).collect()
+    out.into_iter().map(|at| sorted[at].clone()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::tests::fixture;
+
+    fn film(id: u32) -> Key {
+        (MediaType::Movie, id)
+    }
+
+    fn tv(id: u32) -> Key {
+        (MediaType::Tv, id)
+    }
 
     #[test]
     fn plot_neighbours_when_there_is_no_premise_index() {
@@ -1236,7 +1366,7 @@ mod tests {
             None::<&dyn Authorship>,
             None::<&dyn Facets>
         )
-        .contains(&9));
+        .contains(&tv(9)));
     }
 
     /// The Bates Motel case: same primary genre, so the cross-genre penalty never fires on it, but it shares
@@ -1261,8 +1391,8 @@ mod tests {
             None::<&dyn Authorship>,
             None::<&dyn Facets>,
         );
-        assert!(out.contains(&2), "the title sharing the seed's labels must survive");
-        assert!(!out.contains(&3), "a same-genre title sharing only a generic mood must not");
+        assert!(out.contains(&tv(2)), "the title sharing the seed's labels must survive");
+        assert!(!out.contains(&tv(3)), "a same-genre title sharing only a generic mood must not");
         // The shipped scorer keeps the miss and ranks it ABOVE the real neighbour.
         let shipped = more_like_this(Some(&plot), Some(&premise), 1, MediaType::Tv);
         assert_eq!(shipped, vec![3, 2]);
@@ -1306,18 +1436,18 @@ mod tests {
             None::<&dyn Authorship>,
             None::<&dyn Facets>,
         );
-        assert_eq!(none.first(), Some(&2), "on vectors alone the closer, unrelated title leads");
+        assert_eq!(none.first(), Some(&film(2)), "on vectors alone the closer, unrelated title leads");
         assert!(
-            none.iter().position(|x| *x == 3).is_some_and(|p| p > 2),
+            none.iter().position(|x| *x == film(3)).is_some_and(|p| p > 2),
             "and the sibling sits down the row"
         );
         struct SameHand;
         impl Authorship for SameHand {
-            fn nominate(&self) -> Vec<u32> {
-                vec![3]
+            fn nominate(&self) -> Vec<Key> {
+                vec![film(3)]
             }
-            fn makers(&self, id: u32) -> f64 {
-                if id == 3 {
+            fn makers(&self, id: Key) -> f64 {
+                if id == film(3) {
                     1.0
                 } else {
                     0.0
@@ -1332,7 +1462,7 @@ mod tests {
             Some(&SameHand),
             None::<&dyn Facets>,
         );
-        assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
+        assert_eq!(with.first(), Some(&film(3)), "the same hand outranks a closer but unrelated title");
     }
 
     /// The Cheers case. Frasier shares a character with the seed and its kind, but the vectors put it outside
@@ -1356,14 +1486,14 @@ mod tests {
         ]);
         struct Spinoff;
         impl Authorship for Spinoff {
-            fn nominate(&self) -> Vec<u32> {
+            fn nominate(&self) -> Vec<Key> {
                 Vec::new()
             }
-            fn makers(&self, _: u32) -> f64 {
+            fn makers(&self, _: Key) -> f64 {
                 0.0
             }
-            fn characters(&self) -> &[(u32, f64)] {
-                &[(3, 1.0), (7, 1.0)]
+            fn characters(&self) -> &[(Key, f64)] {
+                &[((MediaType::Tv, 3), 1.0), ((MediaType::Tv, 7), 1.0)]
             }
         }
         let mut p = SimilarParams::default();
@@ -1383,6 +1513,49 @@ mod tests {
         assert!(on.iter().all(|s| s.tmdb_id != 7), "the tonal floor still applies: {on:?}");
     }
 
+    /// Breaking Bad and El Camino: a film the seed's premise and plot put first joins a series seed's row
+    /// only while `mix_types` is on, and the series in it keep exactly the order a series-only row gives
+    /// them — the other type is merged in between, never reorders the seed's own.
+    #[test]
+    fn a_mixed_row_adds_the_other_type_and_keeps_the_seeds_own_order() {
+        let subs: &[(&str, f64)] = &[("Crime Drama", 0.9)];
+        let moods: &[(&str, f64)] = &[("Dark & Gritty", 0.9)];
+        let titles: &[crate::index::tests::Row<'_>] = &[
+            (1, "tv", "Crime", false, subs, moods, [100, 0, 0]),
+            (2, "tv", "Crime", false, subs, moods, [90, 40, 0]),
+            (3, "tv", "Crime", false, subs, moods, [80, 60, 0]),
+            (4, "tv", "Crime", false, subs, moods, [60, 80, 0]),
+            (5, "tv", "Crime", false, subs, moods, [30, 95, 0]),
+            (10, "movie", "Crime", false, subs, moods, [99, 10, 0]),
+            (11, "movie", "Crime", false, subs, moods, [20, 95, 30]),
+            (12, "movie", "Crime", false, subs, moods, [0, 50, 90]),
+        ];
+        let (premise, plot) = (fixture(titles), fixture(titles));
+        let row = |mix: bool| -> Vec<Key> {
+            let p = SimilarParams { mix_types: mix, ..SimilarParams::default() };
+            more_like_this_scored(Some(&plot), Some(&premise), 1, MediaType::Tv, None, None, &p)
+                .iter()
+                .map(Scored::key)
+                .collect()
+        };
+        let (single, mixed) = (row(false), row(true));
+        assert!(single.iter().all(|k| k.0 == MediaType::Tv), "{single:?}");
+        assert!(mixed.contains(&film(10)), "{mixed:?}");
+        let own: Vec<Key> = mixed.iter().copied().filter(|k| k.0 == MediaType::Tv).collect();
+        assert_eq!(own, single, "the seed's own type, in the order a single-type row gives it");
+    }
+
+    /// The map puts a cosine as far from the other type's mean, in its deviations, as it is from the seed
+    /// type's; a type with no spread is left as it is.
+    #[test]
+    fn a_cross_type_cosine_is_read_on_the_seed_types_scale() {
+        let own = ScanStats { mean: 0.55, sd: 0.05 };
+        let other = ScanStats { mean: 0.51, sd: 0.04 };
+        assert!((z_map(0.51, own, other) - 0.55).abs() < 1e-12, "the other type's mean is the seed type's");
+        assert!((z_map(0.59, own, other) - 0.65).abs() < 1e-12, "two deviations up is two deviations up");
+        assert_eq!(z_map(0.7, own, ScanStats::default()), 0.7);
+    }
+
     /// A candidate with no confident labels is not filtered out: unknown is not none.
     #[test]
     fn an_unlabelled_candidate_is_not_gated_by_the_tonal_floor() {
@@ -1399,7 +1572,7 @@ mod tests {
             None::<&dyn Authorship>,
             None::<&dyn Facets>
         )
-        .contains(&2));
+        .contains(&tv(2)));
     }
 
     /// Every knob `KNOBS` names is one `get` and `set` answer, and setting a knob to its own default
@@ -1419,7 +1592,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 44, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 45, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
         }
@@ -1460,11 +1633,11 @@ mod tests {
         ]);
         struct SameHand;
         impl Authorship for SameHand {
-            fn nominate(&self) -> Vec<u32> {
-                vec![3]
+            fn nominate(&self) -> Vec<Key> {
+                vec![film(3)]
             }
-            fn makers(&self, id: u32) -> f64 {
-                f64::from(u8::from(id == 3))
+            fn makers(&self, id: Key) -> f64 {
+                f64::from(u8::from(id == film(3)))
             }
         }
         let rank = |p: &SimilarParams| {
@@ -1473,7 +1646,7 @@ mod tests {
         let shipped = rank(&SimilarParams::default());
         assert_eq!(shipped[0].tmdb_id, 3);
         assert_eq!(shipped[0].maker, 1.0);
-        let ids: Vec<u32> = shipped.iter().map(|s| s.tmdb_id).collect();
+        let ids: Vec<Key> = shipped.iter().map(Scored::key).collect();
         assert_eq!(
             ids,
             more_like_this_pooled(None, Some(&premise), 1, MediaType::Movie, Some(&SameHand), None),
@@ -1503,11 +1676,11 @@ mod tests {
         ]);
         struct SameHand;
         impl Authorship for SameHand {
-            fn nominate(&self) -> Vec<u32> {
-                vec![1, 6]
+            fn nominate(&self) -> Vec<Key> {
+                vec![film(1), film(6)]
             }
-            fn makers(&self, id: u32) -> f64 {
-                f64::from(u8::from(id == 6))
+            fn makers(&self, id: Key) -> f64 {
+                f64::from(u8::from(id == film(6)))
             }
         }
         let mut p = SimilarParams::default();
@@ -1518,18 +1691,19 @@ mod tests {
         // Retrieval by hand: the premise index's nearest `pool_k`, then the nominations the pool lacks.
         let mut ids: Vec<u32> =
             premise.nearest(1, MediaType::Movie, 3).into_iter().map(|n| n.tmdb_id).collect();
-        ids.extend(SameHand.nominate().into_iter().filter(|&id| id != 1));
+        ids.extend(SameHand.nominate().into_iter().map(|(_, id)| id).filter(|&id| id != 1));
         let seed_row = premise.row_of(1, MediaType::Movie).unwrap();
         let pool: Vec<Candidate> = ids
             .iter()
             .map(|&id| Candidate {
-                tmdb_id: id,
+                key: film(id),
                 premise: premise.row_of(id, MediaType::Movie).map(|row| premise.similarity(seed_row, row)),
                 plot: None,
+                plot_rank: None,
             })
             .collect();
-        let labels = |id: u32| premise.labels(id, MediaType::Movie);
-        let ranked = rank_pool(&pool, 1, &labels, Some(&SameHand), None, Extras::default(), &p);
+        let labels = |(kind, id): Key| premise.labels(id, kind);
+        let ranked = rank_pool(&pool, film(1), &labels, Some(&SameHand), None, Extras::default(), &p);
 
         assert_eq!(ranked, served);
         assert_eq!(served.len(), 4, "three retrieved and one nominated: {served:?}");
@@ -1545,7 +1719,7 @@ mod tests {
     }
 
     impl Facets for Era {
-        fn facets(&self, id: u32) -> Vec<(Axis, ValueId, f64)> {
+        fn facets(&self, (_, id): Key) -> Vec<(Axis, ValueId, f64)> {
             match id {
                 1 => (0..12).map(|axis| (axis, 1, 1.0)).collect(),
                 // Answers every axis, so the ones it disagrees on count against it.
@@ -1553,7 +1727,7 @@ mod tests {
                 _ => Vec::new(),
             }
         }
-        fn year(&self, id: u32) -> Option<f64> {
+        fn year(&self, (_, id): Key) -> Option<f64> {
             Some(if id == 3 { 1990.0 } else { 2000.0 })
         }
         fn prevalence(&self, _: Axis, _: ValueId) -> f64 {
@@ -1613,16 +1787,16 @@ mod tests {
     struct Viewers;
 
     impl Audience for Viewers {
-        fn rating(&self, id: u32) -> Option<(f64, f64)> {
+        fn rating(&self, (_, id): Key) -> Option<(f64, f64)> {
             (id == 2).then_some((5.0, 100.0))
         }
-        fn popularity(&self, id: u32) -> Option<f64> {
+        fn popularity(&self, (_, id): Key) -> Option<f64> {
             Some(if id == 3 { 1000.0 } else { 1.0 })
         }
     }
 
     /// The seed (1) and seven candidates, closest first on the premise vectors: 2, 3, then 4..=8.
-    fn audience_row(p: &SimilarParams, keep: Option<&dyn Fn(u32) -> bool>) -> Vec<u32> {
+    fn audience_row(p: &SimilarParams, keep: Option<&dyn Fn(Key) -> bool>) -> Vec<u32> {
         let premise = fixture(&[
             (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
             (2, "movie", "Drama", false, &[], &[], [95, 0, 0]),
@@ -1655,7 +1829,7 @@ mod tests {
         assert!(!with("min_votes", 101.0).contains(&2), "100 votes: dropped");
         assert_eq!(with("min_popularity", 5.0), [3], "only the popular title clears the floor");
         assert_eq!(with("w_popularity", 10.0)[0], 3, "popularity lifts 3 over 2");
-        let not_two = |id: u32| id != 2;
+        let not_two = |id: Key| id != film(2);
         assert!(!audience_row(&SimilarParams::default(), Some(&not_two)).contains(&2));
     }
 
@@ -1679,11 +1853,11 @@ mod tests {
         ]);
         struct Eight;
         impl Authorship for Eight {
-            fn nominate(&self) -> Vec<u32> {
-                vec![8]
+            fn nominate(&self) -> Vec<Key> {
+                vec![film(8)]
             }
-            fn makers(&self, id: u32) -> f64 {
-                f64::from(u8::from(id == 8))
+            fn makers(&self, id: Key) -> f64 {
+                f64::from(u8::from(id == film(8)))
             }
         }
         let rank = |knob: &str, value: f64, of: u32| {

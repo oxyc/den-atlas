@@ -5,6 +5,7 @@
 //! way. Pure: a row of ids and a map of grades in, numbers out.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
 /// A judgement of one candidate as a recommendation for one seed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,21 +58,23 @@ pub fn dcg(gains: impl Iterator<Item = f64>) -> f64 {
     gains.enumerate().map(|(i, g)| g / ((i + 2) as f64).log2()).sum()
 }
 
-/// One row against one case's judgements, at `k`.
-pub fn score(row: &[u32], grades: &HashMap<u32, Grade>, k: usize) -> Scores {
+/// One row against one case's judgements, at `k`. The ideal is over every judgement the case holds, so a
+/// row that cannot reach some of them — films for a series seed, in a row of one type — is scored against
+/// the same ideal as one that can.
+pub fn score<K: Eq + Hash>(row: &[K], grades: &HashMap<K, Grade>, k: usize) -> Scores {
     let mut ideal: Vec<f64> = grades.values().map(|g| g.gain()).collect();
     ideal.sort_by(|a, b| b.total_cmp(a));
     let idcg = dcg(ideal.into_iter().take(k));
     let ratio = |d: f64| if idcg > 0.0 { d / idcg } else { 0.0 };
 
     let top = &row[..row.len().min(k)];
-    let gain = |id: &u32| grades.get(id).map_or(0.0, |g| g.gain());
-    let condensed: Vec<u32> = row.iter().copied().filter(|id| grades.contains_key(id)).take(k).collect();
+    let gain = |id: &K| grades.get(id).map_or(0.0, |g| g.gain());
+    let condensed: Vec<&K> = row.iter().filter(|id| grades.contains_key(id)).take(k).collect();
     let count =
         |want: &[Grade]| top.iter().filter(|id| grades.get(id).is_some_and(|g| want.contains(g))).count();
     Scores {
         ndcg: ratio(dcg(top.iter().map(gain))),
-        condensed: ratio(dcg(condensed.iter().map(gain))),
+        condensed: ratio(dcg(condensed.into_iter().map(gain))),
         precision: count(&[Grade::Good, Grade::Ok]) as f64 / k as f64,
         bad: count(&[Grade::Bad]),
         judged: top.iter().filter(|id| grades.contains_key(id)).count(),

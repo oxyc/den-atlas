@@ -538,6 +538,35 @@ impl Index {
         )
     }
 
+    /// `nearest` for each type in one scan: the title's own type first, then the other, each with its `k`
+    /// nearest (the own type's list is exactly `nearest`'s) and the mean and standard deviation of every
+    /// title of that type's cosine to it — what a cross-type cosine is read against (`similar.rs`). Empty
+    /// when the title isn't indexed.
+    pub fn nearest_by_type(&self, tmdb_id: u32, media_type: MediaType, k: usize) -> Vec<TypeNeighbours> {
+        let Some(&query_row) = self.rows.get(&(media_type, tmdb_id)) else { return Vec::new() };
+        let query = self.row_vector(query_row as usize);
+        let other = match media_type {
+            MediaType::Movie => MediaType::Tv,
+            MediaType::Tv => MediaType::Movie,
+        };
+        [media_type, other]
+            .into_iter()
+            .map(|kind| {
+                let scored = self.scores(
+                    |row| row != query_row as usize && self.records[row].media_type == Some(kind),
+                    query,
+                );
+                let raw = ScanStats::of(&scored);
+                let unit = QUANTUM * QUANTUM;
+                TypeNeighbours {
+                    media_type: kind,
+                    stats: ScanStats { mean: raw.mean / unit, sd: raw.sd / unit },
+                    nearest: self.best(scored, k),
+                }
+            })
+            .collect()
+    }
+
     /// The `k` titles nearest to an outside vector — one embedded by the same model and quantiser as this
     /// index (semantic search, or a synopsis standing in for an unindexed title). Empty on a dimension
     /// mismatch: that's another vector space.
@@ -805,6 +834,15 @@ impl Index {
             })
             .collect()
     }
+}
+
+/// One type's answer in `Index::nearest_by_type`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeNeighbours {
+    pub media_type: MediaType,
+    pub nearest: Vec<Neighbor>,
+    /// Every title of this type's cosine to the query, in `similarity`'s units.
+    pub stats: ScanStats,
 }
 
 /// The spread of one scan's scores: their mean and standard deviation, zero when nothing was scanned.

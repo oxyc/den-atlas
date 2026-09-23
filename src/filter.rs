@@ -1198,10 +1198,12 @@ impl<'a> Context<'a> {
             Data::Like => {
                 let known = self.filter.types[self.t()].clone();
                 let Ok(tmdb_id) = id.parse::<u32>() else { return (vec![0; words], known) };
+                // The route's type only: a mixed row's other type is not a title this route lists.
                 let similar = self.indexes.more_like_this(tmdb_id, self.media_type);
                 let rows: Vec<usize> = similar
                     .iter()
-                    .filter_map(|&id| {
+                    .filter(|&&(media, _)| media == self.media_type)
+                    .filter_map(|&(_, id)| {
                         self.view.row_of(u8::from(self.media_type == MediaType::Tv), id).ok().flatten()
                     })
                     .map(|row| row.0)
@@ -1468,7 +1470,8 @@ impl<'a> Context<'a> {
                 let media = u8::from(self.media_type == MediaType::Tv);
                 let rows = similar
                     .iter()
-                    .filter_map(|&id| self.view.row_of(media, id).ok().flatten())
+                    .filter(|&&(kind, _)| kind == self.media_type)
+                    .filter_map(|&(_, id)| self.view.row_of(media, id).ok().flatten())
                     .map(|row| row.0 as u32)
                     .collect();
                 (rows, format!("like:{tmdb_id}"))
@@ -1935,7 +1938,12 @@ mod tests {
     fn like_is_the_similar_set_in_its_order() {
         let indexes = fixture("like");
         let context = Context::new(&indexes, Movie, None);
-        let similar: Vec<u64> = indexes.more_like_this(1, Movie).iter().map(|&id| u64::from(id)).collect();
+        let similar: Vec<u64> = indexes
+            .more_like_this(1, Movie)
+            .iter()
+            .filter(|&&(media, _)| media == Movie)
+            .map(|&(_, id)| u64::from(id))
+            .collect();
         let like = context.titles(&request(Route::Titles, "sel=like:1")).0;
         assert_eq!(ids(&like), similar);
         let counted = context.counts(&request(Route::Counts, "sel=like:1")).0;

@@ -125,19 +125,20 @@ fn title(index: &Index, id: u32, media: MediaType) -> String {
 /// One anchor's pooled row, built the ONE way — the reporting loop and `RAIL_SHOW` both call this.
 ///
 /// An independently constructed copy printed a different row than the one being measured, which is worse
-/// than no print at all.
+/// than no print at all. The seed's own type only: the shipped scorer it is compared with never mixes.
 fn pooled(indexes: &Indexes, id: u32, media: MediaType) -> Option<Vec<u32>> {
     let view = indexes.store.view();
     let facets = SeedFacets::new(&view, &indexes.store.aggregates, media).ok()?;
     let authorship = SeedAuthorship::of(&view, media, id).ok()?;
-    Some(more_like_this_pooled(
+    let row = more_like_this_pooled(
         Some(&indexes.plot),
         indexes.premise.as_ref(),
         id,
         media,
         Some(&authorship as &dyn Authorship),
         Some(&facets as &dyn Facets),
-    ))
+    );
+    Some(row.into_iter().filter(|&(kind, _)| kind == media).map(|(_, id)| id).collect())
 }
 
 /// Exit code, as the other subcommands return one.
@@ -232,7 +233,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
             if row.is_empty() {
                 return 0.0;
             }
-            let hits = row.iter().take(20).filter(|&&other| authorship.makers(other) > 0.0).count();
+            let hits = row.iter().take(20).filter(|&&other| authorship.makers((media, other)) > 0.0).count();
             hits as f64 / row.len().min(20) as f64
         };
         auth_share_a += by_same_maker(&a);
