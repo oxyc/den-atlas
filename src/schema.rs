@@ -663,9 +663,13 @@ fn routes() -> Value {
                 ),
             ],
             "returns": "{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, \
-                        occupation?}], total, order, orderUnavailable?, labels, coverage, ignored, ignoredTraits?, \
-                        unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
+                        occupation?, knownFor?}], total, order, orderUnavailable?, labels, coverage, ignored, \
+                        ignoredTraits?, unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
             "counts": {
+                "people[].knownFor": "[{type, id, title, year}]: up to 3 of the person's matching titles (the \
+                                      selection's, under the role asked for), the highest in their own type's \
+                                      popularity order first, named by their cards; left out without a \
+                                      popularity order",
                 "order": "the order the page is in",
                 "orderUnavailable": "the order asked for (or defaulted to) when it could not be used: \
                                      prominence without a popularity order, answered in credits instead",
@@ -699,6 +703,41 @@ fn routes() -> Value {
                 "total": "people credited on the matching titles and holding every trait",
                 "traitCoverage": "per applied trait, the credited people it is on record for (count) out of \
                                   every person credited under the selection and role (denominator)",
+            },
+        },
+        {
+            "method": "GET",
+            "path": "/index/filter/{type}/people/values/{trait}.json",
+            "example": "/index/filter/movie/people/values/citizenship.json?sel=decade:2020&q=iceland",
+            "about": "One person trait's values, counted as people/counts.json counts them but every value rather \
+                      than the top, labelled, most people first, then by name; with q, those whose name or an \
+                      alias has a word starting q. For the traits whose values are Wikidata items: gender, \
+                      citizenship, occupation.",
+            "parameters": [
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
+                with(param("trait", "enum", "gender, citizenship or occupation"), json!({ "in": "path" })),
+                with(
+                    param("sel", "string", "the titles, as counts.json"),
+                    json!({ "max": crate::filter::MAX_SELECTION }),
+                ),
+                with(param("traits", "string", "as people.json"), json!({ "max": crate::filter::MAX_SELECTION })),
+                with(
+                    param("q", "string", "a prefix, folded and lowercased as names are"),
+                    json!({ "min": crate::filter::MIN_PREFIX }),
+                ),
+                with(
+                    param("limit", "integer", "values returned"),
+                    json!({ "default": crate::filter::VALUES_LIMIT, "max": crate::filter::VALUES_LIMIT }),
+                ),
+            ],
+            "returns": "{kind, mode, values: [{id, name, count}], complete, denominator, coverage, ignored, \
+                        ignoredTraits?, unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
+            "counts": {
+                "values[].count": "people credited under the selection and the other traits holding the value",
+                "denominator": "people credited under the selection and the other traits",
             },
         },
         {
