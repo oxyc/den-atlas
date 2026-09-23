@@ -265,6 +265,31 @@ pub fn suggest(sources: &Sources<'_>, seeds: &[(MediaType, u32)], tuning: &Tunin
     json!({ "seeds": seeds, "titles": pooled })
 }
 
+/// Titles `/playground/titles.json` suggests.
+const TITLE_HITS: usize = 8;
+
+/// `GET /playground/titles.json?q=` — the page's title autocomplete: the den-titles fuzzy search (typo-tolerant,
+/// popularity-weighted) over films and series at once, kept to the titles the store has, since only those can
+/// have a row, with the store's title and year. One request per search, where the catalog route is one per type.
+pub fn titles(indexes: &Indexes, export: &den_titlesearch::TitleIndex, query: &str) -> Value {
+    let Some(cards) = indexes.cards.as_ref() else { return json!({ "titles": [] }) };
+    // Deeper than what is shown, because the export holds titles the store does not.
+    let titles: Vec<Value> = export
+        .search(query, None, TITLE_HITS * 4)
+        .iter()
+        .filter_map(|hit| {
+            let media = match hit.media_type {
+                den_titlesearch::MediaType::Movie => MediaType::Movie,
+                den_titlesearch::MediaType::Tv => MediaType::Tv,
+            };
+            let card = cards.get(&(media, hit.tmdb_id))?;
+            Some(json!({ "key": seed_key(media, hit.tmdb_id), "title": card.title, "year": card.year }))
+        })
+        .take(TITLE_HITS)
+        .collect();
+    json!({ "titles": titles })
+}
+
 /// `GET /playground/params.json` — every knob, its range, and production's value for it.
 pub fn params_json() -> String {
     let production = SimilarParams::default();

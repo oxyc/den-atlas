@@ -6,312 +6,733 @@
 <title>Tuning playground</title>
 <style>
   :root {
-    --bg: #fafaf9; --panel: #ffffff; --text: #1c1917; --muted: #78716c; --line: #e7e5e4;
-    --accent: #2563eb; --up: #15803d; --down: #b91c1c; --changed: #fef3c7;
+    color-scheme: light dark;
+    --bg: #f6f5f3; --panel: #ffffff; --text: #1c1917; --muted: #655f5a; --line: #e2dfdb;
+    --accent: #2458d6; --accent-text: #ffffff; --accent-soft: #e3ebfc; --up: #137a39; --down: #b42318;
+    --changed: #fff3d1; --changed-line: #d9a514; --shadow: 0 1px 2px rgb(0 0 0 / .06);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #1c1917; --panel: #292524; --text: #f5f5f4; --muted: #a8a29e; --line: #44403c;
-      --accent: #60a5fa; --up: #4ade80; --down: #f87171; --changed: #422006;
+      --bg: #141312; --panel: #1f1d1b; --text: #f3f1ee; --muted: #aaa39d; --line: #3a3633;
+      --accent: #86aefc; --accent-text: #0d1422; --accent-soft: #1d2a45; --up: #5bd98a; --down: #f58a80;
+      --changed: #3a2f12; --changed-line: #c9961a; --shadow: none;
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
-         font: 14px/1.45 system-ui, -apple-system, sans-serif; }
-  main { max-width: 1400px; margin: 0 auto; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  h2 { font-size: 15px; margin: 24px 0 8px; }
-  h3 { font-size: 13px; margin: 12px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
-  p, li { color: var(--muted); }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
-            margin-top: 12px; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
-  label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
-  label.inline { flex-direction: row; align-items: center; gap: 4px; }
-  input, select, button, textarea { font: inherit; color: var(--text); background: var(--bg);
-         border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
-  button { cursor: pointer; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .card-head { justify-content: space-between; align-items: center; }
-  .card-head h2 { margin: 0; }
-  #hits button, .chip button { font-size: 12px; padding: 2px 8px; margin-left: 6px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; padding: 0; list-style: none; }
-  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 10px; color: var(--text); }
-  .knobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
-  .knob input { width: 100%; }
-  .knob.changed input { background: var(--changed); }
-  .knob small { font-size: 11px; }
-  .error { color: var(--down); white-space: pre-wrap; }
-  .note { color: var(--accent); }
-  .scroll { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-  th, td { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
-  th { font-size: 12px; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
-  td.title, th.title { text-align: left; white-space: normal; min-width: 180px; }
-  td.title a { color: var(--text); }
-  .up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
-  .neg { color: var(--down); }
-  :root { color-scheme: light dark; }
-  p { overflow-wrap: anywhere; }
-  input, select, textarea { max-width: 100%; }
-  label.inline { max-width: 100%; }
-  input[type=file] { min-width: 0; }
-  /* Always in view: how many knobs differ from production, a way back, and whether a re-rank is running. */
-  #bar { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-         margin: 8px -16px 0; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
-  #bar a { color: var(--accent); }
-  #bar.busy { border-bottom-color: var(--accent); box-shadow: 0 1px 0 var(--accent); }
-  #bar-count.changed { background: var(--changed); border-radius: 6px; padding: 2px 6px; color: var(--text); }
-  details.group { border-top: 1px solid var(--line); }
-  details.group:first-of-type { border-top: 0; }
-  details.group > summary { cursor: pointer; padding: 10px 0; font-size: 13px; font-weight: 600; color: var(--muted);
-         text-transform: uppercase; letter-spacing: .04em; }
-  details.group > summary .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
-  details.group > .knobs { padding-bottom: 12px; }
-  .knob .ctl { display: flex; gap: 8px; align-items: center; }
-  .knob .ctl input[type=range] { flex: 1; min-width: 0; padding: 0; border: 0; background: none; accent-color: var(--accent); }
-  .knob .ctl input[type=number] { width: 6.5em; flex: none; }
-  /* The per-title card list replaces a seed's table on narrow screens; the table stays on wide ones. */
-  .cards { display: none; list-style: none; margin: 0; padding: 0; }
-  .cards > li { border-bottom: 1px solid var(--line); }
-  .cards summary { display: flex; gap: 8px; align-items: baseline; padding: 10px 0; cursor: pointer;
-         font-variant-numeric: tabular-nums; }
-  .cards summary .rank { min-width: 2ch; text-align: right; color: var(--muted); }
-  .cards summary .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .cards summary .score { color: var(--muted); }
-  .cards dl { display: grid; grid-template-columns: auto 1fr auto; gap: 2px 12px; margin: 0 0 10px;
-         font-variant-numeric: tabular-nums; font-size: 13px; }
-  .cards dt { color: var(--muted); } .cards dd { margin: 0; text-align: right; }
-  .cards dd.value { color: var(--muted); font-size: 12px; }
-  .cards dd.meta { grid-column: 1 / -1; text-align: left; color: var(--muted); padding-top: 4px; }
-  .cards .meta a { color: var(--accent); }
-  #knobs, #judged-section, #rows { scroll-margin-top: 64px; }
-  @media (max-width: 760px) {
-    body { padding: 12px; }
-    #bar { margin: 8px -12px 0; padding: 8px 12px; }
-    h2 { font-size: 16px; }
-    button, select, input:not([type=checkbox]):not([type=range]):not([type=file]) { min-height: 44px; }
-    button { padding: 8px 12px; }
-    input[type=checkbox] { width: 22px; height: 22px; }
-    label.inline { min-height: 44px; }
-    .knob .ctl input[type=range] { height: 44px; }
-    .knob .ctl input[type=number] { font-size: 16px; }
-    input, select { font-size: 16px; } /* below 16px iOS zooms the page on focus */
-    details > summary { padding: 10px 0; }
-    #hits li { padding: 6px 0; }
-    #hits button, .chip button { min-height: 36px; min-width: 36px; }
-    .card-head { flex-wrap: nowrap; }
-    .card-head h2 { min-width: 0; overflow-wrap: anywhere; }
-    td.title, th.title { min-width: 120px; }
-    .wide { display: none; }
-    .cards { display: block; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 18px; margin: 0; }
+  h3 { font-size: 16px; margin: 0; }
+  p { margin: 0; overflow-wrap: anywhere; }
+  a { color: var(--accent); }
+  code { font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; min-height: 44px; padding: 8px 14px; border-radius: 10px;
+           border: 1px solid var(--line); background: var(--panel); }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.link { border: 0; background: none; color: var(--accent); padding: 8px 6px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  select, input.value, input[type=search] { min-height: 44px; padding: 8px 10px; border-radius: 10px;
+         border: 1px solid var(--line); background: var(--bg); font-size: 16px; max-width: 100%; }
+  .muted { color: var(--muted); }
+  .hint { color: var(--muted); font-size: 14px; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .error { color: var(--down); }
+
+  /* The bar: what is changed, a way back, and whether a re-rank is running. Always in view. */
+  #bar { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); }
+  #bar .inner { max-width: 1440px; margin: 0 auto; padding: 6px 16px; display: flex; gap: 8px; align-items: center;
+                flex-wrap: wrap; min-height: 56px; }
+  #bar #bar-count { font-weight: 600; color: var(--text); text-decoration: none; display: inline-block; line-height: 44px; }
+  #bar-count.changed { background: var(--changed); border-radius: 8px; padding: 0 10px; }
+  @media (max-width: 599px) { #settings .head h2 { flex-basis: 100%; } .wide { display: none; } }
+  #bar a { min-height: 44px; display: inline-flex; align-items: center; }
+  #bar-score { color: var(--text); text-decoration: none; font-size: 14px; }
+  #bar-score:empty { display: none; }
+  #bar-busy { margin-left: auto; color: var(--muted); font-size: 14px; }
+  #bar-busy.on::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px;
+         border-radius: 50%; border: 2px solid var(--accent); border-right-color: transparent;
+         animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #bar-busy.on::before { animation: none; } }
+
+  .page { max-width: 1440px; margin: 0 auto; padding: 16px; display: grid; gap: 16px;
+          grid-template-columns: minmax(0, 1fr); }
+  .intro { display: grid; gap: 4px; }
+  .intro p { color: var(--muted); }
+  .main { display: grid; gap: 16px; min-width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px;
+           box-shadow: var(--shadow); min-width: 0; }
+  .panel > * + * { margin-top: 12px; }
+  .head { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; justify-content: space-between; }
+  @media (min-width: 1100px) {
+    .page { grid-template-columns: minmax(0, 1fr) 400px; }
+    .intro { grid-column: 1 / -1; }
+    /* Settings run beside both the results and the end section, so the sticky column never covers it. */
+    #settings { grid-column: 2; grid-row: 2 / span 2; }
+    #end { grid-column: 1; }
+    #settings { position: sticky; top: 72px; max-height: calc(100vh - 88px); overflow-y: auto; align-self: start; }
   }
+
+  /* Chips: the titles ranked, watched titles, filters. */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 0; padding: 0; }
+  .chip { display: inline-flex; align-items: center; gap: 2px; border: 1px solid var(--line); border-radius: 999px;
+          background: var(--bg); padding-left: 14px; max-width: 100%; min-height: 44px; }
+  .chip .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .chip .label small { color: var(--muted); }
+  .chip button { border: 0; background: none; min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
+                 color: var(--muted); font-size: 20px; line-height: 1; }
+  .chip button:hover { color: var(--down); }
+
+  /* Autocomplete. */
+  .combo { position: relative; }
+  .combo input { width: 100%; }
+  .combo ul { position: absolute; z-index: 6; left: 0; right: 0; top: calc(100% + 4px); margin: 0; padding: 4px;
+              list-style: none; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+              box-shadow: 0 8px 24px rgb(0 0 0 / .18); max-height: min(60vh, 420px); overflow-y: auto; }
+  .combo li { display: flex; gap: 10px; align-items: center; padding: 6px 8px; border-radius: 8px; min-height: 48px;
+              cursor: pointer; }
+  .combo li[aria-selected=true] { background: var(--accent-soft); }
+  .combo li[aria-disabled=true] { cursor: default; opacity: .55; }
+  .combo li.note { cursor: default; color: var(--muted); }
+  .combo .poster { width: 28px; height: 42px; flex: none; border-radius: 4px; background: var(--line); object-fit: cover;
+                   display: grid; place-items: center; font-size: 11px; color: var(--muted); }
+  .combo .t { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .combo .m { color: var(--muted); font-size: 13px; white-space: nowrap; }
+
+  /* One card per title ranked. */
+  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
+  .card { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--bg); min-width: 0; }
+  .card > * + * { margin-top: 8px; }
+  .card h3 { overflow-wrap: anywhere; }
+  .card .sub { color: var(--muted); font-size: 13px; }
+  .card.busy ol, .card.busy .sub { opacity: .55; }
+  .card .state { font-size: 14px; }
+  .card .state.error { background: color-mix(in srgb, var(--down) 12%, transparent); border-radius: 8px;
+                       padding: 8px 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .card ol { list-style: none; margin: 0; padding: 0; }
+  .card li + li { border-top: 1px solid var(--line); }
+  .title-btn { width: 100%; display: flex; gap: 8px; align-items: baseline; text-align: left; border: 0;
+               background: none; border-radius: 6px; padding: 10px 4px; }
+  .title-btn:hover { background: var(--accent-soft); }
+  .title-btn .rank { min-width: 2ch; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .title-btn .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .title-btn .name small, h3 small { color: var(--muted); font-weight: 400; }
+  .move { font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .move.same { color: var(--muted); }
+  .move.new { color: var(--accent); font-weight: 600; }
+  .why { padding: 4px 4px 12px 30px; font-size: 14px; }
+  .why > * + * { margin-top: 6px; }
+  .reasons { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  .reasons li { display: grid; grid-template-columns: minmax(0, 1fr) 64px 52px; gap: 8px; align-items: center;
+                border: 0 !important; }
+  .reasons .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .reasons .bar span { display: block; height: 100%; background: var(--up); }
+  .reasons .neg .bar span { background: var(--down); }
+  .reasons .pts { text-align: right; font-variant-numeric: tabular-nums; }
+  details > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 4px 8px;
+                      flex-wrap: wrap; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details:not(.group) > summary::before { content: "▸"; color: var(--muted); width: 1em; }
+  details[open]:not(.group) > summary::before { content: "▾"; }
+  #ymal-list { margin: 0; padding: 0; list-style: none; }
+  #ymal-list li { display: flex; gap: 8px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--line); }
+  #ymal-list .rank { min-width: 2ch; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #ymal-list .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .dropped summary { font-size: 14px; color: var(--muted); }
+  .dropped ul { margin: 0; padding-left: 20px; font-size: 14px; }
+
+  /* How it scores. */
+  .headline { font-size: 18px; }
+  .headline b { font-size: 22px; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 140px; }
+
+  /* Settings. */
+  #settings .head h2 { margin-right: auto; }
+  #settings-count { color: var(--muted); }
+  #settings-count.changed { color: var(--text); background: var(--changed); border-radius: 8px; padding: 4px 10px; }
+  details.group { border-top: 1px solid var(--line); }
+  details.group > summary { padding: 8px 0; font-weight: 600; justify-content: space-between; list-style: none; }
+  details.group > summary::-webkit-details-marker { display: none; }
+  details.group > summary::after { content: "+"; font-size: 20px; color: var(--muted); width: 24px; text-align: center; }
+  details.group[open] > summary::after { content: "–"; }
+  details.group > summary .n { margin-left: auto; font-weight: 400; font-size: 13px; color: var(--text);
+                               background: var(--changed); border-radius: 8px; padding: 2px 8px; }
+  .group-body { display: grid; gap: 10px; padding-bottom: 14px; }
+  .group-body > .hint { margin-bottom: 2px; }
+  .knob { border-left: 3px solid transparent; padding: 4px 0 4px 10px; display: grid; gap: 2px; }
+  .knob.changed { border-left-color: var(--changed-line); background: var(--changed); border-radius: 0 8px 8px 0; }
+  .knob.invalid { border-left-color: var(--down); }
+  .knob .name { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+  .knob label { font-weight: 600; }
+  .knob .about { color: var(--muted); font-size: 13px; }
+  .knob .ctl { display: flex; gap: 8px; align-items: center; }
+  .knob .track { position: relative; flex: 1; min-width: 0; }
+  .knob input[type=range] { width: 100%; height: 44px; margin: 0; accent-color: var(--accent); display: block; }
+  /* Production's value, as a tick under the slider. */
+  .knob .def { position: absolute; bottom: 6px; width: 2px; height: 8px; background: var(--muted);
+               transform: translateX(-1px); pointer-events: none; }
+  .knob input.value { width: 6.5em; flex: none; }
+  .knob.invalid input.value { border-color: var(--down); }
+  .knob .reset { min-width: 44px; padding: 0; flex: none; }
+  .knob .prod { font-size: 12px; color: var(--muted); }
+  .knob .problem { font-size: 13px; color: var(--down); }
+  .switch { display: flex; gap: 10px; align-items: center; min-height: 44px; }
+  .switch input { width: 22px; height: 22px; accent-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .row select { flex: 1 1 140px; min-width: 0; }
+
+  /* The end: save and share. */
+  #end .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #end .check { display: inline-flex; gap: 8px; align-items: center; min-height: 44px; color: var(--muted); }
+  #end .check input { width: 20px; height: 20px; }
+  #end-note:empty { display: none; }
+  button.danger { color: var(--down); }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 </head>
 <body>
-<main>
-  <h1>Tuning playground</h1>
-  <p>More Like This for a set of seeds, ranked by the scorer atlas serves, with any of its knobs moved. Every
-     field starts at production's value; only what you change is sent, and every row re-ranks when you stop
-     typing or let go of a slider. Beside each title is its rank in production's row. Points are what each signal added to the
-     score (spread &times; weight &times; value). Everything on the page is in the address, so a setup can be
-     shared with Copy link, or saved with Export.</p>
+<div id="bar">
+  <div class="inner">
+    <a href="#settings" id="bar-count">Production settings</a>
+    <button type="button" id="bar-reset" hidden>Reset</button>
+    <a href="#score-h" id="bar-score"></a>
+    <span id="bar-busy" role="status" aria-live="polite"></span>
+  </div>
+</div>
 
-  <div id="bar">
-    <span id="bar-count">production</span>
-    <button type="button" id="bar-reset">Reset<span class="wide"> knobs</span></button>
-    <a href="#knobs">Knobs</a>
-    <a href="#rows">Rows</a>
-    <a href="#judged-section">Judged</a>
-    <span id="bar-status" class="muted wide"></span>
+<div class="page">
+  <header class="intro">
+    <h1>Tuning playground</h1>
+    <p>Tune how More Like This ranks titles. Changes only affect this page.</p>
+  </header>
+
+  <div class="main">
+    <section class="panel" aria-labelledby="titles-h">
+      <div class="head"><h2 id="titles-h">Titles</h2><span class="hint" id="titles-count"></span></div>
+      <ul class="chips" id="seeds" aria-label="Titles ranked"></ul>
+      <div class="combo" id="seed-combo">
+        <label class="sr" for="seed-q">Add a title</label>
+        <input id="seed-q" type="search" placeholder="Add a title: type a name, e.g. breaking bad" autocomplete="off">
+      </div>
+      <p class="error" id="titles-error" role="alert"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="results-h">
+      <div class="head">
+        <h2 id="results-h">Results</h2>
+        <label class="hint">Show <select id="limit" aria-label="Titles shown per row"></select> per title</label>
+      </div>
+      <p class="hint">Each title's More Like This row. <span class="up">▲</span>/<span class="down">▼</span> is
+         how many places a title moved against production; tap a title to see why it is there.</p>
+      <div class="cards" id="cards"></div>
+      <details class="panel" id="ymal">
+        <summary><h3>You might also like</h3><span class="hint" id="ymal-sub"></span></summary>
+        <p class="hint">The rows of these titles pooled together, as the home screen's You might also like
+           does.</p>
+        <ul class="chips" id="ymal-seeds" aria-label="You might also like is pooled from"></ul>
+        <button type="button" id="ymal-use">Use my titles</button>
+        <ol id="ymal-list"></ol>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="score-h">
+      <h2 id="score-h">How it scores</h2>
+      <p class="headline" id="score-headline">Scoring…</p>
+      <p class="hint">A score of how well rows match hand-judged answers (nDCG at 10 over the tuning half of the
+         judged titles; 1 is perfect). Higher is better.</p>
+      <details id="score-details">
+        <summary>Details per judged title</summary>
+        <div id="score-dev"></div>
+        <details id="score-test">
+          <summary>Held-out half: look once, when you are done tuning</summary>
+          <div id="score-test-body"></div>
+        </details>
+      </details>
+    </section>
   </div>
 
-  <section>
-    <div class="row">
+  <aside class="panel" id="settings" aria-labelledby="settings-h">
+    <div class="head">
+      <h2 id="settings-h">Settings</h2>
+      <span id="settings-count">None changed</span>
+      <button type="button" id="settings-reset" disabled>Reset all</button>
+    </div>
+    <p class="hint">Every setting starts at production's value. Rows re-rank when you let go of a slider or
+       stop typing.</p>
+    <p class="error" id="settings-error" role="alert"></p>
+    <div id="groups"></div>
+  </aside>
+
+  <section class="panel" id="end" aria-labelledby="end-h">
+    <h2 id="end-h">Save and share</h2>
+    <div class="actions">
       <button type="button" id="copy">Copy link</button>
-      <button type="button" id="export">Export</button>
-      <label class="inline"><input type="checkbox" id="export-full"> full rows</label>
-      <label class="inline">Import <input type="file" id="import" accept="application/json,.json"></label>
-      <button type="button" id="reset-knobs">Reset knobs to production</button>
-      <button type="button" id="reset-seeds">Reset seeds to the defaults</button>
-      <button type="button" id="reset-all">Reset all</button>
+      <button type="button" id="export">Export debug snapshot</button>
+      <label class="check"><input type="checkbox" id="export-full"> with 50 titles per row</label>
+      <button type="button" id="import-btn">Import a snapshot…</button>
+      <input type="file" id="import" accept="application/json,.json" hidden>
+      <button type="button" id="reset-everything" class="danger">Reset everything</button>
     </div>
-    <p id="note" class="note"></p>
-    <p>Export saves the knobs, seeds, watched titles and filters, and a read-only snapshot for whoever
-       debugs it: the atlas and store it was ranked on, each seed's row with every signal's points, and the
-       judged scores if you scored them. Import restores the knobs and seeds and ignores the snapshot.</p>
+    <p class="hint">The link and the snapshot both carry your titles and settings. The snapshot also records,
+       for whoever debugs it, the atlas and dataset it ranked on, every row's scores and the judged scores.
+       Import restores the titles and settings.</p>
+    <p id="end-note" role="status" aria-live="polite"></p>
   </section>
-
-  <section>
-    <h3>Seeds</h3>
-    <div class="row">
-      <label>Titles per seed <input id="limit" type="number" min="1" size="5"></label>
-      <button type="button" id="clear">Clear seeds</button>
-    </div>
-    <form id="add" class="row" style="margin-top:8px">
-      <label>Type <select id="type"><option value="series">series</option><option value="movie">movie</option></select></label>
-      <label>TMDB id <input id="id" inputmode="numeric" size="9"></label>
-      <button type="submit" data-to="seeds">Add seed</button>
-      <button type="submit" data-to="suggest">Add to You might also like</button>
-      <button type="submit" data-to="watched">Add to watched</button>
-    </form>
-    <form id="search" class="row" style="margin-top:8px">
-      <label>Or find it by title <input id="q" size="30" placeholder="the wire"></label>
-      <button type="submit">Search</button>
-    </form>
-    <ul id="hits"></ul>
-  </section>
-
-  <section>
-    <h3>I have watched</h3>
-    <p>Dropped from every row and from You might also like, and each row ordered for someone who watched
-       them: den-core's household tilt, the same one a browse row's <code>tilt.liked</code> applies, with
-       these titles as what was liked.</p>
-    <ul class="chips" id="watched"></ul>
-  </section>
-
-  <section>
-    <h3>Filters</h3>
-    <p>Only candidates carrying every filter are ranked: a plot facet (<code>tone=bleak</code>,
-       <code>ending=bittersweet</code>, <code>era=…</code>) or a label (<code>mood=Feel-good</code>,
-       <code>subgenre=Heist</code>) — the constraints <code>/index/plot</code> reads.</p>
-    <form id="filter" class="row">
-      <label>axis=value <input id="filter-text" size="30" placeholder="tone=bleak"></label>
-      <button type="submit">Add filter</button>
-    </form>
-    <ul class="chips" id="filters"></ul>
-  </section>
-
-  <section>
-    <div id="knobs"></div>
-  </section>
-
-  <section id="judged-section">
-    <div class="row">
-      <button type="button" id="judge">Score on the judged set</button>
-      <span id="judged-status" class="muted"></span>
-    </div>
-    <p>These knobs against the hand-judged cases (<code>judged/rail.json</code>), at k = 10, beside production.
-       The headline is the <b>dev</b> half: tune on it. The test half exists to confirm a change once, when
-       you are done — read it every time and you are tuning on it too.</p>
-    <div id="judged"></div>
-    <details id="test-half">
-      <summary>Test half — read once</summary>
-      <div id="judged-test"></div>
-    </details>
-  </section>
-
-  <section>
-    <h3>You might also like</h3>
-    <p><code>/index/suggest</code> for these seeds: each seed's row minus the seeds and the watched titles,
-       pooled in seed order, with the same knobs. Beside each title is its place in production's pool.</p>
-    <ul class="chips" id="suggest-seeds"></ul>
-    <div class="scroll"><table id="suggest"></table></div>
-  </section>
-
-  <p id="status" class="muted"></p>
-  <p id="error" class="error"></p>
-  <div id="rows"></div>
-
-  <h2>Not here</h2>
-  <ul>
-    <li><b>TMDB votes</b>: atlas has no TMDB vote count any more (the store dropped it); TMDB's export
-        popularity is the popularity knob.</li>
-    <li><b>Franchise</b>: More Like This does not read it, so there is nothing to tune.</li>
-  </ul>
-</main>
+</div>
 <script>
 "use strict";
 // Relative to wherever atlas is mounted, with or without a trailing slash.
 const base = location.pathname.replace(/\/+$/, "");
 const root = base.replace(/\/playground$/, "");
 const $ = (id) => document.getElementById(id);
-const SIGNALS = ["maker", "home", "facet", "noul", "critique", "coverage", "tone", "world", "year", "popularity"];
-// Every row is re-ranked in ONE request (`rows.json`), and only once typing pauses: the relay allows an
-// address a few dozen playground requests a minute, which a request per seed per keystroke would spend in
-// seconds.
+// Every row is re-ranked in ONE request (`rows.json`, which also carries the judged scores), and only once
+// typing pauses or a slider is let go: the relay allows an address a few dozen playground requests a minute.
 const DEBOUNCE_MS = 300;
+const SEARCH_DEBOUNCE_MS = 250;
 const FILTER = "filter.";
+
+// Plain names for the knobs `params.json` lists, by the group they are shown in. A knob missing here still
+// appears, under Advanced with its own name, so a knob added to the scorer is never hidden.
+const GROUPS = [
+  ["story", "How similar the story is"],
+  ["people", "People and studios"],
+  ["tone", "Tone and mood"],
+  ["era", "Era"],
+  ["filters", "Filters"],
+  ["advanced", "Advanced"],
+];
+const facetAxis = (axis, label) =>
+  [axis === "era" ? "era" : axis === "tone" ? "tone" : "story", `${label} match`,
+   `Multiplies the story-shape bonus for the ${axis} trait alone. 1 is production.`];
+const KNOBS = {
+  w_premise: ["story", "Premise similarity", "How much a similar set-up counts, from the premise text."],
+  w_plot: ["story", "Plot similarity", "How much a similar plot counts, from the plot summary."],
+  w_noul: ["story", "Shared subjects", "Bonus for sharing the subjects the taxonomy tags."],
+  w_critique: ["story", "Argues about similar things", "Bonus for questioning the same things: power, class, faith…"],
+  w_coverage: ["story", "Covers the seed's core themes", "Bonus for touching what the seed is most about; rarer themes count more."],
+  w_facet: ["story", "Story shape", "Bonus for matching setting, pacing, ending and the other story traits; rare matches count more."],
+  w_world: ["story", "Different-world penalty", "Penalty when one is realist and the other fantastical."],
+  w_facet_setting: facetAxis("setting", "Setting"),
+  w_facet_scope: facetAxis("scope", "Scope"),
+  w_facet_ending: facetAxis("ending", "Ending"),
+  w_facet_pacing: facetAxis("pacing", "Pacing"),
+  w_facet_chronology: facetAxis("chronology", "Chronology"),
+  w_facet_continuity: facetAxis("continuity", "Continuity"),
+  w_facet_conflict: facetAxis("conflict", "Conflict"),
+  w_facet_ensemble: facetAxis("ensemble", "Ensemble"),
+  w_facet_timespan: facetAxis("timespan", "Time span"),
+  w_facet_archetype: facetAxis("archetype", "Story type"),
+  w_maker: ["people", "Same director, writer or creator", "Bonus for sharing the people who made it."],
+  w_home: ["people", "Same network or studio", "Bonus for the same broadcaster or production company."],
+  w_tone: ["tone", "Same subgenres and mood", "Bonus for sharing the seed's confident subgenres and moods."],
+  w_facet_tone: facetAxis("tone", "Tone"),
+  tone_floor: ["tone", "Minimum tone match", "Drops a candidate sharing less than this of the seed's subgenres and moods."],
+  min_confidence: ["tone", "Label confidence needed", "A subgenre or mood label below this confidence is ignored."],
+  w_facet_era: facetAxis("era", "Era"),
+  w_year: ["era", "Released around the same time", "Bonus for close release years. Off in production."],
+  year_halflife: ["era", "Year closeness half-life", "Years apart at which the release-year bonus halves."],
+  same_animation: ["filters", "Keep animation and live action apart", "Never mixes animated titles with live action."],
+  min_imdb_rating: ["filters", "Minimum IMDb rating", "Drops titles rated below this. Unrated titles stay. Needs IMDb ratings on the server."],
+  min_imdb_votes: ["filters", "Minimum IMDb votes", "Drops titles with fewer votes. Needs IMDb ratings on the server."],
+  w_popularity: ["filters", "Favour popular titles", "Bonus for TMDB popularity. Off in production. Needs title search on the server."],
+  min_popularity: ["filters", "Minimum popularity", "Drops titles below this TMDB popularity. Unknown stays. Needs title search on the server."],
+  pool_k: ["advanced", "Candidates considered", "How many nearest titles each vector index hands to the scorer."],
+  pool_floor_pct: ["advanced", "Missing-text fallback", "A title without premise or plot text is scored at this percentile of the pool."],
+  spread_low_pct: ["advanced", "Bonus scale: low percentile", "Every bonus is measured in the gap between two percentiles of the pool; this is the lower."],
+  spread_high_pct: ["advanced", "Bonus scale: high percentile", "…and this is the upper."],
+  noul_floor: ["advanced", "Subject strength needed", "A subject tag weaker than this is ignored."],
+  world_floor: ["advanced", "Fantastical threshold", "A world score below this reads as realist."],
+  defining: ["advanced", "Core-theme threshold", "A theme at least this strong defines the seed."],
+  critique_floor: ["advanced", "Theme strength needed", "A theme weaker than this says nothing."],
+  holds: ["advanced", "Common-theme cutoff", "How strong a theme must be for a title to count as holding it, when weighing rarity."],
+  subgenre_cap: ["advanced", "Most titles per subgenre", "At most this many titles sharing a main subgenre near the top of a row…"],
+  cap_window: ["advanced", "…near the top means the first", "…counted within this many leading titles."],
+  max_row: ["advanced", "Longest row", "The most titles a row keeps."],
+};
+// What each signal in a title's score is, in plain words; `base` is the text similarity it starts from.
+const SIGNALS = {
+  maker: "Same director, writer or creator", home: "Same network or studio", facet: "Similar story shape",
+  noul: "Shared subjects", critique: "Argues about similar things", coverage: "Covers the seed's core themes",
+  tone: "Same subgenres and mood", world: "Different kind of world", year: "Released around the same time",
+  popularity: "Popularity",
+};
+// The facet filters `filter.<axis>=` reads: the plot facets and the two label families.
+const FILTER_AXES = [
+  ["tone", "Tone"], ["ending", "Ending"], ["era", "Era"], ["setting", "Setting"], ["scope", "Scope"],
+  ["pacing", "Pacing"], ["chronology", "Chronology"], ["continuity", "Continuity"], ["conflict", "Conflict"],
+  ["ensemble", "Ensemble"], ["timespan", "Time span"], ["archetype", "Story type"], ["mood", "Mood"],
+  ["subgenre", "Subgenre"],
+];
+
 let p = {};
 let knobs = [];
-// The page's state, apart from the knob inputs. Seeds are `movie:<id>` / `series:<id>`, in order.
+// The page's state apart from the knob inputs. Seeds are `movie:<id>` / `series:<id>`, in order.
 let seeds = [], suggestSeeds = [], watched = [], filters = [];
+// Names seen for a key, from search hits and answers, so chips can say more than an id.
+const names = new Map();
+// The last answer drawn, so a failed re-rank can keep showing it.
+let last = null;
+// Titles whose "why" is open, as `<seed>|<id>`, kept across re-ranks.
+const openWhy = new Set();
 let timer = 0;
 // Answers can arrive out of order; only the newest request's is drawn.
 let asked = 0;
-// Whether the judged scores shown are for the current state, so Export can include them.
-let judgedFresh = false;
+let schema = null;
 
 function fmt(n, d = 3) { return n == null ? "–" : Number(n).toFixed(d); }
-function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+const kindOf = (key) => key.split(":")[0];
+const kindName = (key) => kindOf(key) === "movie" ? "Film" : "Series";
+function nameOf(key) {
+  const n = names.get(key);
+  return n ? `${esc(n.title)}${n.year ? ` <small>(${n.year})</small>` : ""}` : `${kindName(key)} ${esc(key.split(":")[1])}`;
+}
+function plainName(key) { return names.get(key)?.title || `${kindName(key)} ${key.split(":")[1]}`; }
+function why(body) { return body.detail || body.error || "no detail"; }
 
-const narrow = matchMedia("(max-width: 760px)");
+// ---------- Knobs ----------
 
-// The knobs, grouped by what they affect, in the order `params.json` names the groups. Each group folds;
-// on a narrow screen only the groups with a changed knob start open.
+const metaOf = (k) => KNOBS[k.name] || ["advanced", k.name, k.about];
+function sliderStep(k) {
+  const span = k.max - k.min;
+  if (k.integer) return Math.max(1, Math.round(span / 1000));
+  return span <= 10 ? 0.05 : span <= 100 ? 0.5 : 1;
+}
+
 function buildKnobs(values) {
-  $("knobs").innerHTML = "";
-  for (const group of p.knobGroups) {
+  $("groups").innerHTML = "";
+  for (const [id, title] of GROUPS) {
     const box = document.createElement("details");
     box.className = "group";
-    box.dataset.group = group;
-    box.innerHTML = `<summary>${esc(group)} <span class=muted></span></summary>`;
-    const grid = document.createElement("div");
-    grid.className = "knobs";
-    for (const k of knobs.filter((k) => k.group === group)) {
-      const wrap = document.createElement("label");
-      wrap.className = "knob";
-      const step = k.integer ? 1 : 0.05;
-      const range = `min="${k.min}" max="${k.max}" step="${step}"`;
-      wrap.innerHTML = `${esc(k.name)} <small>(${k.default})</small>` +
-        `<span class=ctl><input type="range" ${range} aria-label="${esc(k.name)}">` +
-        `<input type="number" name="${esc(k.name)}" ${range}></span>` +
-        `<small>${esc(k.about)}</small>`;
-      const [slider, input] = wrap.querySelectorAll("input");
-      input.value = values[k.name] ?? k.default;
-      slider.value = input.value;
-      const mark = () => { wrap.classList.toggle("changed", Number(input.value) !== k.default); countChanged(); };
-      input.addEventListener("input", () => { slider.value = input.value; mark(); schedule(); });
-      // Dragging moves the number only; the rows re-rank once the thumb is let go (`change`), so a drag is
-      // one request, not one per step it passed through.
-      slider.addEventListener("input", () => { input.value = slider.value; mark(); });
-      slider.addEventListener("change", schedule);
-      wrap.classList.toggle("changed", Number(input.value) !== k.default);
-      grid.appendChild(wrap);
-    }
-    box.appendChild(grid);
-    box.open = !narrow.matches || grid.querySelector(".changed") !== null;
-    $("knobs").appendChild(box);
+    box.dataset.group = id;
+    box.innerHTML = `<summary>${esc(title)} <span class="n" hidden></span></summary><div class="group-body"></div>`;
+    const body = box.querySelector(".group-body");
+    for (const k of knobs.filter((k) => metaOf(k)[0] === id)) body.appendChild(knobControl(k, values[k.name]));
+    if (id === "filters") body.appendChild(filterControls());
+    $("groups").appendChild(box);
+    // Collapsed, unless the address opened the page with something in this group changed.
+    box.open = body.querySelector(".knob.changed") !== null || (id === "filters" && (filters.length || watched.length));
   }
   countChanged();
 }
 
-// The changed-knob count in each group's heading and in the bar.
-function countChanged() {
-  for (const box of $("knobs").querySelectorAll("details.group")) {
-    const n = box.querySelectorAll(".knob.changed").length;
-    box.querySelector("summary .muted").textContent = n ? `· ${n} changed` : "";
+function knobControl(k, value) {
+  const [, label, about] = metaOf(k);
+  const wrap = document.createElement("div");
+  wrap.className = "knob";
+  wrap.dataset.name = k.name;
+  const id = `k-${k.name}`;
+  if (k.name === "same_animation") {
+    wrap.innerHTML = `<label class="switch"><input type="checkbox" id="${id}" name="${esc(k.name)}">${esc(label)}</label>` +
+      `<p class="about">${esc(about)} <code>${esc(k.name)}</code></p>`;
+    const box = wrap.querySelector("input");
+    box.checked = Number(value ?? k.default) === 1;
+    box.addEventListener("change", () => { markKnob(wrap, k); schedule(); });
+    markKnob(wrap, k);
+    return wrap;
   }
-  const n = $("knobs").querySelectorAll(".knob.changed").length;
-  $("bar-count").textContent = n ? `${n} changed` : "production";
-  $("bar-count").classList.toggle("changed", n > 0);
-  $("bar-reset").disabled = n === 0;
+  const at = ((k.default - k.min) / (k.max - k.min)) * 100;
+  wrap.innerHTML =
+    `<div class="name"><label for="${id}">${esc(label)}</label><code>${esc(k.name)}</code></div>` +
+    `<p class="about">${esc(about)}</p>` +
+    `<div class="ctl"><span class="track"><input type="range" min="${k.min}" max="${k.max}" step="${sliderStep(k)}" ` +
+    `aria-label="${esc(label)}"><span class="def" style="left:calc(8px + (100% - 16px) * ${at / 100})" ` +
+    `title="Production: ${k.default}"></span></span>` +
+    `<input type="text" class="value" id="${id}" name="${esc(k.name)}" inputmode="decimal" autocomplete="off" spellcheck="false">` +
+    `<button type="button" class="reset" aria-label="Reset ${esc(label)} to production (${k.default})" title="Reset to production (${k.default})">↺</button></div>` +
+    `<p class="prod">Production: ${k.default} <span class="problem"></span></p>`;
+  const [slider, input] = wrap.querySelectorAll("input");
+  input.value = value ?? k.default;
+  slider.value = input.value;
+  input.addEventListener("input", () => {
+    const v = parseNumber(input.value);
+    if (v !== null) slider.value = v;
+    markKnob(wrap, k);
+    schedule();
+  });
+  // An emptied field goes back to production when left, rather than sitting blank.
+  input.addEventListener("blur", () => { if (input.value === "") { input.value = k.default; slider.value = k.default; markKnob(wrap, k); schedule(); } });
+  // Dragging moves the number only; the rows re-rank once the thumb is let go (`change`), so a drag is one
+  // request, not one per step it passed through.
+  slider.addEventListener("input", () => { input.value = slider.value; markKnob(wrap, k); });
+  slider.addEventListener("change", schedule);
+  wrap.querySelector(".reset").addEventListener("click", () => {
+    input.value = k.default; slider.value = k.default; markKnob(wrap, k); refresh();
+  });
+  markKnob(wrap, k);
+  return wrap;
 }
 
-function changed() {
+// A knob's value as the address should carry it, or why it cannot be sent. `within` is the knob's own
+// element while it is being built and not yet on the page.
+function knobValue(k, within = document) {
+  const el = within.querySelector(`[name="${k.name}"]`);
+  if (el.type === "checkbox") return { value: el.checked ? 1 : 0 };
+  if (el.value.trim() === "") return { value: k.default };
+  const v = parseNumber(el.value);
+  if (v === null) return { problem: "must be a number" };
+  if (v < k.min || v > k.max) return { problem: `must be from ${k.min} to ${k.max}` };
+  if (k.integer && !Number.isInteger(v)) return { problem: "must be a whole number" };
+  // Always written with a dot, whichever separator was typed: the server reads `3.45`, never `3,45`.
+  return { value: v, raw: String(v) };
+}
+
+// A typed number, with a dot or a comma as the decimal separator ("3.45" or "3,45"), or null.
+function parseNumber(text) {
+  const t = String(text).trim().replace(",", ".");
+  return /^-?(\d+\.?\d*|\.\d+)$/.test(t) ? Number(t) : null;
+}
+
+function markKnob(wrap, k) {
+  const got = knobValue(k, wrap);
+  wrap.classList.toggle("invalid", !!got.problem);
+  wrap.classList.toggle("changed", !got.problem && got.value !== k.default);
+  const problem = wrap.querySelector(".problem");
+  if (problem) problem.textContent = got.problem ? `· ${got.problem}` : "";
+  const reset = wrap.querySelector(".reset");
+  if (reset) reset.disabled = !wrap.classList.contains("changed") && !got.problem;
+  countChanged();
+}
+
+function changedKnobs() {
   const out = {};
   for (const k of knobs) {
-    const v = document.querySelector(`input[name="${k.name}"]`).value;
-    if (v !== "" && Number(v) !== k.default) out[k.name] = v;
+    const got = knobValue(k);
+    if (!got.problem && got.value !== k.default) out[k.name] = got.raw ?? String(got.value);
   }
   return out;
 }
 
+// How many settings differ from production: knobs, each facet filter, and the watched list as one.
+function countChanged() {
+  let total = 0;
+  for (const box of $("groups").querySelectorAll("details.group")) {
+    let n = box.querySelectorAll(".knob.changed").length;
+    if (box.dataset.group === "filters") n += filters.length + (watched.length ? 1 : 0);
+    const badge = box.querySelector("summary .n");
+    badge.hidden = n === 0;
+    badge.textContent = `${n} changed`;
+    total += n;
+  }
+  const text = total ? `${total} setting${total === 1 ? "" : "s"} changed` : "Production settings";
+  $("bar-count").innerHTML = total
+    ? `${total} <span class="wide">setting${total === 1 ? "" : "s"} </span>changed` : "Production settings";
+  $("bar-count").title = total ? `${text}: go to Settings` : "Go to Settings";
+  $("bar-count").classList.toggle("changed", total > 0);
+  $("bar-reset").hidden = total === 0;
+  $("settings-count").textContent = total ? text : "None changed";
+  $("settings-count").classList.toggle("changed", total > 0);
+  $("settings-reset").disabled = total === 0;
+}
+
+function resetSettings() {
+  filters = []; watched = [];
+  buildKnobs({});
+  drawLists();
+  refresh();
+}
+
+// ---------- Filters and watched (in the Filters group) ----------
+
+function filterControls() {
+  const box = document.createElement("div");
+  box.className = "group-body";
+  box.innerHTML =
+    `<div class="knob"><div class="name"><label for="filter-axis">Only titles that are…</label><code>filter.&lt;axis&gt;</code></div>` +
+    `<p class="about">Keeps only candidates carrying every filter here.</p>` +
+    `<div class="row"><select id="filter-axis" aria-label="Filter on">` +
+    FILTER_AXES.map(([a, l]) => `<option value="${a}">${esc(l)}</option>`).join("") +
+    `</select><select id="filter-value" aria-label="Value"><option value="">Loading…</option></select>` +
+    `<button type="button" id="filter-add">Add</button></div>` +
+    `<ul class="chips" id="filters" aria-label="Filters"></ul></div>` +
+    `<div class="knob"><div class="name"><label for="watched-q">Already watched</label><code>watched</code></div>` +
+    `<p class="about">Dropped from every row, and each row leans toward them, as for someone who liked them.</p>` +
+    `<div class="combo" id="watched-combo"><input id="watched-q" type="search" placeholder="Add a watched title" autocomplete="off"></div>` +
+    `<ul class="chips" id="watched" aria-label="Watched titles"></ul></div>`;
+  box.querySelector("#filter-axis").addEventListener("change", fillFilterValues);
+  box.querySelector("#filter-add").addEventListener("click", () => {
+    const axis = $("filter-axis").value, value = $("filter-value").value;
+    if (!value) return;
+    if (!filters.some((f) => f.axis === axis && f.value === value)) filters.push({ axis, value });
+    drawLists(); countChanged(); refresh();
+  });
+  combo(box.querySelector("#watched-q"), (hit) => {
+    $("settings-error").textContent = "";
+    if (watched.includes(hit.key)) return;
+    if (watched.length >= p.maxWatched) { $("settings-error").textContent = `At most ${p.maxWatched} watched titles.`; return; }
+    watched.push(hit.key); drawLists(); countChanged(); refresh();
+  }, (key) => watched.includes(key));
+  loadSchema().then(fillFilterValues);
+  return box;
+}
+
+async function loadSchema() {
+  if (schema) return schema;
+  try {
+    const resp = await fetch(`${root}/index/schema.json`);
+    schema = resp.ok ? await resp.json() : { error: `HTTP ${resp.status}` };
+  } catch (e) {
+    schema = { error: String(e) };
+  }
+  return schema;
+}
+
+function fillFilterValues() {
+  const select = $("filter-value");
+  if (!select || !schema) return;
+  if (schema.error) {
+    select.innerHTML = `<option value="">Could not load values (${esc(schema.error)})</option>`;
+    return;
+  }
+  const values = (schema.fields?.[$("filter-axis").value]?.values || []).map((v) => String(v.value));
+  select.innerHTML = values.length
+    ? values.map((v) => `<option value="${esc(v)}">${esc(v.replace(/-/g, " "))}</option>`).join("")
+    : `<option value="">No values in this dataset</option>`;
+}
+
+function chip(label, attr, value, what) {
+  return `<li class="chip"><span class="label">${label}</span>` +
+    `<button type="button" data-${attr}="${esc(value)}" aria-label="Remove ${esc(what)}">×</button></li>`;
+}
+
+function drawLists() {
+  $("seeds").innerHTML = seeds.map((key) => chip(nameOf(key), "unseed", key, plainName(key))).join("");
+  $("titles-count").textContent = `${seeds.length} of ${p.maxSeeds}`;
+  $("seed-q").disabled = seeds.length >= p.maxSeeds;
+  $("seed-q").placeholder = seeds.length >= p.maxSeeds
+    ? `At most ${p.maxSeeds} titles: remove one to add another` : "Add a title: type a name, e.g. breaking bad";
+  $("ymal-seeds").innerHTML = suggestSeeds.map((key) => chip(nameOf(key), "unsuggest", key, plainName(key))).join("");
+  $("ymal-sub").textContent = suggestSeeds.length
+    ? `pooled from ${suggestSeeds.map(plainName).join(", ")}` : "no titles to pool";
+  if ($("filters")) {
+    const axisName = (a) => (FILTER_AXES.find(([x]) => x === a) || [a, a])[1];
+    $("filters").innerHTML = filters.map((f, i) =>
+      chip(`${esc(axisName(f.axis))}: ${esc(f.value)}`, "unfilter", i, `${axisName(f.axis)} ${f.value}`)).join("");
+    $("watched").innerHTML = watched.map((key) => chip(nameOf(key), "unwatch", key, plainName(key))).join("");
+  }
+}
+
+// ---------- Autocomplete ----------
+
+// Whether atlas has its fuzzy title index (`TITLE_SEARCH`): checked once per page load with an empty
+// `titles.json`, which answers 404 without it.
+let titleSearch = false;
+
+// A search box that suggests titles as you type — through `titles.json` (the fuzzy title index, both types
+// in one request) when atlas has it, else `/index/query.json` — debounced, the older request aborted. A
+// pasted TMDB id (or `movie:603`) is offered as-is, as the one way in by id.
+function combo(input, onPick, taken) {
+  const list = document.createElement("ul");
+  list.id = `${input.id}-list`;
+  list.setAttribute("role", "listbox");
+  list.hidden = true;
+  input.after(list);
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", "false");
+  input.setAttribute("aria-controls", list.id);
+  let hits = [], active = -1, wait = 0, ctl = null;
+
+  const close = () => { list.hidden = true; input.setAttribute("aria-expanded", "false"); input.removeAttribute("aria-activedescendant"); active = -1; };
+  const draw = (note) => {
+    list.innerHTML = hits.map((h, i) => {
+      const off = taken(h.key);
+      const poster = h.poster
+        ? `<img class="poster" src="https://image.tmdb.org/t/p/w92${esc(h.poster)}" alt="" loading="lazy">`
+        : `<span class="poster" aria-hidden="true">${kindOf(h.key) === "movie" ? "Film" : "TV"}</span>`;
+      return `<li role="option" id="${list.id}-${i}" data-i="${i}" aria-selected="${i === active}"${off ? ' aria-disabled="true"' : ""}>` +
+        `${poster}<span class="t">${esc(h.title)}</span><span class="m">${[h.year, kindName(h.key), off ? "added" : ""].filter(Boolean).join(" · ")}</span></li>`;
+    }).join("") + (note ? `<li class="note" aria-disabled="true">${esc(note)}</li>` : "");
+    list.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    if (active >= 0) {
+      input.setAttribute("aria-activedescendant", `${list.id}-${active}`);
+      list.querySelector(`[data-i="${active}"]`)?.scrollIntoView({ block: "nearest" });
+    }
+  };
+  const byId = (q) => {
+    const key = q.match(/^(movie|series):(\d+)$/);
+    if (key) return [{ key: q, title: `TMDB id ${key[2]}` }];
+    if (/^\d+$/.test(q)) return ["movie", "series"].map((k) => ({ key: `${k}:${q}`, title: `TMDB id ${q}` }));
+    return [];
+  };
+  async function find(q) {
+    ctl?.abort();
+    ctl = new AbortController();
+    const direct = byId(q);
+    hits = direct;
+    active = direct.findIndex((h) => !taken(h.key));
+    if (direct.length) { draw(); return; }
+    draw("Searching…");
+    let note = "";
+    try {
+      const address = titleSearch ? `${base}/titles.json?q=${encodeURIComponent(q)}`
+        : `${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`;
+      const resp = await fetch(address, { signal: ctl.signal });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(resp.status === 429 ? "too many searches, wait a moment" : why(body));
+      hits = titleSearch ? body.titles || []
+        : (body.hits || []).filter((h) => h.type === "movie" || h.type === "series").map((h) => (
+          { key: `${h.type}:${h.id}`, title: h.title || `TMDB id ${h.id}`, year: h.year, poster: h.posterPath }));
+      for (const h of hits) if (!h.title.startsWith("TMDB id")) names.set(h.key, { title: h.title, year: h.year });
+      if (!hits.length) note = "No titles match. You can also paste a TMDB id.";
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      hits = []; note = `Search failed: ${e.message}`;
+    }
+    active = hits.findIndex((h) => !taken(h.key));
+    draw(note);
+  }
+  const pick = (i) => {
+    const h = hits[i];
+    if (!h || taken(h.key)) return;
+    onPick(h);
+    input.value = "";
+    close();
+  };
+  input.addEventListener("input", () => {
+    clearTimeout(wait);
+    const q = input.value.trim();
+    if (q.length < 2 && !/^\d+$/.test(q)) { ctl?.abort(); close(); return; }
+    wait = setTimeout(() => find(q), SEARCH_DEBOUNCE_MS);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { close(); return; }
+    if (e.key === "Enter") { e.preventDefault(); if (!list.hidden) pick(active); return; }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    if (list.hidden) { if (hits.length) draw(); return; }
+    const step = e.key === "ArrowDown" ? 1 : -1;
+    for (let n = 0, i = active; n < hits.length; n++) {
+      i = (i + step + hits.length) % hits.length;
+      if (!taken(hits[i].key)) { active = i; break; }
+    }
+    draw();
+  });
+  // Pressing an option must not blur the input first, or the list closes under the pointer.
+  list.addEventListener("pointerdown", (e) => e.preventDefault());
+  list.addEventListener("click", (e) => { const li = e.target.closest("[data-i]"); if (li) pick(Number(li.dataset.i)); });
+  input.addEventListener("blur", () => setTimeout(close, 100));
+  input.addEventListener("focus", () => { if (hits.length && input.value.trim()) draw(); });
+}
+
+// ---------- State and the address ----------
+
 // The page's state as a query string — the shape `State::query` writes and `State::parse` reads. Lists are
 // written raw (`movie:5723,series:1438`) so the address stays readable; an absent seed list means the
-// defaults and an empty one means none, which is how "clear" survives a reload.
+// defaults and an empty one means none, which is how an emptied list survives a reload.
 function query() {
-  const q = new URLSearchParams(changed());
+  const q = new URLSearchParams(changedKnobs());
   q.set("limit", $("limit").value || p.defaultLimit);
   let out = `${q}&seeds=${seeds.join(",")}&suggest=${suggestSeeds.join(",")}`;
   if (watched.length) out += `&watched=${watched.join(",")}`;
@@ -319,13 +740,8 @@ function query() {
   return out;
 }
 
-// Read a state back from a query string into the page.
 function applyQuery(search) {
   const url = new URLSearchParams(search);
-  const values = {};
-  for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
-  buildKnobs(values);
-  $("limit").value = Math.min(Number(url.get("limit")) || p.defaultLimit, p.maxRowsLimit);
   const list = (name, fallback, max) =>
     url.has(name) ? url.get(name).split(",").filter(Boolean).slice(0, max) : [...fallback];
   seeds = list("seeds", p.defaultSeeds, p.maxSeeds);
@@ -333,208 +749,205 @@ function applyQuery(search) {
   watched = list("watched", [], p.maxWatched);
   filters = [...url.entries()].filter(([key]) => key.startsWith(FILTER))
     .map(([key, value]) => ({ axis: key.slice(FILTER.length), value }));
+  setLimit(Math.min(Number(url.get("limit")) || p.defaultLimit, p.maxRowsLimit));
+  const values = {};
+  for (const k of knobs) if (url.has(k.name)) values[k.name] = url.get(k.name);
+  buildKnobs(values);
   drawLists();
 }
 
-function chips(id, list, attr) {
-  $(id).innerHTML = list.map((key) =>
-    `<li class=chip>${esc(key)}<button type="button" data-${attr}="${esc(key)}">×</button></li>`).join("");
-}
-
-function drawLists() {
-  chips("watched", watched, "unwatch");
-  chips("suggest-seeds", suggestSeeds, "unsuggest");
-  $("filters").innerHTML = filters.map((f, i) =>
-    `<li class=chip>${esc(f.axis)}=${esc(f.value)}<button type="button" data-unfilter="${i}">×</button></li>`).join("");
+function setLimit(n) {
+  const options = [...new Set([10, 20, 30, p.maxRowsLimit, n])].filter((v) => v >= 1 && v <= p.maxRowsLimit)
+    .sort((a, b) => a - b);
+  $("limit").innerHTML = options.map((v) => `<option value="${v}">${v}</option>`).join("");
+  $("limit").value = String(n);
 }
 
 function schedule() {
   clearTimeout(timer);
-  timer = setTimeout(() => refresh().catch(report), DEBOUNCE_MS);
+  timer = setTimeout(refresh, DEBOUNCE_MS);
 }
+
+// ---------- Ranking ----------
 
 async function refresh() {
   clearTimeout(timer);
-  judgedFresh = false;
-  const q = query();
-  history.replaceState(null, "", `${base}?${q}`);
-  $("error").textContent = "";
-  if (!seeds.length && !suggestSeeds.length) {
-    $("status").textContent = "No seeds: add one above.";
-    $("rows").innerHTML = ""; $("suggest").innerHTML = "";
+  const bad = knobs.map((k) => [k, knobValue(k).problem]).find(([, problem]) => problem);
+  if (bad) {
+    $("settings-error").textContent =
+      `${metaOf(bad[0])[1]} ${bad[1]}. Nothing re-ranks until it does.`;
     return;
   }
+  $("settings-error").textContent = "";
+  const q = query();
+  history.replaceState(null, "", `${base}?${q}`);
   const mine = ++asked;
-  $("status").textContent = $("bar-status").textContent = "Ranking…";
-  $("bar").classList.add("busy");
-  const resp = await fetch(`${base}/rows.json?${q}`).finally(() => {
-    if (mine === asked) { $("bar-status").textContent = ""; $("bar").classList.remove("busy"); }
-  });
-  const body = await resp.json().catch(() => ({}));
+  setBusy(true);
+  let resp, body;
+  try {
+    resp = await fetch(`${base}/rows.json?${q}&judged=1`);
+    body = await resp.json().catch(() => ({}));
+  } catch (e) {
+    if (mine === asked) { setBusy(false); failed(`atlas could not be reached (${e.message})`); }
+    return;
+  }
   if (mine !== asked) return;
-  if (!resp.ok) { $("status").textContent = ""; $("error").textContent = body.detail || body.error || resp.status; return; }
-  $("status").textContent = (body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters") +
-    (watched.length ? ` · ${watched.length} watched` : "") + (filters.length ? ` · ${filters.length} filters` : "");
-  $("rows").innerHTML = seeds.length ? body.rows.map(card).join("") : "<p class=muted>No More Like This seeds.</p>";
-  $("suggest").innerHTML = suggestTable(body.suggest);
-}
-
-function note(text) { $("note").textContent = text; }
-
-function remove(key) {
-  seeds = seeds.filter((s) => s !== key);
-  document.querySelector(`[data-card="${key}"]`)?.remove();
-  // Nothing re-ranks when a seed goes, so only the address changes.
-  history.replaceState(null, "", `${base}?${query()}`);
-  if (!seeds.length) $("status").textContent = "No More Like This seeds.";
-}
-
-function add(key, to) {
-  $("error").textContent = "";
-  const [list, max, what] = to === "suggest" ? [suggestSeeds, p.maxSuggestSeeds, "You might also like seeds"]
-    : to === "watched" ? [watched, p.maxWatched, "watched titles"] : [seeds, p.maxSeeds, "seeds"];
-  if (list.includes(key)) return;
-  if (list.length >= max) { $("error").textContent = `At most ${max} ${what}.`; return; }
-  list.push(key);
+  setBusy(false);
+  if (!resp.ok) {
+    failed(resp.status === 429 ? "too many requests from this address; wait a few seconds and retry"
+      : `${why(body)} (HTTP ${resp.status})`);
+    return;
+  }
+  last = body;
+  for (const a of body.rows) if (a.seed.title) names.set(a.key, { title: a.seed.title, year: a.seed.year });
+  for (const s of body.suggest?.seeds || []) if (s.title) names.set(s.key, { title: s.title, year: s.year });
   drawLists();
-  refresh().catch(report);
+  drawCards();
+  drawSuggest(body.suggest);
+  drawScore(body.judged);
 }
 
-async function search() {
-  const q = $("q").value.trim();
-  if (!q) return;
-  $("hits").innerHTML = "<li class=muted>Searching…</li>";
-  const resp = await fetch(`${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`);
-  const body = await resp.json().catch(() => ({}));
-  const hits = (body.hits || []).filter((h) => h.type === "movie" || h.type === "series");
-  const button = (key, to, text) => `<button type="button" data-add="${key}" data-to="${to}">${text}</button>`;
-  $("hits").innerHTML = hits.length
-    ? hits.map((h) => `<li>${esc(h.title || h.id)}${h.year ? ` <span class=muted>(${h.year})</span>` : ""} ` +
-        `<span class=muted>${h.type}</span>${button(`${h.type}:${h.id}`, "seeds", "Seed")}` +
-        `${button(`${h.type}:${h.id}`, "suggest", "You might also like")}` +
-        `${button(`${h.type}:${h.id}`, "watched", "Watched")}</li>`).join("")
-    : `<li class=muted>${resp.ok ? "Nothing found." : esc(body.detail || body.error || resp.status)}</li>`;
+function setBusy(on) {
+  $("bar-busy").textContent = on ? "Re-ranking…" : "";
+  $("bar-busy").classList.toggle("on", on);
+  for (const card of $("cards").querySelectorAll(".card")) card.classList.toggle("busy", on);
 }
 
-function moved(rank, production) {
-  return production == null ? "<span class=up>new</span>"
-    : production === rank ? `<span class=muted>${production}</span>`
-    : `<span class=${production > rank ? "up" : "down"}>${production}</span>`;
+// A request that failed: every card says so and offers a retry, over the last answer it had, if any.
+function failed(message) {
+  drawCards(message);
+  $("score-headline").innerHTML = `<span class="error">Not updated: ${esc(message)}</span>`;
+  $("bar-score").textContent = "";
 }
 
-// One seed's card: its row, production's rank beside each title, and what the tuning pushed out.
-function card(a) {
-  const type = a.key.split(":")[0];
-  const seed = a.seed.title ? `${esc(a.seed.title)}${a.seed.year ? ` <span class=muted>(${a.seed.year})</span>` : ""}` : esc(a.key);
-  const counts = a.total
-    ? `${a.titles.length} of ${a.total} (production row: ${a.productionTotal}); spread ${fmt(a.spread, 4)}` +
-      (a.tilted ? "; ordered for the watched titles" : "")
-    : "No row: atlas has no neighbours for this title, or the filters left none.";
-  let html = `<section data-card="${esc(a.key)}"><div class="row card-head"><h2>${seed} <span class=muted>${esc(a.key)}</span></h2>` +
-    `<button type="button" data-remove="${esc(a.key)}">Remove</button></div><p class=muted>${counts}</p>`;
-  if (a.titles.length) {
-    html += `<div class="scroll wide"><table>${table(a, type)}</table></div><ul class=cards>${cards(a, type)}</ul>`;
+function moveBadge(rank, production) {
+  if (production == null) return `<span class="move new" title="Not in production's row">new</span>`;
+  if (production === rank) return `<span class="move same" title="Same place as production">=</span>`;
+  const up = production > rank;
+  const n = Math.abs(production - rank);
+  return `<span class="move ${up ? "up" : "down"}" title="Production: #${production}" ` +
+    `aria-label="${up ? "up" : "down"} ${n} from production #${production}">${up ? "▲" : "▼"}${n}</span>`;
+}
+
+// Every seed's card, in the order of the seed list: its row from the last answer, or why there is none.
+function drawCards(error) {
+  const rows = new Map((last?.rows || []).map((a) => [a.key, a]));
+  $("cards").innerHTML = seeds.length
+    ? seeds.map((key) => card(key, rows.get(key), error)).join("")
+    : `<p class="hint">No titles yet: add one above.</p>`;
+}
+
+function card(key, a, error) {
+  let html = `<article class="card" data-card="${esc(key)}"><h3>${nameOf(key)}</h3>`;
+  if (error) {
+    html += `<p class="state error" role="alert">Couldn't re-rank: ${esc(error)}.` +
+      ` <button type="button" data-retry>Retry</button></p>` +
+      (a ? `<p class="sub">Showing the last result.</p>` : "");
   }
-  if (a.left.length) {
-    html += `<details><summary>Pushed out of the first ${a.titles.length} (${a.left.length})</summary><ul>` +
-      a.left.map((t) => `<li>${esc(t.title || t.id)} — production #${t.production}</li>`).join("") + "</ul></details>";
+  if (!a) return html + (error ? "" : `<p class="state muted">Ranking…</p>`) + "</article>";
+  const kind = kindName(key);
+  if (a.seed.title == null) {
+    return html + `<p class="state error">Atlas has no ${kind.toLowerCase()} with TMDB id ${esc(key.split(":")[1])},` +
+      ` so there is no row. Check it is a ${kind.toLowerCase()}, not a ${kind === "Film" ? "series" : "film"}.</p></article>`;
   }
-  return html + "</section>";
-}
-
-function table(a, type) {
-  const tmdb = type === "movie" ? "movie" : "tv";
-  let html = "<thead><tr><th>#</th><th>prod</th><th class=title>title</th><th>score</th><th>base</th>" +
-    SIGNALS.map((s) => `<th>${s}</th>`).join("") + "<th class=title>subgenre</th></tr></thead><tbody>";
+  if (!a.productionTotal && !a.total) {
+    return html + `<p class="state error">Atlas knows this title but has no More Like This row for it:` +
+      ` it lacks the text or labels to compare.</p></article>`;
+  }
+  if (!a.total) {
+    return html + `<p class="state error">Your settings leave nothing in this row: production has` +
+      ` ${a.productionTotal} titles, and the filters or minimums drop them all.</p></article>`;
+  }
+  html += `<p class="sub">${kind} · top ${a.titles.length} of ${a.total}` +
+    (a.total !== a.productionTotal ? ` (production ${a.productionTotal})` : "") +
+    (a.tilted ? " · leaning toward what you watched" : "") + "</p><ol>";
   for (const t of a.titles) {
-    const name = t.title ? `${esc(t.title)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""}` : t.id;
-    html += `<tr><td>${t.rank}</td><td>${moved(t.rank, t.production)}</td>` +
-      `<td class=title><a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">${name}</a></td>` +
-      `<td>${fmt(t.score)}</td><td>${fmt(t.base)}</td>` +
-      SIGNALS.map((s) => {
-        const sig = t.signals[s];
-        const cls = sig.points < 0 ? "neg" : sig.points === 0 ? "muted" : "";
-        return `<td class="${cls}" title="value ${fmt(sig.value)}">${fmt(sig.points)}</td>`;
-      }).join("") +
-      `<td class=title>${esc(t.subgenre || "")}${t.held ? " <span class=muted>(held by cap)</span>" : ""}</td></tr>`;
+    const open = openWhy.has(`${key}|${t.id}`);
+    html += `<li><button type="button" class="title-btn" data-why="${esc(key)}|${t.id}" aria-expanded="${open}">` +
+      `<span class="rank">${t.rank}</span><span class="name">${esc(t.title || `TMDB id ${t.id}`)}` +
+      `${t.year ? ` <small>(${t.year})</small>` : ""}</span>${moveBadge(t.rank, t.production)}</button>` +
+      `<div class="why"${open ? "" : " hidden"}>${whyHtml(key, t)}</div></li>`;
   }
-  return html + "</tbody>";
+  html += "</ol>";
+  if (a.left.length) {
+    html += `<details class="dropped"><summary>${a.left.length} of production's top ${a.titles.length} dropped out</summary><ul>` +
+      a.left.map((t) => `<li>${esc(t.title || `TMDB id ${t.id}`)}${t.year ? ` (${t.year})` : ""} · was #${t.production}</li>`).join("") +
+      "</ul></details>";
+  }
+  return html + "</article>";
 }
 
-// The narrow-screen form of `table`: one line per title (rank, title, places moved against production,
-// score), its per-signal points folded underneath.
-function cards(a, type) {
-  const tmdb = type === "movie" ? "movie" : "tv";
-  return a.titles.map((t) => {
-    const name = t.title ? `${esc(t.title)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""}` : t.id;
-    const shift = t.production == null ? "<span class=up>new</span>"
-      : t.production === t.rank ? "<span class=muted>=</span>"
-      : t.production > t.rank ? `<span class=up title="production #${t.production}">▲${t.production - t.rank}</span>`
-      : `<span class=down title="production #${t.production}">▼${t.rank - t.production}</span>`;
-    const signals = SIGNALS.map((s) => {
-      const sig = t.signals[s];
-      const cls = sig.points < 0 ? "neg" : sig.points === 0 ? "muted" : "";
-      return `<dt>${s}</dt><dd class=value>value ${fmt(sig.value)}</dd><dd class="${cls}">${fmt(sig.points)}</dd>`;
-    }).join("");
-    return `<li><details><summary><span class=rank>${t.rank}</span><span class=name>${name}</span>${shift}` +
-      `<span class=score>${fmt(t.score)}</span></summary><dl>` +
-      `<dt>production</dt><dd></dd><dd>${t.production == null ? "–" : `#${t.production}`}</dd>` +
-      `<dt>base</dt><dd></dd><dd>${fmt(t.base)}</dd>${signals}` +
-      `<dd class=meta>${esc(t.subgenre || "")}${t.held ? " (held by cap)" : ""} · ` +
-      `<a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">TMDB</a></dd>` +
-      `</dl></details></li>`;
-  }).join("");
+// Why a title is where it is: the text similarity it starts from, then every signal that added or took
+// points, largest first.
+function whyHtml(key, t) {
+  const parts = Object.entries(t.signals).filter(([, s]) => Math.abs(s.points) >= 0.0005)
+    .sort((a, b) => Math.abs(b[1].points) - Math.abs(a[1].points));
+  const top = Math.max(...parts.map(([, s]) => Math.abs(s.points)), 1e-9);
+  const line = (label, pts) =>
+    `<li class="${pts < 0 ? "neg" : ""}"><span>${esc(label)}</span><span class="bar"><span style="width:${(Math.abs(pts) / top) * 100}%"></span></span>` +
+    `<span class="pts ${pts < 0 ? "down" : ""}">${pts >= 0 ? "+" : ""}${fmt(pts)}</span></li>`;
+  const tmdb = kindOf(key) === "movie" ? "movie" : "tv";
+  return `<p>Starts at <b>${fmt(t.base)}</b> for how alike the premise and plot texts are${parts.length ? ", then:" : "."}</p>` +
+    (parts.length ? `<ul class="reasons">${parts.map(([name, s]) => line(SIGNALS[name] || name, s.points)).join("")}</ul>` : "") +
+    `<p class="hint">Score ${fmt(t.score)} · ${t.production == null ? "not in production's row" : `production #${t.production}`}` +
+    `${t.subgenre ? ` · ${esc(t.subgenre)}` : ""}${t.held ? " · moved down by the per-subgenre limit" : ""}` +
+    ` · <a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">TMDB</a></p>`;
 }
 
-function suggestTable(s) {
-  if (!s || !s.titles.length) return "<tbody><tr><td class=title>No suggestions.</td></tr></tbody>";
-  return "<thead><tr><th>#</th><th>prod</th><th class=title>title</th></tr></thead><tbody>" +
-    s.titles.map((t) => `<tr><td>${t.rank}</td><td>${moved(t.rank, t.production)}</td>` +
-      `<td class=title>${esc(t.title || t.key)}${t.year ? ` <span class=muted>(${t.year})</span>` : ""} ` +
-      `<span class=muted>${esc(t.key)}</span></td></tr>`).join("") + "</tbody>";
+function drawSuggest(s) {
+  $("ymal-list").innerHTML = s && s.titles.length
+    ? s.titles.map((t) => `<li><span class="rank">${t.rank}</span><span class="name">${esc(t.title || t.key)}${t.year ? ` <small class="muted">(${t.year})</small>` : ""}</span> ` +
+        `${moveBadge(t.rank, t.production)}</li>`).join("")
+    : `<li class="hint">${suggestSeeds.length ? "Nothing to suggest for these titles." : "Add titles to pool, or use your titles."}</li>`;
 }
 
-// One half's mean and cases, tuned against production.
+// The judged scores: the tuning half's mean as the headline, every case and the held-out half folded away.
+function drawScore(j) {
+  if (!j) { $("score-headline").textContent = "No score in this answer."; $("bar-score").textContent = ""; return; }
+  const dev = j.dev;
+  const d = dev.tuned.ndcg - dev.production.ndcg;
+  const tuned = j.changed.length || Math.abs(d) > 1e-12 || dev.tuned.bad !== dev.production.bad;
+  $("bar-score").innerHTML = `Quality ${fmt(dev.tuned.ndcg)}` + (tuned && Math.abs(d) >= 0.0005
+    ? ` <span class="${d > 0 ? "up" : "down"}">${d > 0 ? "▲" : "▼"}${fmt(Math.abs(d))}</span>` : "");
+  $("score-headline").innerHTML = tuned
+    ? `Quality on hand-judged titles: <b>${fmt(dev.tuned.ndcg)}</b>, was ${fmt(dev.production.ndcg)} ` +
+      (Math.abs(d) < 0.0005 ? `<span class="muted">(no change)</span>`
+        : `<span class="${d > 0 ? "up" : "down"}">(${d > 0 ? "+" : ""}${fmt(d)}, ${d > 0 ? "better" : "worse"})</span>`)
+    : `Quality on hand-judged titles: <b>${fmt(dev.production.ndcg)}</b> <span class="muted">(production)</span>`;
+  $("score-dev").innerHTML = halfHtml(j, "dev");
+  $("score-test-body").innerHTML = halfHtml(j, "test");
+}
+
 function halfHtml(j, half) {
   const m = j[half];
   const delta = (t, pr) => {
     const d = t - pr;
-    return d === 0 ? "" : ` <span class=${d > 0 ? "up" : "down"}>${d > 0 ? "+" : ""}${fmt(d)}</span>`;
+    return Math.abs(d) < 0.0005 ? "" : ` <span class="${d > 0 ? "up" : "down"}">${d > 0 ? "+" : ""}${fmt(d)}</span>`;
   };
-  let html = `<p><b>${half} nDCG@${j.k} ${fmt(m.tuned.ndcg)}</b>${delta(m.tuned.ndcg, m.production.ndcg)} ` +
-    `<span class=muted>(production ${fmt(m.production.ndcg)}; n=${m.n})</span> · ` +
-    `nDCG' ${fmt(m.tuned.condensed)}${delta(m.tuned.condensed, m.production.condensed)} · ` +
-    `P ${fmt(m.tuned.precision, 2)} · bad ${m.tuned.bad} <span class=muted>(production ${m.production.bad})</span></p>`;
-  html += "<div class=scroll><table><thead><tr><th class=title>seed</th><th>nDCG</th><th>prod</th>" +
-    "<th>nDCG'</th><th>P</th><th>bad</th><th>judged</th></tr></thead><tbody>";
+  let html = `<p>${m.n} titles · score ${fmt(m.tuned.ndcg)}${delta(m.tuned.ndcg, m.production.ndcg)} ` +
+    `<span class="muted">(production ${fmt(m.production.ndcg)})</span> · titles judged bad in the top ${j.k}: ` +
+    `${m.tuned.bad} <span class="muted">(production ${m.production.bad})</span></p>`;
+  html += `<div class="scroll"><table><thead><tr><th>Title</th><th>Score</th><th>Production</th>` +
+    `<th>Precision</th><th>Bad</th></tr></thead><tbody>`;
   for (const c of j.cases.filter((c) => c.split === half)) {
-    html += `<tr><td class=title>${esc(c.title)}</td><td>${fmt(c.tuned.ndcg)}${delta(c.tuned.ndcg, c.production.ndcg)}</td>` +
-      `<td class=muted>${fmt(c.production.ndcg)}</td><td>${fmt(c.tuned.condensed)}</td>` +
-      `<td>${fmt(c.tuned.precision, 2)}</td><td>${c.tuned.bad}</td><td>${c.tuned.judged}</td></tr>`;
+    html += `<tr><td>${esc(c.title)}</td><td>${fmt(c.tuned.ndcg)}${delta(c.tuned.ndcg, c.production.ndcg)}</td>` +
+      `<td class="muted">${fmt(c.production.ndcg)}</td><td>${fmt(c.tuned.precision, 2)}</td><td>${c.tuned.bad}</td></tr>`;
   }
   return html + "</tbody></table></div>";
 }
 
-// The judged set ranks with everything but the seed lists, so they are left out of its query.
-function tuningQuery() {
-  return query().split("&").filter((kv) => !/^(seeds|suggest)=/.test(kv)).join("&");
-}
+// ---------- Save and share ----------
 
-async function judge() {
-  $("judged-status").textContent = "Scoring…";
-  const resp = await fetch(`${base}/judged.json?${tuningQuery()}`);
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) { $("judged-status").textContent = body.detail || body.error || resp.status; return; }
-  $("judged-status").textContent = body.changed.length ? `tuned: ${body.changed.join(", ")}` : "production parameters";
-  $("judged").innerHTML = halfHtml(body, "dev");
-  $("judged-test").innerHTML = halfHtml(body, "test");
-  judgedFresh = true;
+function note(text, isError) {
+  $("end-note").textContent = text;
+  $("end-note").className = isError ? "error" : "";
 }
 
 async function exportFile() {
+  note("Exporting…");
   const full = $("export-full").checked ? "&full=1" : "";
-  const resp = await fetch(`${base}/export.json?${query()}${full}${judgedFresh ? "&judged=1" : ""}`);
-  if (!resp.ok) { const body = await resp.json().catch(() => ({})); report(body.detail || body.error || resp.status); return; }
+  const resp = await fetch(`${base}/export.json?${query()}${full}&judged=1`);
+  if (!resp.ok) { const body = await resp.json().catch(() => ({})); note(`Export failed: ${why(body)}`, true); return; }
   const blob = new Blob([await resp.text()], { type: "application/json" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
@@ -545,73 +958,95 @@ async function exportFile() {
 }
 
 async function importFile(file) {
+  note("Importing…");
   const resp = await fetch(`${base}/import.json`, { method: "POST", body: await file.text() });
   const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) { report(`Import refused: ${body.detail || body.error || resp.status}`); return; }
+  if (!resp.ok) { note(`Import refused: ${why(body)}`, true); return; }
   applyQuery(body.query);
   note(body.removed.length
-    ? `Imported. These knobs from an older file no longer exist and were skipped: ${body.removed.join(", ")}.`
+    ? `Imported. These settings from an older file no longer exist and were skipped: ${body.removed.join(", ")}.`
     : "Imported.");
+  last = null;
+  drawCards();
   await refresh();
 }
+
+// ---------- Wiring ----------
 
 async function start() {
-  p = await (await fetch(`${base}/params.json`)).json();
+  const resp = await fetch(`${base}/params.json`);
+  if (!resp.ok) throw new Error(`params.json answered HTTP ${resp.status}`);
+  p = await resp.json();
   knobs = p.knobs;
-  $("limit").max = p.maxRowsLimit;
+  fetch(`${base}/titles.json?q=`).then((r) => { titleSearch = r.ok; }, () => {});
   applyQuery(location.search);
+  drawCards();
   await refresh();
 }
 
-const report = (e) => { $("error").textContent = String(e); };
-$("limit").addEventListener("input", schedule);
+combo($("seed-q"), (hit) => {
+  $("titles-error").textContent = "";
+  if (seeds.includes(hit.key)) return;
+  if (seeds.length >= p.maxSeeds) { $("titles-error").textContent = `At most ${p.maxSeeds} titles.`; return; }
+  seeds.push(hit.key);
+  drawLists();
+  drawCards();
+  refresh();
+}, (key) => seeds.includes(key));
+
+$("limit").addEventListener("change", refresh);
+$("bar-reset").addEventListener("click", resetSettings);
+$("settings-reset").addEventListener("click", resetSettings);
+$("ymal-use").addEventListener("click", () => {
+  suggestSeeds = seeds.slice(0, p.maxSuggestSeeds); drawLists(); refresh();
+});
 $("copy").addEventListener("click", async () => {
   history.replaceState(null, "", `${base}?${query()}`);
-  await navigator.clipboard.writeText(location.href).then(() => note("Link copied."), () => note(location.href));
+  await navigator.clipboard.writeText(location.href).then(() => note("Link copied."),
+    () => note(`Copy this link: ${location.href}`));
 });
-$("export").addEventListener("click", () => exportFile().catch(report));
+$("export").addEventListener("click", () => exportFile().catch((e) => note(`Export failed: ${e}`, true)));
+$("import-btn").addEventListener("click", () => $("import").click());
 $("import").addEventListener("change", (e) => {
   const file = e.target.files[0];
   e.target.value = "";
-  if (file) importFile(file).catch(report);
+  if (file) importFile(file).catch((err) => note(`Import failed: ${err}`, true));
 });
-for (const id of ["reset-knobs", "bar-reset"]) {
-  $(id).addEventListener("click", () => { buildKnobs({}); refresh().catch(report); });
-}
-$("reset-seeds").addEventListener("click", () => {
-  seeds = [...p.defaultSeeds]; suggestSeeds = [...p.defaultSuggestSeeds]; drawLists(); refresh().catch(report);
+$("reset-everything").addEventListener("click", () => {
+  if (!confirm("Reset titles and settings to the defaults?")) return;
+  openWhy.clear();
+  applyQuery("");
+  note("Everything is back to the defaults.");
+  refresh();
 });
-$("reset-all").addEventListener("click", () => { applyQuery(""); refresh().catch(report); });
-$("clear").addEventListener("click", () => { seeds = []; refresh().catch(report); });
-$("add").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const id = $("id").value.trim();
-  if (!/^\d+$/.test(id)) { $("error").textContent = "A TMDB id is a number."; return; }
-  add(`${$("type").value}:${id}`, e.submitter?.dataset.to || "seeds");
-});
-$("search").addEventListener("submit", (e) => { e.preventDefault(); search().catch(report); });
-$("filter").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const [axis, ...rest] = $("filter-text").value.split("=");
-  const value = rest.join("=").trim();
-  if (!axis.trim() || !value) { $("error").textContent = "A filter is axis=value, e.g. tone=bleak."; return; }
-  filters.push({ axis: axis.trim(), value });
-  $("filter-text").value = "";
-  drawLists();
-  refresh().catch(report);
-});
-// Delegated, because the cards, chips and search results are redrawn.
+// Delegated, because the cards and chips are redrawn.
 document.addEventListener("click", (e) => {
-  const at = (attr) => e.target.closest(`[data-${attr}]`)?.dataset;
-  if (at("remove")) remove(at("remove").remove);
-  if (at("add")) add(at("add").add, at("add").to);
+  const at = (attr) => e.target.closest(`[data-${attr}]`);
+  const w = at("why");
+  if (w) {
+    const open = w.getAttribute("aria-expanded") !== "true";
+    w.setAttribute("aria-expanded", String(open));
+    w.nextElementSibling.hidden = !open;
+    if (open) openWhy.add(w.dataset.why); else openWhy.delete(w.dataset.why);
+    return;
+  }
+  if (at("retry")) { refresh(); return; }
   const drop = (list, key) => list.filter((k) => k !== key);
-  if (at("unwatch")) { watched = drop(watched, at("unwatch").unwatch); drawLists(); refresh().catch(report); }
-  if (at("unsuggest")) { suggestSeeds = drop(suggestSeeds, at("unsuggest").unsuggest); drawLists(); refresh().catch(report); }
-  if (at("unfilter")) { filters.splice(Number(at("unfilter").unfilter), 1); drawLists(); refresh().catch(report); }
+  if (at("unseed")) {
+    // Nothing else re-ranks when a title goes, so only its card and the address change.
+    seeds = drop(seeds, at("unseed").dataset.unseed);
+    drawLists(); drawCards();
+    history.replaceState(null, "", `${base}?${query()}`);
+    return;
+  }
+  if (at("unwatch")) { watched = drop(watched, at("unwatch").dataset.unwatch); drawLists(); countChanged(); refresh(); }
+  if (at("unsuggest")) { suggestSeeds = drop(suggestSeeds, at("unsuggest").dataset.unsuggest); drawLists(); refresh(); }
+  if (at("unfilter")) { filters.splice(Number(at("unfilter").dataset.unfilter), 1); drawLists(); countChanged(); refresh(); }
 });
-$("judge").addEventListener("click", () => { judge().catch((e) => { $("judged-status").textContent = String(e); }); });
-start().catch((e) => { $("error").textContent = `Could not load the playground: ${e}`; });
+start().catch((e) => {
+  $("cards").innerHTML = `<p class="error" role="alert">Could not load the playground: ${esc(e.message || e)}</p>`;
+  $("score-headline").textContent = "";
+});
 </script>
 </body>
 </html>
