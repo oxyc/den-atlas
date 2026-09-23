@@ -343,6 +343,22 @@ async fn handle_playground(
     if route == "/playground/params.json" {
         return serve_json(method, headers, crate::playground::params_json(), "no-store", None).await;
     }
+    if route == "/playground/titles.json" {
+        // A 404 without the title index (`TITLE_SEARCH` off, or its first build not landed): the page then
+        // searches with `/index/query.json`.
+        let Some(export) = state.titles.as_ref().and_then(|t| t.index()) else { return not_found() };
+        let (q, _) = crate::playground::take_param(query, "q");
+        let q = q.unwrap_or_default();
+        let (indexes, _) = match queries.get(|| warm_embed(state)).await {
+            Ok(got) => got,
+            Err(e) => {
+                eprintln!("index load failed: {e}");
+                return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
+            }
+        };
+        let body = crate::playground::titles(&indexes, &export, &q).to_string();
+        return serve_json(method, headers, body, "no-store", None).await;
+    }
     enum Ask {
         Judged,
         Similar(den_index::MediaType, u32),
@@ -1956,6 +1972,43 @@ mod tests {
         // Enabled without the index routes it is off too: there is nothing to rank with.
         let bare = Arc::new(AppState { playground: true, ..AppState::for_test(None) });
         assert_eq!(get(&bare, "/playground").await.status(), 404);
+    }
+
+    /// The page's title autocomplete: the fuzzy title index over both types in one answer, kept to titles
+    /// the store has, with the store's title and year. Without the title index it is a 404, which the page
+    /// reads as "search with /index/query.json".
+    #[tokio::test]
+    async fn the_playground_title_search_uses_the_title_index_when_there_is_one() {
+        use den_titlesearch::{MediaType, TitleIndex, TitleRecord};
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let Ok(mut state) = Arc::try_unwrap(index_state("den-atlas-playground-titles")) else {
+            panic!("fresh state has one owner")
+        };
+        state.playground = true;
+        let without = Arc::new(state);
+        assert_eq!(get(&without, "/playground/titles.json?q=").await.status(), 404);
+        let Ok(mut state) = Arc::try_unwrap(without) else { panic!("one owner") };
+        let record = |tmdb_id, media_type, title: &str, popularity| TitleRecord {
+            tmdb_id,
+            media_type,
+            title: title.into(),
+            popularity,
+        };
+        let index = TitleIndex::build(vec![
+            record(1, MediaType::Movie, "One", 10.0),
+            // More popular, but not in the store: it can have no row, so it is not offered.
+            record(999, MediaType::Movie, "One Piece", 90.0),
+        ]);
+        state.titles = Some(Arc::new(crate::titles::TitleSearch::with_index(index)));
+        let on = Arc::new(state);
+        let probe = get(&on, "/playground/titles.json?q=").await;
+        assert_eq!(probe.status(), 200);
+        assert_eq!(probe.headers()["cache-control"], "no-store");
+        let hits = json(body_of(get(&on, "/playground/titles.json?q=one").await).await);
+        let keys: Vec<&str> =
+            hits["titles"].as_array().unwrap().iter().map(|t| t["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["movie:1"], "{hits}");
+        assert_eq!(hits["titles"][0]["title"], "One");
     }
 
     /// On, the page and its knobs are served, a tuned row answers `no-store`, and a bad value is a 400

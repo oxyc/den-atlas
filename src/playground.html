@@ -35,7 +35,7 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
   button.link { border: 0; background: none; color: var(--accent); padding: 8px 6px; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  select, input[type=number], input[type=search] { min-height: 44px; padding: 8px 10px; border-radius: 10px;
+  select, input.value, input[type=search] { min-height: 44px; padding: 8px 10px; border-radius: 10px;
          border: 1px solid var(--line); background: var(--bg); font-size: 16px; max-width: 100%; }
   .muted { color: var(--muted); }
   .hint { color: var(--muted); font-size: 14px; }
@@ -179,8 +179,8 @@
   /* Production's value, as a tick under the slider. */
   .knob .def { position: absolute; bottom: 6px; width: 2px; height: 8px; background: var(--muted);
                transform: translateX(-1px); pointer-events: none; }
-  .knob input[type=number] { width: 6.5em; flex: none; }
-  .knob input[type=number]:invalid, .knob.invalid input[type=number] { border-color: var(--down); }
+  .knob input.value { width: 6.5em; flex: none; }
+  .knob.invalid input.value { border-color: var(--down); }
   .knob .reset { min-width: 44px; padding: 0; flex: none; }
   .knob .prod { font-size: 12px; color: var(--muted); }
   .knob .problem { font-size: 13px; color: var(--down); }
@@ -448,13 +448,18 @@ function knobControl(k, value) {
     `<div class="ctl"><span class="track"><input type="range" min="${k.min}" max="${k.max}" step="${sliderStep(k)}" ` +
     `aria-label="${esc(label)}"><span class="def" style="left:calc(8px + (100% - 16px) * ${at / 100})" ` +
     `title="Production: ${k.default}"></span></span>` +
-    `<input type="number" id="${id}" name="${esc(k.name)}" min="${k.min}" max="${k.max}" step="${k.integer ? 1 : "any"}" inputmode="decimal">` +
+    `<input type="text" class="value" id="${id}" name="${esc(k.name)}" inputmode="decimal" autocomplete="off" spellcheck="false">` +
     `<button type="button" class="reset" aria-label="Reset ${esc(label)} to production (${k.default})" title="Reset to production (${k.default})">↺</button></div>` +
     `<p class="prod">Production: ${k.default} <span class="problem"></span></p>`;
   const [slider, input] = wrap.querySelectorAll("input");
   input.value = value ?? k.default;
   slider.value = input.value;
-  input.addEventListener("input", () => { if (input.value !== "") slider.value = input.value; markKnob(wrap, k); schedule(); });
+  input.addEventListener("input", () => {
+    const v = parseNumber(input.value);
+    if (v !== null) slider.value = v;
+    markKnob(wrap, k);
+    schedule();
+  });
   // An emptied field goes back to production when left, rather than sitting blank.
   input.addEventListener("blur", () => { if (input.value === "") { input.value = k.default; slider.value = k.default; markKnob(wrap, k); schedule(); } });
   // Dragging moves the number only; the rows re-rank once the thumb is let go (`change`), so a drag is one
@@ -473,12 +478,19 @@ function knobControl(k, value) {
 function knobValue(k, within = document) {
   const el = within.querySelector(`[name="${k.name}"]`);
   if (el.type === "checkbox") return { value: el.checked ? 1 : 0 };
-  if (el.validity.badInput) return { problem: "must be a number" };
-  if (el.value === "") return { value: k.default };
-  const v = Number(el.value);
-  if (!Number.isFinite(v) || v < k.min || v > k.max) return { problem: `must be from ${k.min} to ${k.max}` };
+  if (el.value.trim() === "") return { value: k.default };
+  const v = parseNumber(el.value);
+  if (v === null) return { problem: "must be a number" };
+  if (v < k.min || v > k.max) return { problem: `must be from ${k.min} to ${k.max}` };
   if (k.integer && !Number.isInteger(v)) return { problem: "must be a whole number" };
-  return { value: v, raw: el.value };
+  // Always written with a dot, whichever separator was typed: the server reads `3.45`, never `3,45`.
+  return { value: v, raw: String(v) };
+}
+
+// A typed number, with a dot or a comma as the decimal separator ("3.45" or "3,45"), or null.
+function parseNumber(text) {
+  const t = String(text).trim().replace(",", ".");
+  return /^-?(\d+\.?\d*|\.\d+)$/.test(t) ? Number(t) : null;
 }
 
 function markKnob(wrap, k) {
@@ -612,8 +624,13 @@ function drawLists() {
 
 // ---------- Autocomplete ----------
 
-// A search box that suggests titles as you type: `/index/query.json`, debounced, the older request aborted.
-// A pasted TMDB id (or `movie:603`) is offered as-is, as the one way in by id.
+// Whether atlas has its fuzzy title index (`TITLE_SEARCH`): checked once per page load with an empty
+// `titles.json`, which answers 404 without it.
+let titleSearch = false;
+
+// A search box that suggests titles as you type — through `titles.json` (the fuzzy title index, both types
+// in one request) when atlas has it, else `/index/query.json` — debounced, the older request aborted. A
+// pasted TMDB id (or `movie:603`) is offered as-is, as the one way in by id.
 function combo(input, onPick, taken) {
   const list = document.createElement("ul");
   list.id = `${input.id}-list`;
@@ -659,14 +676,15 @@ function combo(input, onPick, taken) {
     draw("Searching…");
     let note = "";
     try {
-      const resp = await fetch(`${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`, { signal: ctl.signal });
+      const address = titleSearch ? `${base}/titles.json?q=${encodeURIComponent(q)}`
+        : `${root}/index/query.json?q=${encodeURIComponent(q)}&limit=8`;
+      const resp = await fetch(address, { signal: ctl.signal });
       const body = await resp.json().catch(() => ({}));
       if (!resp.ok) throw new Error(resp.status === 429 ? "too many searches, wait a moment" : why(body));
-      hits = (body.hits || []).filter((h) => h.type === "movie" || h.type === "series").map((h) => {
-        const hit = { key: `${h.type}:${h.id}`, title: h.title || `TMDB id ${h.id}`, year: h.year, poster: h.posterPath };
-        if (h.title) names.set(hit.key, { title: h.title, year: h.year });
-        return hit;
-      });
+      hits = titleSearch ? body.titles || []
+        : (body.hits || []).filter((h) => h.type === "movie" || h.type === "series").map((h) => (
+          { key: `${h.type}:${h.id}`, title: h.title || `TMDB id ${h.id}`, year: h.year, poster: h.posterPath }));
+      for (const h of hits) if (!h.title.startsWith("TMDB id")) names.set(h.key, { title: h.title, year: h.year });
       if (!hits.length) note = "No titles match. You can also paste a TMDB id.";
     } catch (e) {
       if (e.name === "AbortError") return;
@@ -960,6 +978,7 @@ async function start() {
   if (!resp.ok) throw new Error(`params.json answered HTTP ${resp.status}`);
   p = await resp.json();
   knobs = p.knobs;
+  fetch(`${base}/titles.json?q=`).then((r) => { titleSearch = r.ok; }, () => {});
   applyQuery(location.search);
   drawCards();
   await refresh();
