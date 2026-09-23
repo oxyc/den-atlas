@@ -81,6 +81,8 @@ pub struct Indexes {
     aggregates: Mutex<HashMap<(u64, u64), Arc<den_index::RailAggregates>>>,
     /// Every filter kind's values as the titles carrying them (`Indexes::filter`).
     filter: OnceLock<FilterIndex>,
+    /// `/index/schema.json`, serialised (`Indexes::schema_json`).
+    schema: OnceLock<String>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -212,6 +214,17 @@ impl Indexes {
     /// load does, so no request waits on it.
     pub fn filter(&self) -> &FilterIndex {
         self.filter.get_or_init(|| FilterIndex::build(self))
+    }
+
+    /// `/index/schema.json`'s body, built the first time it is asked for and kept for as long as these indexes
+    /// are: ~70 KB of counts over the whole corpus, ~150 ms on the box, and the same bytes on every call.
+    ///
+    /// Kept HERE, on the indexes of one dataset, because everything `schema::document` reads is fixed when
+    /// they load — the counts, the facet index's snapshot of the vote counts, the filter index — and nothing
+    /// live (the ratings and character holders) reaches it. A dataset swap restarts the process and a reload
+    /// after an idle release builds new indexes, so a schema can never outlive the dataset it describes.
+    pub fn schema_json(&self) -> &str {
+        self.schema.get_or_init(|| crate::schema::document(self).to_string())
     }
 
     /// A title's vote count — what every browse row is ORDERED by.
@@ -774,6 +787,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
         filter: OnceLock::new(),
+        schema: OnceLock::new(),
     };
     eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {
@@ -1228,6 +1242,25 @@ mod tests {
         }
         eprintln!("{seeds} seeds, {nominated} nominations and {shares} shares agree with the facts");
         assert!(seeds > 400, "a real corpus, got {seeds} seeds");
+    }
+
+    /// `/index/schema.json` is built once per loaded dataset: the second call is the first call's bytes, not
+    /// a rebuild of them, and those bytes are exactly what the document serialises to.
+    #[tokio::test]
+    async fn the_schema_is_built_once_per_load() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-schema-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let (indexes, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
+        let first = indexes.schema_json();
+        let second = indexes.schema_json();
+        assert!(std::ptr::eq(first, second), "the second call rebuilt the schema");
+        assert_eq!(first, crate::schema::document(&indexes).to_string());
+        assert!(first.contains(r#""datasetVersion":"v1""#), "{first}");
+
+        // A new load — which is what a dataset swap or an idle release ends in — builds its own.
+        let (reloaded, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
+        assert!(!std::ptr::eq(first, reloaded.schema_json()), "a new load kept the old schema");
+        assert_eq!(first, reloaded.schema_json());
     }
 
     /// TMDB numbers kept for the fixture's movie 1 alone, joined onto its store.

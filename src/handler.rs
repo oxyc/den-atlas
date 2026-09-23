@@ -854,7 +854,7 @@ impl IndexQuestion {
                 "subgenres": plot.subgenre_labels(),
                 "moods": plot.mood_labels(),
             }),
-            Self::Schema => crate::schema::document(indexes),
+            Self::Schema => return indexes.schema_json().to_owned(),
             Self::Rows { media_type, mood, label } => {
                 let number = |key: &str, default: usize| {
                     query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
