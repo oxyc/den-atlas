@@ -604,7 +604,12 @@ fn routes() -> Value {
                     json!({ "in": "path", "field": "mediaType" }),
                 ),
                 with(
-                    param("sel", "string", "[-]<kind>:<id>, comma-separated, in canonical order"),
+                    param(
+                        "sel",
+                        "string",
+                        "[-]<kind>:<id>, comma-separated, AND-ed, in canonical order; <kind>:<id>|<id> is one \
+                         item matching any of its values (filter.or)",
+                    ),
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
             ],
@@ -688,8 +693,9 @@ fn routes() -> Value {
                     param(
                         "traits",
                         "string",
-                        "[-]<trait>:<id>, comma-separated, in canonical order; born takes a decade (born:1970) \
-                         or one range of birth years (born:1976-1996, born:1976-, born:-1996): \
+                        "[-]<trait>:<id>, comma-separated, in canonical order, <trait>:<id>|<id> OR-ing values \
+                         as sel does (citizenship:Q30|Q145); born takes a decade (born:1970) or one range of \
+                         birth years (born:1976-1996, born:1976-, born:-1996), never in a group: \
                          filter.traits.kinds.born",
                     ),
                     json!({ "max": crate::filter::MAX_SELECTION }),
@@ -726,7 +732,8 @@ fn routes() -> Value {
             "path": "/index/filter/{type}/people/counts.json",
             "example": "/index/filter/movie/people/counts.json?sel=decade:1980",
             "about": "For every value of every person trait, the people credited under the selection and the \
-                      other traits holding it; a one-pick trait (gender, born) counted without its own pick.",
+                      other traits holding it; a one-pick trait (gender, born) counted without its own pick, a \
+                      trait with an OR group without its groups.",
             "parameters": [
                 with(
                     param("type", "enum", "movie, series or all (films and series together)"),

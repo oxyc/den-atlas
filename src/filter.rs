@@ -1,7 +1,7 @@
 //! `/index/filter/<movie|series|all>/…` — stackable filters over the corpus, for Den Web's Search
 //! (oxyc/den#133, oxyc/den#134): a selection of values from many kinds (genre, language, decade, a mood, a plot
-//! axis, a person, a studio, a rating, …) AND-ed together, and three questions about it. `all` asks them of
-//! films and series together (`Scope`).
+//! axis, a person, a studio, a rating, …) AND-ed together — an item may OR several values of its kind,
+//! `country:FR|IT` — and three questions about it. `all` asks them of films and series together (`Scope`).
 //!
 //! - `counts.json` — for every value of every kind, how many titles carry the selection AND that value, so an
 //!   option that would leave nothing is hidden instead of spending TMDB discover calls to find out.
@@ -61,6 +61,8 @@ type Bits = Vec<u64>;
 type Key = (MediaType, u32);
 /// A kind table's reading of `<kind>:<id>` as its canonical pair.
 type Normalise<'f> = &'f dyn Fn(&str, &str) -> Result<(String, String), String>;
+/// Whether a kind table refuses a group of these normalised ids as one item.
+type OneValue<'f> = &'f dyn Fn(&str, &[String]) -> bool;
 
 /// The most values one selection may name.
 pub const MAX_SELECTION: usize = 16;
@@ -93,11 +95,19 @@ const FIRST_YEAR: i64 = 1870;
 /// How a kind's values combine within a selection. `And`: a title holds several (genres, people), so two
 /// selected values both apply and each value is counted under the whole selection. `Single`: a title holds one
 /// (its decade, its runtime), so a client picks one, and each value is counted as the alternative pick —
-/// under the selection WITHOUT this kind's own values.
+/// under the selection WITHOUT this kind's own values. Either takes an OR group (`decade:1980|1990`), and an
+/// `And` kind with one counts without it (`counted_apart`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     And,
     Single,
+}
+
+/// Whether a kind's values are counted without this item of it: any item of a one-pick kind, whose values are
+/// alternatives to its pick; a positive OR group of an and kind, whose other values are what the group could
+/// add. An and kind's single values and exclusions narrow what its values are counted under.
+fn counted_apart(mode: Mode, item: &Item) -> bool {
+    mode == Mode::Single || (item.group() && !item.exclude)
 }
 
 impl Mode {
@@ -406,18 +416,48 @@ pub fn spec(name: &str) -> Option<&'static Spec> {
     SPECS.iter().find(|s| s.name == name)
 }
 
-/// One `[-]<kind>:<id>` of a selection, normalised.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// One `[-]<kind>:<id>[|<id>…]` of a selection, normalised: a value, or a group of values of one kind OR-ed
+/// together (`country:FR|IT`, French or Italian).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub kind: String,
-    /// `-kind:id`: the titles known NOT to carry the value.
+    /// `-kind:id`: the titles known NOT to carry the value — for a group, none of its values.
     pub exclude: bool,
-    pub id: String,
+    /// Sorted, each once, never empty; more than one is an OR group.
+    pub ids: Vec<String>,
 }
 
 impl Item {
     fn spelled(&self) -> String {
-        format!("{}{}:{}", if self.exclude { "-" } else { "" }, self.kind, encode(&self.id))
+        let ids: Vec<String> = self.ids.iter().map(|id| encode(id)).collect();
+        format!("{}{}:{}", if self.exclude { "-" } else { "" }, self.kind, ids.join("|"))
+    }
+
+    /// One of its values as a lone item is written, as `unknownValues` names it.
+    fn spelled_value(&self, id: &str) -> String {
+        format!("{}{}:{}", if self.exclude { "-" } else { "" }, self.kind, encode(id))
+    }
+
+    /// Whether it is an OR group of several values.
+    fn group(&self) -> bool {
+        self.ids.len() > 1
+    }
+
+    /// The canonical order: by kind, then positive before excluded, then the ids joined by `|`, as strings.
+    fn order_key(&self) -> (&str, bool, String) {
+        (&self.kind, self.exclude, self.ids.join("|"))
+    }
+}
+
+impl Ord for Item {
+    fn cmp(&self, other: &Item) -> std::cmp::Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+
+impl PartialOrd for Item {
+    fn partial_cmp(&self, other: &Item) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -573,14 +613,18 @@ impl Request {
     ///   person-trait kinds (`people.rs`); `order` lowercased.
     /// - `sel`: the items `[-]<kind>:<id>` joined by `,`, each id normalised as its kind says (`Id`), sorted by
     ///   kind, then positive before excluded, then id (compared as strings), each once. `:`, `,` and `-` are
-    ///   literal; an id is percent-encoded as JavaScript's `encodeURIComponent` does.
+    ///   literal; an id is percent-encoded as JavaScript's `encodeURIComponent` does. An item may name several
+    ///   ids of its kind joined by `|` (literal; `%7C` reads the same), OR-ed: they are sorted and each kept
+    ///   once, one left is written without `|`, and the item sorts by its ids joined by `|`.
     /// - `skip` and `limit` plain decimals, `limit` within 1..=100 and `skip` a multiple of it.
     /// - `q` normalised as the kind's names are (folded and lowercased, words joined by single spaces), encoded
     ///   like an id.
     ///
     /// The error is a request that cannot be answered as sent: a malformed item, an id its kind cannot read
-    /// (a `like` under `all` without its type), too many values, a query too long, a `skip` that is not a page
-    /// boundary, a prefix too short, an order `people.json` does not know.
+    /// (a `like` under `all` without its type), too many values (a group counts each of its values), a group
+    /// whose values resolve to different kinds or of a kind that takes one value an item (`like`, a `born`
+    /// range), a query too long, a `skip` that is not a page boundary, a prefix too short, an order
+    /// `people.json` does not know.
     pub fn parse(route: Route, scope: Scope, query: &str) -> Result<Request, String> {
         if query.len() > MAX_QUERY {
             return Err(format!("a query of at most {MAX_QUERY} bytes"));
@@ -602,30 +646,53 @@ impl Request {
         }
         let decode = |v: &str| crate::handler::percent_decode(&v.replace('+', " "));
 
-        // `sel` and `traits` share one grammar; each kind table normalises its own ids.
-        let read_items = |name: &str, normalise: Normalise<'_>| -> Result<Vec<Item>, String> {
-            let list = params.get(name).map(|v| decode(v)).unwrap_or_default();
-            let raw: Vec<&str> = list.split(',').filter(|i| !i.is_empty()).collect();
-            if raw.len() > MAX_SELECTION {
-                return Err(format!("{name}: at most {MAX_SELECTION} values"));
-            }
-            let mut items = Vec::with_capacity(raw.len());
-            for item in raw {
-                let (exclude, item) = match item.strip_prefix('-') {
-                    Some(rest) => (true, rest),
-                    None => (false, item),
-                };
-                let (kind, id) =
-                    item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
-                let (kind, id) = normalise(kind, id)?;
-                items.push(Item { kind, exclude, id });
-            }
-            items.sort();
-            items.dedup();
-            Ok(items)
-        };
-        let items = read_items("sel", &|kind, id| normalise(kind, id, scope))?;
-        let traits = read_items("traits", &|kind, id| people::normalise(kind, id, scope))?;
+        // `sel` and `traits` share one grammar; each kind table normalises its own ids, and says which of its
+        // values cannot be OR-ed.
+        let read_items =
+            |name: &str, normalise: Normalise<'_>, one_value: OneValue<'_>| -> Result<Vec<Item>, String> {
+                let list = params.get(name).map(|v| decode(v)).unwrap_or_default();
+                let raw: Vec<&str> = list.split(',').filter(|i| !i.is_empty()).collect();
+                if raw.iter().map(|item| item.split('|').count()).sum::<usize>() > MAX_SELECTION {
+                    return Err(format!(
+                        "{name}: at most {MAX_SELECTION} values, a group counting each of its values"
+                    ));
+                }
+                let mut items = Vec::with_capacity(raw.len());
+                for item in raw {
+                    let (exclude, item) = match item.strip_prefix('-') {
+                        Some(rest) => (true, rest),
+                        None => (false, item),
+                    };
+                    let (kind, group) =
+                        item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
+                    let mut resolved: Option<String> = None;
+                    let mut ids = Vec::new();
+                    for id in group.split('|') {
+                        let (kind, id) = normalise(kind, id)?;
+                        if resolved.as_ref().is_some_and(|r| *r != kind) {
+                            return Err(format!(
+                                "{item:?}: its values resolve to different kinds; name the kind"
+                            ));
+                        }
+                        resolved = Some(kind);
+                        ids.push(id);
+                    }
+                    ids.sort();
+                    ids.dedup();
+                    let kind = resolved.unwrap_or_default();
+                    if ids.len() > 1 && one_value(&kind, &ids[..]) {
+                        return Err(format!("{item:?}: {kind} takes one value an item, not a group"));
+                    }
+                    items.push(Item { kind, exclude, ids });
+                }
+                items.sort();
+                items.dedup();
+                Ok(items)
+            };
+        // `like` orders `titles.json` by one title's similar set, so it names one title an item.
+        let items = read_items("sel", &|kind, id| normalise(kind, id, scope), &|kind, _| kind == "like")?;
+        let traits =
+            read_items("traits", &|kind, id| people::normalise(kind, id, scope), &people::one_value)?;
         people::check(&traits)?;
         let order = match params.get("order").map(|v| decode(v)) {
             Some(order) if !order.trim().is_empty() => people::Order::parse(&order)?,
@@ -706,6 +773,22 @@ impl Request {
             format!("?{}", self.canonical_query)
         }
     }
+}
+
+/// A kind's selected ids as an answer names them in `selected` and `excluded`: every value of its positive
+/// items and of its excluded ones, a group's each, sorted and each once.
+fn selected_ids<'i>(items: &[&'i Item]) -> (Vec<&'i str>, Vec<&'i str>) {
+    let ids = |exclude: bool| {
+        let mut ids: Vec<&str> = items
+            .iter()
+            .filter(|i| i.exclude == exclude)
+            .flat_map(|i| i.ids.iter().map(String::as_str))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    (ids(false), ids(true))
 }
 
 /// Percent-encoded as JavaScript's `encodeURIComponent` does, so a browser client can build the canonical
@@ -1667,6 +1750,29 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The titles carrying any value of an item, and the titles its kind is known for.
+    fn item_bits(&self, spec: &Spec, item: &Item) -> (Bits, Bits) {
+        let mut ids = item.ids.iter();
+        let (mut value, known) = self.value_bits(spec, ids.next().map_or("", String::as_str));
+        for id in ids {
+            let (more, _) = self.value_bits(spec, id);
+            value.iter_mut().zip(&more).for_each(|(v, m)| *v |= m);
+        }
+        (value, known)
+    }
+
+    /// The titles carrying any value of an item only tentatively; `None` when none of its values has a tier.
+    fn item_likely(&self, spec: &Spec, item: &Item) -> Option<Bits> {
+        let mut union: Option<Bits> = None;
+        for likely in item.ids.iter().filter_map(|id| self.likely_bits(spec, id)) {
+            match union.as_mut() {
+                Some(union) => union.iter_mut().zip(likely).for_each(|(u, l)| *u |= l),
+                None => union = Some(likely.clone()),
+            }
+        }
+        union
+    }
+
     /// A value's titles within `base` — its confident bits, and its tentative ones — and how many of them
     /// count only through the tentative tier.
     fn counted(&self, base: &Matched, bits: &[u64], likely: Option<&Bits>) -> Counted {
@@ -1678,14 +1784,24 @@ impl<'a> Context<'a> {
     /// the tentative tier (`Matched`). `-kind:id` keeps the titles known for the kind and not carrying the
     /// value, and on a plot axis "known" is the confident tier alone: an exclusion never keeps a title for a
     /// tentative value, and a title whose axis is only tentative is dropped as unknown, whichever way it leans.
+    /// A group matches a title carrying any of its values, in either tier; excluded, one known to carry none.
     fn matched(&self, applied: &[(&'static Spec, &Item)], skip: Option<&str>) -> Matched {
+        self.matched_without(applied, &|spec, _| Some(spec.name) == skip)
+    }
+
+    /// `matched`, leaving out the items `drop` names.
+    fn matched_without(
+        &self,
+        applied: &[(&'static Spec, &Item)],
+        drop: &dyn Fn(&Spec, &Item) -> bool,
+    ) -> Matched {
         let mut sure = self.filter.types[self.t()].clone();
         let mut any = sure.clone();
         for (spec, item) in applied {
-            if Some(spec.name) == skip {
+            if drop(spec, item) {
                 continue;
             }
-            let (value, known) = self.value_bits(spec, &item.id);
+            let (value, known) = self.item_bits(spec, item);
             if item.exclude {
                 for matched in [&mut sure, &mut any] {
                     matched.iter_mut().zip(value.iter().zip(&known)).for_each(|(m, (v, k))| *m &= k & !v);
@@ -1693,14 +1809,23 @@ impl<'a> Context<'a> {
                 continue;
             }
             sure.iter_mut().zip(&value).for_each(|(m, v)| *m &= v);
-            match self.likely_bits(spec, &item.id) {
+            match self.item_likely(spec, item) {
                 Some(likely) => {
-                    any.iter_mut().zip(value.iter().zip(likely)).for_each(|(m, (v, l))| *m &= v | l)
+                    any.iter_mut().zip(value.iter().zip(&likely)).for_each(|(m, (v, l))| *m &= v | l)
                 }
                 None => any.iter_mut().zip(&value).for_each(|(m, v)| *m &= v),
             }
         }
         Matched { sure, any }
+    }
+
+    /// What a kind's own values are counted under (`counts.json`, `values/<kind>.json`) when it differs from
+    /// the whole selection: the selection without the kind's items that are alternatives to its values
+    /// (`counted_apart`), so each value reads as what picking it, or adding it to the group, would give.
+    /// `None` when the kind has no such item, and its values count under the whole selection.
+    fn base_for(&self, spec: &Spec, applied: &[(&'static Spec, &Item)]) -> Option<Matched> {
+        let apart = |s: &Spec, i: &Item| s.name == spec.name && counted_apart(s.mode, i);
+        applied.iter().any(|(s, i)| apart(s, i)).then(|| self.matched_without(applied, &apart))
     }
 
     /// The titles of the route's type (of both, under `all`): what `total` and every coverage is out of.
@@ -1716,7 +1841,7 @@ impl<'a> Context<'a> {
             if out.contains_key(spec.name) {
                 continue;
             }
-            let (_, known) = self.value_bits(spec, &item.id);
+            let (_, known) = self.value_bits(spec, &item.ids[0]);
             let count = and_count(&known, &self.filter.types[self.t()]);
             out.insert(spec.name.to_owned(), json!({ "count": count, "denominator": population }));
         }
@@ -1829,21 +1954,21 @@ impl<'a> Context<'a> {
             }
             Data::Character | Data::Like => complete = false,
         }
-        // Every selected value, with its label, even at 0.
-        for item in selected {
-            if !values.contains_key(&item.id) {
-                let (bits, _) = self.value_bits(spec, &item.id);
-                let tally = self.counted(base, &bits, self.likely_bits(spec, &item.id));
-                put(&mut values, item.id.clone(), tally);
+        // Every selected value, a group's each, with its label, even at 0.
+        for id in selected.iter().flat_map(|item| &item.ids) {
+            if !values.contains_key(id) {
+                let (bits, _) = self.value_bits(spec, id);
+                let tally = self.counted(base, &bits, self.likely_bits(spec, id));
+                put(&mut values, id.clone(), tally);
             }
             match spec.data {
                 Data::Entity(_) => {
-                    if let Some(label) = self.entity_of(&item.id).and_then(|e| self.label(e)) {
-                        labels.insert(item.id.clone(), label.into());
+                    if let Some(label) = self.entity_of(id).and_then(|e| self.label(e)) {
+                        labels.insert(id.clone(), label.into());
                     }
                 }
                 Data::Character => {
-                    labels.insert(item.id.clone(), item.id.replace('-', " ").into());
+                    labels.insert(id.clone(), id.replace('-', " ").into());
                 }
                 _ => {}
             }
@@ -1862,8 +1987,8 @@ impl<'a> Context<'a> {
                 }
             }
         }
-        // What the values are counted out of: the selection, or for a one-pick kind with its pick made, the
-        // selection without that pick — so `tone.values.comic` may exceed `total`.
+        // What the values are counted out of: the selection, or for a one-pick kind with its pick made or an and
+        // kind with an OR group, the selection without them — so `tone.values.comic` may exceed `total`.
         let mut answer = json!({
             "mode": spec.mode.name(), "complete": complete, "values": values, "denominator": popcount(&base.any),
         });
@@ -1873,14 +1998,12 @@ impl<'a> Context<'a> {
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
         }
-        let ids = |exclude: bool| -> Vec<&str> {
-            selected.iter().filter(|i| i.exclude == exclude).map(|i| i.id.as_str()).collect()
-        };
-        if !ids(false).is_empty() {
-            answer["selected"] = json!(ids(false));
+        let (positive, excluded) = selected_ids(selected);
+        if !positive.is_empty() {
+            answer["selected"] = json!(positive);
         }
-        if !ids(true).is_empty() {
-            answer["excluded"] = json!(ids(true));
+        if !excluded.is_empty() {
+            answer["excluded"] = json!(excluded);
         }
         answer
     }
@@ -1904,11 +2027,11 @@ impl<'a> Context<'a> {
             if !spec.listed() && selected.is_empty() {
                 continue;
             }
-            // A one-pick kind counts each value as the alternative pick: without its own values applied.
-            let answer = if spec.mode == Mode::Single && !selected.is_empty() {
-                self.kind_answer(spec, &self.matched(applied, Some(spec.name)), &selected)
-            } else {
-                self.kind_answer(spec, &matched, &selected)
+            // A one-pick kind counts each value as the alternative pick, and an and kind with an OR group each
+            // value as one the group could add: without those items applied.
+            let answer = match self.base_for(spec, applied) {
+                Some(base) => self.kind_answer(spec, &base, &selected),
+                None => self.kind_answer(spec, &matched, &selected),
             };
             kinds.insert(spec.name.to_owned(), answer);
         }
@@ -1947,8 +2070,13 @@ impl<'a> Context<'a> {
     /// or facet rows did not load, a ratings join has not landed), so it should be cached briefly.
     fn envelope(&self, answer: &mut Value, applied: &[(&'static Spec, &Item)], ignored: Vec<String>) -> bool {
         answer["ignored"] = json!(ignored);
-        let unknown: Vec<String> =
-            applied.iter().filter(|(s, i)| !self.known_value(s, &i.id)).map(|(_, i)| i.spelled()).collect();
+        // Each value by itself: a group keeps its known values, and names the others here.
+        let unknown: Vec<String> = applied
+            .iter()
+            .flat_map(|(s, i)| {
+                i.ids.iter().filter(|id| !self.known_value(s, id)).map(|id| i.spelled_value(id))
+            })
+            .collect();
         if !unknown.is_empty() {
             answer["unknownValues"] = json!(unknown);
         }
@@ -1973,14 +2101,10 @@ impl<'a> Context<'a> {
     }
 
     /// A likely match's rank key: the lowest probability among the plot axes it carries only tentatively.
-    /// `plot` is each selected plot value that has a tier: its axis, and its confident titles.
-    fn lowest_tentative(
-        tier: &den_store::TentativeFacets<'_>,
-        plot: &[(usize, Option<&Bits>)],
-        row: usize,
-    ) -> u8 {
+    /// `plot` is each selected plot item that has a tier: its axis, and its values' confident titles.
+    fn lowest_tentative(tier: &den_store::TentativeFacets<'_>, plot: &[(usize, Bits)], row: usize) -> u8 {
         plot.iter()
-            .filter(|(_, sure)| !sure.is_some_and(|bits| has(bits, row)))
+            .filter(|(_, sure)| !has(sure, row))
             .filter_map(|&(axis, _)| tier.get(den_store::Row(row), axis).map(|t| t.probability))
             .min()
             .unwrap_or(0)
@@ -1996,8 +2120,8 @@ impl<'a> Context<'a> {
         let confident = popcount(&matched.sure);
         let like = applied
             .iter()
-            .find(|(s, i)| s.data == Data::Like && !i.exclude && self.like_key(&i.id).is_some())
-            .map(|(_, i)| i.id.as_str());
+            .find(|(s, i)| s.data == Data::Like && !i.exclude && self.like_key(&i.ids[0]).is_some())
+            .map(|(_, i)| i.ids[0].as_str());
         let (order, order_id): (Vec<u32>, String) = match like {
             Some(id) => (self.like_rows(id), format!("like:{id}")),
             None => (self.derived.order[self.t()].clone(), self.derived.order_id[self.t()].clone()),
@@ -2007,12 +2131,12 @@ impl<'a> Context<'a> {
         let mut likely: Vec<(u8, usize, u32)> = Vec::new();
         if request.skip + request.limit > confident && total > confident {
             let tier = self.view.tentative_facets().unwrap_or_default();
-            let plot: Vec<(usize, Option<&Bits>)> = applied
+            let plot: Vec<(usize, Bits)> = applied
                 .iter()
-                .filter(|(spec, item)| !item.exclude && self.likely_bits(spec, &item.id).is_some())
+                .filter(|(spec, item)| !item.exclude && self.item_likely(spec, item).is_some())
                 .filter_map(|(spec, item)| {
                     let axis = den_store::FACET_AXES.iter().position(|a| *a == spec.name)?;
-                    Some((axis, self.filter.bits.get(spec.name).and_then(|v| v.values.get(&item.id))))
+                    Some((axis, self.item_bits(spec, item).0))
                 })
                 .collect();
             likely = order
@@ -2053,12 +2177,7 @@ impl<'a> Context<'a> {
     /// name has a word starting `q` when one is given.
     pub fn values(&self, spec: &'static Spec, request: &Request) -> (Value, bool) {
         let (applied, ignored) = self.split(&request.items);
-        let own = applied.iter().any(|(s, _)| s.name == spec.name);
-        let base = if spec.mode == Mode::Single && own {
-            self.matched(&applied, Some(spec.name))
-        } else {
-            self.matched(&applied, None)
-        };
+        let base = self.base_for(spec, &applied).unwrap_or_else(|| self.matched(&applied, None));
         let q = request.q.as_deref();
         // Every value matches a search that names none, all alike.
         let tier = |name: &str| match q {
@@ -2275,14 +2394,30 @@ pub fn schema() -> Value {
                    highest lowest-probability first and then in the route's order, each card marked \
                    likely: true; people.json counts people on both. A store without likely values answers \
                    none of these fields, and every count is confident",
-        "unknownValues": "selected items whose value the kind does not hold (a typo, a label's wrong case): \
-                          they match nothing, and are named so a client can tell them from a real zero",
+        "unknownValues": "selected values the kind does not hold (a typo, a label's wrong case), each as \
+                          [-]<kind>:<id>, a group's one by one: they match nothing, and are named so a client can \
+                          tell them from a real zero",
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
                       excluded, then id as strings, each once, joined by ','; ids encoded as encodeURIComponent \
-                      does, ':' ',' '-' literal. Then traits (people), written the same way, and order (people, \
+                      does, ':' ',' '-' '|' literal. An OR group's ids are sorted as strings and each kept once, \
+                      joined by '|', and the group sorts among the items by that joined id; a group left with one \
+                      id is written without '|'. Then traits (people), written the same way, and order (people, \
                       lowercased); then skip and limit (titles, people) or q and limit (values, people values), \
                       each only when not its default. Any other \
                       spelling answers privately with Content-Location naming this one.",
+        "or": "<kind>:<id>|<id>… is one item matching any of its values: country:FR|IT is French or Italian, \
+               decade:1980|1990 the 1980s or 1990s. Separate items still AND, within a kind and across kinds: \
+               country:FR,country:IT is both, country:FR|IT,decade:1990 either of the 1990s. -<kind>:<a>|<b> is \
+               neither: the titles known for the kind carrying none of the values. Every kind takes a group but \
+               like (one title an item); a group's values must resolve to one kind (structure:single-day|nonlinear \
+               is refused). A group counts toward maxSelection by its values. '|' is literal in the canonical \
+               URL, and %7C reads the same. A value the kind does not hold is named in unknownValues as \
+               [-]<kind>:<id> and the group's other values apply; a group of none matches nothing. On a plot \
+               axis a group matches either tier as a lone value does, and its exclusion reads the confident \
+               tier alone. In counts.json and values/<kind>.json a kind with a positive group is counted \
+               without its groups (a one-pick kind without any of its items), so each value is what \
+               adding it to the group would give; every other kind is counted under the group. selected and \
+               excluded list every id of the kind's items, a group's each",
         "traits": people::schema(),
         "maxSelection": MAX_SELECTION,
         "maxQuery": MAX_QUERY,
@@ -3119,6 +3254,153 @@ mod tests {
         assert_eq!(nordic["label"], "Nordic");
     }
 
+    /// Five films: 1 French (1990s), 2 Italian (1990s), 3 French and Italian (1980s), 4 American (1990s), 5 with
+    /// no country on record (1980s).
+    fn countries_store(name: &str) -> Indexes {
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let title = |tmdb_id, year, countries: Vec<&'static str>| crate::store::fixture::Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(year))),
+            votes: 100 - tmdb_id,
+            countries,
+            ..crate::store::fixture::Title::default()
+        };
+        let titles = [
+            title(1, 1990, vec!["FR"]),
+            title(2, 1995, vec!["IT"]),
+            title(3, 1985, vec!["FR", "IT"]),
+            title(4, 1999, vec!["US"]),
+            title(5, 1980, vec![]),
+        ];
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &[]);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the countries store loads");
+        crate::queries::load_for_tools(&ds).expect("its indexes load")
+    }
+
+    fn sorted_ids(indexes: &Indexes, query: &str) -> Vec<u64> {
+        let mut found = ids(&Context::new(indexes, Movie, None).titles(&request(Route::Titles, query)).0);
+        found.sort_unstable();
+        found
+    }
+
+    /// `|` OR-s values of one kind; separate items still AND, within a kind and across kinds.
+    #[test]
+    fn a_group_is_the_union_and_separate_items_the_intersection() {
+        let indexes = countries_store("or-union");
+        assert_eq!(sorted_ids(&indexes, "sel=country:FR|IT"), vec![1, 2, 3], "French or Italian");
+        assert_eq!(sorted_ids(&indexes, "sel=country:FR,country:IT"), vec![3], "French and Italian");
+        assert_eq!(sorted_ids(&indexes, "sel=country:FR|IT,decade:1990"), vec![1, 2], "either, in the 1990s");
+        assert_eq!(
+            sorted_ids(&indexes, "sel=decade:1980|1990"),
+            vec![1, 2, 3, 4, 5],
+            "a one-pick kind OR-ed"
+        );
+        assert_eq!(counts(&indexes, Movie, "sel=country:FR|IT")["total"], 3);
+        // Excluded, a group is none of its values, and a title with no country on record stays out.
+        assert_eq!(
+            sorted_ids(&indexes, "sel=-country:FR|IT"),
+            vec![4],
+            "neither; 5 is not known to be neither"
+        );
+        assert_eq!(sorted_ids(&indexes, "sel=-country:FR"), vec![2, 4]);
+    }
+
+    /// A group with a value its kind does not hold keeps the others and names that one, as a lone unknown
+    /// value is named; a group of nothing but unknown values matches nothing.
+    #[test]
+    fn an_unknown_value_in_a_group_is_named_and_the_rest_apply() {
+        let indexes = countries_store("or-unknown");
+        let partly = counts(&indexes, Movie, "sel=country:FR|XX");
+        assert_eq!(partly["total"], 2, "French alone: 1 and 3");
+        assert_eq!(partly["unknownValues"], json!(["country:XX"]));
+        let excluded = counts(&indexes, Movie, "sel=-country:IT|XX");
+        assert_eq!((&excluded["total"], &excluded["unknownValues"]), (&2.into(), &json!(["-country:XX"])));
+        let none = counts(&indexes, Movie, "sel=country:XX|YY");
+        assert_eq!(none["total"], 0);
+        assert_eq!(none["unknownValues"], json!(["country:XX", "country:YY"]));
+        assert_eq!(none["kinds"]["country"]["selected"], json!(["XX", "YY"]));
+    }
+
+    /// counts.json counts a kind with an OR group selected without the group — what each value would add — and
+    /// every other kind under it. A lone value of an and kind still narrows its own kind's counts.
+    #[test]
+    fn a_kind_with_a_group_counts_its_values_without_the_group() {
+        let indexes = countries_store("or-counts");
+        let either = counts(&indexes, Movie, "sel=country:FR|IT,decade:1990");
+        assert_eq!(either["total"], 2);
+        let country = &either["kinds"]["country"];
+        assert_eq!(country["values"], json!({ "FR": 1, "IT": 1, "US": 1 }), "the 1990s films, group aside");
+        assert_eq!(country["denominator"], 3);
+        assert_eq!(country["selected"], json!(["FR", "IT"]));
+        // The one-pick decade, counted without its own pick but under the group: 3 is from the 1980s.
+        assert_eq!(either["kinds"]["decade"]["values"], json!({ "1980": 1, "1990": 2 }));
+        // The AND form counts country under the whole selection.
+        let both = counts(&indexes, Movie, "sel=country:FR,country:IT");
+        assert_eq!(both["kinds"]["country"]["values"], json!({ "FR": 1, "IT": 1 }));
+        // A lone value beside a group: the kind is counted under the lone value, not the group.
+        let french = counts(&indexes, Movie, "sel=country:FR,country:IT|US");
+        assert_eq!(french["total"], 1, "3 is French and Italian");
+        assert_eq!(french["kinds"]["country"]["values"], json!({ "FR": 2, "IT": 1, "US": 0 }));
+        assert_eq!(french["kinds"]["country"]["selected"], json!(["FR", "IT", "US"]));
+        // values/<kind>.json counts the same way.
+        let spec = spec("country").unwrap();
+        let values = Context::new(&indexes, Movie, None)
+            .values(spec, &request(Route::Values(spec), "sel=country:FR|IT,decade:1990"))
+            .0;
+        assert_eq!(values["denominator"], 3);
+        assert_eq!(values["values"].as_array().unwrap().len(), 3, "{values}");
+    }
+
+    /// A group on a plot axis reads both tiers as a lone value does: a title needing a likely value is a likely
+    /// match, and an excluded group reads the confident tier alone.
+    #[test]
+    fn a_plot_axis_group_keeps_the_tiers() {
+        let indexes = tentative_fixture("or-likely");
+        let either = counts(&indexes, Movie, "sel=ending:bittersweet|happy");
+        assert_eq!(
+            (&either["total"], &either["confident"], &either["likely"]),
+            (&5.into(), &2.into(), &3.into()),
+            "1 and 4 confidently; 2, 3 and 5 only tentatively"
+        );
+        let titles = Context::new(&indexes, Movie, None)
+            .titles(&request(Route::Titles, "sel=ending:bittersweet|happy"))
+            .0;
+        assert_eq!(ids(&titles), vec![1, 4, 2, 5, 3], "confident by votes, then likely by probability");
+        let neither = counts(&indexes, Movie, "sel=-ending:happy|open");
+        assert_eq!(
+            (&neither["total"], &neither["likely"]),
+            (&1.into(), &0.into()),
+            "film 1 alone: the rest are happy or only tentative"
+        );
+    }
+
+    /// A group counts toward the cap by its values; `like` and a group across axes are refused.
+    #[test]
+    fn a_group_is_capped_by_its_values_and_refused_where_it_cannot_apply() {
+        let sixteen = (1..=16).map(|g| g.to_string()).collect::<Vec<_>>();
+        let (first, rest) = sixteen.split_at(9);
+        let query = format!("sel=genre:{},genre:{}", first.join("|"), rest.join("|"));
+        assert!(Request::parse(Route::Counts, Scope::Type(Movie), &query).is_ok(), "{query}");
+        let seventeen = format!("{query},genre:17");
+        assert!(Request::parse(Route::Counts, Scope::Type(Movie), &seventeen).is_err());
+        let one_group = format!("sel=genre:{}|17", sixteen.join("|"));
+        assert!(Request::parse(Route::Counts, Scope::Type(Movie), &one_group).is_err());
+        for refused in
+            ["sel=like:550|680", "sel=structure:single-day|nonlinear", "sel=country:FR|", "sel=country:|"]
+        {
+            assert!(Request::parse(Route::Titles, Scope::Type(Movie), refused).is_err(), "{refused}");
+        }
+    }
+
     /// Den Web tests against the same file (tests/fixtures/facets-canonical.json): every url answers as its
     /// canonical one, a canonical url is canonical, and the refused ones are refused.
     #[test]
@@ -3266,9 +3548,17 @@ mod tests {
             "sel=person:Q25191",
             "sel=genre:18,person:Q25191",
             "sel=decade:2000,subgenre:Heist,-warning:violence",
+            // OR groups beside their AND forms.
+            "sel=country:FR|IT",
+            "sel=country:FR,country:IT",
+            "sel=country:FR|IT,decade:1990",
+            "sel=-country:FR|IT",
+            "sel=decade:1980|1990",
+            "sel=genre:18|28|35|53|80",
         ] {
             let parsed = request(Route::Counts, query);
-            time(&format!("counts {query:?}"), &|| context.counts(&parsed).0.to_string());
+            let body = time(&format!("counts {query:?}"), &|| context.counts(&parsed).0.to_string());
+            eprintln!("  total {}", serde_json::from_str::<Value>(&body).unwrap()["total"]);
             let parsed = request(
                 Route::Titles,
                 &format!("{query}{}limit=40", if query.is_empty() { "" } else { "&" }),

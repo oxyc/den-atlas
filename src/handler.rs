@@ -3164,6 +3164,13 @@ mod tests {
         assert_eq!(typo["total"], 0);
         assert_eq!(typo["unknownValues"], serde_json::json!(["mood:tense", "tone:blaek"]));
 
+        // An OR group's `|` is literal in the canonical URL, and `%7C` is a second spelling of it.
+        let either = get(&state, "/index/filter/movie/counts.json?sel=country:ES|KR").await;
+        assert!(either.headers().get(header::CONTENT_LOCATION).is_none());
+        assert_eq!(json(body_of(either).await)["total"], 3, "Spanish or Korean: all three films");
+        let encoded = get(&state, "/index/filter/movie/counts.json?sel=country:KR%7CES").await;
+        assert_eq!(encoded.headers()[header::CONTENT_LOCATION], "counts.json?sel=country:ES|KR");
+
         for path in [
             "/index/filter/movie/counts.json?sel=genre:action",
             "/index/filter/movie/counts.json?sel=person:bob",
