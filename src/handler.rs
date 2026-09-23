@@ -1445,7 +1445,8 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
 /// A request spelled any way but the canonical one is ANSWERED, not redirected — den-edge's relay drops a
 /// redirect's `Location`, so a 308 there reads as an empty answer — but privately and briefly, so no shared
 /// cache holds a second copy under a second key, and `Content-Location` names the one URL to ask next time.
-/// A degraded answer (a kind this atlas should answer and cannot yet) is kept five minutes rather than an hour.
+/// A degraded answer (a kind this atlas should answer and cannot yet, through a failure at runtime) is kept
+/// five minutes rather than an hour.
 async fn filter_answer(
     state: &Arc<AppState>,
     indexes: Arc<crate::queries::Indexes>,

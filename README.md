@@ -202,10 +202,13 @@ pins url → canonical url pairs a client can test against.
   max-age=60`, with `Content-Location` naming the canonical URL. At most 16 values and a 2,048-byte query;
   a malformed item, an id its kind cannot read, a `skip` off a page boundary or a short prefix is a `400`.
 - **Unknown or unavailable.** A kind atlas does not know, or cannot answer now, is left out of the result and
-  named in `ignored`. `kindsUnavailable` lists the kinds this atlas should answer and cannot (a store section
-  that did not read, a ratings or principals join not yet landed); its answers carry
-  `X-Den-Degraded: filter_kinds_unavailable` and are kept five minutes. On store 5b1c3213b6a1 `warning` is
-  unavailable: no title scores 0.5 on any `depicts` axis (the highest is 0.28).
+  named in `ignored`. `kindsUnavailable` lists the kinds this atlas should answer and cannot. When that is a
+  runtime failure — the facts or facet rows did not load, a ratings or principals join has not landed — the
+  answer carries `X-Den-Degraded: filter_kinds_unavailable` and is kept five minutes. When it is the dataset
+  version — a section the store does not carry, a score table no title reaches the floor of — it is only
+  listed, and cached as usual. Availability is read off the loaded store: on 5b1c3213b6a1 `warning` is
+  unavailable (its `depicts` scores are title-only, the highest 0.28), and a store with article-based scores
+  offers it on load.
 - **Cost** on that store: 509 values in bitsets plus posting lists for the entity kinds, 11 MB, built at load in
   ~0.1 s; the name index for `values/…?q=` is built on the first search, 7.7 MB. The empty selection's counts
   are kept (0.1 ms); a three-kind selection answers in under 1 ms, the broadest single genre in ~6 ms, a titles

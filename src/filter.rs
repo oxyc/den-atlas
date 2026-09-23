@@ -286,7 +286,9 @@ const ENTITY_KINDS: &[EntitySpec] = &[
 /// `audience` at 0.5, between made-for-children's 4,965 titles at 0.4 and 3,303 at 0.6. `critique` at 0.6: at
 /// 0.4 "the self" claims 24,513 titles, half the corpus; at 0.6, 9,083 and the rest 1–7k. `warning` at 0.5
 /// finds nothing on that store — its highest score on any title is 0.28 (graphic violence 0.17) — so it is
-/// reported unavailable there rather than answering every exclusion with "all clean".
+/// reported unavailable there rather than answering every exclusion with "all clean". Those were title-only
+/// scores; a store with the article-based ones reaches the floor and offers `warning` on load, with nothing to
+/// switch — availability is read off the loaded table, never declared.
 const DENSE_KINDS: [(&str, &str, &str, u8, &str); 4] = [
     ("technique", "technique", "technique_names", 40, "how it is made: live action, anime, CG, …"),
     ("audience", "audience", "audience_names", 50, "who it is made for"),
@@ -609,6 +611,10 @@ pub struct FilterIndex {
     entities: Vec<Option<EntityKind>>,
     /// Kinds this store should answer and whose source did not read.
     unavailable: Vec<&'static str>,
+    /// Those of `unavailable` that are a property of this dataset version — a section the store does not
+    /// carry, a score table no title reaches the floor of — rather than a failure at runtime. Reported, but
+    /// no reason to cache an answer briefly: it will not change until the next dataset.
+    stable: Vec<&'static str>,
     derived: Mutex<Option<Arc<Derived>>>,
     names: OnceLock<NameIndex>,
     build_bytes: usize,
@@ -672,6 +678,7 @@ impl FilterIndex {
 
         let mut bits: BTreeMap<&'static str, Valued> = BTreeMap::new();
         let mut unavailable: Vec<&'static str> = Vec::new();
+        let mut stable: Vec<&'static str> = Vec::new();
         let add =
             |bits: &mut BTreeMap<&'static str, Valued>, kind: &'static str, value: String, row: usize| {
                 let valued =
@@ -704,6 +711,7 @@ impl FilterIndex {
             open(&mut bits, "runtime");
         } else {
             unavailable.push("runtime");
+            stable.push("runtime");
         }
 
         let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
@@ -778,12 +786,14 @@ impl FilterIndex {
             })();
             let Some((cells, names, strings)) = read else {
                 unavailable.push(kind);
+                stable.push(kind);
                 continue;
             };
             // A vocabulary no title reaches the floor of can answer nothing, and an exclusion over it would
             // call every title clean.
             if !names.is_empty() && !cells.iter().any(|&score| score >= floor) {
                 unavailable.push(kind);
+                stable.push(kind);
                 continue;
             }
             open(&mut bits, kind);
@@ -859,6 +869,7 @@ impl FilterIndex {
                 entities.push(Some(EntityKind { postings, known }));
             } else {
                 unavailable.push(entity.name);
+                stable.push(entity.name);
                 entities.push(None);
             }
         }
@@ -880,6 +891,7 @@ impl FilterIndex {
             bits,
             entities,
             unavailable,
+            stable,
             derived: Mutex::new(None),
             names: OnceLock::new(),
             build_bytes,
@@ -1405,11 +1417,13 @@ impl<'a> Context<'a> {
     fn envelope(&self, answer: &mut Value, ignored: Vec<String>) -> bool {
         answer["ignored"] = json!(ignored);
         let unavailable = self.unavailable();
-        let degraded = !unavailable.is_empty();
-        if degraded {
+        if !unavailable.is_empty() {
             answer["kindsUnavailable"] = json!(unavailable);
         }
-        degraded
+        // Degraded — a short cache and the header — only for a failure at runtime (the facts or facet rows
+        // did not load, a ratings or principals join has not landed). A kind this dataset version cannot
+        // answer is reported, but answers about it will not change until the next dataset does.
+        unavailable.iter().any(|kind| !self.filter.stable.contains(kind))
     }
 
     /// `counts.json`. The flag says a kind this atlas should answer is unavailable.
@@ -1781,6 +1795,47 @@ mod tests {
         // Movie 1's 9,000 votes put it first.
         let titles = Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "")).0;
         assert_eq!(ids(&titles), vec![1, 2, 3]);
+    }
+
+    /// Whether `warning` answers is read off the loaded store, not declared: a store whose `depicts` scores
+    /// reach the floor offers it (the route fixture's movie 1 scores 0.85), and one whose scores all stay under
+    /// it — as the title-only scores of store 5b1c3213b6a1 did — reports it unavailable, without calling the
+    /// answer degraded: that is the dataset version, not a failure, and it lasts until the next one.
+    #[test]
+    fn warning_is_offered_exactly_when_the_store_s_depicts_reach_the_floor() {
+        let reaching = fixture("warning-reaching");
+        let context = Context::new(&reaching, Movie, None);
+        assert_eq!(context.status(spec("warning").unwrap()), Status::Ready);
+        assert_eq!(
+            context.counts(&request(Route::Counts, "")).0["kinds"]["warning"]["values"],
+            json!({ "violence": 1 })
+        );
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-warning-low-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let title = |tmdb_id, violence| crate::store::fixture::Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            depicts: vec![("graphic_violence", violence)],
+            ..crate::store::fixture::Title::default()
+        };
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &[title(1, 17), title(2, 28)], &[]);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the low-scoring store loads");
+        let low = crate::queries::load_for_tools(&ds).expect("its indexes load");
+        let context = Context::new(&low, Movie, None);
+        assert_eq!(context.status(spec("warning").unwrap()), Status::Unavailable);
+        let (answer, degraded) = context.counts(&request(Route::Counts, "sel=-warning:graphic_violence"));
+        assert_eq!(answer["kindsUnavailable"], json!(["warning"]));
+        assert_eq!(answer["ignored"], json!(["warning"]), "not answered with every title clean");
+        assert!(!degraded, "a property of the dataset, not an outage");
     }
 
     /// Before the first ratings join lands, `rating` is unavailable — said so, and a selection naming it is
