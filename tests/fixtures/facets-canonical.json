@@ -1,5 +1,5 @@
 {
-  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
+  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
   "cases": [
     { "url": "/index/filter/movie/counts.json", "canonical": "/index/filter/movie/counts.json" },
     { "url": "/index/filter/movie/counts.json?sel=", "canonical": "/index/filter/movie/counts.json" },
@@ -34,7 +34,13 @@
     { "url": "/index/filter/movie/values/person.json?limit=10&q=Nolan&sel=genre:18", "canonical": "/index/filter/movie/values/person.json?sel=genre:18&q=nolan" },
     { "url": "/index/filter/movie/values/region.json?q=Scandi", "canonical": "/index/filter/movie/values/region.json?q=scandi" },
     { "url": "/index/filter/movie/values/company.json?limit=3", "canonical": "/index/filter/movie/values/company.json?limit=3" },
-    { "url": "/index/filter/movie/values/character.json?q=Walter+White&limit=9", "canonical": "/index/filter/movie/values/character.json?q=walter%20white" }
+    { "url": "/index/filter/movie/values/character.json?q=Walter+White&limit=9", "canonical": "/index/filter/movie/values/character.json?q=walter%20white" },
+    { "url": "/index/filter/all/counts.json", "canonical": "/index/filter/all/counts.json" },
+    { "url": "/index/filter/all/counts.json?sel=genre:28,network:q49", "canonical": "/index/filter/all/counts.json?sel=genre:28,network:Q49" },
+    { "url": "/index/filter/all/titles.json?limit=40&skip=40&sel=genre:10762", "canonical": "/index/filter/all/titles.json?sel=genre:10762&skip=40&limit=40" },
+    { "url": "/index/filter/all/titles.json?sel=like:movie-550", "canonical": "/index/filter/all/titles.json?sel=like:movie-550" },
+    { "url": "/index/filter/all/titles.json?sel=like:Series-01396,genre:18", "canonical": "/index/filter/all/titles.json?sel=genre:18,like:series-1396" },
+    { "url": "/index/filter/all/values/person.json?q=Nolan", "canonical": "/index/filter/all/values/person.json?q=nolan" }
   ],
   "refused": [
     "/index/filter/movie/counts.json?sel=genre:action",
@@ -45,6 +51,10 @@
     "/index/filter/movie/titles.json?skip=x",
     "/index/filter/movie/values/person.json?q=b",
     "/index/filter/movie/values/character.json?q=wa",
-    "/index/filter/movie/values/character.json"
+    "/index/filter/movie/values/character.json",
+    "/index/filter/movie/titles.json?sel=like:movie-550",
+    "/index/filter/all/titles.json?sel=like:550",
+    "/index/filter/all/titles.json?sel=like:tv-1396",
+    "/index/filter/all/titles.json?sel=like:series-"
   ]
 }

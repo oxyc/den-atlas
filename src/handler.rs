@@ -763,10 +763,11 @@ enum IndexQuestion {
     Plot {
         media_type: den_index::MediaType,
     },
-    /// A filter question (`filter.rs`): counts, titles or one kind's values under a selection. Its query is
-    /// read in `handle_index`, before the load, so a malformed one never pays for it. Answered there.
+    /// A filter question (`filter.rs`): counts, titles or one kind's values under a selection, of one type or
+    /// of both (`all`). Its query is read in `handle_index`, before the load, so a malformed one never pays for
+    /// it. Answered there.
     Filter {
-        media_type: den_index::MediaType,
+        scope: crate::filter::Scope,
         route: crate::filter::Route,
     },
 }
@@ -793,20 +794,16 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
-            ["filter", type_, question] => {
-                let route = match *question {
-                    "counts" => crate::filter::Route::Counts,
-                    "titles" => crate::filter::Route::Titles,
+            ["filter", type_, route @ ..] => {
+                let route = match route {
+                    ["counts"] => crate::filter::Route::Counts,
+                    ["titles"] => crate::filter::Route::Titles,
+                    ["values", kind] => {
+                        crate::filter::Route::Values(crate::filter::spec(kind).filter(|s| s.searchable())?)
+                    }
                     _ => return None,
                 };
-                Some(Self::Filter { media_type: index_media_type(type_)?, route })
-            }
-            ["filter", type_, "values", kind] => {
-                let spec = crate::filter::spec(kind).filter(|s| s.searchable())?;
-                Some(Self::Filter {
-                    media_type: index_media_type(type_)?,
-                    route: crate::filter::Route::Values(spec),
-                })
+                Some(Self::Filter { scope: crate::filter::Scope::parse(type_)?, route })
             }
             ["query"] => Some(Self::Query),
             ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
@@ -1539,7 +1536,7 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
 async fn filter_answer(
     state: &Arc<AppState>,
     indexes: Arc<crate::queries::Indexes>,
-    media_type: den_index::MediaType,
+    scope: crate::filter::Scope,
     route: crate::filter::Route,
     request: crate::filter::Request,
     rest: &str,
@@ -1551,7 +1548,7 @@ async fn filter_answer(
     let location = (!canonical)
         .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
     let (body, degraded) = tokio::task::spawn_blocking(move || {
-        let context = crate::filter::Context::new(&indexes, media_type, export);
+        let context = crate::filter::Context::new(&indexes, scope, export);
         let (body, degraded) = match route {
             crate::filter::Route::Counts => context.counts(&request),
             crate::filter::Route::Titles => context.titles(&request),
@@ -1587,15 +1584,17 @@ async fn handle_index(
         return not_found();
     };
     let filter = match &question {
-        IndexQuestion::Filter { media_type, route } => match crate::filter::Request::parse(*route, query) {
-            Ok(request) => Some((*media_type, *route, request)),
-            Err(detail) => {
-                return json_response(
-                    serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
-                    StatusCode::BAD_REQUEST,
-                )
+        IndexQuestion::Filter { scope, route } => {
+            match crate::filter::Request::parse(*route, *scope, query) {
+                Ok(request) => Some((*scope, *route, request)),
+                Err(detail) => {
+                    return json_response(
+                        serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+                        StatusCode::BAD_REQUEST,
+                    )
+                }
             }
-        },
+        }
         _ => None,
     };
     // A search's whole text goes to den-embed at once, while the indexes are got — and loaded, after an idle
@@ -1625,8 +1624,8 @@ async fn handle_index(
             return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
-    if let Some((media_type, route, request)) = filter {
-        let answer = filter_answer(state, indexes, media_type, route, request, rest).await;
+    if let Some((scope, route, request)) = filter {
+        let answer = filter_answer(state, indexes, scope, route, request, rest).await;
         let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
         return match answer {
             Ok((body, cache_control, location, degraded)) => {
@@ -3128,6 +3127,66 @@ mod tests {
         assert_eq!((two["values"].as_array().unwrap().len(), &two["complete"]), (2, &false.into()));
         let all = json(body_of(get(&state, "/index/filter/movie/values/person.json").await).await);
         assert_eq!(all["values"].as_array().unwrap()[..2], two["values"].as_array().unwrap()[..], "a prefix");
+    }
+
+    /// `all` at every filter route: films and series counted together, one popularity order over both paged
+    /// like a type's, values over both, and a `like` that names its title's type — the mixed row
+    /// `/index/similar` serves. A bare `like` id there is a 400; a typed one spelled otherwise is answered and
+    /// named canonically.
+    #[tokio::test]
+    async fn filter_routes_answer_for_films_and_series_together() {
+        let state = index_state("den-atlas-filter-all");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let typed = |answer: &serde_json::Value| -> Vec<(String, u64)> {
+            let titles = answer["titles"].as_array().unwrap();
+            titles
+                .iter()
+                .map(|t| (t["type"].as_str().unwrap().to_owned(), t["id"].as_u64().unwrap()))
+                .collect()
+        };
+        let pair = |media: &str, id: u64| (media.to_owned(), id);
+
+        let korean = get(&state, "/index/filter/all/counts.json?sel=country:KR").await;
+        assert_eq!(korean.status(), 200);
+        assert_eq!(
+            korean.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600, stale-while-revalidate=86400"
+        );
+        let korean = json(body_of(korean).await);
+        assert_eq!(korean["total"], 3, "movies 1 and 2 and series 4");
+        assert_eq!(korean["kinds"]["subgenre"]["values"], serde_json::json!({ "Heist": 3 }));
+
+        let top = json(body_of(get(&state, "/index/filter/all/titles.json").await).await);
+        let order = vec![pair("movie", 2), pair("series", 4), pair("movie", 1), pair("movie", 3)];
+        assert_eq!(typed(&top), order, "most voted first, over both types");
+        let page = json(body_of(get(&state, "/index/filter/all/titles.json?skip=1&limit=1").await).await);
+        assert_eq!((typed(&page), &page["order"]), (order[1..2].to_vec(), &top["order"]));
+
+        let decades =
+            json(body_of(get(&state, "/index/filter/all/values/decade.json?sel=country:KR").await).await);
+        assert_eq!(decades["values"].as_array().unwrap().len(), 3, "{decades}");
+
+        let like = json(body_of(get(&state, "/index/filter/all/titles.json?sel=like:movie-1").await).await);
+        let similar = json(body_of(get(&state, "/index/similar/movie/1.json?limit=200").await).await);
+        let mixed: Vec<(String, u64)> = similar["mixed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["type"].as_str().unwrap().to_owned(), t["id"].as_u64().unwrap()))
+            .filter(|&(_, id)| id <= 4)
+            .collect();
+        assert_eq!(typed(&like), mixed, "the mixed row, in its order, the titles with a card");
+        assert_eq!(like["order"], "like:movie-1");
+
+        let spelled = get(&state, "/index/filter/all/counts.json?sel=like:Movie-01").await;
+        assert_eq!(spelled.status(), 200);
+        assert_eq!(spelled.headers()[header::CONTENT_LOCATION], "counts.json?sel=like:movie-1");
+        for path in
+            ["/index/filter/all/titles.json?sel=like:1", "/index/filter/all/counts.json?sel=like:tv-1"]
+        {
+            assert_eq!(get(&state, path).await.status(), 400, "{path}");
+        }
+        assert_eq!(get(&state, "/index/filter/both/counts.json").await.status(), 404);
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

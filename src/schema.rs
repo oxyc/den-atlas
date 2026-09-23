@@ -492,10 +492,14 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/filter/{type}/counts.json",
             "example": "/index/filter/movie/counts.json?sel=country:KR,genre:18",
-            "about": "For every value of every listed kind, the titles of one type carrying the selection and \
-                      that value; `filter` in this document describes the kinds and the canonical form.",
+            "about": "For every value of every listed kind, the titles of one type (of both, under all) carrying \
+                      the selection and that value; `filter` in this document describes the kinds, the \
+                      canonical form and all.",
             "parameters": [
-                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
                 with(
                     param("sel", "string", "[-]<kind>:<id>, comma-separated, in canonical order"),
                     json!({ "max": crate::filter::MAX_SELECTION }),
@@ -508,10 +512,14 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/filter/{type}/titles.json",
             "example": "/index/filter/movie/titles.json?sel=genre:18&limit=40",
-            "about": "The titles of one type carrying the selection, most voted first (in similarity order \
-                      with a like selected), as /index/row/{type}.json draws them.",
+            "about": "The titles of one type (of both, under all: one order over both) carrying the selection, \
+                      most voted first (in similarity order with a like selected), as /index/row/{type}.json \
+                      draws them.",
             "parameters": [
-                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
                 with(param("sel", "string", "as counts.json"), json!({ "max": crate::filter::MAX_SELECTION })),
                 with(param("skip", "integer", "a multiple of limit; left out when 0"), json!({ "default": 0 })),
                 with(
@@ -528,7 +536,10 @@ fn routes() -> Value {
             "about": "One kind's values under the selection, labelled, most titles first; with q, those with a \
                       word starting q (a character: its name starting q).",
             "parameters": [
-                with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
                 with(param("kind", "enum", "any kind but like"), json!({ "in": "path" })),
                 with(param("sel", "string", "as counts.json"), json!({ "max": crate::filter::MAX_SELECTION })),
                 with(
