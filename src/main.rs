@@ -9,6 +9,7 @@ mod config;
 mod dataset;
 mod descriptor;
 mod facts;
+mod filter;
 mod fit;
 mod handler;
 mod http;

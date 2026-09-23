@@ -16,6 +16,7 @@
 use crate::characters::Characters;
 use crate::dataset::Dataset;
 use crate::facts::Facts;
+use crate::filter::FilterIndex;
 use crate::fit::Corpus;
 use crate::plotrows::{cards_from_store, Card, PlotFacets};
 use crate::ratings::{Ratings, RatingsIndex};
@@ -76,6 +77,8 @@ pub struct Indexes {
     /// Corpus aggregates for a critique floor and holds share other than production's, by their bits
     /// (`Indexes::aggregates_for`).
     aggregates: Mutex<HashMap<(u64, u64), Arc<den_index::RailAggregates>>>,
+    /// Every filter kind's values as the titles carrying them (`Indexes::filter`).
+    filter: OnceLock<FilterIndex>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -181,6 +184,12 @@ impl Indexes {
     /// asked for, which the load does, so no billboard waits on it.
     pub fn corpus(&self) -> &Corpus {
         self.corpus.get_or_init(|| Corpus::of(self))
+    }
+
+    /// What `/index/filter/…` counts and selects over, built once: the first time it is asked for, which the
+    /// load does, so no request waits on it.
+    pub fn filter(&self) -> &FilterIndex {
+        self.filter.get_or_init(|| FilterIndex::build(self))
     }
 
     /// A title's vote count — what every browse row is ORDERED by.
@@ -718,12 +727,17 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
+        filter: OnceLock::new(),
     };
     eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {
         indexes.corpus();
     });
-    Ok((indexes, format!("{phases}, fit {}", seconds(fit_took))))
+    let (filter_mb, filter_took) = timed(|| indexes.filter().bytes() as f64 / 1_000_000.0);
+    Ok((
+        indexes,
+        format!("{phases}, fit {}, filters {} ({filter_mb:.1} MB)", seconds(fit_took), seconds(filter_took)),
+    ))
 }
 
 /// A small, real dataset — twelve titles in one store — written to `dir` and loaded, for route tests.
@@ -796,6 +810,14 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             franchise: vec![50, 51],
             based_kind: vec!["book", "play"],
             alias_titles: vec!["One", "하나", "Uno"],
+            runtime: 95,
+            companies: vec![60],
+            locations: vec![80],
+            subjects: vec![70],
+            instance_of: vec![90],
+            technique: vec![("live_action", 95)],
+            audience: vec![("made_for_adults", 80)],
+            depicts: vec![("violence", 85)],
             ..Title::default()
         },
         Title {
@@ -810,6 +832,9 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             votes: 500,
             released: Some((D1995, 0)),
             countries: vec!["KR"],
+            runtime: 130,
+            instance_of: vec![90],
+            depicts: vec![("violence", 20)],
             ..Title::default()
         },
         Title {
@@ -824,6 +849,8 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             votes: 50,
             released: Some((D1985, 0)),
             countries: vec!["ES"],
+            runtime: 160,
+            audience: vec![("made_for_children", 90)],
             ..Title::default()
         },
         Title {
@@ -859,6 +886,10 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
         // People search indexes the aliases as well as the name.
         Entity { qid: 2, name: "Lead Actor", tmdb: None, aliases: vec!["Bong Joon-ho", "기생충 배우"] },
         Entity { qid: 50, name: "A Franchise", tmdb: None, aliases: Vec::new() },
+        Entity { qid: 60, name: "A Studio", tmdb: None, aliases: Vec::new() },
+        Entity { qid: 70, name: "Revenge", tmdb: None, aliases: Vec::new() },
+        Entity { qid: 80, name: "Seoul", tmdb: None, aliases: Vec::new() },
+        Entity { qid: 90, name: "feature film", tmdb: None, aliases: Vec::new() },
     ];
 
     std::fs::create_dir_all(dir).unwrap();

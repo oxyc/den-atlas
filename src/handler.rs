@@ -763,6 +763,12 @@ enum IndexQuestion {
     Plot {
         media_type: den_index::MediaType,
     },
+    /// A filter question (`filter.rs`): counts, titles or one kind's values under a selection. Its query is
+    /// read in `handle_index`, before the load, so a malformed one never pays for it. Answered there.
+    Filter {
+        media_type: den_index::MediaType,
+        route: crate::filter::Route,
+    },
 }
 
 impl IndexQuestion {
@@ -787,6 +793,21 @@ impl IndexQuestion {
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
+            ["filter", type_, question] => {
+                let route = match *question {
+                    "counts" => crate::filter::Route::Counts,
+                    "titles" => crate::filter::Route::Titles,
+                    _ => return None,
+                };
+                Some(Self::Filter { media_type: index_media_type(type_)?, route })
+            }
+            ["filter", type_, "values", kind] => {
+                let spec = crate::filter::spec(kind).filter(|s| s.searchable())?;
+                Some(Self::Filter {
+                    media_type: index_media_type(type_)?,
+                    route: crate::filter::Route::Values(spec),
+                })
+            }
             ["query"] => Some(Self::Query),
             ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
@@ -885,7 +906,9 @@ impl IndexQuestion {
                     number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
                 )
             }
-            Self::Search | Self::Facets | Self::Query => unreachable!("answered in handle_index"),
+            Self::Search | Self::Facets | Self::Query | Self::Filter { .. } => {
+                unreachable!("answered in handle_index")
+            }
         };
         body.to_string()
     }
@@ -1440,6 +1463,50 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
     with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
 }
 
+/// `/index/filter/<type>/…` (`filter.rs`), off the request threads: the body, its `Cache-Control`, the
+/// canonical URL to name in `Content-Location` when the request spelled another, and whether a kind was
+/// unavailable.
+///
+/// A request spelled any way but the canonical one is ANSWERED, not redirected — den-edge's relay drops a
+/// redirect's `Location`, so a 308 there reads as an empty answer — but privately and briefly, so no shared
+/// cache holds a second copy under a second key, and `Content-Location` names the one URL to ask next time.
+/// A degraded answer (a kind this atlas should answer and cannot yet, through a failure at runtime) is kept
+/// five minutes rather than an hour.
+async fn filter_answer(
+    state: &Arc<AppState>,
+    indexes: Arc<crate::queries::Indexes>,
+    media_type: den_index::MediaType,
+    route: crate::filter::Route,
+    request: crate::filter::Request,
+    rest: &str,
+) -> Result<(String, &'static str, Option<String>, bool), String> {
+    let export = state.titles.as_ref().and_then(|t| t.index());
+    // The path is part of the key too: `counts` without `.json` answers, but as a second spelling.
+    let segment = rest.rsplit('/').next().unwrap_or(rest);
+    let canonical = request.canonical && segment.ends_with(".json");
+    let location = (!canonical)
+        .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
+    let (body, degraded) = tokio::task::spawn_blocking(move || {
+        let context = crate::filter::Context::new(&indexes, media_type, export);
+        let (body, degraded) = match route {
+            crate::filter::Route::Counts => context.counts(&request),
+            crate::filter::Route::Titles => context.titles(&request),
+            crate::filter::Route::Values(spec) => context.values(spec, &request),
+        };
+        (body.to_string(), degraded)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let cache_control = if !canonical {
+        "private, max-age=60"
+    } else if degraded {
+        "public, max-age=300"
+    } else {
+        "public, max-age=3600, stale-while-revalidate=86400"
+    };
+    Ok((body, cache_control, location, degraded))
+}
+
 /// `/index/…` — TMDB ids only; the Den apps hydrate titles themselves. Off (404) unless `INDEX_QUERIES` is
 /// set. The indexes load on the first query, and that answer's `Server-Timing` says how long it took.
 async fn handle_index(
@@ -1454,6 +1521,18 @@ async fn handle_index(
     let Some(queries) = state.index.as_ref() else { return not_found() };
     let Some(question) = IndexQuestion::parse(rest.strip_suffix(".json").unwrap_or(rest)) else {
         return not_found();
+    };
+    let filter = match &question {
+        IndexQuestion::Filter { media_type, route } => match crate::filter::Request::parse(*route, query) {
+            Ok(request) => Some((*media_type, *route, request)),
+            Err(detail) => {
+                return json_response(
+                    serde_json::json!({ "error": "bad_request", "detail": detail }).to_string(),
+                    StatusCode::BAD_REQUEST,
+                )
+            }
+        },
+        _ => None,
     };
     // A search's whole text goes to den-embed at once, while the indexes are got — and loaded, after an idle
     // spell — so a cold den-embed loads its model alongside them, not after (`query_answer`).
@@ -1482,6 +1561,27 @@ async fn handle_index(
             return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
+    if let Some((media_type, route, request)) = filter {
+        let answer = filter_answer(state, indexes, media_type, route, request, rest).await;
+        let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
+        return match answer {
+            Ok((body, cache_control, location, degraded)) => {
+                let mut resp = serve_json(method, headers, body, cache_control, None).await;
+                if let Some(location) = location.and_then(|l| header::HeaderValue::from_str(&l).ok()) {
+                    resp.headers_mut().insert(header::CONTENT_LOCATION, location);
+                }
+                if degraded {
+                    resp.headers_mut()
+                        .insert(DEGRADED, header::HeaderValue::from_static("filter_kinds_unavailable"));
+                }
+                with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
+            }
+            Err(e) => {
+                eprintln!("filter answer failed: {e}");
+                json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        };
+    }
     // An answer is the dataset's — and, for search, den-embed's vector for the text, which is fixed for the
     // dataset's model — so it changes when the dataset does, at most once a day, and its ETag with it: fresh
     // for an hour, and served stale while it revalidates. A search that should have been ranked through
@@ -2682,6 +2782,202 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Filter counts at the URLs Den Web builds: a canonical one is public, carries an ETag and revalidates to
+    /// a 304; any other spelling of the same question is answered — never redirected, since den-edge's relay
+    /// drops `Location` — with the same body, privately and briefly, naming the canonical URL in
+    /// `Content-Location`; a malformed one is a 400 before anything loads.
+    #[tokio::test]
+    async fn filter_counts_answer_every_spelling_and_name_the_canonical_one() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let state = index_state("den-atlas-filter-counts");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+
+        let all = get(&state, "/index/filter/movie/counts.json").await;
+        assert_eq!(all.status(), 200);
+        assert_eq!(
+            all.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600, stale-while-revalidate=86400"
+        );
+        assert!(all.headers().get(DEGRADED).is_none(), "every kind this state offers answers");
+        let all = json(body_of(all).await);
+        assert_eq!(all["total"], 3);
+        assert_eq!(all["kinds"]["country"]["values"], serde_json::json!({ "DK": 1, "ES": 1, "KR": 2 }));
+        assert_eq!(all["kinds"]["country"]["mode"], "and");
+        assert_eq!(all["kinds"]["decade"]["mode"], "single");
+        assert_eq!(all["ignored"], serde_json::json!([]));
+
+        // The web's own URL for Korea and Heist, as `facetCountsUrl` writes it.
+        let canonical = "/index/filter/movie/counts.json?sel=country:KR,subgenre:Heist";
+        let korean = get(&state, canonical).await;
+        let etag = korean.headers()[header::ETAG].clone();
+        assert!(korean.headers().get(header::CONTENT_LOCATION).is_none());
+        let korean_body = body_of(korean).await;
+        let korean = json(korean_body.clone());
+        assert_eq!(korean["total"], 2);
+        assert_eq!(korean["kinds"]["country"]["values"], serde_json::json!({ "DK": 1, "KR": 2 }));
+        assert_eq!(korean["kinds"]["country"]["selected"], serde_json::json!(["KR"]));
+        assert_eq!(korean["kinds"]["mood"]["values"], serde_json::json!({ "Tense": 1 }));
+        let req = HttpRequest::builder().uri(canonical).header("if-none-match", etag);
+        assert_eq!(handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await.status(), 304);
+
+        // URLSearchParams' spelling, and an unsorted, lowercased one: the same body, named canonically.
+        for other in [
+            "/index/filter/movie/counts.json?sel=country%3AKR%2Csubgenre%3AHeist",
+            "/index/filter/movie/counts.json?sel=subgenre:Heist,country:kr",
+            "/index/filter/movie/counts?sel=country:KR,subgenre:Heist,country:KR",
+        ] {
+            let resp = get(&state, other).await;
+            assert_eq!(resp.status(), 200, "{other}");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, max-age=60", "{other}");
+            let location = resp.headers()[header::CONTENT_LOCATION].to_str().unwrap().to_owned();
+            assert_eq!(location, "counts.json?sel=country:KR,subgenre:Heist", "{other}");
+            assert_eq!(body_of(resp).await, korean_body, "{other}");
+        }
+        let emptied = get(&state, "/index/filter/movie/counts.json?sel=").await;
+        assert_eq!(emptied.headers()[header::CONTENT_LOCATION], "counts.json");
+        // The path is part of the key: without `.json` even a canonical query is a second spelling.
+        let bare = get(&state, "/index/filter/movie/counts?sel=country:KR,subgenre:Heist").await;
+        assert_eq!(bare.headers()[header::CACHE_CONTROL], "private, max-age=60");
+        assert_eq!(bare.headers()[header::CONTENT_LOCATION], "counts.json?sel=country:KR,subgenre:Heist");
+
+        // A kind this atlas does not know is answered around, and said so; so is a value its kind lacks.
+        let unknown = json(body_of(get(&state, "/index/filter/movie/counts.json?sel=nope:1").await).await);
+        assert_eq!((&unknown["total"], &unknown["ignored"]), (&3.into(), &serde_json::json!(["nope"])));
+        let typo = json(
+            body_of(get(&state, "/index/filter/movie/counts.json?sel=mood:tense,tone:blaek").await).await,
+        );
+        assert_eq!(typo["total"], 0);
+        assert_eq!(typo["unknownValues"], serde_json::json!(["mood:tense", "tone:blaek"]));
+
+        for path in [
+            "/index/filter/movie/counts.json?sel=genre:action",
+            "/index/filter/movie/counts.json?sel=person:bob",
+            "/index/filter/movie/counts.json?sel=genre",
+            "/index/filter/movie/counts.json?sel=:1",
+            "/index/filter/movie/counts.json?sel=-:x",
+        ] {
+            let resp = get(&state, path).await;
+            assert_eq!(resp.status(), 400, "{path}");
+            assert_eq!(json(body_of(resp).await)["error"], "bad_request", "{path}");
+        }
+        for path in [
+            "/index/filter/anime/counts.json",
+            "/index/filter/movie/nope.json",
+            "/index/filter/movie/values/like.json",
+            "/index/facets/movie.json",
+            "/index/browse/movie.json",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 404, "{path}");
+        }
+    }
+
+    /// The titles carrying a selection: the very cards `/index/row` draws, paged, with the page in the
+    /// canonical URL — which is the cache key, so it carries an ETag and revalidates.
+    #[tokio::test]
+    async fn filter_titles_page_a_selection_by_canonical_url() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let state = index_state("den-atlas-filter-titles");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |answer: &serde_json::Value| -> Vec<u64> {
+            answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
+        };
+
+        let korean = get(&state, "/index/filter/movie/titles.json?sel=country:KR,subgenre:Heist").await;
+        assert_eq!(korean.status(), 200);
+        assert_eq!(
+            korean.headers()[header::CACHE_CONTROL],
+            "public, max-age=3600, stale-while-revalidate=86400"
+        );
+        let etag = korean.headers()[header::ETAG].clone();
+        let korean = json(body_of(korean).await);
+        assert_eq!((ids(&korean), &korean["total"]), (vec![2, 1], &serde_json::json!(2)));
+        assert!(korean["order"].as_str().is_some_and(|o| o.len() == 16), "{korean}");
+        assert_eq!(korean["coverage"]["country"], serde_json::json!({ "count": 3, "denominator": 3 }));
+
+        // The same card, field for field, that a browse row draws for the same title.
+        let row = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist").await).await);
+        let card = |answer: &serde_json::Value, id: u64| {
+            answer["titles"].as_array().unwrap().iter().find(|t| t["id"] == id).cloned().unwrap()
+        };
+        assert_eq!(card(&korean, 1), card(&row, 1));
+        assert_eq!(card(&korean, 2), card(&row, 2));
+
+        let page = json(
+            body_of(get(&state, "/index/filter/movie/titles.json?sel=subgenre:Heist&skip=1&limit=1").await)
+                .await,
+        );
+        assert_eq!((ids(&page), &page["total"]), (vec![1], &serde_json::json!(3)));
+        let top = json(body_of(get(&state, "/index/filter/movie/titles.json").await).await);
+        assert_eq!(ids(&top), vec![2, 1, 3], "no selection: most voted first");
+
+        // More like movie 1, in its own order, and within it only the comedy.
+        let like = json(body_of(get(&state, "/index/filter/movie/titles.json?sel=like:1").await).await);
+        let similar = json(body_of(get(&state, "/index/similar/movie/1.json?limit=200").await).await);
+        assert_eq!(serde_json::json!(ids(&like)), similar["ids"], "the similar set, in similarity order");
+        assert_eq!(like["order"], "like:1");
+        let comedy =
+            json(body_of(get(&state, "/index/filter/movie/titles.json?sel=genre:35,like:1").await).await);
+        assert_eq!(ids(&comedy), vec![3]);
+
+        // Excluded violence: movie 1 depicts it, movie 2 is on record as not, movie 3 was described and
+        // scores nothing — known clean.
+        let calm =
+            json(body_of(get(&state, "/index/filter/movie/titles.json?sel=-warning:violence").await).await);
+        assert_eq!(ids(&calm), vec![2, 3]);
+
+        let req = HttpRequest::builder()
+            .uri("/index/filter/movie/titles.json?sel=country:KR,subgenre:Heist")
+            .header("if-none-match", etag);
+        let revalidated = handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await;
+        assert_eq!(revalidated.status(), 304);
+
+        let other =
+            get(&state, "/index/filter/movie/titles.json?limit=500&skip=0&sel=subgenre:Heist,country:kr")
+                .await;
+        assert_eq!(other.status(), 200);
+        assert_eq!(other.headers()[header::CACHE_CONTROL], "private, max-age=60");
+        assert_eq!(
+            other.headers()[header::CONTENT_LOCATION],
+            "titles.json?sel=country:KR,subgenre:Heist&limit=100"
+        );
+        for path in [
+            "/index/filter/movie/titles.json?skip=x",
+            "/index/filter/movie/titles.json?skip=1&limit=2",
+            "/index/filter/movie/titles.json?sel=genre",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 400, "{path}");
+        }
+    }
+
+    /// One kind's values under a selection: a prefix search over names and aliases for people, over label
+    /// words for the rest — most titles first, labelled.
+    #[tokio::test]
+    async fn filter_values_search_a_kind_by_prefix() {
+        let state = index_state("den-atlas-filter-values");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let bong = json(body_of(get(&state, "/index/filter/movie/values/person.json?q=Bong").await).await);
+        assert_eq!(bong["kind"], "person");
+        assert_eq!(bong["values"], serde_json::json!([{ "id": "Q2", "name": "Lead Actor", "count": 1 }]));
+        let director = json(body_of(get(&state, "/index/filter/movie/values/made.json?q=dir").await).await);
+        assert_eq!(director["values"][0]["tmdbId"], 11, "a person's TMDB id, where Wikidata has it");
+        let cult = json(body_of(get(&state, "/index/filter/movie/values/subgenre.json?q=cult").await).await);
+        assert_eq!(
+            cult["values"],
+            serde_json::json!([{ "id": "Campy/Cult", "name": "Campy/Cult", "count": 1 }])
+        );
+        let korean =
+            json(body_of(get(&state, "/index/filter/movie/values/decade.json?sel=country:KR").await).await);
+        assert_eq!(korean["values"].as_array().unwrap().len(), 2, "{korean}");
+        assert_eq!(get(&state, "/index/filter/movie/values/person.json?q=b").await.status(), 400);
+        // A page of people without a prefix: the top of the counts, the rest counted but not named.
+        let two = json(body_of(get(&state, "/index/filter/movie/values/person.json?limit=2").await).await);
+        assert_eq!((two["values"].as_array().unwrap().len(), &two["complete"]), (2, &false.into()));
+        let all = json(body_of(get(&state, "/index/filter/movie/values/person.json").await).await);
+        assert_eq!(all["values"].as_array().unwrap()[..2], two["values"].as_array().unwrap()[..], "a prefix");
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

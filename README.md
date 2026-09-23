@@ -118,6 +118,9 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total,semantics,coverage}`. `total` is the retrieved pool, not a corpus count, and `semantics` says so; `coverage` names every constraint the query applied, its value, how it was applied and how many titles have that field on record out of the titles of the type asked for (the corpus when none was). The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
 | `GET /index/row/<movie\|series>.json?<axis>=<value>…&mood=&subgenre=&skip=&limit=` (also `/index/plot/…`) | with `INDEX_QUERIES` on: a browse row from the store's facet axes (ending, era, chronology, pacing, tone, …) and the labels' moods and subgenres (≥ 0.55), alone or combined. A few thin values also answer as merged display rows — `ending=unresolved` (open, ambiguous, cyclical), `ending=unhappy` (tragic, bittersweet), `chronology=out-of-order` (nonlinear, framed, parallel-strands), listed in `/index/schema.json` under `fields.<axis>.merged`; similarity keeps the raw values — `{titles:[{type,id,title,posterPath,year,genreIds,originalLanguage?}],total,coverage}`, the titles carrying every constraint, most confident then most voted, 24 a page, at most 100. `coverage.fields` reports every filtered field against the selected movie/series population and also names the full corpus; a missing facet is unknown, never false |
 | …and the same route's **taste tilt**: `&tilt.liked=m550,t1396&tilt.disliked=m176&tilt.era=<center>,<spread>&tilt.w.embedding=&tilt.w.dislike=&tilt.w.era=&tilt.w.square=` | the WHOLE row reordered for one household before the page is cut, so a title the plain order puts on page 3 can lead page 1. Ids are `m`/`t` + TMDB id, at most 500 a list; `tilt.era` is den-core's fitted curve and its presence is what turns the era term on (omit it for a row already fixed to an era). The four `tilt.w.*` levers are den-core's `tilt::Weights`, each independently overridable and defaulting to its shipped value. **Reorder only** — same `total`, same titles, so paging state stays valid; the answer adds `taste`, the fingerprint of the order the page is a slice of. A taste atlas cannot place returns the plain row, never an error. Memoised per (row × taste × weights); a request carrying `tilt.*` is `private`-cached rather than `public`, since its URL names the household's titles |
+| `GET /index/filter/<movie\|series>/counts.json?sel=…` | with `INDEX_QUERIES` on: stackable filters' counts (see **Filters** below) — `{total, kinds: {<kind>: {mode, complete, values: {<id>: n}, labels?, selected?, excluded?}}, coverage, ignored, kindsUnavailable?}`: for every value of every listed kind, the titles of the type carrying the whole selection AND that value; zero counts left out, except a selected or excluded id, which always appears. Den Web hides an option at 0 in a `complete` kind |
+| `GET /index/filter/<movie\|series>/titles.json?sel=…&skip=&limit=` | with `INDEX_QUERIES` on: the titles carrying the selection, most voted first (in similarity order when a `like` is selected), as the cards `/index/row` returns — `{titles, total, order, coverage, ignored, kindsUnavailable?}`; 24 a page, at most 100, `skip` a multiple of `limit`. `order` fingerprints the order the page is a slice of (it moves with the rating provider's votes, or is `like:<id>`) |
+| `GET /index/filter/<movie\|series>/values/<kind>.json?sel=…&q=&limit=` | with `INDEX_QUERIES` on: one kind's values under the selection, labelled, most titles first — `{kind, mode, values: [{id, name, count, tmdbId?}], complete, ignored, kindsUnavailable?}`, 10 at most; with `q` (2 characters or more), only those with a word starting it: the typeahead for people, studios, subjects and places, over names and aliases. `character` is search-only: `q` of 3 or more, a name starting it, 5 at most |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids}],pooled}`, More Like This per seed and pooled in seed order |
@@ -169,6 +172,51 @@ stated in the load line (`row order: …`) rather than left to be inferred. When
 `/health` reports `votes_unusable`: rows still come back full, in tmdb-id order, which is the one degradation
 here that looks like a working addon. `/recommend` reads the same dump's `averageRating` where no upstream
 list scored a title, in place of the flat prior it used to rate those with.
+
+### Filters
+
+`/index/filter/<type>/…` is Den Web's stackable Search: a selection of values, AND-ed, and three questions
+about it (counts, titles, one kind's values). `/index/schema.json`'s `filter` object lists every kind with its
+`mode`, id format, listing and floors, the axis aliases and the canonical rules; `tests/fixtures/facets-canonical.json`
+pins url → canonical url pairs a client can test against.
+
+- **`sel`** is `[-]<kind>:<id>` items joined by `,`. Kinds: `genre` (TMDB id; a series also under 10759/10765/10768),
+  `language`, `country` (every one a title lists), `decade` (first year; a series' first air date), `mood`,
+  `subgenre`, `primary` (the labels' primary genre), `animated` (`yes`/`no`), `runtime` (`under-90`, `90-120`,
+  `120-150`, `over-150`; a series per episode), `source` (adapted from), `rating` (the rating provider's average ≥ 6,
+  7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the twelve
+  plot axes (`structure` resolves by value; the merged rows count their members' union), the entity kinds
+  `person` (anyone credited), `made`, `cast`, `company`, `network` (series), `subject`, `place` and `format`
+  (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles, formats from a curated
+  list), `character` (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set
+  `/index/similar` answers).
+- **Mode.** `and` kinds hold several values a title (two genres are both genres) and count under the whole
+  selection. `single` kinds hold one (decade, runtime, rating, primary, animated, the plot axes, like) and count
+  each value under the selection WITHOUT the kind's own pick, so the other decades read as alternatives.
+- **Exclude** with `-kind:id`: the titles known for the kind (something on record for it) and not carrying the
+  value. `coverage` in every answer says how many titles of the type each applied kind is known for.
+- **Canonical form**: items normalised per kind, sorted by kind, then positive before excluded, then id, each
+  once, ids encoded as `encodeURIComponent` does, `:` `,` `-` literal; then `skip`/`limit` (titles) or `q`/`limit`
+  (values), each only when not its default. The canonical URL is public for an hour and revalidates by ETag. Any
+  other spelling is ANSWERED, not redirected (den-edge's relay drops `Location`): the same body, `private,
+  max-age=60`, with `Content-Location` naming the canonical URL. At most 16 values and a 2,048-byte query;
+  a malformed item, an id its kind cannot read, a `skip` off a page boundary or a short prefix is a `400`.
+- **Unknown, unavailable, not offered.** A kind atlas does not know, or cannot answer now, is left out of the
+  result and named in `ignored`; a value its kind does not hold (a typo, a label in the wrong case) matches
+  nothing and is named in `unknownValues`. `kindsUnavailable` lists the kinds this atlas should answer and
+  cannot through a failure at runtime — the facts or facet rows did not load, the rating provider has no votes
+  yet — and such an answer carries `X-Den-Degraded: filter_kinds_unavailable` and is kept five minutes. A kind
+  the loaded dataset has no data for — a section the store does not carry, a score table no title reaches the
+  floor of — is simply not offered: absent from `kinds`, not unavailable, cached as usual. On 5b1c3213b6a1
+  `warning` is not offered (its `depicts` scores are title-only, the highest 0.28); a store with article-based
+  scores offers it on load. `character` is offered once its provider has built the names.
+- **Providers.** `rating` and the vote order read whichever provider fills atlas's ratings holder, and
+  `character` its character links: IMDb's dumps today, TMDB on the way (as a filter and a sort only).
+- **Cost** on that store: 509 values in bitsets plus posting lists for the entity kinds, 11 MB, built at load in
+  ~0.1 s; the name index for `values/…?q=` is built on the first search, 7.7 MB. The empty selection's counts
+  are kept (0.1 ms); a three-kind selection answers in under 1 ms, the broadest single genre in ~6 ms, a titles
+  page in ~0.1 ms, a name search in ~7 ms, and a page of people or cast without a prefix in 2–7 ms (only the
+  values that can reach the page are named).
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows and search include
@@ -231,7 +279,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
-| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
+| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
 | `IMDB_RATINGS` | on | IMDb's daily `title.ratings` dump joined onto the store's `imdb` column — the vote count browse rows are ordered by and the score `/recommend` rates a title with. Only alongside `INDEX_QUERIES`. Empty or `0` ⇒ off, and row order comes from the store's own `votes` column alone; with that column gone too, rows come back in tmdb-id order and `/health` reports `votes_unusable` |
 | `IMDB_CHARACTERS` | on | IMDb's `title.principals` dump, streamed and filtered to the store's `imdb` ids, built into a per-title list of titles that share a character (spin-offs, sequels). Built in the background, weekly; the filtered rows (~24 MB) are kept in `CACHE_DIR`, so a restart within the week rebuilds from them rather than downloading the ~780 MB dump. Only alongside `INDEX_QUERIES`. Empty or `0` ⇒ off. Nothing ranks on it yet (oxyc/den-atlas#43) |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
