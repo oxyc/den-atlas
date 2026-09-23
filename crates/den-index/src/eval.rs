@@ -4,7 +4,7 @@
 //! its tuning playground, and a build of this crate running in a browser — computes one number the same
 //! way. Pure: a row of ids and a map of grades in, numbers out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 /// A judgement of one candidate as a recommendation for one seed.
@@ -81,6 +81,25 @@ pub fn score<K: Eq + Hash>(row: &[K], grades: &HashMap<K, Grade>, k: usize) -> S
     }
 }
 
+/// The share of a row's first `k` for which `carries` holds, out of the titles the row actually has there.
+///
+/// The genre-shelf measure (oxyc/den-atlas#23): twenty crime procedurals for The Wire are each a defensible
+/// neighbour, so no judgement of a member catches them. Only the row's shape does. An empty row carries
+/// nothing and reads 0.
+pub fn share<K>(row: &[K], k: usize, carries: impl Fn(&K) -> bool) -> f64 {
+    let top = &row[..row.len().min(k)];
+    if top.is_empty() {
+        return 0.0;
+    }
+    top.iter().filter(|id| carries(id)).count() as f64 / top.len() as f64
+}
+
+/// How many distinct values the first `k` of a row carry between them. `values` is a title's own, so a title
+/// with several (its confident subgenres) adds each.
+pub fn distinct<K, V: Eq + Hash>(row: &[K], k: usize, values: impl Fn(&K) -> Vec<V>) -> usize {
+    row.iter().take(k).flat_map(values).collect::<HashSet<V>>().len()
+}
+
 /// Means over a set of cases; `bad` and `judged` are summed, since a count per case is what they are.
 pub fn mean(all: &[Scores]) -> Scores {
     let n = all.len().max(1) as f64;
@@ -128,6 +147,22 @@ mod tests {
         let g = grades(&[(1, Grade::Good)]);
         assert_eq!(score(&[5, 6, 1], &g, 2).ndcg, 0.0);
         assert_eq!(score(&[1], &grades(&[(1, Grade::Bad)]), 10).ndcg, 0.0);
+    }
+
+    /// A shelf of one genre reads 1 and a varied row does not; only the first k count, out of what the row has.
+    #[test]
+    fn share_and_distinct_read_the_rows_shape() {
+        let crime = |id: &u32| *id < 100;
+        let shelf: Vec<u32> = (0..20).collect();
+        assert_eq!(share(&shelf, 20, crime), 1.0);
+        assert_eq!(distinct(&shelf, 20, |id| vec![crime(id)]), 1);
+        let varied: Vec<u32> = (0..10).chain(100..110).collect();
+        assert_eq!(share(&varied, 20, crime), 0.5);
+        assert_eq!(distinct(&varied, 20, |id| vec![crime(id)]), 2);
+        assert_eq!(share(&varied, 10, crime), 1.0, "past k counts for nothing");
+        assert_eq!(share(&shelf[..4], 20, crime), 1.0, "a short row is read out of its own length");
+        assert_eq!(share::<u32>(&[], 20, crime), 0.0);
+        assert_eq!(distinct(&[1u32, 2], 20, |id| vec![*id, *id + 1]), 3, "a title adds each of its values");
     }
 
     #[test]
