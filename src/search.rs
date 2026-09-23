@@ -22,6 +22,7 @@
 //! query set.
 
 use crate::facts::SourceKinds;
+use crate::filter::Place;
 use crate::queries::Indexes;
 use den_index::{FacetQuery, MediaType};
 use den_titlesearch::{fold, trigram_keys, TitleIndex};
@@ -219,6 +220,50 @@ const PLOT_PHRASES: &[(&str, &str, &str)] = &[
     ("in space", "setting", "space"),
 ];
 
+/// Ways people name a content warning, and the `warning` value (`filter.rs`, the store's `depicts` table) each
+/// is. Read only in what a query rules out ("heist movies without gore"): nobody asks for more of one, and a
+/// value the loaded store does not hold rules out nothing and is reported as unapplied.
+const WARNING_PHRASES: &[(&str, &str)] = &[
+    ("violence", "graphic_violence"),
+    ("violent", "graphic_violence"),
+    ("graphic violence", "graphic_violence"),
+    ("gore", "graphic_violence"),
+    ("gory", "graphic_violence"),
+    ("blood", "graphic_violence"),
+    ("bloody", "graphic_violence"),
+    ("animal death", "animal_harm"),
+    ("animal deaths", "animal_harm"),
+    ("animals dying", "animal_harm"),
+    ("animal dies", "animal_harm"),
+    ("animal harm", "animal_harm"),
+    ("animal cruelty", "animal_harm"),
+    ("animal abuse", "animal_harm"),
+    ("dead animals", "animal_harm"),
+    ("dog dies", "animal_harm"),
+    ("the dog dies", "animal_harm"),
+    ("dog death", "animal_harm"),
+    ("pet death", "animal_harm"),
+    ("drugs", "drug_use"),
+    ("drug use", "drug_use"),
+    ("drug abuse", "drug_use"),
+    ("self harm", "self_harm"),
+    ("suicide", "self_harm"),
+    ("suicidal", "self_harm"),
+    ("sex", "sexual_content"),
+    ("sexual", "sexual_content"),
+    ("sexual content", "sexual_content"),
+    ("sex scenes", "sexual_content"),
+    ("nudity", "sexual_content"),
+];
+
+/// Words that say a narrative location follows: "films set in Paris", "a series that takes place in Tokyo".
+const SETTING_WORDS: &[&str] =
+    &["set in", "set on", "takes place in", "takes place on", "take place in", "taking place in"];
+
+/// Words that open a ruled-out phrase about DEGREE ("not too scary"): what follows is a quality, never a
+/// title, so it is read against the tables alone.
+const DEGREE: &[&str] = &["too", "so", "very", "overly"];
+
 /// What a query names, and the words it leaves over.
 pub struct Parsed {
     /// The whole query, folded: what titles are matched against.
@@ -245,6 +290,8 @@ pub struct Parsed {
     source_kinds: u16,
     /// The people the query names, by Q-id, most credited first.
     people: Vec<u32>,
+    /// The narrative locations the query names ("set in Paris").
+    places: Vec<Place>,
     /// Those of them who mostly make titles (direct or create) rather than appear in them.
     makers: Vec<u32>,
     /// Each of them's titles, and whether they made each (`Facts::credits`): read off the facts once per query.
@@ -331,9 +378,16 @@ impl Parsed {
         self.facet.decade = None;
     }
 
+    /// Each ruled-out phrase nothing was read from: no facet, table, content warning, place or title. It
+    /// ruled nothing out, which the answer says (`unknownValues`) rather than leaving it to look applied.
+    pub fn unapplied_exclusions(&self) -> &[String] {
+        &self.excluded.unapplied
+    }
+
     /// True when the query named anything the facts or labels can answer directly.
     fn names_something(&self) -> bool {
         !self.people.is_empty()
+            || !self.places.is_empty()
             || !self.genres.is_empty()
             || !self.labels.is_empty()
             || !self.plot.is_empty()
@@ -383,8 +437,14 @@ struct Excluded {
     decades: Vec<u16>,
     media_types: Vec<MediaType>,
     names: Names,
+    /// Content warnings ruled out, as `warning` values the store holds.
+    warnings: Vec<&'static str>,
+    /// Places ruled out ("not set in New York").
+    places: Vec<Place>,
     /// Titles CALLED what was ruled out, and the rest of a franchise one of them leads.
     titles: HashSet<Key>,
+    /// The phrases nothing was read from (`Parsed::unapplied_exclusions`).
+    unapplied: Vec<String>,
 }
 
 impl Excluded {
@@ -409,7 +469,8 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
     if !negation.excluded.is_empty() && !exact_titles(indexes, &whole).is_empty() {
         negation = den_index::Negation { kept: whole.clone(), excluded: Vec::new() };
     }
-    let facet = FacetQuery::parse(&negation.kept);
+    let (asked, places, place_words) = take_settings(&negation.kept, indexes);
+    let facet = FacetQuery::parse(&asked);
     let contested = facet.has_strong_facet()
         && exact_titles(indexes, &negation.kept).into_iter().any(|pop| pop >= EXACT_POPULAR);
     let total = words(&negation.kept).len().max(1);
@@ -435,7 +496,7 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
                 consumed.remove(at);
             }
         }
-        rest = words(&negation.kept)
+        rest = words(&asked)
             .into_iter()
             .filter(|word| match consumed.iter().position(|c| c == word) {
                 Some(at) => {
@@ -446,6 +507,9 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
             })
             .collect();
     }
+    // A place's name stays for the vectors, read like a label's words: the facts say a blockbuster visits
+    // Paris, the plot text says which films are about being there.
+    rest.extend(place_words);
     let excluded = read_excluded(&negation.excluded, indexes, &label_names);
     let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
         .facts
@@ -477,26 +541,51 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         broadcaster: None,
         year_from_param: false,
         people,
+        places,
         makers,
         excluded,
     }
 }
 
-/// The ruled-out phrases, each read by the facet parser and the same tables as the words asked for.
+/// The ruled-out phrases, each read by the facet parser, for content warnings, and by the same tables as the
+/// words asked for; the words none of them read name titles, unless the phrase is about degree ("too scary").
 fn read_excluded(phrases: &[String], indexes: &Indexes, label_names: &[(String, &str, bool)]) -> Excluded {
     let mut out = Excluded { phrases: phrases.to_vec(), ..Excluded::default() };
     for phrase in phrases {
-        let facet = FacetQuery::parse(phrase);
+        let (phrase_rest, places, _) = take_settings(phrase, indexes);
+        let facet = FacetQuery::parse(&phrase_rest);
         out.countries.extend(facet.country);
         out.decades.extend(facet.decade);
         out.media_types.extend(facet.media_type);
+        let tokens = words(&facet.leftover);
+        let degree = tokens.first().is_some_and(|w| DEGREE.contains(&w.as_str()));
+        // A phrase that is, whole, a popular title stays one — "not sex and the city" rules out the series, not
+        // every title with sexual content — unless it is nothing but a warning's name: "without blood" is
+        // about blood, whatever film is called Blood.
+        let whole = trim_filler(&tokens).join(" ");
+        let titled = !WARNING_PHRASES.iter().any(|&(words, _)| words == whole)
+            && !whole.is_empty()
+            && exact_titles(indexes, &whole).into_iter().any(|p| p >= EXACT_POPULAR);
+        let (warnings, tokens) = if titled { (Vec::new(), tokens) } else { read_warnings(&tokens, indexes) };
         // A one-word name is never read here: "without batman" means the character, not someone called Batman.
-        let names = read_names(&words(&facet.leftover), false, indexes, label_names);
-        let named_facet = facet.country.is_some() || facet.decade.is_some() || facet.media_type.is_some();
-        let franchises = !names.names_anything() && !named_facet;
+        let names = read_names(&tokens, false, indexes, label_names);
+        let named_facet = facet.country.is_some()
+            || facet.decade.is_some()
+            || facet.media_type.is_some()
+            || !places.is_empty();
+        let franchises = !names.names_anything() && !named_facet && warnings.is_empty();
         let called = trim_filler(&names.rest);
-        if !called.is_empty() {
+        let before = out.titles.len();
+        if !called.is_empty() && !degree {
             out.titles.extend(titles_called(indexes, called, franchises));
+        }
+        if !named_facet && !names.names_anything() && warnings.is_empty() && out.titles.len() == before {
+            out.unapplied.push(phrase.clone());
+        }
+        for warning in warnings {
+            if !out.warnings.contains(&warning) {
+                out.warnings.push(warning);
+            }
         }
         let into = &mut out.names;
         into.genres.extend(names.genres);
@@ -504,8 +593,34 @@ fn read_excluded(phrases: &[String], indexes: &Indexes, label_names: &[(String, 
         into.plot.extend(names.plot);
         into.source_kinds |= names.source_kinds;
         into.people.extend(names.people);
+        out.places.extend(places);
     }
     out
+}
+
+/// The content warnings among `tokens`, longest phrase first, as the `warning` values the loaded store holds,
+/// and the tokens left once those phrases are taken out. A phrase for a value the store does not hold is left
+/// in, to be read as anything else or reported as unapplied.
+fn read_warnings(tokens: &[String], indexes: &Indexes) -> (Vec<&'static str>, Vec<String>) {
+    let held = |value: &str| indexes.filter().titles_with("warning", value).is_some();
+    let (mut warnings, mut rest) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    'words: while at < tokens.len() {
+        for span in (1..=MAX_PHRASE_WORDS.min(tokens.len() - at)).rev() {
+            let phrase = tokens[at..at + span].join(" ");
+            let named = WARNING_PHRASES.iter().find(|&&(words, value)| words == phrase && held(value));
+            if let Some(&(_, value)) = named {
+                if !warnings.contains(&value) {
+                    warnings.push(value);
+                }
+                at += span;
+                continue 'words;
+            }
+        }
+        rest.push(tokens[at].clone());
+        at += 1;
+    }
+    (warnings, rest)
 }
 
 /// The popularity of every title the text is exactly the name of (a leading article aside), by the displayed
@@ -657,6 +772,58 @@ fn read_names(
     Names { genres, labels, plot, source_kinds, people, rest, unread }
 }
 
+/// The places `text` names after setting words ("films set in Paris"), the text without those words, and the
+/// words that named the places. Read before the facets, so "set in japan" is where a title takes place and
+/// not where it was made; setting words that name no place after them stay in the text.
+fn take_settings(text: &str, indexes: &Indexes) -> (String, Vec<Place>, Vec<String>) {
+    let tokens = words(text);
+    let (mut kept, mut places, mut named): (Vec<String>, Vec<Place>, Vec<String>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let mut at = 0;
+    while at < tokens.len() {
+        match setting_at(&tokens, at, indexes) {
+            Some((end, from, place)) => {
+                if !places.iter().any(|p| p.qid == place.qid) {
+                    places.push(place);
+                }
+                named.extend(tokens[from..end].iter().cloned());
+                at = end;
+            }
+            None => {
+                kept.push(tokens[at].clone());
+                at += 1;
+            }
+        }
+    }
+    (kept.join(" "), places, named)
+}
+
+/// A place named after setting words at `at` ("set in the moon", "takes place in new york city"): the longest
+/// run of words that is exactly a place's name or alias, with a leading "the" also tried without it, and
+/// where the words it took end and its name starts.
+fn setting_at(tokens: &[String], at: usize, indexes: &Indexes) -> Option<(usize, usize, Place)> {
+    let opens = SETTING_WORDS.iter().map(|s| s.split(' ').collect::<Vec<_>>()).find(|setting| {
+        tokens.get(at..at + setting.len()).is_some_and(|w| w.iter().zip(setting).all(|(a, b)| a == b))
+    })?;
+    let from = at + opens.len();
+    for span in (1..=MAX_PHRASE_WORDS.min(tokens.len().saturating_sub(from))).rev() {
+        let name = &tokens[from..from + span];
+        // "set in space" is the plot facet `setting=space` (thousands of titles), not the few on record as set
+        // in outer space: a place the plot phrases already read is left to them.
+        let phrase = tokens[from - 1..from + span].join(" ");
+        if PLOT_PHRASES.iter().any(|&(words, _, _)| words == phrase) {
+            return None;
+        }
+        let bare = name.strip_prefix(&["the".to_owned()][..]).filter(|n| !n.is_empty());
+        for key in std::iter::once(name).chain(bare) {
+            if let Some(place) = indexes.filter().place_named(indexes, &key.join(" ")) {
+                return Some((from + span, from, place));
+            }
+        }
+    }
+    None
+}
+
 /// What the lanes found about a candidate before scoring.
 #[derive(Default)]
 struct Found {
@@ -705,6 +872,12 @@ pub fn answer(
     };
     // What the query ruled out by title or plot facet, worked out once; the rest is read per title.
     let mut ruled_out: HashSet<Key> = parsed.excluded.titles.clone();
+    for warning in &parsed.excluded.warnings {
+        ruled_out.extend(indexes.filter().titles_with("warning", warning).unwrap_or_default());
+    }
+    for place in &parsed.excluded.places {
+        ruled_out.extend(place.titles.iter().copied());
+    }
     if let Some(plot_facets) = &indexes.plot_facets {
         for &(axis, value) in &parsed.excluded.names.plot {
             for kind in [MediaType::Movie, MediaType::Tv] {
@@ -770,6 +943,9 @@ pub fn answer(
         for &genre in &parsed.genres {
             named_titles.extend(facts.titles_with_genre(genre));
         }
+    }
+    for place in &parsed.places {
+        named_titles.extend(place.titles.iter().copied());
     }
     if !named_titles.is_empty() {
         named_titles.sort_unstable();
@@ -847,10 +1023,11 @@ pub fn answer(
         }
     }
 
+    let placed: HashSet<Key> = parsed.places.iter().flat_map(|p| p.titles.iter().copied()).collect();
     let mut scored: Vec<Scored> = found
         .iter()
         .filter(|(key, _)| wanted(key.0) && allowed(**key))
-        .filter_map(|(&key, found)| features(indexes, parsed, key, found, &plot_confidence))
+        .filter_map(|(&key, found)| features(indexes, parsed, key, found, &plot_confidence, &placed))
         .collect();
     let exact_answered = scored.iter().any(|s| s.exact && s.pop >= EXACT_POPULAR);
     let w_sem = W_SEMANTIC * (0.3 + 0.7 * parsed.lambda) * if exact_answered { 0.3 } else { 1.0 };
@@ -957,6 +1134,7 @@ pub fn answer(
             "labels": parsed.labels.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             "plotFacets": parsed.plot.iter().map(|(axis, value)| format!("{axis}={value}")).collect::<Vec<_>>(),
             "basedOnKind": SourceKinds::names(parsed.source_kinds),
+            "places": places_json(&parsed.places),
             "yearMin": parsed.facet.year_min,
             "yearMax": parsed.facet.year_max,
             "language": parsed.facet.language,
@@ -1000,8 +1178,21 @@ fn excluded_json(excluded: &Excluded) -> serde_json::Value {
         "plotFacets": names.plot.iter().map(|(axis, value)| format!("{axis}={value}")).collect::<Vec<_>>(),
         "basedOnKind": SourceKinds::names(names.source_kinds),
         "people": people,
+        "warnings": excluded.warnings,
+        "places": places_json(&excluded.places),
         "titles": excluded.titles.len(),
+        "unapplied": excluded.unapplied,
     })
+}
+
+/// Places as the parse reports them: `[{qid, name, titles}]`, `titles` the count set there on record.
+fn places_json(places: &[Place]) -> serde_json::Value {
+    places
+        .iter()
+        .map(
+            |p| serde_json::json!({ "qid": format!("Q{}", p.qid), "name": p.name, "titles": p.titles.len() }),
+        )
+        .collect()
 }
 
 /// Every constraint the query applied, and how: a parameter filters, a constraint read from the words discounts,
@@ -1062,6 +1253,10 @@ fn applied(parsed: &Parsed, media_type: Option<MediaType>) -> Vec<crate::schema:
     if !parsed.people.is_empty() {
         let qids: Vec<String> = parsed.people.iter().map(|qid| format!("Q{qid}")).collect();
         push("people", json!(qids), "boost", None);
+    }
+    if !parsed.places.is_empty() {
+        let qids: Vec<String> = parsed.places.iter().map(|p| format!("Q{}", p.qid)).collect();
+        push("place", json!(qids), "discount", None);
     }
     out
 }
@@ -1196,6 +1391,7 @@ fn features(
     key: Key,
     found: &Found,
     plot_confidence: &HashMap<Key, f64>,
+    placed: &HashSet<Key>,
 ) -> Option<Scored> {
     let (kind, id) = key;
     let facets = indexes.facets.as_ref().and_then(|f| f.title(id, kind));
@@ -1234,6 +1430,16 @@ fn features(
             // a claim about origin, and the corpus shows the guess is wrong about half the time: "spanish" as
             // a country misses 1,138 Spanish-LANGUAGE titles. An exact title keeps both readings alive.
             phi = discount_text_facet(phi, spared);
+        }
+    }
+    // A place the query said a title is set in, read like a country: a title on record as set only elsewhere
+    // is discounted, one with no narrative location at all is unknown. P840 lists where a title is set, not
+    // every place it visits, so neither is dropped.
+    if !parsed.places.is_empty() && !placed.contains(&key) {
+        if indexes.filter().entity_on_record(indexes, "place", key) {
+            phi = discount_text_facet(phi, spared);
+        } else {
+            phi *= UNKNOWN_FACET;
         }
     }
     // The broadcaster, from a parameter, so it drops — but only for series, since a film has no such fact
@@ -1638,6 +1844,99 @@ mod tests {
         let found = answer(&indexes, None, &parsed, None, None, 0, PAGE);
         assert_eq!(found["hits"][0]["id"], 1, "{found}");
         assert!(found["hits"][0]["score"].as_f64().unwrap() >= W_TITLE * EXACT_TITLE, "{found}");
+    }
+
+    /// The indexes of a store of seven heist films: 1–5 set in Paris, 6 in San Francisco (also called "Paris
+    /// of the West"), 7 nowhere on record; 1 and 6 depict graphic violence, 2 below the floor.
+    fn heists(name: &str) -> Indexes {
+        use crate::store::fixture::{Entity, Title};
+        let titles: Vec<Title> = (1..=7)
+            .map(|id| Title {
+                media: 0,
+                tmdb_id: id,
+                primary_genre: "Crime",
+                subgenres: vec![("Heist", 90)],
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A Job", None, Some(2000))),
+                votes: 1000 - id,
+                locations: match id {
+                    1..=5 => vec![1],
+                    6 => vec![2],
+                    _ => vec![],
+                },
+                depicts: match id {
+                    1 | 6 => vec![("graphic_violence", 90)],
+                    2 => vec![("graphic_violence", 20)],
+                    _ => vec![("graphic_violence", 0)],
+                },
+                ..Title::default()
+            })
+            .collect();
+        let entities = [
+            Entity { qid: 1, name: "Paris", ..Entity::default() },
+            Entity { qid: 2, name: "San Francisco", aliases: vec!["Paris of the West"], ..Entity::default() },
+        ];
+        let dir = std::env::temp_dir().join(format!("den-atlas-search-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &entities);
+        let meta = serde_json::json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m",
+                                       "dims": 3, "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        crate::queries::load_for_tools(&crate::dataset::Dataset::load(&dir).unwrap()).unwrap()
+    }
+
+    fn ids(answer: &serde_json::Value) -> Vec<u64> {
+        answer["hits"].as_array().unwrap().iter().map(|h| h["id"].as_u64().unwrap()).collect()
+    }
+
+    /// A ruled-out content warning drops the titles the store holds it for, and only those: 2 depicts it
+    /// below the floor and stays. Any of its names reads it.
+    #[test]
+    fn a_ruled_out_content_warning_drops_what_depicts_it() {
+        let indexes = heists("warning");
+        for query in ["heist movies without gore", "heist not graphic violence", "heist nothing too violent"]
+        {
+            let parsed = parse(query, &indexes);
+            assert!(parsed.unapplied_exclusions().is_empty(), "{query}");
+            let found = answer(&indexes, None, &parsed, None, None, 0, PAGE);
+            assert_eq!(found["parse"]["excluded"]["warnings"], serde_json::json!(["graphic_violence"]));
+            assert_eq!(ids(&found), vec![2, 3, 4, 5, 7], "{query}: {found}");
+        }
+    }
+
+    /// A ruled-out phrase that names nothing the store holds drops nothing and says so: a quality ("too
+    /// scary") is never read as a title, and a warning the store does not hold is no warning.
+    #[test]
+    fn a_ruled_out_phrase_naming_nothing_is_reported_unapplied() {
+        let indexes = heists("unapplied");
+        for (query, phrase) in [("heist not too scary", "too scary"), ("heist without drugs", "drugs")] {
+            let parsed = parse(query, &indexes);
+            assert_eq!(parsed.unapplied_exclusions(), [phrase]);
+            let found = answer(&indexes, None, &parsed, None, None, 0, PAGE);
+            assert_eq!(found["parse"]["excluded"]["unapplied"], serde_json::json!([phrase]));
+            assert_eq!(ids(&found).len(), 7, "nothing dropped: {found}");
+        }
+    }
+
+    /// "set in Paris" names the place by its name, not by the alias another place goes by. The titles set
+    /// there lead; one set elsewhere on record is discounted, one set nowhere on record less so; and
+    /// "not set in Paris" drops them.
+    #[test]
+    fn set_in_names_a_place() {
+        let indexes = heists("place");
+        let parsed = parse("heist movies set in paris", &indexes);
+        let found = answer(&indexes, None, &parsed, None, None, 0, PAGE);
+        assert_eq!(found["parse"]["places"][0]["qid"], "Q1", "{found}");
+        assert_eq!(found["parse"]["mediaType"], "movie");
+        assert_eq!(ids(&found), vec![1, 2, 3, 4, 5, 7, 6], "{found}");
+        assert_eq!(hit(&found, "movie", 6)["f"]["phi"], WRONG_TEXT_FACET);
+        assert_eq!(hit(&found, "movie", 7)["f"]["phi"], UNKNOWN_FACET);
+        assert_eq!(found["coverage"]["fields"]["place"]["applied"], "discount");
+        let elsewhere =
+            answer(&indexes, None, &parse("heist not set in paris", &indexes), None, None, 0, PAGE);
+        assert_eq!(ids(&elsewhere), vec![6, 7], "{elsewhere}");
     }
 
     #[test]

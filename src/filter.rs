@@ -776,6 +776,13 @@ struct Derived {
     empty: [OnceLock<(Value, usize)>; 3],
 }
 
+/// A narrative location a query named (`FilterIndex::place_named`).
+pub struct Place {
+    pub qid: u32,
+    pub name: String,
+    pub titles: Vec<Key>,
+}
+
 /// Every kind's values over the store's rows (`FilterIndex::build`).
 pub struct FilterIndex {
     keys: Vec<Key>,
@@ -1137,6 +1144,52 @@ impl FilterIndex {
         [0, 1].map(|t| and_count(bits, &self.types[t]))
     }
 
+    /// Titles with a card an entity kind has anything on record for, of one type or both.
+    pub fn entity_known(&self, kind: &str, media_type: Option<MediaType>) -> usize {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == kind);
+        let Some(entity) = at.and_then(|at| self.entities[at].as_ref()) else { return 0 };
+        and_count(&entity.known, &self.types[media_type.map_or(Scope::All, Scope::Type).index()])
+    }
+
+    /// Whether an entity kind has anything on record for a title: a title with no narrative location is not
+    /// known to be set anywhere else.
+    pub fn entity_on_record(&self, indexes: &Indexes, kind: &str, (media_type, id): Key) -> bool {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == kind);
+        let Some(entity) = at.and_then(|at| self.entities[at].as_ref()) else { return false };
+        let row = indexes.store.view().row_of(u8::from(media_type == MediaType::Tv), id).ok().flatten();
+        row.is_some_and(|row| has(&entity.known, row.0))
+    }
+
+    /// Every title carrying one value of a bitset kind (`warning:graphic_violence`); `None` when the kind is
+    /// not offered or holds no such value, which is not the same as no title carrying it.
+    pub fn titles_with(&self, kind: &str, value: &str) -> Option<Vec<Key>> {
+        let bits = self.bits.get(kind)?.values.get(value)?;
+        Some(ones(bits).map(|row| self.keys[row]).collect())
+    }
+
+    /// The narrative location (P840) a folded name (`facts::name_key`) is exactly the name or an alias of, and
+    /// the titles set there; the one set in the most titles when several go by it (Paris, not Paris, Texas).
+    /// `None` when no place the `place` kind lists goes by it.
+    pub fn place_named(&self, indexes: &Indexes, key: &str) -> Option<Place> {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == "place")?;
+        let kind = self.entities[at].as_ref()?;
+        let entity = self
+            .names(indexes)
+            .matching(key)
+            .into_iter()
+            .filter(|&(e, tier)| tier == 0 && kind.titles(e) >= ENTITY_KINDS[at].min_titles)
+            .max_by_key(|&(e, _)| (kind.titles(e), std::cmp::Reverse(e)))?
+            .0;
+        let view = indexes.store.view();
+        let qid = *view.column::<u32>("ent_qid").ok()?.get(entity as usize)?;
+        let name = view.column::<u32>("ent_name").ok()?.get(entity as usize).copied();
+        let name = name.and_then(|n| view.strings().ok()?.get(n)).unwrap_or_default().to_owned();
+        let mut rows: Vec<u32> = kind.postings.iter().flat_map(|p| p.of(entity).iter().copied()).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some(Place { qid, name, titles: rows.into_iter().map(|row| self.keys[row as usize]).collect() })
+    }
+
     /// The provider- and export-dependent part, rebuilt when either has swapped since it was last built.
     fn derived(&self, indexes: &Indexes, export: Option<Arc<TitleIndex>>) -> Arc<Derived> {
         let ratings = indexes.ratings.as_ref().and_then(|r| r.index());
@@ -1307,22 +1360,44 @@ impl NameIndex {
         out
     }
 
-    /// Entities with a name or alias in which some word starts `prefix`, each once.
-    fn matching(&self, prefix: &str) -> Vec<u32> {
-        let mut out: Vec<u32> = self
+    /// Entities with a name or alias in which some word starts `prefix`, each once, with the best `match_tier`
+    /// any of its names reaches.
+    fn matching(&self, prefix: &str) -> Vec<(u32, u8)> {
+        let mut out: Vec<(u32, u8)> = self
             .names
             .iter()
-            .filter(|&&(_, from, to)| {
-                let name = &self.text[from as usize..to as usize];
-                name.starts_with(prefix)
-                    || name.match_indices(' ').any(|(i, _)| name[i + 1..].starts_with(prefix))
+            .filter_map(|&(entity, from, to)| {
+                match_tier(&self.text[from as usize..to as usize], prefix).map(|tier| (entity, tier))
             })
-            .map(|&(entity, _, _)| entity)
             .collect();
         out.sort_unstable();
-        out.dedup();
+        out.dedup_by_key(|&mut (entity, _)| entity);
         out
     }
+}
+
+/// How well a folded name (`facts::name_key`) answers a values search, best first: 0 when it is the query,
+/// 1 when it holds the query as whole words ("walt disney pictures" for `disney`), 2 when a word only starts
+/// with it (`disneynature`); `None` when no word starts with it. Ordering by title count alone let an alias
+/// outrank the name itself: San Francisco, which Wikidata also calls "Paris of the West", came before Paris.
+/// Whole words rather than the start of the name are the middle tier because a typeahead is searched by
+/// surname: `nolan` is Christopher Nolan before Nolan Gerard Funk.
+fn match_tier(name: &str, q: &str) -> Option<u8> {
+    if name == q {
+        return Some(0);
+    }
+    std::iter::once(0)
+        .chain(name.match_indices(' ').map(|(i, _)| i + 1))
+        .filter(|&at| name[at..].starts_with(q))
+        .map(|at| {
+            let after = &name[at + q.len()..];
+            if after.is_empty() || after.starts_with(' ') {
+                1
+            } else {
+                2
+            }
+        })
+        .min()
 }
 
 /// Whether a kind answers now.
@@ -1822,14 +1897,13 @@ impl<'a> Context<'a> {
             self.matched(&applied, None)
         };
         let q = request.q.as_deref();
-        let words_match = |name: &str| {
-            let key = crate::facts::name_key(name);
-            q.is_none_or(|q| {
-                key.starts_with(q) || key.match_indices(' ').any(|(i, _)| key[i + 1..].starts_with(q))
-            })
+        // Every value matches a search that names none, all alike.
+        let tier = |name: &str| match q {
+            Some(q) => match_tier(&crate::facts::name_key(name), q),
+            None => Some(0),
         };
-        // (id, name, count, tiebreak, tmdb)
-        let mut found: Vec<(String, String, usize, usize, Option<u32>)> = Vec::new();
+        // (match tier, id, name, count, tiebreak, tmdb)
+        let mut found: Vec<(u8, String, String, usize, usize, Option<u32>)> = Vec::new();
         // Values counted but left unnamed past the page, so `complete` still counts them.
         let mut beyond = 0;
         if self.status(spec) == Status::Ready {
@@ -1847,54 +1921,59 @@ impl<'a> Context<'a> {
                         let studio = self.indexes.studios.get(value).filter(|_| spec.name == "studio");
                         let name = region
                             .map_or_else(|| studio.map_or(value.as_str(), |s| s.name.as_str()), |r| r.label);
-                        let matches = match region {
-                            Some(r) => [r.label, r.slug].iter().chain(r.aliases).any(|n| words_match(n)),
-                            None => words_match(name),
+                        let matched = match region {
+                            Some(r) => {
+                                [r.label, r.slug].iter().chain(r.aliases).filter_map(|n| tier(n)).min()
+                            }
+                            None => tier(name),
                         };
                         let n = and_count(&base, bits);
-                        if n > 0 && matches {
+                        if let (true, Some(matched)) = (n > 0, matched) {
                             let all = and_count(&self.filter.types[self.t()], bits);
-                            found.push((value.clone(), name.to_owned(), n, all, None));
+                            found.push((matched, value.clone(), name.to_owned(), n, all, None));
                         }
                     }
                 }
                 Data::Entity(i) => {
                     if let Some(kind) = self.filter.entities[i].as_ref() {
-                        let candidates: Vec<(u32, usize)> = match q {
+                        let candidates: Vec<(u32, u8, usize)> = match q {
                             Some(q) => self
                                 .filter
                                 .names(self.indexes)
                                 .matching(q)
                                 .into_iter()
-                                .filter(|&e| self.listable(i, kind, e))
-                                .filter_map(|e| {
+                                .filter(|&(e, _)| self.listable(i, kind, e))
+                                .filter_map(|(e, tier)| {
                                     let mut rows: Vec<u32> =
                                         kind.postings.iter().flat_map(|p| p.of(e).iter().copied()).collect();
                                     rows.sort_unstable();
                                     rows.dedup();
                                     let n = rows.iter().filter(|&&r| has(&base, r as usize)).count();
-                                    (n > 0).then_some((e, n))
+                                    (n > 0).then_some((e, tier, n))
                                 })
                                 .collect(),
                             None => self
                                 .entity_counts(i, &base)
                                 .into_iter()
-                                .map(|(e, n)| (e, n as usize))
+                                .map(|(e, n)| (e, 0, n as usize))
                                 .collect(),
                         };
                         // A person kind can count hundreds of thousands of values, so only those that can
-                        // reach the page are named: the top `limit` by count and titles, and any tied with
-                        // the last of them (the name decides among those, below).
-                        let mut ranked: Vec<(u32, usize, usize)> =
-                            candidates.into_iter().map(|(e, n)| (e, n, kind.titles(e))).collect();
+                        // reach the page are named: the top `limit` by match, count and titles, and any tied
+                        // with the last of them (the name decides among those, below).
+                        let mut ranked: Vec<(u32, u8, usize, usize)> =
+                            candidates.into_iter().map(|(e, tier, n)| (e, tier, n, kind.titles(e))).collect();
                         beyond += ranked.len().saturating_sub(request.limit);
-                        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
-                        if let Some(&(_, n, titles)) = ranked.get(request.limit.saturating_sub(1)) {
-                            ranked.retain(|&(_, rn, rt)| (rn, rt) >= (n, titles));
+                        let rank = |&(_, tier, n, titles): &(u32, u8, usize, usize)| {
+                            (tier, std::cmp::Reverse(n), std::cmp::Reverse(titles))
+                        };
+                        ranked.sort_unstable_by_key(rank);
+                        if let Some(last) = ranked.get(request.limit.saturating_sub(1)).map(rank) {
+                            ranked.retain(|value| rank(value) <= last);
                         }
-                        for (e, n, titles) in ranked {
+                        for (e, tier, n, titles) in ranked {
                             let name = self.label(e).unwrap_or_default().to_owned();
-                            found.push((self.qid(e), name, n, titles, self.tmdb(e)));
+                            found.push((tier, self.qid(e), name, n, titles, self.tmdb(e)));
                         }
                     }
                 }
@@ -1902,8 +1981,15 @@ impl<'a> Context<'a> {
                     if let (Some(characters), Some(q)) = (self.characters.as_ref(), q) {
                         for (name, rows) in characters.named().with_prefix(q) {
                             let n = rows.iter().filter(|&&r| has(&base, r as usize)).count();
-                            if n > 0 {
-                                found.push((name.replace(' ', "-"), name.to_owned(), n, rows.len(), None));
+                            if let (true, Some(tier)) = (n > 0, match_tier(name, q)) {
+                                found.push((
+                                    tier,
+                                    name.replace(' ', "-"),
+                                    name.to_owned(),
+                                    n,
+                                    rows.len(),
+                                    None,
+                                ));
                             }
                         }
                     }
@@ -1911,12 +1997,14 @@ impl<'a> Context<'a> {
                 Data::Like => {}
             }
         }
-        found.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
+        found.sort_by(|a, b| {
+            a.0.cmp(&b.0).then(b.3.cmp(&a.3)).then(b.4.cmp(&a.4)).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1))
+        });
         let complete = found.len() <= request.limit && beyond == 0;
         let values: Vec<Value> = found
             .into_iter()
             .take(request.limit)
-            .map(|(id, name, count, _, tmdb)| {
+            .map(|(_, id, name, count, _, tmdb)| {
                 let mut value = json!({ "id": id, "name": name, "count": count });
                 if let Some(tmdb) = tmdb {
                     value["tmdbId"] = json!(tmdb);
@@ -2420,6 +2508,77 @@ mod tests {
         let series: Vec<u64> = first.iter().filter(|(m, _)| m == "series").map(|&(_, id)| id).collect();
         assert_eq!(series, vec![101, 102, 103, 104, 105], "each type keeps its own order");
         assert_eq!(first[0], pair("movie", 1), "the most popular film, then the most popular series");
+    }
+
+    /// The tiers every values search orders by, the person traits' included.
+    #[test]
+    fn a_name_matches_exactly_then_by_whole_words_then_by_a_word_start() {
+        assert_eq!(match_tier("paris", "paris"), Some(0));
+        assert_eq!(match_tier("paris of the west", "paris"), Some(1));
+        assert_eq!(match_tier("walt disney pictures", "disney"), Some(1));
+        assert_eq!(match_tier("new york city", "new york"), Some(1));
+        assert_eq!(match_tier("disneynature", "disney"), Some(2));
+        assert_eq!(match_tier("disneytoon disney", "disney"), Some(1), "the best of its words");
+        assert_eq!(match_tier("san francisco", "paris"), None);
+    }
+
+    /// A values search puts the value it names first, then those holding it as whole words, then those with
+    /// a word merely starting with it, each by titles. San Francisco, which Wikidata also calls "Paris of
+    /// the West", used to lead `q=paris` wherever it had more titles than Paris.
+    #[test]
+    fn a_values_search_leads_with_the_value_it_names() {
+        use crate::store::fixture::{Entity, Title};
+        let title = |tmdb_id, locations: Vec<u32>, cast: Vec<u32>| Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            votes: 100,
+            locations,
+            cast,
+            ..Title::default()
+        };
+        // Paris is set in 5 titles, San Francisco in 8, Parisot in 12; Nolan North is in 3, Christopher
+        // Nolan in 2, Nolanne in 4.
+        let titles: Vec<Title> = (1..=12)
+            .map(|id| {
+                let mut places = vec![3];
+                places.extend((id <= 5).then_some(1));
+                places.extend((id <= 8).then_some(2));
+                let cast = [(id <= 3, 10), (id <= 2, 11), (id <= 4, 12)];
+                title(id, places, cast.into_iter().filter(|c| c.0).map(|c| c.1).collect())
+            })
+            .collect();
+        let entities = [
+            Entity { qid: 1, name: "Paris", ..Entity::default() },
+            Entity { qid: 2, name: "San Francisco", aliases: vec!["Paris of the West"], ..Entity::default() },
+            Entity { qid: 3, name: "Parisot", ..Entity::default() },
+            Entity { qid: 10, name: "Nolan North", ..Entity::default() },
+            Entity { qid: 11, name: "Christopher Nolan", ..Entity::default() },
+            Entity { qid: 12, name: "Nolanne Smith", ..Entity::default() },
+        ];
+        let indexes = store_of("values-order", &titles, &entities);
+        let context = Context::new(&indexes, Movie, None);
+        let ids = |kind: &str, q: &str| {
+            let spec = spec(kind).unwrap();
+            let answer = context.values(spec, &request(Route::Values(spec), &format!("q={q}"))).0;
+            let ids: Vec<String> = answer["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap().into())
+                .collect();
+            ids
+        };
+        assert_eq!(ids("place", "paris"), ["Q1", "Q2", "Q3"], "the name, the alias's whole word, a prefix");
+        assert_eq!(ids("place", "pari"), ["Q3", "Q2", "Q1"], "no whole word: by titles");
+        assert_eq!(ids("person", "nolan"), ["Q10", "Q11", "Q12"], "a surname is a whole word");
+        assert_eq!(ids("person", "christopher nolan"), ["Q11"]);
+        let limited = spec("place").unwrap();
+        let first = context.values(limited, &request(Route::Values(limited), "q=paris&limit=1")).0;
+        assert_eq!(first["values"][0]["id"], "Q1", "the page is cut after ordering: {first}");
     }
 
     /// Films 1 (action) and 4, series 2 (Action & Adventure, and kids) and 3 (kids), both on network Q70.
