@@ -189,7 +189,8 @@ This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ### Filters
 
-`/index/filter/<type>/…` is Den Web's stackable Search: a selection of values, AND-ed, and three questions
+`/index/filter/<type>/…` is Den Web's stackable Search: a selection of values, AND-ed (an item may OR several
+values of its kind), and three questions
 about it (counts, titles, one kind's values). `/index/schema.json`'s `filter` object lists every kind with its
 `mode`, id format, listing and floors, the axis aliases and the canonical rules; `tests/fixtures/facets-canonical.json`
 pins url → canonical url pairs a client can test against.
@@ -218,12 +219,23 @@ pins url → canonical url pairs a client can test against.
   each value under the selection WITHOUT the kind's own pick, so the other decades read as alternatives.
 - **Exclude** with `-kind:id`: the titles known for the kind (something on record for it) and not carrying the
   value. `coverage` in every answer says how many titles of the type each applied kind is known for.
+- **Or** with `|`: `country:FR|IT` is one item, French OR Italian; separate items still AND
+  (`country:FR,country:IT` is both, `country:FR|IT,decade:1990` either of the 1990s), and `-country:FR|IT` is
+  neither (known for the kind, carrying none). Every kind takes a group except `like`; a one-pick kind's group is
+  how to ask for several (`decade:1980|1990`). A value the kind lacks is named in `unknownValues` and the rest of
+  its group applies. On a plot axis a group matches both tiers as a lone value does. `counts.json` and
+  `values/<kind>.json` count a kind with a group without the group — each value is what adding it would give —
+  and every other kind under it; `selected`/`excluded` list a group's ids one by one.
 - **Canonical form**: items normalised per kind, sorted by kind, then positive before excluded, then id, each
-  once, ids encoded as `encodeURIComponent` does, `:` `,` `-` literal; then `skip`/`limit` (titles) or `q`/`limit`
+  once, ids encoded as `encodeURIComponent` does, `:` `,` `-` `|` literal; a group's ids sorted and deduplicated,
+  the group sorting by its ids joined with `|`, and a one-value group written without `|` (`%7C` is accepted as a
+  second spelling); then `skip`/`limit` (titles) or `q`/`limit`
   (values), each only when not its default. The canonical URL is public for an hour and revalidates by ETag. Any
   other spelling is ANSWERED, not redirected (den-edge's relay drops `Location`): the same body, `private,
-  max-age=60`, with `Content-Location` naming the canonical URL. At most 16 values and a 2,048-byte query;
-  a malformed item, an id its kind cannot read, a `skip` off a page boundary or a short prefix is a `400`.
+  max-age=60`, with `Content-Location` naming the canonical URL. At most 16 values, a group counting each of its
+  values, and a 2,048-byte query; a malformed item, an id its kind cannot read, a group of `like` or of values
+  resolving to different kinds (`structure:single-day|nonlinear`), a `skip` off a page boundary or a short
+  prefix is a `400`.
 - **Unknown, unavailable, not offered.** A kind atlas does not know, or cannot answer now, is left out of the
   result and named in `ignored`; a value its kind does not hold (a typo, a label in the wrong case) matches
   nothing and is named in `unknownValues`. `kindsUnavailable` lists the kinds this atlas should answer and
@@ -245,10 +257,13 @@ pins url → canonical url pairs a client can test against.
   trait is about a person and means nothing to the title routes. Kinds: `gender`, `citizenship`, `occupation`
   (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `born` (decade of
   P569, `born:1970` for 1970–1979; a century-precision birth has none) and `role` (`cast`, `director`, `writer`,
-  `creator`: the credit on a matching title; two roles mean both on one title, `-role:cast` credited without
-  it). `born` also takes a range of birth years, both ends inclusive and either left open — `born:1976-1996`,
-  `born:1976-`, `born:-1996`, each year 1800 to next year — one per request and with no other positive `born`
-  beside it; a reversed range, a year that is not digits or out of that span is a 400. A birth dated only to its
+  `creator`: the credit on a matching title; two roles mean both on one title, `role:cast|director` either,
+  `-role:cast` credited without it). Every trait takes an OR group as `sel` does (`citizenship:Q30|Q145` is
+  American or British, `citizenship:Q30,citizenship:Q145` dual citizens); `people/counts.json` counts a trait
+  with a group without it and the others under it, `role` over the credits walked without the group.
+  `born` also takes a range of birth years, both ends inclusive and either left open — `born:1976-1996`,
+  `born:1976-`, `born:-1996`, each year 1800 to next year — one per request, never in a group, and with no other
+  positive `born` beside it; a reversed range, a year that is not digits or out of that span is a 400. A birth dated only to its
   decade or century is in a range when its whole span is, out of it when none of it is, and unknown when it
   straddles an end. `gender` and `born` are one pick and count without their own pick: under a range,
   `people/counts.json` still counts `born` by decade, as if the range were not picked, and names the range in

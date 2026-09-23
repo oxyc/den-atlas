@@ -13,16 +13,20 @@
 //!
 //! A person is credited on a title through its cast or its makers (director, writer, creator). `role` narrows
 //! which credits count: `role:cast` counts cast credits alone, two roles (`role:director,role:writer`) count
-//! only the titles a person holds both on, and `-role:cast` only those they are credited on and not cast in.
+//! only the titles a person holds both on, a group (`role:director|writer`) those they hold either on, and
+//! `-role:cast` only those they are credited on and not cast in (`-role:cast|director`: neither).
 //! `credits` is how many matching titles a person's counted credits are on.
+//!
+//! Every trait takes an OR group as `sel` does: `citizenship:Q30|Q145` is American or British, where
+//! `citizenship:Q30,citizenship:Q145` is both. A `born` range stands alone, never in a group.
 //!
 //! The person traits are stored as Wikidata states them, as the items it names — `gender` (P21) with whatever
 //! values it holds, `citizenship` (P27), `occupation` (P106) — and `born` (P569) by decade, or by a range of
 //! years (`born:1976-1996`, `born:1976-`, `born:-1996`). Nothing is inferred, and unknown is never a match: a
 //! person with no gender on record matches no `gender:`, and no `-gender:` either, since they are not known to
-//! lack it. A birth dated only to its century has no decade; a birth dated only to its decade or century is in
-//! a range when its whole span is, out of it when none of its span is, and unknown when the span straddles an
-//! end. `traitCoverage` says how many of the credited people each applied trait is on record for.
+//! lack it — nor any group of values, nor its exclusion. A birth dated only to its century has no decade; a
+//! birth dated only to its decade or century is in a range when its whole span is, out of it when none of its
+//! span is, and unknown when the span straddles an end. `traitCoverage` says how many of the credited people each applied trait is on record for.
 //!
 //! # Order
 //!
@@ -35,7 +39,10 @@
 //! Without a popularity order the weights would be TMDB-id order, so prominence falls back to `credits` and
 //! says so.
 
-use super::{normalise_id, ones, Context, Id, Item, Mode, Request, Scope, Status, ENTITY_KINDS, TOP_K};
+use super::{
+    counted_apart, normalise_id, ones, selected_ids, Context, Id, Item, Mode, Request, Scope, Status,
+    ENTITY_KINDS, TOP_K,
+};
 use den_store::{List, PersonDate, PersonTraits, Row};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -86,9 +93,9 @@ const TRAITS: [TraitSpec; 5] = [
         data: Trait::Born,
         about: "the decade of birth (P569), born:1970 for 1970-1979; a birth dated only to its century has none. \
                 Or a range of birth years, both ends inclusive and either left open: born:1976-1996, \
-                born:1976-, born:-1996; one range, and no other born pick beside it, per request. A birth \
-                dated only to its decade or century matches a range when its whole span lies inside it, and \
-                is unknown when the span straddles an end",
+                born:1976-, born:-1996; one range, never in a group, and no other born pick beside it, per \
+                request. A birth dated only to its decade or century matches a range when its whole span lies \
+                inside it, and is unknown when the span straddles an end. Decades OR: born:1970|1980",
     },
     TraitSpec {
         name: "citizenship",
@@ -110,7 +117,8 @@ const TRAITS: [TraitSpec; 5] = [
         id: Id::Lower,
         data: Trait::Role,
         about: "the credit on a matching title: cast, director, writer or creator; two roles count the titles \
-                a person holds both on, -role:<role> those they are credited on without it",
+                a person holds both on, a group (role:cast|director) those they hold either on, -role:<role> \
+                those they are credited on without it",
     },
 ];
 
@@ -194,10 +202,16 @@ pub(super) fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, S
 /// `born` pick, which could only narrow it — one range says it.
 pub(super) fn check(traits: &[Item]) -> Result<(), String> {
     let picks: Vec<&Item> = traits.iter().filter(|i| i.kind == "born" && !i.exclude).collect();
-    if picks.len() > 1 && picks.iter().any(|i| i.id.contains('-')) {
+    if picks.len() > 1 && picks.iter().any(|i| i.ids.iter().any(|id| id.contains('-'))) {
         return Err("born: one range per request, and no other born pick beside it".to_owned());
     }
     Ok(())
+}
+
+/// Whether a group of these ids is refused as one item: a `born` range stands alone, as it stands alone among
+/// the `born` picks (`check`) — one range already says any span of years, and decades OR-ed are `born:1970|1980`.
+pub(super) fn one_value(kind: &str, ids: &[String]) -> bool {
+    kind == "born" && ids.iter().any(|id| id.contains('-'))
 }
 
 /// The earliest birth year a `born` range may name; the latest is next year.
@@ -271,13 +285,15 @@ struct Sources<'a> {
     roles: u8,
 }
 
-/// A person trait the request applies, with the value it names read into the store's terms: an entity index,
-/// a decade, or a range of birth years. `None` names nothing the store holds, and matches no one.
+/// A person trait the request applies, with the values it names read into the store's terms: entity indexes,
+/// decades, or a range of birth years. A value the store does not hold is left out, and an item left with
+/// none matches no one.
 struct Applied<'r> {
-    bit: u8,
+    /// Its kind's position in `TRAITS`.
+    kind: usize,
     spec: &'static TraitSpec,
     item: &'r Item,
-    target: Option<Target>,
+    targets: Vec<Target>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -290,14 +306,37 @@ enum Target {
 /// The traits of a request, split.
 struct Split<'r> {
     applied: Vec<Applied<'r>>,
-    /// Roles a counted credit must hold, and must not.
-    want: u8,
+    /// Roles a counted credit must hold — one of each item's, and each role item is a mask of the roles it
+    /// names, OR-ed — and must not.
+    want: Vec<Want>,
     avoid: u8,
-    /// Trait kinds named and not applied, and items whose value the kind does not hold.
+    /// Trait kinds named and not applied, and values the kind does not hold.
     ignored: Vec<String>,
     unknown: Vec<String>,
-    /// The person kinds with a positive or excluded item.
-    selected: u8,
+}
+
+/// A positive role item: the roles it names, and whether it is an OR group.
+#[derive(Clone, Copy)]
+struct Want {
+    roles: u8,
+    group: bool,
+}
+
+impl Split<'_> {
+    /// The applied items a person kind's values are counted without (`counted_apart`), as bits over
+    /// `applied` — the bits `fails` answers in.
+    fn apart(&self, kind: usize) -> u32 {
+        self.applied
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.kind == kind && counted_apart(a.spec.mode, a.item))
+            .fold(0, |apart, (at, _)| apart | 1 << at)
+    }
+
+    /// The role masks without the OR groups: what `role` is counted under in `people/counts.json`.
+    fn want_apart(&self) -> Vec<u8> {
+        self.want.iter().filter(|w| !w.group).map(|w| w.roles).collect()
+    }
 }
 
 /// Per entity: the matching titles its counted credits are on, and the roles it holds on them.
@@ -432,11 +471,10 @@ impl<'a> Context<'a> {
     fn split_traits<'r>(&self, sources: &Sources<'a>, items: &'r [Item]) -> Split<'r> {
         let mut split = Split {
             applied: Vec::new(),
-            want: 0,
+            want: Vec::new(),
             avoid: 0,
             ignored: Vec::new(),
             unknown: Vec::new(),
-            selected: 0,
         };
         for item in items {
             let spec = trait_spec(&item.kind);
@@ -447,40 +485,46 @@ impl<'a> Context<'a> {
                 }
                 continue;
             };
-            let target = match spec.data {
-                Trait::Role => {
-                    let bit = ROLES.iter().find(|(name, _)| *name == item.id).map(|&(_, bit)| bit);
+            if spec.data == Trait::Role {
+                let mut roles = 0;
+                for id in &item.ids {
+                    let bit = ROLES.iter().find(|(name, _)| name == id).map(|&(_, bit)| bit);
                     match bit.filter(|&bit| sources.roles & bit != 0) {
-                        Some(bit) if item.exclude => split.avoid |= bit,
-                        Some(bit) => split.want |= bit,
-                        None => {
-                            split.unknown.push(item.spelled());
-                            if !item.exclude {
-                                split.want |= NO_ROLE;
-                            }
-                        }
+                        Some(bit) => roles |= bit,
+                        None => split.unknown.push(item.spelled_value(id)),
                     }
-                    continue;
                 }
-                Trait::Born if item.id.contains('-') => Years::parse(&item.id).ok().map(Target::Years),
-                Trait::Born => item.id.parse::<i64>().ok().map(Target::Value),
-                Trait::Gender | Trait::Citizenship | Trait::Occupation => {
-                    self.entity_of(&item.id).map(|e| Target::Value(i64::from(e)))
+                if item.exclude {
+                    split.avoid |= roles;
+                } else {
+                    // A role item naming nothing the credits hold matches no one.
+                    let roles = if roles == 0 { NO_ROLE } else { roles };
+                    split.want.push(Want { roles, group: item.group() });
                 }
-            };
-            if target.is_none() {
-                split.unknown.push(item.spelled());
+                continue;
             }
-            let bit = 1 << TRAITS.iter().position(|t| t.data == spec.data).unwrap_or(0);
-            split.selected |= bit;
-            split.applied.push(Applied { bit, spec, item, target });
+            let mut targets = Vec::with_capacity(item.ids.len());
+            for id in &item.ids {
+                let target = match spec.data {
+                    Trait::Born if id.contains('-') => Years::parse(id).ok().map(Target::Years),
+                    Trait::Born => id.parse::<i64>().ok().map(Target::Value),
+                    _ => self.entity_of(id).map(|e| Target::Value(i64::from(e))),
+                };
+                match target {
+                    Some(target) => targets.push(target),
+                    None => split.unknown.push(item.spelled_value(id)),
+                }
+            }
+            let kind = TRAITS.iter().position(|t| t.data == spec.data).unwrap_or(0);
+            split.applied.push(Applied { kind, spec, item, targets });
         }
         split
     }
 
     /// Every person credited on the rows of `base`, counting a title for them when their credits on it hold
-    /// every role of `want` and none of `avoid` — and, with `weigh`, keeping their biggest titles (`top`).
-    fn tally(&self, sources: &Sources<'a>, base: &[u64], want: u8, avoid: u8, weigh: bool) -> Tally {
+    /// a role of each mask of `want` and none of `avoid` — and, with `weigh`, keeping their biggest titles
+    /// (`top`).
+    fn tally(&self, sources: &Sources<'a>, base: &[u64], want: &[u8], avoid: u8, weigh: bool) -> Tally {
         let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
         let mut tally = Tally {
             credits: vec![0; size],
@@ -514,7 +558,7 @@ impl<'a> Context<'a> {
                 let e = e as usize;
                 let roles = on_row[e] & !CREDITED;
                 on_row[e] = 0;
-                if roles & want != want || roles & avoid != 0 {
+                if want.iter().any(|&mask| roles & mask == 0) || roles & avoid != 0 {
                     continue;
                 }
                 if tally.credits[e] == 0 {
@@ -534,34 +578,32 @@ impl<'a> Context<'a> {
         tally
     }
 
-    /// Whether a person holds a trait's value: `None` when the trait is not on record for them.
-    fn holds(&self, sources: &Sources<'a>, data: Trait, target: Option<Target>, e: u32) -> Option<bool> {
-        let value = match target {
-            Some(Target::Value(value)) => Some(value),
-            _ => None,
-        };
-        let among = |values: &[u32]| {
-            (!values.is_empty()).then(|| value.is_some_and(|t| values.iter().any(|&v| i64::from(v) == t)))
-        };
+    /// Whether a person holds any of a trait's values: `None` when the trait is not on record for them.
+    fn holds(&self, sources: &Sources<'a>, data: Trait, targets: &[Target], e: u32) -> Option<bool> {
+        let named = |value: i64| targets.contains(&Target::Value(value));
+        let among =
+            |values: &[u32]| (!values.is_empty()).then(|| values.iter().any(|&v| named(i64::from(v))));
         match data {
             Trait::Gender => among(sources.traits.genders(e)),
             Trait::Citizenship => among(sources.traits.citizenships(e)),
             Trait::Occupation => among(sources.traits.occupations(e)),
-            Trait::Born => match target {
-                Some(Target::Years(years)) => birth_span(sources.traits.born(e)).and_then(|s| years.holds(s)),
-                _ => birth_decade(sources.traits.born(e)).map(|decade| Some(decade) == value),
+            // A range stands alone in its item (`one_value`).
+            Trait::Born => match targets {
+                [Target::Years(years)] => birth_span(sources.traits.born(e)).and_then(|s| years.holds(s)),
+                _ => birth_decade(sources.traits.born(e)).map(named),
             },
             Trait::Role => None,
         }
     }
 
-    /// The person kinds whose items a person does not satisfy, as bits. Unknown satisfies nothing: neither
-    /// the value nor its exclusion.
-    fn fails(&self, sources: &Sources<'a>, applied: &[Applied<'_>], e: u32) -> u8 {
+    /// The applied items a person does not satisfy, as bits over `applied`. Unknown satisfies nothing: neither
+    /// the value nor its exclusion, and neither any value of a group nor the group's exclusion.
+    fn fails(&self, sources: &Sources<'a>, applied: &[Applied<'_>], e: u32) -> u32 {
         applied
             .iter()
-            .filter(|a| self.holds(sources, a.spec.data, a.target, e) != Some(!a.item.exclude))
-            .fold(0, |fails, a| fails | a.bit)
+            .enumerate()
+            .filter(|(_, a)| self.holds(sources, a.spec.data, &a.targets, e) != Some(!a.item.exclude))
+            .fold(0, |fails, (at, _)| fails | 1 << at)
     }
 
     /// Whether every applied item of a person kind is on record for a person: known, whether it matches or
@@ -569,9 +611,9 @@ impl<'a> Context<'a> {
     fn on_record(&self, sources: &Sources<'a>, applied: &[Applied<'_>], data: Trait, e: u32) -> bool {
         let mut items = applied.iter().filter(|a| a.spec.data == data).peekable();
         if items.peek().is_none() {
-            return self.holds(sources, data, None, e).is_some();
+            return self.holds(sources, data, &[], e).is_some();
         }
-        items.all(|a| self.holds(sources, data, a.target, e).is_some())
+        items.all(|a| self.holds(sources, data, &a.targets, e).is_some())
     }
 
     /// The title selection, the traits, and who is credited under them; with `weigh`, how prominently.
@@ -581,7 +623,8 @@ impl<'a> Context<'a> {
         let base = self.matched(&applied, None).any;
         let sources = self.sources();
         let split = self.split_traits(&sources, &request.traits);
-        let tally = self.tally(&sources, &base, split.want, split.avoid, weigh);
+        let want: Vec<u8> = split.want.iter().map(|w| w.roles).collect();
+        let tally = self.tally(&sources, &base, &want, split.avoid, weigh);
         let mut envelope = json!({ "coverage": self.coverage(&applied) });
         let mut degraded = self.envelope(&mut envelope, &applied, ignored);
         if !split.ignored.is_empty() {
@@ -595,12 +638,13 @@ impl<'a> Context<'a> {
                 json!(TRAITS[..PERSON_KINDS].iter().map(|t| t.name).collect::<Vec<_>>());
             degraded = true;
         }
-        People { sources, split, tally, envelope, degraded }
+        People { sources, split, tally, base, envelope, degraded }
     }
 
     /// `people/counts.json`: for every value of every trait, the people credited under the selection and the
-    /// other traits holding it — a one-pick kind (gender, born) counted without its own pick, as
-    /// `counts.json` counts a one-pick kind.
+    /// other traits holding it — a one-pick kind (gender, born) counted without its own pick, and a kind with
+    /// an OR group (`citizenship:Q30|Q145`, `role:cast|director`) without its groups, as `counts.json` counts
+    /// them.
     pub fn people_counts(&self, request: &Request) -> (Value, bool) {
         let people = self.people_of(request, false);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
@@ -608,13 +652,33 @@ impl<'a> Context<'a> {
         let mut roles = [0u32; 4];
         let mut known = [0usize; PERSON_KINDS];
         let mut total = 0usize;
+        let apart: [u32; PERSON_KINDS] = std::array::from_fn(|i| split.apart(i));
+        // A role group's roles are counted over the credits walked without it: a second walk, only then.
+        let role_tally = split
+            .want
+            .iter()
+            .any(|w| w.group)
+            .then(|| self.tally(sources, &people.base, &split.want_apart(), split.avoid, false));
+        if let Some(role_tally) = &role_tally {
+            for &e in &role_tally.touched {
+                if self.fails(sources, &split.applied, e) == 0 {
+                    for (count, &(_, bit)) in roles.iter_mut().zip(&ROLES) {
+                        if role_tally.held[e as usize] & bit != 0 {
+                            *count += 1;
+                        }
+                    }
+                }
+            }
+        }
         for &e in &tally.touched {
             let fails = self.fails(sources, &split.applied, e);
             if fails == 0 {
                 total += 1;
-                for (count, &(_, bit)) in roles.iter_mut().zip(&ROLES) {
-                    if tally.held[e as usize] & bit != 0 {
-                        *count += 1;
+                if role_tally.is_none() {
+                    for (count, &(_, bit)) in roles.iter_mut().zip(&ROLES) {
+                        if tally.held[e as usize] & bit != 0 {
+                            *count += 1;
+                        }
                     }
                 }
             }
@@ -622,9 +686,7 @@ impl<'a> Context<'a> {
                 continue;
             }
             for (i, spec) in TRAITS[..PERSON_KINDS].iter().enumerate() {
-                let own = 1u8 << i;
-                let alone =
-                    if spec.mode == Mode::Single && split.selected & own != 0 { fails & !own } else { fails };
+                let alone = fails & !apart[i];
                 let (entities, decade): (&[u32], Option<i64>) = match spec.data {
                     Trait::Gender => (sources.traits.genders(e), None),
                     Trait::Citizenship => (sources.traits.citizenships(e), None),
@@ -664,10 +726,7 @@ impl<'a> Context<'a> {
         let coverage: Map<String, Value> = split
             .applied
             .iter()
-            .map(|a| {
-                let i = a.bit.trailing_zeros() as usize;
-                (a.spec.name.to_owned(), json!({ "count": known[i], "denominator": credited }))
-            })
+            .map(|a| (a.spec.name.to_owned(), json!({ "count": known[a.kind], "denominator": credited })))
             .collect();
         let mut answer = people.envelope;
         answer["total"] = json!(total);
@@ -702,43 +761,42 @@ impl<'a> Context<'a> {
             }
             values.insert(id, n.into());
         }
-        for item in &selected {
+        for id in selected.iter().flat_map(|item| &item.ids) {
             // A born range is no decade value: it is named in `selected` or `excluded` alone.
-            if values.contains_key(&item.id) || (spec.data == Trait::Born && item.id.contains('-')) {
+            if values.contains_key(id) || (spec.data == Trait::Born && id.contains('-')) {
                 continue;
             }
             let value = match spec.data {
-                Trait::Born => item.id.parse().ok(),
-                Trait::Role => ROLES.iter().find(|r| r.0 == item.id).map(|r| i64::from(r.1)),
-                _ => self.entity_of(&item.id).map(i64::from),
+                Trait::Born => id.parse().ok(),
+                Trait::Role => ROLES.iter().find(|r| r.0 == id).map(|r| i64::from(r.1)),
+                _ => self.entity_of(id).map(i64::from),
             };
             let n = value.and_then(|v| counted.get(&v)).copied().unwrap_or(0);
             if spec.id == Id::Qid {
-                if let Some(label) = self.entity_of(&item.id).and_then(|e| self.label(e)) {
-                    labels.insert(item.id.clone(), label.into());
+                if let Some(label) = self.entity_of(id).and_then(|e| self.label(e)) {
+                    labels.insert(id.clone(), label.into());
                 }
             }
-            values.insert(item.id.clone(), n.into());
+            values.insert(id.clone(), n.into());
         }
         let mut answer = json!({ "mode": spec.mode.name(), "complete": listed, "values": values });
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
         }
-        let ids = |exclude: bool| -> Vec<&str> {
-            selected.iter().filter(|i| i.exclude == exclude).map(|i| i.id.as_str()).collect()
-        };
-        if !ids(false).is_empty() {
-            answer["selected"] = json!(ids(false));
+        let (positive, excluded) = selected_ids(&selected);
+        if !positive.is_empty() {
+            answer["selected"] = json!(positive);
         }
-        if !ids(true).is_empty() {
-            answer["excluded"] = json!(ids(true));
+        if !excluded.is_empty() {
+            answer["excluded"] = json!(excluded);
         }
         answer
     }
 
     /// `people/values/<trait>.json`: one entity trait's values, counted as `people/counts.json` counts them —
     /// the people credited under the selection and the other traits holding each, a one-pick trait (gender)
-    /// without its own pick — but every value rather than the top `TOP_K`, labelled, most people first, then
+    /// without its own pick and a trait with an OR group without its groups — but every value rather than the
+    /// top `TOP_K`, labelled, most people first, then
     /// by name; with `q`, only those with a name or alias having a word starting `q`, the value it names exactly
     /// first, then those holding it as whole words, then the rest (`match_tier`). So a value past the top
     /// (citizenship:Iceland among the films of the 2020s) can be found by name.
@@ -746,7 +804,7 @@ impl<'a> Context<'a> {
         let people = self.people_of(request, false);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let i = TRAITS.iter().position(|t| t.name == kind).unwrap_or(0);
-        let (spec, own) = (&TRAITS[i], 1u8 << i);
+        let (spec, apart) = (&TRAITS[i], split.apart(i));
         // (entity, match tier), by entity.
         let named: Option<Vec<(u32, u8)>> =
             request.q.as_deref().map(|q| self.filter.names(self.indexes).matching(q));
@@ -758,10 +816,7 @@ impl<'a> Context<'a> {
         let mut denominator = 0usize;
         if sources.status == Status::Ready {
             for &e in &tally.touched {
-                let fails = self.fails(sources, &split.applied, e);
-                let alone =
-                    if spec.mode == Mode::Single && split.selected & own != 0 { fails & !own } else { fails };
-                if alone != 0 {
+                if self.fails(sources, &split.applied, e) & !apart != 0 {
                     continue;
                 }
                 denominator += 1;
@@ -979,6 +1034,8 @@ struct People<'a, 'r> {
     sources: Sources<'a>,
     split: Split<'r>,
     tally: Tally,
+    /// The matching titles the credits were walked on.
+    base: Vec<u64>,
     envelope: Value,
     degraded: bool,
 }
@@ -1016,9 +1073,15 @@ pub(super) fn schema() -> Value {
         "defaultOrder": Order::default().name(),
         "orderTies": "most matching titles, then most titles in the corpus, then Q-id; under name, the Q-id",
         "about": "people.json and people/counts.json take the title selection as sel, and the person traits as \
-                  traits in the same [-]<kind>:<id> grammar and canonical order. A person matches a trait only \
-                  when it is on record for them: unknown matches neither a value nor its exclusion. Gender, \
-                  citizenship and occupation are the Wikidata items the store names, labelled in labels",
+                  traits in the same [-]<kind>:<id> grammar and canonical order, OR groups included \
+                  (citizenship:Q30|Q145 is American or British; filter.or). A person matches a trait only \
+                  when it is on record for them: unknown matches neither a value nor its exclusion, nor a \
+                  group nor its exclusion. Gender, citizenship and occupation are the Wikidata items the store \
+                  names, labelled in labels. A value a trait does not hold is named in unknownTraits as \
+                  [-]<kind>:<id>, a group's one by one. people/counts.json and people/values/<trait>.json count \
+                  a trait with a positive group without its groups, gender and born without any of their \
+                  items, and every other trait under them; role:cast|director counts role over the credits \
+                  walked without the group",
     })
 }
 
@@ -1284,6 +1347,95 @@ mod tests {
         assert_eq!(paged, names(&all));
         let both = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300,citizenship:Q301");
         assert_eq!(names(&both), named(&[("Bob", 3)]), "citizenship holds several at once");
+    }
+
+    fn sorted_names(answer: &Value) -> Vec<String> {
+        let mut found: Vec<String> = names(answer).into_iter().map(|(n, _)| n).collect();
+        found.sort();
+        found
+    }
+
+    /// `|` OR-s a trait's values: Swedish or American is Ann and Bob, where Swedish and American is Bob alone.
+    /// Unknown is still never a match: Cid, Dee and Eve have no citizenship on record, so they are neither
+    /// Swedish or American nor known to be neither.
+    #[test]
+    fn a_trait_group_is_the_union_and_unknown_matches_neither_side() {
+        let indexes = people_store("or-citizenship");
+        let either = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300|Q301");
+        assert_eq!(sorted_names(&either), vec!["Ann", "Bob"]);
+        let both = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300,citizenship:Q301");
+        assert_eq!(sorted_names(&both), vec!["Bob"]);
+        let neither = ask(&indexes, Scope::All, Route::People, "traits=-citizenship:Q300|Q301");
+        assert_eq!(neither["total"], 0, "no one on record holds another citizenship: {neither}");
+        let genders = ask(&indexes, Scope::All, Route::People, "traits=gender:Q200|Q202");
+        assert_eq!(sorted_names(&genders), vec!["Ann", "Cid"]);
+        let other = ask(&indexes, Scope::All, Route::People, "traits=-gender:Q200|Q202");
+        assert_eq!(sorted_names(&other), vec!["Bob", "Eve"], "Dee has no gender on record");
+        let decades = ask(&indexes, Scope::All, Route::People, "traits=born:1970|1980");
+        assert_eq!(sorted_names(&decades), vec!["Ann", "Bob", "Eve"], "Cid's century has no decade");
+        let unknown = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300|Q999999");
+        assert_eq!(sorted_names(&unknown), vec!["Ann", "Bob"]);
+        assert_eq!(unknown["unknownTraits"], json!(["citizenship:Q999999"]));
+    }
+
+    /// `role:cast|director` counts a title credited as either; `-role:cast|writer` one credited as neither.
+    #[test]
+    fn a_role_group_counts_titles_held_in_either_role() {
+        let indexes = people_store("or-roles");
+        let either = ask(&indexes, Movie, Route::People, "traits=role:cast|director&order=credits");
+        assert_eq!(
+            names(&either),
+            named(&[("Bob", 2), ("Cid", 2), ("Ann", 2), ("Dee", 1), ("Eve", 1)]),
+            "Cid directs films 1 and 3"
+        );
+        let both = ask(&indexes, Movie, Route::People, "traits=role:cast,role:director");
+        assert_eq!(names(&both), named(&[("Bob", 1)]), "film 2 alone holds both");
+        let neither = ask(&indexes, Movie, Route::People, "traits=-role:cast|writer");
+        assert_eq!(names(&neither), named(&[("Cid", 1)]), "Cid directs film 3 and writes only film 1");
+        let grip = ask(&indexes, Movie, Route::People, "traits=role:grip|writer");
+        assert_eq!((&grip["total"], &grip["unknownTraits"]), (&1.into(), &json!(["role:grip"])));
+    }
+
+    /// people/counts.json counts a trait with an OR group without the group — what each value would add — and
+    /// every other trait under it; a role group the same, over the credits walked without it.
+    #[test]
+    fn a_trait_with_a_group_counts_its_values_without_the_group() {
+        let indexes = people_store("or-counts");
+        let either =
+            ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020&traits=citizenship:Q300|Q301");
+        assert_eq!(either["total"], 2);
+        let citizenship = &either["traits"]["citizenship"];
+        assert_eq!(
+            citizenship["values"],
+            json!({ "Q300": 2, "Q301": 1 }),
+            "Ann and Bob Swedish, Bob American"
+        );
+        assert_eq!(citizenship["selected"], json!(["Q300", "Q301"]));
+        assert_eq!(either["traits"]["gender"]["values"], json!({ "Q200": 1, "Q201": 1 }), "under the group");
+        let both = ask(
+            &indexes,
+            Movie,
+            Route::PeopleCounts,
+            "sel=decade:2020&traits=citizenship:Q300,citizenship:Q301",
+        );
+        assert_eq!(both["traits"]["citizenship"]["values"], json!({ "Q300": 1, "Q301": 1 }), "Bob alone");
+        let makers = ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020&traits=occupation:Q401|Q402");
+        assert_eq!(makers["total"], 2, "Bob and Cid");
+        assert_eq!(
+            makers["traits"]["occupation"]["values"],
+            json!({ "Q400": 3, "Q401": 2, "Q402": 1 }),
+            "Ann, Bob and Eve are actors, whatever the group"
+        );
+
+        let crew = ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020&traits=role:director|writer");
+        assert_eq!(crew["total"], 2, "Bob directs film 2, Cid directs and writes film 1");
+        assert_eq!(
+            crew["traits"]["role"]["values"],
+            json!({ "cast": 4, "director": 2, "writer": 1 }),
+            "Ann, Bob, Dee and Eve are cast in the 2020 films, whatever the group"
+        );
+        assert_eq!(crew["traits"]["role"]["selected"], json!(["director", "writer"]));
+        assert_eq!(crew["traits"]["gender"]["values"], json!({ "Q201": 1, "Q202": 1 }), "under the group");
     }
 
     /// Twenty films, film i (TMDB id i + 1) at rank i in the popularity order when `popular`, so it weighs
@@ -1855,13 +2007,22 @@ mod tests {
                 Route::People,
                 "sel=decade:2020&traits=gender:Q6581097,role:cast&skip=100&limit=100",
             ),
+            // OR groups beside their AND forms: American or British, against dual citizens.
+            (Scope::All, Route::People, "traits=citizenship:Q30|Q145"),
+            (Scope::All, Route::People, "traits=citizenship:Q145,citizenship:Q30"),
+            (Scope::All, Route::People, "traits=-citizenship:Q145|Q30"),
+            (Scope::All, Route::PeopleCounts, "traits=citizenship:Q145|Q30"),
+            (Movie.into(), Route::People, "sel=decade:2020&traits=role:cast|director"),
+            (Movie.into(), Route::People, "sel=decade:2020&traits=role:cast,role:director"),
+            (Movie.into(), Route::PeopleCounts, "sel=decade:2020&traits=role:cast|director"),
         ] {
             let label = if matches!(route, Route::People) { "people" } else { "people/counts" };
             let answer = time(label, scope, route, query);
             if matches!(route, Route::People) {
                 show(&answer);
             } else {
-                eprintln!("  gender {}", answer["traits"]["gender"]["values"]);
+                eprintln!("  total {}, gender {}", answer["total"], answer["traits"]["gender"]["values"]);
+                eprintln!("  role {}", answer["traits"]["role"]["values"]);
             }
         }
     }

@@ -1,5 +1,5 @@
 {
-  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it; `born` is a decade (born:1970) or one range of birth years, ends inclusive and either left out (born:1976-1996, born:1976-, born:-1996), with no other positive born pick beside it. people.json's `order` follows `traits`, lowercased, and is left out when it is the default, `prominence`. people/values/<trait>.json (gender, citizenship, occupation) takes sel, traits, q and limit, in that order, as values/<kind>.json does. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
+  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it; `born` is a decade (born:1970) or one range of birth years, ends inclusive and either left out (born:1976-1996, born:1976-, born:-1996), with no other positive born pick beside it. people.json's `order` follows `traits`, lowercased, and is left out when it is the default, `prominence`. people/values/<trait>.json (gender, citizenship, occupation) takes sel, traits, q and limit, in that order, as values/<kind>.json does. An item may OR values of its kind with a literal `|` (country:FR|IT; %7C is a second spelling): its ids sorted as strings and each kept once, the item sorted among the others by its ids joined with `|`, a one-value group written without `|`; a group counts toward the 16-value cap by its values; like and a born range never go in a group. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
   "cases": [
     { "url": "/index/filter/movie/counts.json", "canonical": "/index/filter/movie/counts.json" },
     { "url": "/index/filter/movie/counts.json?sel=", "canonical": "/index/filter/movie/counts.json" },
@@ -65,7 +65,28 @@
     { "url": "/index/filter/movie/titles.json?order=name", "canonical": "/index/filter/movie/titles.json" },
     { "url": "/index/filter/movie/people/values/citizenship.json?q=Iceland", "canonical": "/index/filter/movie/people/values/citizenship.json?q=iceland" },
     { "url": "/index/filter/all/people/values/occupation.json?limit=10&q=Film+Dir&traits=Role:Director&sel=genre:18", "canonical": "/index/filter/all/people/values/occupation.json?sel=genre:18&traits=role:director&q=film%20dir" },
-    { "url": "/index/filter/series/people/values/gender.json?limit=3&order=name&skip=0", "canonical": "/index/filter/series/people/values/gender.json?limit=3" }
+    { "url": "/index/filter/series/people/values/gender.json?limit=3&order=name&skip=0", "canonical": "/index/filter/series/people/values/gender.json?limit=3" },
+    { "url": "/index/filter/movie/counts.json?sel=country:FR|IT", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT" },
+    { "url": "/index/filter/movie/counts.json?sel=country:it|fr", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT" },
+    { "url": "/index/filter/movie/counts.json?sel=country:IT%7CFR", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT" },
+    { "url": "/index/filter/movie/counts.json?sel=country%3AIT%7CFR%2Cdecade%3A1995", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT,decade:1990" },
+    { "url": "/index/filter/movie/counts.json?sel=country:FR|FR", "canonical": "/index/filter/movie/counts.json?sel=country:FR" },
+    { "url": "/index/filter/movie/titles.json?sel=-country:IT|FR,genre:18", "canonical": "/index/filter/movie/titles.json?sel=-country:FR|IT,genre:18" },
+    { "url": "/index/filter/movie/counts.json?sel=country:IT,country:FR|IT", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT,country:IT" },
+    { "url": "/index/filter/movie/counts.json?sel=country:US,country:FR|IT", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT,country:US" },
+    { "url": "/index/filter/movie/counts.json?sel=-country:FR|IT,country:FR|IT", "canonical": "/index/filter/movie/counts.json?sel=country:FR|IT,-country:FR|IT" },
+    { "url": "/index/filter/movie/counts.json?sel=decade:1995|1980", "canonical": "/index/filter/movie/counts.json?sel=decade:1980|1990" },
+    { "url": "/index/filter/movie/counts.json?sel=decade:1991|1999", "canonical": "/index/filter/movie/counts.json?sel=decade:1990" },
+    { "url": "/index/filter/movie/counts.json?sel=genre:28|18,genre:10759", "canonical": "/index/filter/movie/counts.json?sel=genre:10759,genre:18|28" },
+    { "url": "/index/filter/movie/counts.json?sel=subgenre:Heist|Campy/Cult", "canonical": "/index/filter/movie/counts.json?sel=subgenre:Campy%2FCult|Heist" },
+    { "url": "/index/filter/movie/counts.json?sel=tone:Bleak|dark,structure:single-day|single-day", "canonical": "/index/filter/movie/counts.json?sel=timespan:single-day,tone:bleak|dark" },
+    { "url": "/index/filter/movie/counts.json?sel=genre:9|10|1,genre:2|12|3|4|5|6|7|8|11|13|14|15|16", "canonical": "/index/filter/movie/counts.json?sel=genre:11|12|13|14|15|16|2|3|4|5|6|7|8,genre:1|10|9" },
+    { "url": "/index/filter/all/titles.json?sel=network:q49|Q1", "canonical": "/index/filter/all/titles.json?sel=network:Q1|Q49" },
+    { "url": "/index/filter/movie/people.json?traits=citizenship:Q30|q145", "canonical": "/index/filter/movie/people.json?traits=citizenship:Q145|Q30" },
+    { "url": "/index/filter/movie/people.json?traits=role:Director|cast,citizenship:Q30|Q145&sel=country:IT|FR", "canonical": "/index/filter/movie/people.json?sel=country:FR|IT&traits=citizenship:Q145|Q30,role:cast|director" },
+    { "url": "/index/filter/movie/people/counts.json?traits=-citizenship:Q145|Q30", "canonical": "/index/filter/movie/people/counts.json?traits=-citizenship:Q145|Q30" },
+    { "url": "/index/filter/movie/people.json?traits=born:1975|1980", "canonical": "/index/filter/movie/people.json?traits=born:1970|1980" },
+    { "url": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097|Q6581072", "canonical": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097" }
   ],
   "refused": [
     "/index/filter/movie/counts.json?sel=genre:action",
@@ -96,6 +117,18 @@
     "/index/filter/movie/people.json?skip=10&limit=24",
     "/index/filter/movie/people.json?order=popularity",
     "/index/filter/movie/people.json?order=credits,name",
-    "/index/filter/movie/people/values/citizenship.json?q=i"
+    "/index/filter/movie/people/values/citizenship.json?q=i",
+    "/index/filter/movie/counts.json?sel=genre:1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17",
+    "/index/filter/movie/counts.json?sel=genre:1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16,genre:17",
+    "/index/filter/movie/counts.json?sel=country:FR|",
+    "/index/filter/movie/counts.json?sel=country:|FR",
+    "/index/filter/movie/counts.json?sel=genre:18|action",
+    "/index/filter/movie/titles.json?sel=like:550|680",
+    "/index/filter/all/titles.json?sel=like:movie-550|series-1396",
+    "/index/filter/movie/counts.json?sel=structure:single-day|nonlinear",
+    "/index/filter/movie/people.json?traits=born:1976-1996|1970",
+    "/index/filter/movie/people.json?traits=born:1976-1986|1990-1996",
+    "/index/filter/movie/people.json?traits=born:1970|1980,born:1976-1996",
+    "/index/filter/movie/people.json?traits=citizenship:Q30|usa"
   ]
 }
