@@ -957,14 +957,13 @@ pub(crate) fn similar_json(
     tmdb_id: u32,
     query: &str,
 ) -> serde_json::Value {
-    let row = indexes.more_like_this(tmdb_id, media_type);
+    let (row, mixed) = indexes.more_like_this_rows(tmdb_id, media_type);
     let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
     let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
-    let mixed = indexes.more_like_this_mixed(tmdb_id, media_type);
     let mixed_page: Vec<(u32, den_index::MediaType)> =
         mixed.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
     serde_json::json!({

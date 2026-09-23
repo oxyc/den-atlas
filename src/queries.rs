@@ -156,6 +156,73 @@ impl Indexes {
         params: &den_index::SimilarParams,
         extras: den_index::Extras<'_>,
     ) -> Vec<den_index::Scored> {
+        self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
+            den_index::more_like_this_with(
+                Some(&self.plot),
+                self.premise.as_ref(),
+                tmdb_id,
+                media_type,
+                authorship,
+                Some(facets),
+                extras,
+                params,
+            )
+        })
+    }
+
+    /// Both of `/index/similar`'s rows: `more_like_this` and `more_like_this_mixed`, from the memo where it
+    /// holds them.
+    ///
+    /// Where it holds neither, the two are ranked over ONE scan of each index (`den_index::more_like_this_both`)
+    /// instead of one scan per row: the seed type's row draws its pool from each index's nearest of that type,
+    /// which the mixed row's scan finds anyway. Where it holds one, the other is ranked alone, as it would be.
+    pub fn more_like_this_rows(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+    ) -> (Arc<[u32]>, Arc<[Key]>) {
+        let seed = (media_type, tmdb_id);
+        let held = {
+            let memo = lock(&self.similar);
+            memo.contains_key(&(seed, false)) || memo.contains_key(&(seed, true))
+        };
+        if held {
+            let one = self.more_like_this(tmdb_id, media_type);
+            return (one, self.more_like_this_mixed(tmdb_id, media_type));
+        }
+        let production = den_index::SimilarParams::default();
+        let keys = |row: Vec<den_index::Scored>| -> Arc<[Key]> { row.iter().map(|s| s.key()).collect() };
+        let (one, mixed) = self.with_seed(tmdb_id, media_type, &production, |authorship, facets| {
+            den_index::more_like_this_both(
+                Some(&self.plot),
+                self.premise.as_ref(),
+                tmdb_id,
+                media_type,
+                authorship,
+                Some(facets),
+                den_index::Extras::default(),
+                &production,
+            )
+        });
+        let (one, mixed) = (keys(one), keys(mixed));
+        let mut memo = lock(&self.similar);
+        if memo.len() + 2 > SIMILAR_MEMO {
+            memo.clear();
+        }
+        memo.insert((seed, false), Arc::clone(&one));
+        memo.insert((seed, true), Arc::clone(&mixed));
+        (one.iter().map(|&(_, id)| id).collect(), mixed)
+    }
+
+    /// `work` given what the rail reads about the seed beyond the vectors: its facets, tuned to `params`, and
+    /// its authorship with its character links. One place, so every More Like This builds them alike.
+    fn with_seed<R>(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        params: &den_index::SimilarParams,
+        work: impl FnOnce(Option<&dyn den_index::Authorship>, &dyn den_index::Facets) -> R,
+    ) -> R {
         let aggregates = self.aggregates_for(params);
         let aggregates = aggregates.as_deref().unwrap_or(&self.store.aggregates);
         // `LoadedStore::open` already proved this builds — `check` calls the same constructor — and
@@ -170,16 +237,7 @@ impl Indexes {
         let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
             .ok()
             .map(|authorship| authorship.with_characters(characters));
-        den_index::more_like_this_with(
-            Some(&self.plot),
-            self.premise.as_ref(),
-            tmdb_id,
-            media_type,
-            authorship.as_ref().map(|a| a as &dyn den_index::Authorship),
-            Some(&facets),
-            extras,
-            params,
-        )
+        work(authorship.as_ref().map(|a| a as &dyn den_index::Authorship), &facets)
     }
 
     /// The corpus aggregates for `params`' critique floor and holds share, or `None` for production's, which
@@ -1261,6 +1319,38 @@ mod tests {
         let (reloaded, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
         assert!(!std::ptr::eq(first, reloaded.schema_json()), "a new load kept the old schema");
         assert_eq!(first, reloaded.schema_json());
+    }
+
+    /// `/index/similar`'s two rows ranked over one scan of each index are the rows ranked apart, over the fixture
+    /// and — with `DEN_STORE` naming a store beside its `dataset.meta.json` — every 40th title of the real
+    /// corpus. Each seed on fresh indexes' memo would be one load per seed, so the rows ranked apart are
+    /// asked of `more_like_this_scored`, which is never memoised.
+    #[tokio::test]
+    async fn both_rows_over_one_scan_are_the_rows_ranked_apart() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-both-{}", std::process::id()));
+        let fixture = write_fixture(&dir);
+        let real = std::env::var("DEN_STORE").ok().map(|store| {
+            let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
+            Dataset::load(dir).expect("the dataset loads")
+        });
+        for (ds, every) in std::iter::once((&fixture, 1)).chain(real.as_ref().map(|ds| (ds, 40))) {
+            let (indexes, _) = IndexQueries::new(ds).get(|| ()).await.expect("indexes");
+            let apart = |id, media, mix| -> Vec<Key> {
+                let p = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
+                indexes.more_like_this_scored(id, media, &p).iter().map(|s| s.key()).collect()
+            };
+            let mut seeds = 0;
+            for (media, id) in indexes.plot.titles().step_by(every) {
+                let (one, mixed) = indexes.more_like_this_rows(id, media);
+                let ids: Vec<u32> = apart(id, media, false).iter().map(|&(_, id)| id).collect();
+                assert_eq!(&*one, ids.as_slice(), "{media:?} {id}: the seed type's row");
+                assert_eq!(&*mixed, apart(id, media, true).as_slice(), "{media:?} {id}: the mixed row");
+                // And from the memo, as the next request for the title gets them.
+                assert_eq!(indexes.more_like_this_rows(id, media), (one, mixed));
+                seeds += 1;
+            }
+            eprintln!("{seeds} seeds: both rows over one scan are the rows ranked apart");
+        }
     }
 
     /// TMDB numbers kept for the fixture's movie 1 alone, joined onto its store.

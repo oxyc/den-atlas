@@ -1,7 +1,7 @@
 //! More Like This — the index half of the tvOS app's `refineMoreLikeThis`. Merging with TMDB's own
 //! recommendations and the theme rerank stay with the client, which holds those.
 
-use crate::{Index, Key, MediaType, ScanStats};
+use crate::{Index, Key, MediaType, ScanStats, TypeNeighbours};
 use std::collections::{HashMap, HashSet};
 
 /// Plot neighbours asked for, and the premise candidates weighed before keeping the best of them.
@@ -1119,6 +1119,70 @@ pub fn more_like_this_with(
     p: &SimilarParams,
 ) -> Vec<Scored> {
     let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
+    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
+    ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p)
+}
+
+/// More Like This of the seed's own type (`mix_types` off) and mixing both types (on), over ONE vector
+/// retrieval: each index scanned once for both rows rather than once per row. `p.mix_types` is ignored.
+///
+/// The same answers as two calls of `more_like_this_with` by construction: a row of one type draws its pool
+/// from each index's `nearest`, and `nearest_by_type`'s own-type list is exactly that list — the same scan,
+/// the same order.
+#[allow(clippy::too_many_arguments)]
+pub fn more_like_this_both(
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+) -> (Vec<Scored>, Vec<Scored>) {
+    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
+    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, true));
+    let (one, mixed) = (SimilarParams { mix_types: false, ..*p }, SimilarParams { mix_types: true, ..*p });
+    let rank =
+        |p: &SimilarParams| ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p);
+    (rank(&one), rank(&mixed))
+}
+
+/// One index's `pool_k` nearest to the seed: of each type (`by_type`, one scan, own type first), or of the
+/// seed's own type alone. `None` without the index; empty when it does not hold the seed.
+fn scan(
+    index: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    pool_k: usize,
+    by_type: bool,
+) -> Option<Vec<TypeNeighbours>> {
+    let index = index?;
+    Some(if by_type {
+        index.nearest_by_type(tmdb_id, media_type, pool_k)
+    } else {
+        vec![TypeNeighbours {
+            media_type,
+            nearest: index.nearest(tmdb_id, media_type, pool_k),
+            stats: ScanStats::default(),
+        }]
+    })
+}
+
+/// Retrieval from `scans` (premise's, then plot's), then `rank_pool`. A row of one type reads only each
+/// scan's own-type list, so it ranks the same over a scan of both types as over one of its own.
+#[allow(clippy::too_many_arguments)]
+fn ranked(
+    scans: &[Option<Vec<TypeNeighbours>>; 2],
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+) -> Vec<Scored> {
     let seed: Key = (media_type, tmdb_id);
     let wanted = |key: Key| key != seed && (p.mix_types || key.0 == media_type);
     let mut pool: Vec<Key> = Vec::new();
@@ -1127,18 +1191,16 @@ pub fn more_like_this_with(
     // title's rank in its own type's plot neighbours, for the tonal floor.
     let mut scales: [Option<(ScanStats, ScanStats)>; 2] = [None, None];
     let mut plot_ranks: HashMap<Key, u32> = HashMap::new();
-    for (at, index) in [premise, plot].into_iter().enumerate() {
-        let Some(index) = index else { continue };
+    for (at, by_type) in scans.iter().enumerate() {
+        let Some(by_type) = by_type else { continue };
         if !p.mix_types {
-            for n in index.nearest(tmdb_id, media_type, p.pool_k) {
+            for n in by_type.iter().filter(|t| t.media_type == media_type).flat_map(|t| &t.nearest) {
                 if seen.insert((n.media_type, n.tmdb_id)) {
                     pool.push((n.media_type, n.tmdb_id));
                 }
             }
             continue;
         }
-        // `pool_k` of each type, in one scan; the seed's own type's list is exactly `nearest`'s.
-        let by_type = index.nearest_by_type(tmdb_id, media_type, p.pool_k);
         if let [own, other] = by_type.as_slice() {
             scales[at] = Some((own.stats, other.stats));
             if at == 1 {
@@ -1754,6 +1816,27 @@ mod tests {
         assert!(mixed.contains(&film(10)), "{mixed:?}");
         let own: Vec<Key> = mixed.iter().copied().filter(|k| k.0 == MediaType::Tv).collect();
         assert_eq!(own, single, "the seed's own type, in the order a single-type row gives it");
+
+        // Both rows over one scan are the two rows ranked apart, signals and all, whichever way the caller's
+        // own `mix_types` is set.
+        for mix in [false, true] {
+            let p = SimilarParams { mix_types: mix, ..SimilarParams::default() };
+            let apart = |mix: bool| {
+                let p = SimilarParams { mix_types: mix, ..p };
+                more_like_this_scored(Some(&plot), Some(&premise), 1, MediaType::Tv, None, None, &p)
+            };
+            let both = more_like_this_both(
+                Some(&plot),
+                Some(&premise),
+                1,
+                MediaType::Tv,
+                None,
+                None,
+                Extras::default(),
+                &p,
+            );
+            assert_eq!(both, (apart(false), apart(true)));
+        }
     }
 
     /// The map puts a cosine as far from the other type's mean, in its deviations, as it is from the seed
