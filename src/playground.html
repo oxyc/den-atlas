@@ -394,6 +394,7 @@ const KNOBS = {
   w_facet_archetype: facetAxis("archetype", "Story type"),
   w_maker: ["people", "Same director, writer or creator", "Bonus for sharing the people who made it."],
   w_character: ["people", "Same characters", "Bonus for a spin-off or sequel sharing the seed's characters; above 0 it also brings them into the pool."],
+  w_region: ["people", "Same country, region, continent", "For a seed from outside the US and UK and not in English: bonus for the same country, less for the same region (Nordic, Slavic…), less again for the same continent."],
   w_home: ["people", "Same network or studio", "Bonus for the same broadcaster or production company."],
   w_tone: ["tone", "Same subgenres and mood", "Bonus for sharing the seed's confident subgenres and moods."],
   w_facet_tone: facetAxis("tone", "Tone"),
@@ -422,7 +423,8 @@ const KNOBS = {
 };
 // What each signal in a title's score is, in plain words; `base` is the text similarity it starts from.
 const SIGNALS = {
-  maker: "Same director, writer or creator", character: "Same characters", home: "Same network or studio",
+  maker: "Same director, writer or creator", character: "Same characters", region: "Same part of the world",
+  home: "Same network or studio",
   facet: "Similar story shape",
   noul: "Shared subjects", critique: "Argues about similar things", coverage: "Covers the seed's core themes",
   tone: "Same subgenres and mood", world: "Different kind of world", year: "Released around the same time",

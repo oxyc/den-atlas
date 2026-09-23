@@ -177,6 +177,9 @@ pub struct SeedFacets<'a> {
     /// The card's release year, for the year term. Empty when the store lacks the section; the term is
     /// then 0 for every title, which is also what production weighs it at (`w_year = 0`).
     card_year: &'a [i16],
+    /// Countries and languages of origin, as string ids, for the regional term (`w_region`). `None` when
+    /// the store lacks them; the term is then 0, as production weighs it when it is off.
+    origin: Option<(den_store::Strings<'a>, den_store::List<'a, u32>, den_store::List<'a, u32>)>,
     /// The per-request floors, from `SimilarParams` (`tuned`); production's unless overridden.
     noul_floor: f64,
     world_floor: f64,
@@ -227,7 +230,32 @@ impl<'a> SeedFacets<'a> {
             // Optional, unlike the rest: a term production does not weigh cannot be a reason to refuse a
             // store, and the producer has been dropping card sections (oxyc/den#118).
             card_year: store.per_row::<i16>("card_year").unwrap_or(&[]),
+            // Optional for the same reason: the regional term is a knob, not a reason to refuse a store.
+            origin: (|| {
+                Some((
+                    store.strings().ok()?,
+                    store.list::<u32>("countries_v", "countries_o").ok()?,
+                    store.list::<u32>("languages_v", "languages_o").ok()?,
+                ))
+            })(),
         })
+    }
+
+    /// A row's two-letter codes out of one of the origin lists, cased by `fold`; anything that is not two
+    /// letters is skipped, as the facts skip it.
+    fn codes(&self, key: Key, countries: bool, fold: fn(&u8) -> u8) -> Vec<[u8; 2]> {
+        let (Some(row), Some((strings, country_list, language_list))) = (self.row(key), self.origin.as_ref())
+        else {
+            return Vec::new();
+        };
+        let list = if countries { country_list } else { language_list };
+        list.get(row)
+            .iter()
+            .filter_map(|&id| match strings.get(id)?.as_bytes() {
+                [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => Some([fold(a), fold(b)]),
+                _ => None,
+            })
+            .collect()
     }
 
     fn row(&self, (media, tmdb_id): Key) -> Option<Row> {
@@ -286,6 +314,14 @@ impl crate::Facets for SeedFacets<'_> {
     fn year(&self, key: Key) -> Option<f64> {
         let &year = self.card_year.get(self.row(key)?.0)?;
         (year != den_store::NONE_I16).then(|| f64::from(year))
+    }
+
+    fn countries(&self, key: Key) -> Vec<[u8; 2]> {
+        self.codes(key, true, u8::to_ascii_uppercase)
+    }
+
+    fn language(&self, key: Key) -> Option<[u8; 2]> {
+        self.codes(key, false, u8::to_ascii_lowercase).first().copied()
     }
 
     fn nouls(&self, key: Key) -> Vec<Weighted> {
