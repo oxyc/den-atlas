@@ -228,7 +228,7 @@ impl PlotFacets {
         axes
     }
 
-    /// Every `(axis, value)` and the titles carrying it, for the facet counts (`facetcounts`).
+    /// Every `(axis, value)` and the titles carrying it, for the filters (`filter.rs`).
     pub fn values(&self) -> impl Iterator<Item = (&str, &str, &[(Key, u8)])> {
         self.by_value.iter().flat_map(|(axis, values)| {
             values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles.as_slice()))

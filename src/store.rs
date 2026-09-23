@@ -224,6 +224,17 @@ pub(crate) mod fixture {
         pub alias_titles: Vec<&'a str>,
         /// Series Q-ids, most specific first — raw, not interned, as the real writer holds them.
         pub franchise: Vec<u32>,
+        /// Q-ids, interned like `makers`: production companies, narrative locations, main subjects and
+        /// what the title is an instance of.
+        pub companies: Vec<u32>,
+        pub locations: Vec<u32>,
+        pub subjects: Vec<u32>,
+        pub instance_of: Vec<u32>,
+        /// (axis, hundredths) in the dense `technique`, `audience` and `depicts` tables; an axis left out
+        /// is 0, as the real writer stores an unanswered one.
+        pub technique: Vec<(&'a str, u8)>,
+        pub audience: Vec<(&'a str, u8)>,
+        pub depicts: Vec<(&'a str, u8)>,
     }
 
     /// One row of the entity table: a person, a franchise, a place.
@@ -333,7 +344,16 @@ pub(crate) mod fixture {
         let mut named: Vec<u32> = table.iter().map(|e| e.qid).collect();
         let mut extra: Vec<String> = Vec::new();
         for title in &titles {
-            for &qid in title.makers.iter().chain(&title.cast).chain(&title.broadcasters) {
+            for &qid in title
+                .makers
+                .iter()
+                .chain(&title.cast)
+                .chain(&title.broadcasters)
+                .chain(&title.companies)
+                .chain(&title.locations)
+                .chain(&title.subjects)
+                .chain(&title.instance_of)
+            {
                 if !named.contains(&qid) {
                     named.push(qid);
                     extra.push(format!("Q{qid}"));
@@ -343,6 +363,9 @@ pub(crate) mod fixture {
         for (qid, name) in named[table.len()..].iter().zip(&extra) {
             table.push(Entity { qid: *qid, name, tmdb: None, aliases: Vec::new() });
         }
+        // `ent_qid` is sorted in the real store (den-spec: "sorted, binary search"), and readers rely on it.
+        table.sort_by_key(|e| e.qid);
+        let named: Vec<u32> = table.iter().map(|e| e.qid).collect();
         let at = |qid: u32| -> u32 {
             u32::try_from(named.iter().position(|&q| q == qid).expect("entity")).expect("entity index")
         };
@@ -470,21 +493,63 @@ pub(crate) mod fixture {
                 .collect();
             b.list(values, offsets, &rows_of);
         }
-        for (values, offsets, pick) in
-            [("makers_v", "makers_o", 0), ("cast_v", "cast_o", 1), ("broadcasters_v", "broadcasters_o", 2)]
-        {
+        for (values, offsets, pick) in [
+            ("makers_v", "makers_o", 0),
+            ("cast_v", "cast_o", 1),
+            ("broadcasters_v", "broadcasters_o", 2),
+            ("companies_v", "companies_o", 3),
+            ("locations_v", "locations_o", 4),
+            ("subjects_v", "subjects_o", 5),
+            ("instance_of_v", "instance_of_o", 6),
+        ] {
             let rows_of: Vec<Vec<u32>> = titles
                 .iter()
                 .map(|t| {
                     let qids = match pick {
                         0 => &t.makers,
                         1 => &t.cast,
-                        _ => &t.broadcasters,
+                        2 => &t.broadcasters,
+                        3 => &t.companies,
+                        4 => &t.locations,
+                        5 => &t.subjects,
+                        _ => &t.instance_of,
                     };
                     qids.iter().map(|&qid| at(qid)).collect()
                 })
                 .collect();
             b.list(values, offsets, &rows_of);
+        }
+
+        // The dense tables the filters read: each axis a column, every row carrying every axis.
+        for (table, names_section, pick) in [
+            ("technique", "technique_names", 0),
+            ("audience", "audience_names", 1),
+            ("depicts", "depicts_names", 2),
+        ] {
+            let of = |t: &Title<'_>| -> Vec<(String, u8)> {
+                let row = match pick {
+                    0 => &t.technique,
+                    1 => &t.audience,
+                    _ => &t.depicts,
+                };
+                row.iter().map(|&(axis, v)| (axis.to_owned(), v)).collect()
+            };
+            let mut axes: Vec<String> =
+                titles.iter().flat_map(|t| of(t).into_iter().map(|(a, _)| a)).collect();
+            axes.sort_unstable();
+            axes.dedup();
+            let cells: Vec<u8> = titles
+                .iter()
+                .flat_map(|t| {
+                    let row = of(t);
+                    axes.iter()
+                        .map(|axis| row.iter().find(|(a, _)| a == axis).map_or(0, |&(_, v)| v))
+                        .collect::<Vec<u8>>()
+                })
+                .collect();
+            b.u8s(table, &cells);
+            let ids: Vec<u32> = axes.iter().map(|axis| b.intern(axis)).collect();
+            b.u32s(names_section, &ids);
         }
 
         // The entity table. Its lists are keyed by entity, not by title row.

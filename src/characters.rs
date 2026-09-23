@@ -202,6 +202,8 @@ pub struct CharacterIndex {
     links: Vec<CharacterLink>,
     /// Undirected links per tier, in `Tier::ALL` order.
     per_tier: [usize; 5],
+    /// The names titles can be filtered by, and who plays each.
+    named: NamedCharacters,
 }
 
 impl std::fmt::Debug for CharacterIndex {
@@ -244,10 +246,16 @@ impl CharacterIndex {
         Tier::ALL.into_iter().zip(self.per_tier)
     }
 
-    /// Resident size of the two arrays, for the log.
-    fn bytes(&self) -> usize {
+    /// The names titles can be filtered by (`filter.rs`).
+    pub fn named(&self) -> &NamedCharacters {
+        &self.named
+    }
+
+    /// Resident size, for the log: the links, and the names titles are filtered by.
+    pub(crate) fn bytes(&self) -> usize {
         self.starts.len() * std::mem::size_of::<u32>()
             + self.links.len() * std::mem::size_of::<CharacterLink>()
+            + self.named.bytes()
     }
 }
 
@@ -366,12 +374,13 @@ impl Characters {
             .map_err(|e| format!("characters task: {e}"))??;
         let tiers: Vec<String> = index.per_tier().map(|(tier, n)| format!("{} {n}", tier.name())).collect();
         let line = format!(
-            "imdb characters: {} links over {} of {} store rows ({}), {:.1} MB of rows from {source}, \
-             {:.1} MB resident, in {:.1}s",
+            "imdb characters: {} links over {} of {} store rows ({}), {} filterable names, {:.1} MB of rows \
+             from {source}, {:.1} MB resident, in {:.1}s",
             index.links(),
             index.linked(),
             index.rows(),
             tiers.join(", "),
+            index.named().len(),
             kept as f64 / 1_000_000.0,
             index.bytes() as f64 / 1_000_000.0,
             started.elapsed().as_secs_f64()
@@ -537,8 +546,9 @@ pub(crate) fn build(
     tsv: impl BufRead,
 ) -> Result<CharacterIndex, String> {
     let (titles, names) = parse(rows, tsv)?;
+    let named = NamedCharacters::build(&titles, &names, row_count);
     let edges = link(titles, &names);
-    Ok(index(row_count, &edges))
+    Ok(CharacterIndex { named, ..index(row_count, &edges) })
 }
 
 /// Every named role per corpus title, its names normalised and interned.
@@ -629,23 +639,7 @@ fn link(titles: Titles, names: &[String]) -> HashMap<Pair, (Tier, f32)> {
         })
         .collect();
 
-    // Document frequency of each name over titles, and of each word over distinct names.
-    let mut df = vec![0u32; names.len()];
-    for cast in &casts {
-        for &n in cast.named.keys() {
-            df[n as usize] += 1;
-        }
-    }
-    let mut token_count: HashMap<&str, u32> = HashMap::new();
-    for (n, name) in names.iter().enumerate() {
-        if df[n] == 0 {
-            continue;
-        }
-        let words: HashSet<&str> = name.split(' ').collect();
-        for word in words {
-            *token_count.entry(word).or_default() += 1;
-        }
-    }
+    let (df, token_count, kind) = classify(&titles, names);
     let tokens = |word: &str| token_count.get(word).copied().unwrap_or(0);
     let weight = |n: u32| {
         let df = df[n as usize];
@@ -655,23 +649,6 @@ fn link(titles: Titles, names: &[String]) -> HashMap<Pair, (Tier, f32)> {
             COMMON_DF as f32 / df as f32
         }
     };
-    let stop: HashSet<&str> = STOP.iter().copied().collect();
-    let kind: Vec<Kind> = names
-        .iter()
-        .enumerate()
-        .map(|(n, name)| {
-            let words: Vec<&str> = name.split(' ').filter(|w| !stop.contains(w)).collect();
-            match words[..] {
-                [] => Kind::Generic,
-                [word] if df[n] >= SINGLE_DF || tokens(word) >= GENERIC_TOKEN || word.chars().count() < 4 => {
-                    Kind::Generic
-                }
-                [_] => Kind::Single,
-                _ if words.iter().all(|w| tokens(w) >= GENERIC_TOKEN) => Kind::Generic,
-                _ => Kind::Multi,
-            }
-        })
-        .collect();
 
     // The main rule: pairs sharing a specific name.
     let mut postings: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -826,6 +803,142 @@ enum Kind {
     Multi,
 }
 
+/// Each name's document frequency over titles (self roles aside), each word's count over the distinct names
+/// played at all, and each name's kind.
+fn classify<'a>(titles: &Titles, names: &'a [String]) -> (Vec<u32>, HashMap<&'a str, u32>, Vec<Kind>) {
+    let mut df = vec![0u32; names.len()];
+    for (_, principals) in titles {
+        let played: HashSet<u32> =
+            principals.iter().filter(|p| !p.is_self).flat_map(|p| p.names.iter().copied()).collect();
+        for n in played {
+            df[n as usize] += 1;
+        }
+    }
+    let mut token_count: HashMap<&str, u32> = HashMap::new();
+    for (n, name) in names.iter().enumerate() {
+        if df[n] == 0 {
+            continue;
+        }
+        let words: HashSet<&str> = name.split(' ').collect();
+        for word in words {
+            *token_count.entry(word).or_default() += 1;
+        }
+    }
+    let tokens = |word: &str| token_count.get(word).copied().unwrap_or(0);
+    let stop: HashSet<&str> = STOP.iter().copied().collect();
+    let kind: Vec<Kind> = names
+        .iter()
+        .enumerate()
+        .map(|(n, name)| {
+            let words: Vec<&str> = name.split(' ').filter(|w| !stop.contains(w)).collect();
+            match words[..] {
+                [] => Kind::Generic,
+                [word] if df[n] >= SINGLE_DF || tokens(word) >= GENERIC_TOKEN || word.chars().count() < 4 => {
+                    Kind::Generic
+                }
+                [_] => Kind::Single,
+                _ if words.iter().all(|w| tokens(w) >= GENERIC_TOKEN) => Kind::Generic,
+                _ => Kind::Multi,
+            }
+        })
+        .collect();
+    (df, token_count, kind)
+}
+
+/// The characters a title can be filtered by (`filter.rs`, the `character` kind): a named role played in at
+/// least two titles, neither generic nor one of `NOT_A_CHARACTER` — the same names the links are made of — and
+/// the store rows playing each.
+#[derive(Default)]
+pub struct NamedCharacters {
+    /// Normalised names (`normalise`), sorted, so a prefix is a range.
+    names: Vec<Box<str>>,
+    /// Name `i`'s rows are `rows[starts[i]..starts[i + 1]]`, ascending.
+    starts: Vec<u32>,
+    rows: Vec<u32>,
+    /// One bit per store row: whether it plays any of these names — the titles a character is known for.
+    known: Vec<u64>,
+}
+
+impl NamedCharacters {
+    fn build(titles: &Titles, names: &[String], row_count: usize) -> NamedCharacters {
+        let (df, _, kind) = classify(titles, names);
+        let skip: HashSet<&str> = NOT_A_CHARACTER.iter().copied().collect();
+        let kept = |n: u32| {
+            df[n as usize] >= 2
+                && kind[n as usize] != Kind::Generic
+                && !skip.contains(names[n as usize].as_str())
+        };
+        let mut played: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (row, principals) in titles {
+            let mut own: Vec<u32> =
+                principals.iter().filter(|p| !p.is_self).flat_map(|p| p.names.iter().copied()).collect();
+            own.sort_unstable();
+            own.dedup();
+            for n in own.into_iter().filter(|&n| kept(n)) {
+                played.entry(n).or_default().push(*row);
+            }
+        }
+        let mut ordered: Vec<(u32, Vec<u32>)> = played.into_iter().collect();
+        ordered.sort_unstable_by(|a, b| names[a.0 as usize].cmp(&names[b.0 as usize]));
+        let mut out = NamedCharacters {
+            known: vec![0; row_count.div_ceil(64)],
+            starts: vec![0],
+            ..NamedCharacters::default()
+        };
+        for (n, mut rows) in ordered {
+            rows.sort_unstable();
+            rows.dedup();
+            for &row in &rows {
+                if let Some(word) = out.known.get_mut(row as usize / 64) {
+                    *word |= 1 << (row % 64);
+                }
+            }
+            out.names.push(names[n as usize].clone().into_boxed_str());
+            out.rows.extend(rows);
+            out.starts.push(out.rows.len() as u32);
+        }
+        out
+    }
+
+    /// The store rows playing a normalised name; empty for a name that is not one of these.
+    pub fn rows(&self, name: &str) -> &[u32] {
+        match self.names.binary_search_by(|n| (**n).cmp(name)) {
+            Ok(i) => &self.rows[self.starts[i] as usize..self.starts[i + 1] as usize],
+            Err(_) => &[],
+        }
+    }
+
+    /// Every name starting with `prefix`, with its rows, in name order.
+    pub fn with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a str, &'a [u32])> + 'a {
+        let from = self.names.partition_point(|n| (**n) < *prefix);
+        self.names[from..].iter().take_while(move |n| n.starts_with(prefix)).enumerate().map(move |(i, n)| {
+            let at = from + i;
+            (&**n, &self.rows[self.starts[at] as usize..self.starts[at + 1] as usize])
+        })
+    }
+
+    /// One bit per store row: whether it plays any of these names.
+    pub fn known(&self) -> &[u64] {
+        &self.known
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.names.iter().map(|n| n.len() + std::mem::size_of::<Box<str>>()).sum::<usize>()
+            + (self.starts.len() + self.rows.len()) * std::mem::size_of::<u32>()
+            + self.known.len() * std::mem::size_of::<u64>()
+    }
+}
+
+/// A character name as the index holds it: the normalisation every role name went through — case,
+/// diacritics, brackets, a trailing number, age and honorific words — so a query meets the names it read.
+pub fn normalise(name: &str) -> String {
+    norm_one(name)
+}
+
 /// How many people two sorted casts share.
 fn shared_people(a: &[u32], b: &[u32]) -> usize {
     a.iter().filter(|p| b.binary_search(p).is_ok()).count()
@@ -852,7 +965,12 @@ fn index(row_count: usize, edges: &HashMap<Pair, (Tier, f32)>) -> CharacterIndex
         sum += *start;
         *start = sum;
     }
-    CharacterIndex { starts, links: directed.into_iter().map(|(_, link)| link).collect(), per_tier }
+    CharacterIndex {
+        starts,
+        links: directed.into_iter().map(|(_, link)| link).collect(),
+        per_tier,
+        named: NamedCharacters::default(),
+    }
 }
 
 /// A role's character list as normalised names: "Bruce Wayne / Batman" gives both, "Joker (voice)" gives

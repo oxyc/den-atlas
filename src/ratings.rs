@@ -100,6 +100,12 @@ impl Ratings {
         }
     }
 
+    /// Swap an index in, as a refresh does.
+    #[cfg(test)]
+    pub fn swap(&self, index: RatingsIndex) {
+        *self.index.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(index));
+    }
+
     /// The current index; `None` until the first refresh lands, and after a refresh that failed with no
     /// previous index to keep.
     pub fn index(&self) -> Option<Arc<RatingsIndex>> {
