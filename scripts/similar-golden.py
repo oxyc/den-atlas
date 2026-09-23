@@ -3,10 +3,12 @@
 
   scripts/similar-golden.py http://127.0.0.1:8080 "<why it was recaptured>"
 
-Asks the atlas for each anchor's whole More Like This row (GET /index/similar/<type>/<id>.json?limit=200)
-and its dataset's version (GET /dataset.json), and rewrites the golden with them. The anchors are the ones
-already in the file. Run it against a binary built from the commit you mean to pin, serving the store the
-golden is for, and say in the second argument what changed.
+Asks the atlas for each anchor's whole More Like This row of its own type — the playground's route with
+mix_types=0, so the atlas needs PLAYGROUND on (GET /playground/similar/<type>/<id>.json?limit=200&mix_types=0)
+— and its dataset's version (GET /dataset.json), and rewrites the golden with them. The golden is of one
+type; the test holds a mixed row's own-type titles to it. The anchors are the ones already in the file. Run it
+against a binary built from the commit you mean to pin, serving the store the golden is for, and say in the
+second argument what changed.
 """
 import json
 import pathlib
@@ -25,14 +27,15 @@ def get(route):
 golden = json.loads(path.read_text())
 anchors = []
 for anchor in golden["anchors"]:
-    ids = get(f"/index/similar/{anchor['type']}/{anchor['id']}.json?limit=200")["ids"]
+    row = get(f"/playground/similar/{anchor['type']}/{anchor['id']}.json?limit=200&mix_types=0")
+    ids = [t["id"] for t in row["titles"]]
     if not ids:
         sys.exit(f"{anchor['name']}: the atlas answered an empty row; is it serving the right store?")
     anchors.append({"name": anchor["name"], "type": anchor["type"], "id": anchor["id"], "ids": ids})
 
 out = {
-    "about": "More Like This rows for these anchors, GET /index/similar/<type>/<id>.json?limit=200 on the store "
-    f"named by datasetVersion, captured by scripts/similar-golden.py. {why}",
+    "about": "More Like This rows of one type for these anchors, GET /playground/similar/<type>/<id>.json"
+    f"?limit=200&mix_types=0 on the store named by datasetVersion, captured by scripts/similar-golden.py. {why}",
     "datasetVersion": get("/dataset.json")["datasetVersion"],
     "anchors": anchors,
 }
