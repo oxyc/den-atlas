@@ -129,24 +129,24 @@ pub const MAX_SUGGEST_SEEDS: usize = 6;
 /// Titles You Might Also Like shows: `/index/suggest`'s default.
 const SUGGEST_SHOWN: usize = 20;
 
-/// What the playground ranks with beyond the store: IMDb's numbers and TMDB's export popularity.
+/// What the playground ranks with beyond the store: TMDB's kept numbers and its export popularity.
 pub struct Sources<'a> {
     pub indexes: &'a Indexes,
     /// TMDB's daily export, for popularity; `None` when title search is off.
     pub export: Option<&'a den_titlesearch::TitleIndex>,
 }
 
-/// `den_index::Audience` over one media type: IMDb's rating and count (`Indexes::imdb_rating`, which is
-/// empty unless `IMDB_RATINGS` is on) and TMDB's export popularity. Read by the filters and the popularity
-/// term only; no answer here carries an IMDb number.
+/// `den_index::Audience` over one media type: TMDB's kept rating and count (`Indexes::rating`, empty while
+/// nothing is kept) and its export popularity. Read by the filters and the popularity term only — plain
+/// filters and a sort term, as `tmdb.rs` allows; no answer here carries the numbers themselves.
 struct Viewers<'a> {
     sources: &'a Sources<'a>,
     media: MediaType,
 }
 
 impl den_index::Audience for Viewers<'_> {
-    fn imdb(&self, tmdb_id: u32) -> Option<(f64, f64)> {
-        let (votes, rating) = self.sources.indexes.imdb_rating(self.media, tmdb_id)?;
+    fn rating(&self, tmdb_id: u32) -> Option<(f64, f64)> {
+        let (votes, rating) = self.sources.indexes.rating(self.media, tmdb_id)?;
         Some((f64::from(rating), f64::from(votes)))
     }
 
@@ -159,7 +159,7 @@ impl den_index::Audience for Viewers<'_> {
     }
 }
 
-/// One seed's row with everything `tuning` asks for: its knobs, IMDb and popularity, its filters, and
+/// One seed's row with everything `tuning` asks for: its knobs, TMDB's numbers and popularity, its filters, and
 /// — when it names watched titles — without them and in den-core's tilted order. Whether it was tilted.
 ///
 /// At production's `Tuning` this is `Indexes::more_like_this_scored` exactly: no filter is consulted, no
@@ -811,7 +811,7 @@ mod tests {
             ("max_row=401", "max_row"),
             ("watched=1438", "watched"),
             ("filter.tone=", "filter.tone"),
-            ("min_imdb_rating=11", "min_imdb_rating"),
+            ("min_rating=11", "min_rating"),
             ("spread_high_pct=50", "spread_high_pct"),
         ] {
             let err = parse(query).unwrap_err();
@@ -833,7 +833,7 @@ mod tests {
     /// A state with every part set, to round-trip.
     fn everything() -> State {
         let mut tuning =
-            parse("w_maker=0.5&min_imdb_rating=6.5&pool_floor_pct=20&critique_floor=0.15&limit=30").unwrap();
+            parse("w_maker=0.5&min_rating=6.5&pool_floor_pct=20&critique_floor=0.15&limit=30").unwrap();
         tuning.watched = vec![(MediaType::Movie, 5723), (MediaType::Tv, 1438)];
         tuning.filters =
             vec![("tone".into(), "bleak".into()), ("subgenre".into(), "Police Procedural".into())];

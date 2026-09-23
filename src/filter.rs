@@ -29,9 +29,9 @@
 //! # The providers are a seam
 //!
 //! Votes and ratings are read through `Indexes::ratings` (a `ratings::Ratings`, whose `RatingsIndex` answers
-//! `votes(row)` and `of(row)`), and character names through `Indexes::characters`. Whatever fills those — the
-//! source is moving from IMDb's dumps to TMDB — this module reads nothing else, so the swap does not touch it.
-//! Either signal is only a filter and a sort here, never learned from or published.
+//! `votes(row)` and `of(row)`), and character names through `Indexes::characters`. `tmdb.rs` fills both from
+//! TMDB, and this module reads nothing else. Either signal is only a filter and a sort here, never learned
+//! from or published — the rules at the top of `tmdb.rs`.
 //!
 //! # The URL is the cache key
 //!
@@ -1807,13 +1807,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rating_reads_imdb_with_a_vote_floor() {
+    async fn rating_reads_tmdb_with_a_vote_floor() {
         let ds = dataset("rating");
         let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");
-        let tsv = "tconst\taverageRating\tnumVotes\ntt0000001\t8.4\t9000\n";
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut gz, tsv.as_bytes()).unwrap();
-        let index = crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).unwrap();
+        let index = crate::ratings::build(&mapped.view(), &HashMap::from([((0, 1), (8.4, 9000))])).unwrap();
         let ratings = Arc::new(crate::ratings::Ratings::with_index(index));
         let queries = IndexQueries::new(&ds).with_ratings(Some(ratings));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
@@ -1872,13 +1869,12 @@ mod tests {
         assert!(!degraded, "a property of the dataset, not an outage");
     }
 
-    /// Before the first ratings join lands, `rating` is unavailable — said so, and a selection naming it is
-    /// answered around it — and when a join lands the rating kind and the vote order are rebuilt from it.
+    /// Before any TMDB numbers are kept, `rating` is unavailable — said so, and a selection naming it is
+    /// answered around it — and when a build lands the rating kind and the vote order are rebuilt from it.
     #[tokio::test]
-    async fn the_imdb_kinds_follow_the_ratings_join() {
+    async fn the_rating_kinds_follow_the_ratings_build() {
         let ds = dataset("rating-swap");
-        let ratings =
-            Arc::new(crate::ratings::Ratings::new(ds.store.clone(), "http://127.0.0.1:9/").unwrap());
+        let ratings = Arc::new(crate::ratings::Ratings::default());
         let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::clone(&ratings)));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
         let before = counts(&indexes, Movie, "sel=rating:8");
@@ -1888,10 +1884,9 @@ mod tests {
         assert_eq!(ids(&order), vec![2, 1, 3], "the store's own votes");
 
         let mapped = crate::store::MappedStore::open(&ds.store).unwrap();
-        let tsv = "tconst\taverageRating\tnumVotes\ntt0000001\t8.4\t9000\n";
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut gz, tsv.as_bytes()).unwrap();
-        ratings.set(Some(crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).unwrap()));
+        ratings.set(Some(
+            crate::ratings::build(&mapped.view(), &HashMap::from([((0, 1), (8.4, 9000))])).unwrap(),
+        ));
         let after = counts(&indexes, Movie, "sel=rating:8");
         assert!(after.get("kindsUnavailable").is_none(), "{after}");
         assert_eq!(after["total"], 1);
@@ -1905,12 +1900,15 @@ mod tests {
     #[tokio::test]
     async fn characters_are_found_by_prefix_and_selectable() {
         let ds = dataset("characters");
-        let tsv = "tconst\tordering\tnconst\tcategory\tjob\tcharacters\n\
-                   tt0000001\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n\
-                   tt0000001\t2\tnm0000200\tactor\t\\N\t[\"Jesse Pinkman\"]\n\
-                   tt0000002\t1\tnm0000100\tactor\t\\N\t[\"Walter White (voice)\"]\n";
-        let rows = HashMap::from([(1, 0), (2, 1)]);
-        let list = crate::characters::build(&rows, 12, std::io::Cursor::new(tsv)).unwrap();
+        let role =
+            |order, person, character: &str| crate::tmdb::Role { order, person, character: character.into() };
+        let credits = |roles| crate::tmdb::Credits { fetched: 0, roles };
+        let kept = HashMap::from([
+            ((0, 1), credits(vec![role(0, 100, "Walter White"), role(1, 200, "Jesse Pinkman")])),
+            ((0, 2), credits(vec![role(0, 100, "Walter White (voice)")])),
+        ]);
+        let mapped = crate::store::MappedStore::open(&ds.store).unwrap();
+        let list = crate::characters::build(&mapped.view(), &kept).unwrap();
         let characters = Arc::new(crate::characters::Characters::with_index(list));
         let queries = IndexQueries::new(&ds).with_characters(Some(characters));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
@@ -1982,8 +1980,8 @@ mod tests {
     }
 
     /// The filters over the REAL corpus, and what they cost. Opt-in: `DEN_STORE` names a store whose directory
-    /// holds its `dataset.meta.json`; `DEN_IMDB_RATINGS`, a `title.ratings.tsv.gz`, adds the rating kind and
-    /// the vote order.
+    /// holds its `dataset.meta.json`; `CACHE_DIR`, a directory of kept TMDB numbers and credits
+    /// (`tmdb-votes.tsv`, `tmdb-credits.tsv`), adds the rating and character kinds and the vote order.
     #[test]
     fn real_corpus_filters_and_timing() {
         let Ok(store) = std::env::var("DEN_STORE") else {
@@ -1992,29 +1990,14 @@ mod tests {
         };
         let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
         let ds = crate::dataset::Dataset::load(dir).expect("the dataset loads");
-        let ratings = std::env::var("DEN_IMDB_RATINGS").ok().map(|path| {
-            let mapped = crate::store::MappedStore::open(&ds.store).unwrap();
-            let gz = std::fs::read(path).expect("the ratings dump");
-            Arc::new(crate::ratings::Ratings::with_index(crate::ratings::build(&mapped.view(), &gz).unwrap()))
-        });
-        // `DEN_IMDB_PRINCIPALS`, IMDb's whole `title.principals.tsv.gz`, adds the character kind.
-        let characters = std::env::var("DEN_IMDB_PRINCIPALS").ok().map(|path| {
-            let mapped = crate::store::MappedStore::open(&ds.store).unwrap();
-            let (rows, row_count) = crate::ratings::imdb_rows(&mapped.view()).unwrap();
-            let started = std::time::Instant::now();
-            let reader =
-                std::io::BufReader::new(flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()));
-            let index = crate::characters::build(&rows, row_count, reader).unwrap();
-            eprintln!(
-                "characters: {} filterable names, {:.1} MB resident with the links ({} links), built in {:?}",
-                index.named().len(),
-                index.bytes() as f64 / 1e6,
-                index.links(),
-                started.elapsed()
-            );
-            Arc::new(crate::characters::Characters::with_index(index))
-        });
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let tmdb = std::env::var("CACHE_DIR").ok().map(|kept| {
+            let tmdb = crate::tmdb::Tmdb::new(ds.store.clone(), Some(kept.into()), None, 0).unwrap();
+            eprintln!("{}", runtime.block_on(tmdb.load()));
+            tmdb
+        });
+        let (ratings, characters) =
+            (tmdb.as_ref().map(|t| t.ratings()), tmdb.as_ref().map(|t| t.characters()));
         let (indexes, _) = runtime
             .block_on(IndexQueries::new(&ds).with_ratings(ratings).with_characters(characters).get(|| ()))
             .expect("the indexes load");
