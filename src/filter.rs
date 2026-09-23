@@ -546,6 +546,8 @@ pub struct Request {
     pub items: Vec<Item>,
     /// The people routes' person traits, ordered like `items`.
     pub traits: Vec<Item>,
+    /// `people.json`'s order.
+    order: people::Order,
     pub skip: usize,
     pub limit: usize,
     /// A values search's prefix, normalised as the kind's names are.
@@ -558,9 +560,10 @@ pub struct Request {
 impl Request {
     /// A route's query string. The canonical spelling, byte for byte:
     ///
-    /// - `sel`, then (people) `traits`, then (titles, people) `skip` and `limit`, or (values) `q` and `limit`;
-    ///   each only when it is not its default (no selection, 0, the route's page) and nothing else. No query at
-    ///   all when everything is. `traits` is written as `sel` is, with the person-trait kinds (`people.rs`).
+    /// - `sel`, then (people) `traits` and `order`, then (titles, people) `skip` and `limit`, or (values) `q`
+    ///   and `limit`; each only when it is not its default (no selection, `prominence`, 0, the route's page)
+    ///   and nothing else. No query at all when everything is. `traits` is written as `sel` is, with the
+    ///   person-trait kinds (`people.rs`); `order` lowercased.
     /// - `sel`: the items `[-]<kind>:<id>` joined by `,`, each id normalised as its kind says (`Id`), sorted by
     ///   kind, then positive before excluded, then id (compared as strings), each once. `:`, `,` and `-` are
     ///   literal; an id is percent-encoded as JavaScript's `encodeURIComponent` does.
@@ -570,7 +573,7 @@ impl Request {
     ///
     /// The error is a request that cannot be answered as sent: a malformed item, an id its kind cannot read
     /// (a `like` under `all` without its type), too many values, a query too long, a `skip` that is not a page
-    /// boundary, a prefix too short.
+    /// boundary, a prefix too short, an order `people.json` does not know.
     pub fn parse(route: Route, scope: Scope, query: &str) -> Result<Request, String> {
         if query.len() > MAX_QUERY {
             return Err(format!("a query of at most {MAX_QUERY} bytes"));
@@ -579,7 +582,7 @@ impl Request {
             Route::Counts => &["sel"],
             Route::Titles => &["sel", "skip", "limit"],
             Route::Values(_) => &["sel", "q", "limit"],
-            Route::People => &["sel", "traits", "skip", "limit"],
+            Route::People => &["sel", "traits", "order", "skip", "limit"],
             Route::PeopleCounts => &["sel", "traits"],
         };
         let mut params: HashMap<&str, &str> = HashMap::new();
@@ -615,6 +618,10 @@ impl Request {
         };
         let items = read_items("sel", &|kind, id| normalise(kind, id, scope))?;
         let traits = read_items("traits", &|kind, id| people::normalise(kind, id, scope))?;
+        let order = match params.get("order").map(|v| decode(v)) {
+            Some(order) if !order.trim().is_empty() => people::Order::parse(&order)?,
+            _ => people::Order::default(),
+        };
 
         let count = |name: &str| -> Result<Option<usize>, String> {
             params
@@ -657,6 +664,9 @@ impl Request {
         if !traits.is_empty() {
             parts.push(format!("traits={}", traits.iter().map(Item::spelled).collect::<Vec<_>>().join(",")));
         }
+        if order != people::Order::default() {
+            parts.push(format!("order={}", order.name()));
+        }
         if skip != 0 {
             parts.push(format!("skip={skip}"));
         }
@@ -668,7 +678,7 @@ impl Request {
         }
         let canonical_query = parts.join("&");
         let canonical = query == canonical_query;
-        Ok(Request { items, traits, skip, limit, q, canonical, canonical_query })
+        Ok(Request { items, traits, order, skip, limit, q, canonical, canonical_query })
     }
 
     /// The canonical query, with its `?`, or nothing.
@@ -738,6 +748,12 @@ struct Derived {
     /// Each scope's rows with a card, most voted first then by TMDB id — the order `titles.json` walks:
     /// [movie, series, all], `all` the two merged by rank within their type (`interleave`).
     order: [Vec<u32>; 3],
+    /// Per store row, its position in its own type's order (`order[0]` or `order[1]`); `u32::MAX` for a row
+    /// with no card. The rank `interleave` merges the types by, read per title (`Context::within_type`).
+    rank: Vec<u32>,
+    /// Whether each type's order is by popularity at all: [movie, series]. False when no title of the type has
+    /// a vote count or an export popularity, and the order is then by TMDB id alone.
+    popular: [bool; 2],
     /// A fingerprint of each order, so a client paging while it changes can tell.
     order_id: [String; 3],
     /// Each scope's counts for the empty selection, worked out once.
@@ -1157,7 +1173,7 @@ impl FilterIndex {
             }
             valued
         });
-        let [movies, series] = [0, 1].map(|t| {
+        let [(movies, films_popular), (series, series_popular)] = [0, 1].map(|t| {
             let mut ranked: Vec<(u32, f64, u32)> = ones(&self.types[t])
                 .map(|row| {
                     let key = self.keys[row];
@@ -1165,8 +1181,15 @@ impl FilterIndex {
                 })
                 .collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)));
-            ranked.into_iter().map(|(row, _, _)| row).collect::<Vec<u32>>()
+            let popular = ranked.first().is_some_and(|r| r.1 > 0.0);
+            (ranked.into_iter().map(|(row, _, _)| row).collect::<Vec<u32>>(), popular)
         });
+        let mut rank = vec![u32::MAX; self.keys.len()];
+        for order in [&movies, &series] {
+            for (i, &row) in order.iter().enumerate() {
+                rank[row as usize] = i as u32;
+            }
+        }
         let all = interleave(&movies, &series);
         let order = [movies, series, all];
         let order_id = [0, 1, 2].map(|t| {
@@ -1181,7 +1204,16 @@ impl FilterIndex {
             }
             format!("{hash:016x}")
         });
-        Derived { ratings, export, rating, order, order_id, empty: std::array::from_fn(|_| OnceLock::new()) }
+        Derived {
+            ratings,
+            export,
+            rating,
+            order,
+            rank,
+            popular: [films_popular, series_popular],
+            order_id,
+            empty: std::array::from_fn(|_| OnceLock::new()),
+        }
     }
 
     /// Entity labels and aliases, folded, for `values/<kind>.json?q=`. Built on the first search.
@@ -1316,6 +1348,26 @@ impl<'a> Context<'a> {
 
     fn t(&self) -> usize {
         self.scope.index()
+    }
+
+    /// How high a title stands in its own type's popularity order, 1 for the top down towards 0: one minus its
+    /// rank there over the type's size — the share `interleave` merges the two types by, so a series and a
+    /// film at the same share weigh the same. 0 for a row with no card.
+    fn within_type(&self, row: usize) -> f64 {
+        let rank = self.derived.rank.get(row).copied().unwrap_or(u32::MAX);
+        let size = self.derived.order[type_index(self.filter.keys[row].0)].len();
+        if rank == u32::MAX || size == 0 {
+            return 0.0;
+        }
+        1.0 - f64::from(rank) / size as f64
+    }
+
+    /// Whether every type of the scope has a popularity order, rather than one by TMDB id alone.
+    fn popular(&self) -> bool {
+        match self.scope {
+            Scope::Type(media_type) => self.derived.popular[type_index(media_type)],
+            Scope::All => self.derived.popular.iter().all(|&p| p),
+        }
     }
 
     /// The title a `like` id names: under one type a TMDB id of it, under `all` a typed one.
@@ -1934,8 +1986,9 @@ pub fn schema() -> Value {
                           they match nothing, and are named so a client can tell them from a real zero",
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
                       excluded, then id as strings, each once, joined by ','; ids encoded as encodeURIComponent \
-                      does, ':' ',' '-' literal. Then traits (people), written the same way; then skip and limit \
-                      (titles, people) or q and limit (values), each only when not its default. Any other \
+                      does, ':' ',' '-' literal. Then traits (people), written the same way, and order (people, \
+                      lowercased); then skip and limit (titles, people) or q and limit (values), each only when \
+                      not its default. Any other \
                       spelling answers privately with Content-Location naming this one.",
         "traits": people::schema(),
         "maxSelection": MAX_SELECTION,

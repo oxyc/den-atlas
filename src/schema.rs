@@ -636,8 +636,9 @@ fn routes() -> Value {
             "path": "/index/filter/{type}/people.json",
             "example": "/index/filter/movie/people.json?sel=decade:1980&traits=role:cast",
             "about": "The people credited on the titles of one type (of both, under all) carrying the selection, \
-                      holding every person trait, most matching titles first, then most titles in the corpus, \
-                      then by Q-id. filter.traits in this document describes the trait kinds.",
+                      holding every person trait, in the order asked for: by default the most prominent first \
+                      (whose biggest matching titles are most popular). filter.traits in this document \
+                      describes the trait kinds and the orders.",
             "parameters": [
                 with(
                     param("type", "enum", "movie, series or all (films and series together)"),
@@ -651,6 +652,10 @@ fn routes() -> Value {
                     param("traits", "string", "[-]<trait>:<id>, comma-separated, in canonical order"),
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
+                with(
+                    param("order", "enum", "filter.traits.orders; left out when the default"),
+                    json!({ "default": "prominence" }),
+                ),
                 with(param("skip", "integer", "a multiple of limit; left out when 0"), json!({ "default": 0 })),
                 with(
                     param("limit", "integer", "people in the page; left out when the default"),
@@ -658,9 +663,12 @@ fn routes() -> Value {
                 ),
             ],
             "returns": "{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, \
-                        occupation?}], total, labels, coverage, ignored, ignoredTraits?, unknownValues?, \
-                        unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
+                        occupation?}], total, order, orderUnavailable?, labels, coverage, ignored, ignoredTraits?, \
+                        unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
             "counts": {
+                "order": "the order the page is in",
+                "orderUnavailable": "the order asked for (or defaulted to) when it could not be used: \
+                                     prominence without a popularity order, answered in credits instead",
                 "people[].credits": "matching titles the person's counted credits are on",
                 "people[].born": "{precision: day|month|year|decade|century, date?, year?, century?}: as far as \
                                   Wikidata dates it",
