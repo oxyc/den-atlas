@@ -147,6 +147,10 @@ pub struct SimilarParams {
     pub mix_types: bool,
     pub noul_floor: f64,
     pub world_floor: f64,
+    /// The world penalty's ramp (`world_gap`): clearly realist at or below `world_realist`, clearly
+    /// fantastical at or above `world_fantastical`.
+    pub world_realist: f64,
+    pub world_fantastical: f64,
     pub defining: f64,
     /// Release-year proximity (`year_proximity`). Off in production.
     pub w_year: f64,
@@ -249,6 +253,8 @@ impl Default for SimilarParams {
             mix_types: MIX_TYPES,
             noul_floor: NOUL_FLOOR,
             world_floor: WORLD_FLOOR,
+            world_realist: WORLD_REALIST,
+            world_fantastical: WORLD_FANTASTICAL,
             defining: DEFINING,
             w_year: W_YEAR,
             year_halflife: YEAR_HALFLIFE,
@@ -391,6 +397,22 @@ impl SimilarParams {
         ),
         knob("noul_floor", "floors", 0.0, 1.0, false, "a noul below this is ignored"),
         knob("world_floor", "floors", 0.0, 1.0, false, "a world score below this reads as realist (0)"),
+        knob(
+            "world_realist",
+            "floors",
+            0.0,
+            1.0,
+            false,
+            "world penalty: a score at or below this is clearly realist ...",
+        ),
+        knob(
+            "world_fantastical",
+            "floors",
+            0.0,
+            1.0,
+            false,
+            "... and at or above this clearly fantastical; only the gap between counts",
+        ),
         knob("defining", "floors", 0.0, 1.0, false, "a critique axis at or above this defines the seed"),
         knob("critique_floor", "floors", 0.0, 1.0, false, "a critique axis below this says nothing"),
         knob("holds", "floors", 0.0, 1.0, false, "critique idf: ln(titles / titles at or above this)"),
@@ -439,6 +461,8 @@ impl SimilarParams {
             "min_confidence" => self.min_confidence,
             "noul_floor" => self.noul_floor,
             "world_floor" => self.world_floor,
+            "world_realist" => self.world_realist,
+            "world_fantastical" => self.world_fantastical,
             "defining" => self.defining,
             "subgenre_cap" => self.subgenre_cap as f64,
             "cap_window" => self.cap_window as f64,
@@ -490,6 +514,8 @@ impl SimilarParams {
             "min_confidence" => self.min_confidence = value,
             "noul_floor" => self.noul_floor = value,
             "world_floor" => self.world_floor = value,
+            "world_realist" => self.world_realist = value,
+            "world_fantastical" => self.world_fantastical = value,
             "defining" => self.defining = value,
             "subgenre_cap" => self.subgenre_cap = whole,
             "cap_window" => self.cap_window = whole,
@@ -693,7 +719,42 @@ const W_FACET: f64 = 2.00;
 /// facet axis says it: Angel agrees with The Wire on `scope = single-city` and `setting = urban` because it
 /// is set in Los Angeles. Asymmetric in effect rather than in form: sharing "not fantastical" is the corpus
 /// default and evidence of nothing, so only the DIFFERENCE is scored, never the agreement.
+///
+/// Only the part of a difference that lies between clearly realist and clearly fantastical counts
+/// (`world_gap`): Game of Thrones at 0.86 and House of the Dragon at 0.71 are both fantastical, and the raw
+/// gap between them punished the one spin-off the row exists for.
 const W_WORLD: f64 = 2.50;
+/// At or below this a world score is clearly realist, at or above `WORLD_FANTASTICAL` clearly fantastical;
+/// between, a title is some way across. 0 and 1 are the raw gap, which is what this replaced.
+///
+/// The store's world scores are bimodal (store 5b1c3213b6a1: half the titles under 0.05, a trough through
+/// 0.4–0.65, a second mode from 0.7 up), so the fantastical end is where that mode starts. The realist end
+/// stays at 0: the scores there are already floored (`WORLD_FLOOR`), and raising it cost the judged set on
+/// every measure (dev nDCG 0.788 → 0.782 at 0.05). `den-atlas rail-eval`, both judged files:
+///
+/// ```text
+/// fantastical   dev nDCG   dev nDCG'   dev bad   test nDCG'   test bad
+///   1.0 (raw)    0.792      0.794        26        0.745        29
+///   0.9          0.790      0.793        26        0.746        28
+///   0.8          0.791      0.799        24        0.747        27
+///   0.7          0.788      0.803        22        0.750        26
+///   0.6          0.784      0.801        22        0.751        26
+///   0.5          0.775      0.803        21        0.748        26
+/// ```
+///
+/// At 0.7 fewer judged-bad titles reach the first ten and the judged ones order better; plain nDCG dips
+/// 0.004 as five of the 300 first-ten places move onto titles nobody has graded. Game of Thrones keeps
+/// House of the Dragon first, and a realist seed's row (The Wire) does not move.
+const WORLD_REALIST: f64 = 0.0;
+const WORLD_FANTASTICAL: f64 = 0.7;
+
+/// The world penalty's distance: the two titles' gap once each score is read on the ramp from realist to
+/// fantastical, so two titles past the same end are no distance apart however their raw scores differ.
+fn world_gap(candidate: f64, seed: f64, realist: f64, fantastical: f64) -> f64 {
+    let span = (fantastical - realist).max(f64::EPSILON);
+    let across = |w: f64| ((w - realist) / span).clamp(0.0, 1.0);
+    (across(candidate) - across(seed)).abs()
+}
 /// Cosine over the 75 taxonomy nouls, which reach `labels-t02.json` only as a thresholded top-three and so
 /// were invisible to `tone`.
 ///
@@ -1283,7 +1344,8 @@ pub fn rank_pool<'l>(
             // simply brings no facet evidence, which is different from bringing disagreeing evidence.
             let fa =
                 facets.and_then(|f| facet_agreement(f, &seed_facets, id, &p.w_facet_axis)).unwrap_or(0.0);
-            let world = facets.map_or(0.0, |f| (f.world(id) - seed_world).abs());
+            let world = facets
+                .map_or(0.0, |f| world_gap(f.world(id), seed_world, p.world_realist, p.world_fantastical));
             // A year missing on either side brings no evidence, so the term is 0 rather than a guess.
             let year = match (seed_year, facets.and_then(|f| f.year(id))) {
                 (Some(a), Some(b)) => year_proximity(a, b, p.year_halflife),
@@ -1674,6 +1736,18 @@ mod tests {
         assert_eq!(origin_affinity(&[], &[*b"SE"]), 0.0);
     }
 
+    /// Game of Thrones (0.86) and House of the Dragon (0.71) are both past the fantastical end: no distance.
+    /// The Wire (0.04) and Angel (0.97) are the whole ramp apart; a half-fantastical title half of it.
+    /// At 0 and 1 the ramp is the raw gap.
+    #[test]
+    fn the_world_gap_counts_only_between_realist_and_fantastical() {
+        let gap = |a, b| world_gap(a, b, WORLD_REALIST, WORLD_FANTASTICAL);
+        assert_eq!(gap(0.71, 0.86), 0.0);
+        assert_eq!(gap(0.97, 0.04), (1.0 - 0.04 / WORLD_FANTASTICAL));
+        assert!((gap(0.35, 0.0) - 0.5).abs() < 1e-12);
+        assert_eq!(world_gap(0.71, 0.86, 0.0, 1.0), (0.71f64 - 0.86).abs());
+    }
+
     /// Only a seed from outside the English-language mainstream is regional.
     #[test]
     fn a_seed_is_regional_outside_the_us_and_britain_and_english() {
@@ -1721,7 +1795,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 46, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 48, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
         }
