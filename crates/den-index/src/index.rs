@@ -14,6 +14,7 @@ use crate::MediaType;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
 
 /// The confidence a label needs to be shown in a row — the tvOS app's `displayConfidenceFloor`. The producer
 /// keeps weaker labels as review material, but a row built from them puts the classifier's least confident
@@ -22,6 +23,29 @@ pub const DISPLAY_CONFIDENCE_FLOOR: f64 = 0.55;
 const HEADER_BYTES: usize = 8;
 /// The quantiser's scale: a unit vector's components were stored as `round(x × 127)`.
 const QUANTUM: f64 = 127.0;
+
+/// The direction in the plot space (bge-m3, 1024 dimensions) along which a vector moves with the length of
+/// the plot it was embedded from: 1024 little-endian `f32`, unit length, pointing towards longer plots.
+///
+/// Short plots pull short plots and long ones long (oxyc/den-dataset#109): on store `b2c60751c955` a seed
+/// under 400 characters has 78% of its plot top 20 under 1,000 characters, a seed over 2,500 has 2.5%,
+/// against a corpus rate of 22%. Most of that is this one direction. A vector's projection on it correlates
+/// 0.87 with log plot length.
+///
+/// Fitted offline, because the store carries no plot text and nothing in it stands in for its length. The
+/// best proxy there is (distributor count, correlated 0.36 with log length) gives a direction at cosine 0.86
+/// to this one, whose projection correlates only 0.74 with length. A canonical correlation over every credit
+/// list's count finds popularity instead (cosine 0.18). The fit: the least-squares slope of the unit plot
+/// vectors on `ln(plot characters)`, over the 33,657 titles whose plot is English, the plot counted as it was
+/// embedded (after translation and the 3,500-character cap), then normalised.
+///
+/// It belongs to the embedding model and the way documents are composed, not to one store: a store embedded
+/// by another model has another space, and a direction of another dimension is not applied at all.
+const PLOT_LENGTH_DIRECTION: &[u8] = include_bytes!("plot-length-direction.f32");
+
+fn plot_length_direction() -> Box<[f32]> {
+    PLOT_LENGTH_DIRECTION.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect()
+}
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -73,6 +97,7 @@ struct RawLabel {
 }
 
 /// A record with its label and genre names interned: the same few hundred names repeat across ~37k titles.
+#[derive(Clone)]
 struct Record {
     tmdb_id: u32,
     /// `None` for a type the app doesn't know; such a row keeps its place (rows align with vectors) but never
@@ -209,6 +234,10 @@ pub struct Index {
     /// Label → titles carrying it, most confident first (stable, so equal confidences keep record order).
     subgenres: HashMap<u32, Vec<Entry>>,
     moods: HashMap<u32, Vec<Entry>>,
+    /// The length direction to remove for `without_length`: the plot index's, when its dimension fits;
+    /// `None` for the premise index, which is another space.
+    length_direction: Option<Box<[f32]>>,
+    without_length: OnceLock<Box<Index>>,
 }
 
 impl Index {
@@ -382,7 +411,70 @@ impl Index {
         vectors[..4].copy_from_slice(&count.to_le_bytes());
         vectors[4..8].copy_from_slice(&width.to_le_bytes());
         let dim = vector_dimension(&vectors, records.len())?;
-        Ok(assemble(String::new(), dim, records, names, vectors))
+        let mut index = assemble(String::new(), dim, records, names, vectors);
+        if matches!(space, Space::Plot) {
+            index.length_direction = Some(plot_length_direction()).filter(|d| d.len() == dim);
+        }
+        Ok(index)
+    }
+
+    /// Whether `without_length` has a direction to remove: true for a plot index of the dimension the
+    /// shipped direction was fitted in.
+    pub fn has_length_direction(&self) -> bool {
+        self.length_direction.is_some()
+    }
+
+    /// This index with the plot-length direction (`PLOT_LENGTH_DIRECTION`) projected out of every vector:
+    /// each row is read as a unit vector, loses its component along the direction, and is re-normalised and
+    /// requantised to int8, so every scorer below reads it exactly as it reads the original. A seed is a row
+    /// of the same index, so the seed and the corpus it is compared with lose the direction alike.
+    ///
+    /// Built on first use and kept with the index: a second copy of the vectors (~49 MB on the plot index)
+    /// that nothing pays for until something asks. An index with no direction answers itself.
+    pub fn without_length(&self) -> &Index {
+        let Some(direction) = &self.length_direction else { return self };
+        self.without_length.get_or_init(|| Box::new(self.with_direction_removed(direction)))
+    }
+
+    /// A fixture index given a length direction, as the store path gives the plot index one.
+    #[cfg(test)]
+    pub(crate) fn with_length_direction(mut self, direction: &[f32]) -> Index {
+        assert_eq!(direction.len(), self.dim);
+        self.length_direction = Some(direction.into());
+        self
+    }
+
+    fn with_direction_removed(&self, direction: &[f32]) -> Index {
+        let mut vectors = self.vectors[..HEADER_BYTES].to_vec();
+        vectors.reserve(self.records.len() * self.dim);
+        let mut unit = vec![0.0f64; self.dim];
+        for row in 0..self.records.len() {
+            for (x, &v) in unit.iter_mut().zip(self.row_vector(row)) {
+                *x = f64::from(v as i8);
+            }
+            let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 0.0 {
+                unit.iter_mut().for_each(|x| *x /= norm);
+                let along: f64 = unit.iter().zip(direction).map(|(x, &d)| x * f64::from(d)).sum();
+                unit.iter_mut().zip(direction).for_each(|(x, &d)| *x -= along * f64::from(d));
+            }
+            // A row that WAS the direction has nothing left; it stays the zero vector it now is.
+            let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let scale = if norm > 0.0 { QUANTUM / norm } else { 0.0 };
+            vectors.extend(unit.iter().map(|x| (x * scale).round().clamp(-QUANTUM, QUANTUM) as i8 as u8));
+        }
+        Index {
+            taxonomy_version: self.taxonomy_version.clone(),
+            dim: self.dim,
+            records: self.records.clone(),
+            names: self.names.clone(),
+            rows: self.rows.clone(),
+            vectors,
+            subgenres: self.subgenres.clone(),
+            moods: self.moods.clone(),
+            length_direction: None,
+            without_length: OnceLock::new(),
+        }
     }
 
     /// Stamp the taxonomy version an index built from the store has no way to know — it is the labelling
@@ -923,7 +1015,18 @@ fn assemble(
     }
     let subgenres = buckets(&records, |r| &r.subgenres);
     let moods = buckets(&records, |r| &r.moods);
-    Index { taxonomy_version, dim, records, names, rows, vectors, subgenres, moods }
+    Index {
+        taxonomy_version,
+        dim,
+        records,
+        names,
+        rows,
+        vectors,
+        subgenres,
+        moods,
+        length_direction: None,
+        without_length: OnceLock::new(),
+    }
 }
 
 /// The label → titles buckets for one label family. A record joins each label once, with the confidence of
@@ -979,6 +1082,16 @@ pub(crate) mod tests {
         // -128 everywhere: the largest product there is, 1024 times over.
         let extreme = vec![0x80u8; 1024];
         assert_eq!(dot(&extreme, &extreme), 1024 * 16384);
+    }
+
+    /// The shipped direction is bge-m3's 1024 dimensions at unit length; a fixture of another dimension
+    /// would not be given it.
+    #[test]
+    fn the_plot_length_direction_is_a_unit_vector_in_the_plot_space() {
+        let direction = plot_length_direction();
+        assert_eq!(direction.len(), 1024);
+        let norm = direction.iter().map(|&d| f64::from(d) * f64::from(d)).sum::<f64>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
     }
 
     /// One fixture title: id, type, primary genre, animated, subgenres, moods, vector.

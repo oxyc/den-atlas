@@ -2,6 +2,7 @@
 //!
 //!   DATA_DIR=<dataset dir> den-atlas rail-ab <dataset dir>
 //!   RAIL_SHOW="The Wire" den-atlas rail-ab <dataset dir>     # …and print that anchor's row in full
+//!   RAIL_KNOBS='w_maker=1' den-atlas rail-ab <dataset dir>   # the pooled arm with knobs moved off production
 //!
 //! Reports, per anchor and in aggregate, the two numbers that describe the SHAPE of a row — the share of
 //! the twenty carrying the anchor's own primary genre, and the share carrying one single subgenre. Those
@@ -22,7 +23,8 @@
 
 use crate::queries::Indexes;
 use den_index::{
-    more_like_this, more_like_this_pooled, Authorship, Facets, Index, MediaType, SeedAuthorship, SeedFacets,
+    more_like_this, more_like_this_scored, Authorship, Facets, Index, MediaType, SeedAuthorship, SeedFacets,
+    SimilarParams,
 };
 use std::collections::HashMap;
 
@@ -126,18 +128,22 @@ fn title(index: &Index, id: u32, media: MediaType) -> String {
 ///
 /// An independently constructed copy printed a different row than the one being measured, which is worse
 /// than no print at all. The seed's own type only: the shipped scorer it is compared with never mixes.
-fn pooled(indexes: &Indexes, id: u32, media: MediaType) -> Option<Vec<u32>> {
+/// Ranked with `params`, production's unless `RAIL_KNOBS` moves them.
+fn pooled(indexes: &Indexes, params: &SimilarParams, id: u32, media: MediaType) -> Option<Vec<u32>> {
     let view = indexes.store.view();
     let facets = SeedFacets::new(&view, &indexes.store.aggregates, media).ok()?;
     let authorship = SeedAuthorship::of(&view, media, id).ok()?;
-    let row = more_like_this_pooled(
+    let row = more_like_this_scored(
         Some(&indexes.plot),
         indexes.premise.as_ref(),
         id,
         media,
         Some(&authorship as &dyn Authorship),
         Some(&facets as &dyn Facets),
-    );
+        params,
+    )
+    .into_iter()
+    .map(|s| s.key());
     Some(row.into_iter().filter(|&(kind, _)| kind == media).map(|(_, id)| id).collect())
 }
 
@@ -162,6 +168,13 @@ pub fn run(dir: &std::path::Path) -> i32 {
     };
     // No store-less arm to guard against any more: `load_for_tools` fails without one.
     let view = indexes.store.view();
+    let params = match crate::playground::parse(&std::env::var("RAIL_KNOBS").unwrap_or_default()) {
+        Ok(tuning) => tuning.params,
+        Err(e) => {
+            eprintln!("rail-ab: RAIL_KNOBS: {e}");
+            return 1;
+        }
+    };
 
     println!(
         "{:<24} {:>9} {:>9}   {:>9} {:>9}   {:>4} {:>4}",
@@ -203,7 +216,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
         };
         let genre = seed.primary_genre.to_string();
         let a = more_like_this(Some(&indexes.plot), indexes.premise.as_ref(), id, media);
-        let Some(b_full) = pooled(&indexes, id, media) else {
+        let Some(b_full) = pooled(&indexes, &params, id, media) else {
             println!("{name:<24}  NO POOLED ROW");
             continue;
         };
@@ -302,7 +315,7 @@ pub fn run(dir: &std::path::Path) -> i32 {
 
     if let Ok(want) = std::env::var("RAIL_SHOW") {
         if let Some(&(name, id, media)) = ANCHORS.iter().find(|a| a.0 == want) {
-            if let Some(row) = pooled(&indexes, id, media) {
+            if let Some(row) = pooled(&indexes, &params, id, media) {
                 println!("\n{name}, pooled scorer:");
                 for (i, id) in row.iter().enumerate().take(20) {
                     println!("  {:>2}. {}", i + 1, title(&indexes.plot, *id, media));
