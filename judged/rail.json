@@ -1,6 +1,6 @@
 {
   "about": {
-    "what": "Hand-judged More Like This cases. Each seed lists candidates graded as recommendations FOR that seed. Scored by `den-atlas rail-eval <dataset dir>` (src/raileval.rs): nDCG@10, condensed nDCG@10, P@10, bad@10, judged@10, against /index/similar and a plot-only control.",
+    "what": "Hand-judged More Like This cases. Each seed lists candidates graded as recommendations FOR that seed. Scored by `den-atlas rail-eval <dataset dir>` (src/raileval.rs): nDCG@10, condensed nDCG@10, P@10, bad@10, judged@10, against /index/similar and a plot-only control, beside the share of the first 20 in the seed's own primary genre and each case's `shape`.",
     "grades": {
       "good": "Someone who liked the seed for what makes it distinctive would plausibly want this next: the same story engine, subject or sensibility, not just the same genre label.",
       "ok": "Defensible but not what the seed is: the same genre and register telling a different story; the same subject in a different register, audience or form (documentary, soap, remake); a remake or franchise entry that adds little.",
@@ -14,12 +14,22 @@
       "triplet-": "The hard negative for this anchor in the same file: an unrelated premise that looks confusable. Graded again for the same reason."
     },
     "pooling": "Candidates are the union of the first 12 of /index/similar and of the plot-only control on dataset 5b1c3213b6a1, plus titles the judge expected and neither arm surfaced. Titles the judge did not know well enough were left unjudged rather than guessed.",
+    "shape": {
+      "what": "Row-shape assertions: what nDCG cannot see, because it judges the members and not the row. Twenty crime procedurals for The Wire are each defensible and the row is still a genre shelf (#23). Read over the first 20 of the row rail-eval scores; a subgenre or mood counts at the scorer's own label confidence floor.",
+      "max_share": "{field: {value: fraction}}: at most this fraction of the row carries the value. Fields: primaryGenre, subgenre, mood.",
+      "min_distinct": "{field: n}: the row carries at least n values of the field between its titles.",
+      "mutual": "n: the row's first title has the seed in its own first n. A consistency check, not a taste judgement.",
+      "beats_plot": "true: the row's nDCG@10 is higher than the plot-only control's on this case.",
+      "observed": "pass or FAIL, as measured on the dataset observedOn names, ranked without character links (no CACHE_DIR). A FAIL is a defect the set holds us to, not a broken test; the DEN_STORE test fails when either outcome moves, so an outcome that moved is updated here with the change that moved it.",
+      "observedOn": "b2c60751c955"
+    },
     "adding": "Run with RAIL_EVAL_UNJUDGED=10 to print the unjudged titles in either arm's first ten as paste-ready lines. Add a grade and a basis and put the line in that seed's `judged`. A new seed needs its `split` from den-dataset scripts/v2/split.py (`half('tv:1438')`, dataset key form); the test re-derives it and fails on a mismatch. Correct a judgement by editing it in place; add a `note` when the reason is not obvious."
   },
   "cases": [
     {
       "seed": "series:1438", "title": "The Wire", "split": "dev",
       "covers": ["series", "crime", "2000s", "english", "famous"],
+      "shape": {"max_share": {"primaryGenre": {"Crime": 0.8}, "subgenre": {"Police Procedural": 0.5}}, "min_distinct": {"primaryGenre": 3}, "mutual": 20, "beats_plot": true, "observed": "pass", "note": "The genre shelf of #23 was 20 of 20 Crime, 11 Police Procedural, one genre. On b2c60751c955: 0.55 Crime, 0.45 Police Procedural, four genres."},
       "judged": [
         {"id": "series:125949", "title": "We Own This City (2022)", "grade": "good", "basis": "issue, maker"},
         {"id": "series:14531", "title": "The Corner (2000)", "grade": "good", "basis": "issue, maker"},
@@ -52,6 +62,7 @@
     {
       "seed": "series:76331", "title": "Succession", "split": "test",
       "covers": ["series", "drama", "2010s", "english", "famous"],
+      "shape": {"min_distinct": {"primaryGenre": 2}, "observed": "pass", "note": "Was 20 of 20 Drama: Dynasty, Dallas, Falcon Crest."},
       "judged": [
         {"id": "series:62703", "title": "Altes Geld (2015)", "grade": "good", "basis": "known", "note": "Heirs of a dying Viennese tycoon compete for the fortune: the same premise, as black comedy."},
         {"id": "series:82782", "title": "The Righteous Gemstones (2019)", "grade": "good", "basis": "known"},
@@ -794,6 +805,7 @@
     {
       "seed": "movie:314365", "title": "Spotlight", "split": "dev",
       "covers": ["movie", "drama", "journalism", "2010s", "english", "famous"],
+      "shape": {"beats_plot": true, "mutual": 10, "observed": "pass", "note": "Proof the premise index can do institutions."},
       "judged": [
         {"id": "movie:446354", "title": "The Post (2017)", "grade": "good", "basis": "issue"},
         {"id": "movie:837881", "title": "She Said (2022)", "grade": "good", "basis": "issue"},
@@ -826,6 +838,7 @@
     {
       "seed": "movie:137", "title": "Groundhog Day", "split": "dev",
       "covers": ["movie", "comedy", "time-loop", "1990s", "english", "famous"],
+      "shape": {"beats_plot": true, "mutual": 10, "observed": "pass", "note": "Palm Springs leads it, and it should lead Palm Springs."},
       "judged": [
         {"id": "movie:587792", "title": "Palm Springs (2020)", "grade": "good", "basis": "issue"},
         {"id": "movie:734622", "title": "Hello Again: A Wedding a Day (2020)", "grade": "good", "basis": "known"},
