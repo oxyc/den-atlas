@@ -252,6 +252,11 @@ impl PlotFacets {
             .len()
     }
 
+    /// Whether rows can be built on `axis` at all: the store carries it (after the `structure` alias).
+    pub fn serves(&self, axis: &str, value: &str) -> bool {
+        self.by_value.contains_key(&resolve_axis(axis, value))
+    }
+
     /// The titles of `media_type` carrying every `(axis, value)`, each at the lowest confidence it carries any
     /// of them. Empty when a constraint names an axis or value the file doesn't have.
     pub fn matching(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
@@ -649,6 +654,21 @@ pub fn row(
 /// The titles of `media_type` carrying every constraint — plot facets (`tone=bleak`) and labels
 /// (`mood=Feel-good`, `subgenre=Heist`) — each at the lowest confidence it carries any of them, on the 3/2/1
 /// scale. What a row lists and what the playground's facet filter keeps, so the two cannot disagree.
+/// The first constraint a row cannot be built on: neither a label family nor a plot axis the store carries.
+/// `country`, `decade`, `language` and the other facts are the filter's (`/index/filter/{type}/titles.json`),
+/// and a row naming one used to answer an empty 200 that read as "no such titles" rather than "wrong route".
+/// An unknown VALUE on a served axis is not this: that row is simply empty.
+pub fn unserved_field<'a>(indexes: &Indexes, constraints: &'a [(String, String)]) -> Option<&'a str> {
+    constraints
+        .iter()
+        .find(|(axis, value)| {
+            axis != "mood"
+                && axis != "subgenre"
+                && !indexes.plot_facets.as_ref().is_some_and(|facets| facets.serves(axis, value))
+        })
+        .map(|(axis, _)| axis.as_str())
+}
+
 pub(crate) fn carrying(
     indexes: &Indexes,
     media_type: MediaType,

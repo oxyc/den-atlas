@@ -873,21 +873,11 @@ impl IndexQuestion {
                 let number = |key: &str, default: usize| {
                     query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
                 };
-                let constraints: Vec<(String, String)> = query
-                    .split('&')
-                    .filter_map(|pair| pair.split_once('='))
-                    .filter(|(key, _)| !matches!(*key, "skip" | "limit"))
-                    // The taste is not an axis. Every tilt parameter carries one prefix so a household's
-                    // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
-                    .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
-                    // Form-encoded, as a browser's URLSearchParams writes it: a space is a `+`.
-                    .map(|(key, value)| (percent_decode(key), percent_decode(&value.replace('+', " "))))
-                    .collect();
                 crate::plotrows::row(
                     indexes,
                     export,
                     *media_type,
-                    &constraints,
+                    &row_constraints(query),
                     crate::plotrows::Tilt::parse(query).as_ref(),
                     number("skip", 0),
                     number("limit", ROW_PAGE).min(MAX_ROW_PAGE),
@@ -899,6 +889,20 @@ impl IndexQuestion {
         };
         body.to_string()
     }
+}
+
+/// A browse row's constraints: every query pair but paging and the household's taste.
+fn row_constraints(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| !matches!(*key, "skip" | "limit"))
+        // The taste is not an axis. Every tilt parameter carries one prefix so a household's
+        // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
+        .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
+        // Form-encoded, as a browser's URLSearchParams writes it: a space is a `+`.
+        .map(|(key, value)| (percent_decode(key), percent_decode(&value.replace('+', " "))))
+        .collect()
 }
 
 /// `/index/similar`'s answer. The row is computed once and memoised, so a later page is a slice rather than
@@ -1663,6 +1667,23 @@ async fn handle_index(
             cache_control = "public, max-age=300";
         }
     };
+    // A row on a field it cannot serve is refused, naming the route that does, rather than answered empty.
+    if let IndexQuestion::Plot { media_type } = &question {
+        let constraints = row_constraints(query);
+        if let Some(field) = crate::plotrows::unserved_field(&indexes, &constraints) {
+            let kind = if *media_type == den_index::MediaType::Tv { "series" } else { "movie" };
+            return json_response(
+                serde_json::json!({
+                    "error": "unknown_field",
+                    "field": field,
+                    "detail": "a row is built on moods, subgenres and plot facets; for facts use the filter",
+                    "filter": format!("/index/filter/{kind}/titles.json"),
+                })
+                .to_string(),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    }
     let mut phases = String::new();
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query).await {
@@ -2873,6 +2894,29 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A row on a fact the schema lists, `country=KR`, used to answer an empty 200 whose coverage said no film
+    /// had a country. It is refused, naming the filter, which is the route that serves facts; alongside a
+    /// served axis it is refused too, since the row would otherwise ignore it or answer empty.
+    #[tokio::test]
+    async fn a_row_on_a_field_it_cannot_serve_names_the_filter_instead() {
+        let state = index_state("den-atlas-row-unserved");
+        for (path, field, filter) in [
+            ("/index/row/movie.json?country=KR", "country", "/index/filter/movie/titles.json"),
+            ("/index/row/series.json?tone=bleak&decade=1990", "decade", "/index/filter/series/titles.json"),
+        ] {
+            let resp = get(&state, path).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+            let body: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
+            assert_eq!(
+                (body["error"].as_str(), body["field"].as_str()),
+                (Some("unknown_field"), Some(field))
+            );
+            assert_eq!(body["filter"], filter);
+        }
+        let paged = get(&state, "/index/row/movie.json?tone=bleak&skip=0&limit=1").await;
+        assert_eq!(paged.status(), StatusCode::OK, "paging is not a field");
     }
 
     /// Filter counts at the URLs Den Web builds: a canonical one is public, carries an ETag and revalidates to
