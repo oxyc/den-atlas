@@ -811,6 +811,9 @@ impl IndexQuestion {
                     ["titles"] => crate::filter::Route::Titles,
                     ["people"] => crate::filter::Route::People,
                     ["people", "counts"] => crate::filter::Route::PeopleCounts,
+                    ["people", "values", kind] => {
+                        crate::filter::Route::PeopleValues(crate::filter::people_values_kind(kind)?)
+                    }
                     ["values", kind] => {
                         crate::filter::Route::Values(crate::filter::spec(kind).filter(|s| s.searchable())?)
                     }
@@ -1626,6 +1629,7 @@ async fn filter_answer(
             crate::filter::Route::Values(spec) => context.values(spec, &request),
             crate::filter::Route::People => context.people(&request),
             crate::filter::Route::PeopleCounts => context.people_counts(&request),
+            crate::filter::Route::PeopleValues(kind) => context.people_values(kind, &request),
         };
         (body.to_string(), degraded)
     })
@@ -3250,6 +3254,25 @@ mod tests {
             "/index/filter/movie/people.json?order=score",
         ] {
             assert_eq!(get(&state, path).await.status(), 400, "{path}");
+        }
+    }
+
+    /// people/values/<trait>.json answers for the traits whose values are items; a decade or a role is listed
+    /// whole by people/counts.json, and has no route here.
+    #[tokio::test]
+    async fn filter_people_values_route() {
+        let state = index_state("den-atlas-filter-people-values");
+        let found = get(&state, "/index/filter/movie/people/values/citizenship.json?q=swe").await;
+        assert_eq!(found.status(), 200);
+        let found = serde_json::from_str::<serde_json::Value>(&body_of(found).await).unwrap();
+        assert_eq!((&found["kind"], &found["mode"]), (&"citizenship".into(), &"and".into()));
+        assert_eq!(get(&state, "/index/filter/movie/people/values/citizenship.json?q=s").await.status(), 400);
+        for path in [
+            "/index/filter/movie/people/values/born.json",
+            "/index/filter/movie/people/values/role.json",
+            "/index/filter/movie/people/values/nope.json",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 404, "{path}");
         }
     }
 

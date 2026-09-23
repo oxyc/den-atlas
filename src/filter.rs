@@ -537,6 +537,13 @@ pub enum Route {
     People,
     /// `people/counts.json`: their traits' counts.
     PeopleCounts,
+    /// `people/values/<trait>.json`: one entity trait's values, with a prefix search (`people_values_kind`).
+    PeopleValues(&'static str),
+}
+
+/// The person trait `people/values/<trait>.json` answers for: those whose values are Wikidata items.
+pub fn people_values_kind(name: &str) -> Option<&'static str> {
+    people::values_kind(name)
 }
 
 /// A request's parameters, read and checked before anything loads.
@@ -560,8 +567,8 @@ pub struct Request {
 impl Request {
     /// A route's query string. The canonical spelling, byte for byte:
     ///
-    /// - `sel`, then (people) `traits` and `order`, then (titles, people) `skip` and `limit`, or (values) `q`
-    ///   and `limit`; each only when it is not its default (no selection, `prominence`, 0, the route's page)
+    /// - `sel`, then (people) `traits` and `order`, then (titles, people) `skip` and `limit`, or (values, people
+    ///   values) `q` and `limit`; each only when it is not its default (no selection, `prominence`, 0, the route's page)
     ///   and nothing else. No query at all when everything is. `traits` is written as `sel` is, with the
     ///   person-trait kinds (`people.rs`); `order` lowercased.
     /// - `sel`: the items `[-]<kind>:<id>` joined by `,`, each id normalised as its kind says (`Id`), sorted by
@@ -584,6 +591,7 @@ impl Request {
             Route::Values(_) => &["sel", "q", "limit"],
             Route::People => &["sel", "traits", "order", "skip", "limit"],
             Route::PeopleCounts => &["sel", "traits"],
+            Route::PeopleValues(_) => &["sel", "traits", "q", "limit"],
         };
         let mut params: HashMap<&str, &str> = HashMap::new();
         for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -633,6 +641,7 @@ impl Request {
             Route::Counts | Route::PeopleCounts => (0, 0),
             Route::Titles | Route::People => (PAGE, MAX_PAGE),
             Route::Values(spec) => (spec.values_limit(), spec.values_limit()),
+            Route::PeopleValues(_) => (VALUES_LIMIT, VALUES_LIMIT),
         };
         let limit = count("limit")?.unwrap_or(default_limit).clamp(default_limit.min(1), max_limit);
         let skip = count("skip")?.unwrap_or(0);
@@ -653,6 +662,13 @@ impl Request {
             }
             (Route::Values(spec), _) if spec.data == Data::Character => {
                 return Err("q: a character is found by name, at least 3 characters".to_owned());
+            }
+            (Route::PeopleValues(_), Some(q)) if !q.trim().is_empty() => {
+                let q = crate::facts::name_key(&q);
+                if q.chars().count() < MIN_PREFIX {
+                    return Err(format!("q: a prefix of at least {MIN_PREFIX} characters"));
+                }
+                Some(q)
             }
             _ => None,
         };
@@ -1987,8 +2003,8 @@ pub fn schema() -> Value {
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
                       excluded, then id as strings, each once, joined by ','; ids encoded as encodeURIComponent \
                       does, ':' ',' '-' literal. Then traits (people), written the same way, and order (people, \
-                      lowercased); then skip and limit (titles, people) or q and limit (values), each only when \
-                      not its default. Any other \
+                      lowercased); then skip and limit (titles, people) or q and limit (values, people values), \
+                      each only when not its default. Any other \
                       spelling answers privately with Content-Location naming this one.",
         "traits": people::schema(),
         "maxSelection": MAX_SELECTION,
@@ -2582,6 +2598,9 @@ mod tests {
                 ["titles.json"] => Route::Titles,
                 ["people.json"] => Route::People,
                 ["people", "counts.json"] => Route::PeopleCounts,
+                ["people", "values", kind] => {
+                    Route::PeopleValues(people_values_kind(kind.trim_end_matches(".json")).unwrap())
+                }
                 ["values", kind] => Route::Values(spec(kind.trim_end_matches(".json")).unwrap()),
                 _ => panic!("{url}"),
             };

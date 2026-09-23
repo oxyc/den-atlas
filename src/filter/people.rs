@@ -160,6 +160,12 @@ fn trait_spec(name: &str) -> Option<&'static TraitSpec> {
     TRAITS.iter().find(|t| t.name == name)
 }
 
+/// The traits `people/values/<trait>.json` answers for: those whose values are Wikidata items, too many to
+/// list whole. A decade or a role is listed whole by `people/counts.json` already.
+pub(super) fn values_kind(name: &str) -> Option<&'static str> {
+    trait_spec(name).filter(|t| t.id == Id::Qid).map(|t| t.name)
+}
+
 /// A trait kind and an id as their canonical pair; an unknown kind is kept, as `sel` keeps one.
 pub(super) fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), String> {
     let kind = kind.trim().to_ascii_lowercase();
@@ -220,28 +226,36 @@ struct Tally {
     touched: Vec<u32>,
     /// Per entity, its position in `touched`, kept with `top`.
     at: Vec<u32>,
-    /// Per entity credited, in `touched` order: the `within_type` weights of its `TOP_TITLES` biggest matching
-    /// titles, largest first. Empty unless the order asks for it.
-    top: Vec<[f64; TOP_TITLES]>,
+    /// Per entity credited, in `touched` order: its `TOP_TITLES` biggest matching titles as (`within_type`
+    /// weight, row), largest first; a weight of 0 is an empty place. Empty unless the titles are weighed.
+    top: Vec<Top>,
 }
 
 /// How many of a person's matching titles their prominence counts: their biggest, so a few hits outrank many
 /// titles from the middle of the table (`Order::Prominence`).
 const TOP_TITLES: usize = 5;
+/// How many of those `people.json` names as what a person is known for.
+const KNOWN_FOR: usize = 3;
+
+type Top = [(f64, u32); TOP_TITLES];
 
 impl Tally {
+    /// A person's biggest matching titles, when the titles were weighed.
+    fn top(&self, e: u32) -> Option<&Top> {
+        self.top.get(self.at.get(e as usize).map_or(usize::MAX, |&at| at as usize))
+    }
+
     /// A person's prominence: the sum of their biggest matching titles' weights; 0 when not weighed.
     fn prominence(&self, e: u32) -> f64 {
-        let at = self.at.get(e as usize).map_or(usize::MAX, |&at| at as usize);
-        self.top.get(at).map_or(0.0, |top| top.iter().sum())
+        self.top(e).map_or(0.0, |top| top.iter().map(|t| t.0).sum())
     }
 }
 
-/// `weight` into a person's biggest titles, if it is one of them.
-fn keep_top(top: &mut [f64; TOP_TITLES], weight: f64) {
-    if let Some(at) = top.iter().position(|&w| weight > w) {
+/// A title into a person's biggest, if it is one of them; on a tie the one met first stays ahead.
+fn keep_top(top: &mut Top, weight: f64, row: u32) {
+    if let Some(at) = top.iter().position(|&(w, _)| weight > w) {
         top.copy_within(at..TOP_TITLES - 1, at + 1);
-        top[at] = weight;
+        top[at] = (weight, row);
     }
 }
 
@@ -369,7 +383,7 @@ impl<'a> Context<'a> {
     }
 
     /// Every person credited on the rows of `base`, counting a title for them when their credits on it hold
-    /// every role of `want` and none of `avoid` — and, with `weigh`, adding its weight to their prominence.
+    /// every role of `want` and none of `avoid` — and, with `weigh`, keeping their biggest titles (`top`).
     fn tally(&self, sources: &Sources<'a>, base: &[u64], want: u8, avoid: u8, weigh: bool) -> Tally {
         let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
         let mut tally = Tally {
@@ -410,14 +424,14 @@ impl<'a> Context<'a> {
                 if tally.credits[e] == 0 {
                     if weigh {
                         tally.at[e] = tally.touched.len() as u32;
-                        tally.top.push([0.0; TOP_TITLES]);
+                        tally.top.push([(0.0, 0); TOP_TITLES]);
                     }
                     tally.touched.push(e as u32);
                 }
                 tally.credits[e] += 1;
                 tally.held[e] |= roles;
                 if weigh {
-                    keep_top(&mut tally.top[tally.at[e] as usize], weight);
+                    keep_top(&mut tally.top[tally.at[e] as usize], weight, row as u32);
                 }
             }
         }
@@ -607,17 +621,77 @@ impl<'a> Context<'a> {
         answer
     }
 
+    /// `people/values/<trait>.json`: one entity trait's values, counted as `people/counts.json` counts them —
+    /// the people credited under the selection and the other traits holding each, a one-pick trait (gender)
+    /// without its own pick — but every value rather than the top `TOP_K`, labelled, most people first, then
+    /// by name; with `q`, only those with a name or alias having a word starting `q`. So a value past the top
+    /// (citizenship:Iceland among the films of the 2020s) can be found by name.
+    pub fn people_values(&self, kind: &str, request: &Request) -> (Value, bool) {
+        let people = self.people_of(request, false);
+        let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
+        let i = TRAITS.iter().position(|t| t.name == kind).unwrap_or(0);
+        let (spec, own) = (&TRAITS[i], 1u8 << i);
+        let named: Option<Vec<u32>> =
+            request.q.as_deref().map(|q| self.filter.names(self.indexes).matching(q));
+        let mut counted: HashMap<u32, u32> = HashMap::new();
+        let mut denominator = 0usize;
+        if sources.status == Status::Ready {
+            for &e in &tally.touched {
+                let fails = self.fails(sources, &split.applied, e);
+                let alone =
+                    if spec.mode == Mode::Single && split.selected & own != 0 { fails & !own } else { fails };
+                if alone != 0 {
+                    continue;
+                }
+                denominator += 1;
+                let values = match spec.data {
+                    Trait::Gender => sources.traits.genders(e),
+                    Trait::Citizenship => sources.traits.citizenships(e),
+                    Trait::Occupation => sources.traits.occupations(e),
+                    Trait::Born | Trait::Role => &[],
+                };
+                for &v in values {
+                    if named.as_ref().is_none_or(|named| named.binary_search(&v).is_ok()) {
+                        *counted.entry(v).or_default() += 1;
+                    }
+                }
+            }
+        }
+        // (id, name, people)
+        let mut found: Vec<(String, String, u32)> = counted
+            .into_iter()
+            .map(|(v, n)| (self.qid(v), self.label(v).unwrap_or_default().to_owned(), n))
+            .collect();
+        found.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        let complete = found.len() <= request.limit;
+        let values: Vec<Value> = found
+            .into_iter()
+            .take(request.limit)
+            .map(|(id, name, count)| json!({ "id": id, "name": name, "count": count }))
+            .collect();
+        let mut answer = people.envelope;
+        answer["kind"] = json!(spec.name);
+        answer["mode"] = json!(spec.mode.name());
+        answer["values"] = json!(values);
+        answer["complete"] = json!(complete);
+        answer["denominator"] = json!(denominator);
+        (answer, people.degraded)
+    }
+
     /// `people.json`: the people credited on the matching titles and holding every trait, in the request's
     /// `order` (`ORDERS`); paged as `titles.json` is. Ties fall to the `credits` order — most matching titles,
     /// then most titles in the whole corpus — then the Q-id; `name` ties go straight to the Q-id. `order` in
     /// the answer names the order used: `prominence` needs a popularity order, and without one the answer is
-    /// in `credits` and names the order it could not use in `orderUnavailable`.
+    /// in `credits` and names the order it could not use in `orderUnavailable`. With a popularity order each
+    /// person carries `knownFor`, their biggest matching titles; without one it is left out rather than chosen
+    /// by TMDB id.
     pub fn people(&self, request: &Request) -> (Value, bool) {
         let order = match request.order {
             Order::Prominence if !self.popular() => Order::Credits,
             order => order,
         };
-        let people = self.people_of(request, order == Order::Prominence);
+        // Weighed whenever there is a popularity order, for `knownFor` whatever the order.
+        let people = self.people_of(request, self.popular());
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let corpus = ENTITY_KINDS
             .iter()
@@ -673,7 +747,14 @@ impl<'a> Context<'a> {
         let page: Vec<Value> = ranked
             .iter()
             .skip(request.skip)
-            .map(|r| self.person_json(sources, r.e, r.credits, tally.held[r.e as usize], &mut labels))
+            .map(|r| {
+                let mut person =
+                    self.person_json(sources, r.e, r.credits, tally.held[r.e as usize], &mut labels);
+                if let Some(top) = tally.top(r.e) {
+                    person["knownFor"] = self.known_for(top);
+                }
+                person
+            })
             .collect();
         let mut answer = people.envelope;
         let mut degraded = people.degraded;
@@ -688,6 +769,24 @@ impl<'a> Context<'a> {
         answer["total"] = json!(total);
         answer["labels"] = Value::Object(labels);
         (answer, degraded)
+    }
+
+    /// What a person is known for: their `KNOWN_FOR` biggest matching titles, biggest first, as their cards
+    /// name them — every matching title has a card, so none is named by TMDB.
+    fn known_for(&self, top: &Top) -> Value {
+        let cards = self.indexes.cards.as_ref();
+        let titles: Vec<Value> = top
+            .iter()
+            .filter(|&&(weight, _)| weight > 0.0)
+            .take(KNOWN_FOR)
+            .filter_map(|&(_, row)| {
+                let key = self.filter.keys[row as usize];
+                let card = cards?.get(&key)?;
+                let kind = if key.0 == den_index::MediaType::Tv { "series" } else { "movie" };
+                Some(json!({ "type": kind, "id": key.1, "title": card.title, "year": card.year }))
+            })
+            .collect();
+        json!(titles)
     }
 
     /// One person as `people.json` lists them; the trait ids they carry are labelled in `labels`.
@@ -884,7 +983,7 @@ mod tests {
             label(FEMALE, "female"),
             label(MALE, "male"),
             label(NON_BINARY, "non-binary"),
-            label(SWEDEN, "Sweden"),
+            Entity { qid: SWEDEN, name: "Sweden", aliases: vec!["Kingdom of Sweden"], ..Entity::default() },
             label(US, "United States"),
             label(ACTOR, "actor"),
             label(DIRECTOR_JOB, "film director"),
@@ -1169,6 +1268,87 @@ mod tests {
         assert_eq!(order_of(&named), ["Amy", "Ängel", "Mo", "Zed"], "the other orders need no popularity");
     }
 
+    /// `people/values/<trait>.json`: every value of an entity trait counted under the selection and the other
+    /// traits, found by a word of its name or an alias; a one-pick trait counted without its own pick.
+    #[test]
+    fn trait_values_are_counted_and_found_by_name() {
+        let indexes = people_store("trait-values");
+        let values = |kind: &'static str, query: &str| -> (Vec<(String, u64)>, Value) {
+            let scope: Scope = Movie.into();
+            let request = Request::parse(Route::PeopleValues(kind), scope, query).unwrap();
+            let answer = Context::new(&indexes, scope, None).people_values(kind, &request).0;
+            let found = answer["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| (v["id"].as_str().unwrap().to_owned(), v["count"].as_u64().unwrap()))
+                .collect();
+            (found, answer)
+        };
+        let pairs =
+            |p: &[(&str, u64)]| -> Vec<(String, u64)> { p.iter().map(|&(i, n)| (i.to_owned(), n)).collect() };
+
+        let (all, answer) = values("citizenship", "sel=decade:2020");
+        assert_eq!(all, pairs(&[("Q300", 2), ("Q301", 1)]), "Ann and Bob are Swedish, Bob American too");
+        assert_eq!((&answer["complete"], &answer["denominator"]), (&json!(true), &json!(5)));
+        assert_eq!(answer["values"][0]["name"], "Sweden");
+        assert_eq!(
+            values("citizenship", "sel=decade:2020&q=stat").0,
+            pairs(&[("Q301", 1)]),
+            "a word of the name"
+        );
+        assert_eq!(values("citizenship", "sel=decade:2020&q=kingdom").0, pairs(&[("Q300", 2)]), "an alias");
+        assert_eq!(values("citizenship", "sel=decade:2020&q=actor").0, pairs(&[]), "an occupation's name");
+        let (top, answer) = values("citizenship", "sel=decade:2020&limit=1");
+        assert_eq!((top, &answer["complete"]), (pairs(&[("Q300", 2)]), &json!(false)));
+
+        // Gender is one pick: counted without its own, as people/counts.json counts it.
+        let (genders, _) = values("gender", "sel=decade:2020&traits=gender:Q201");
+        assert_eq!(genders, pairs(&[("Q201", 2), ("Q200", 1), ("Q202", 1)]));
+        // Occupation holds several: counted under the picks, the gender among them.
+        let (jobs, _) = values("occupation", "sel=decade:2020&traits=gender:Q201,occupation:Q400");
+        assert_eq!(jobs, pairs(&[("Q400", 2), ("Q401", 1)]), "Bob and Eve act, Bob directs");
+        let (crew, _) = values("occupation", "sel=decade:2020&traits=-role:cast&q=screen");
+        assert_eq!(crew, pairs(&[("Q402", 1)]), "Cid writes film 1 and is not in its cast");
+    }
+
+    /// `knownFor`: a person's three biggest matching titles by their standing in their own type — a series at
+    /// the top of the series beside a film at the top of the films — counting only the credits the role asks
+    /// for, and left out when there is no popularity order to tell the biggest.
+    #[test]
+    fn known_for_is_the_biggest_matching_titles() {
+        let indexes = people_store("known-for");
+        let known = |answer: &Value, name: &str| -> Vec<(String, u64)> {
+            let person = answer["people"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap();
+            person["knownFor"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{person}"))
+                .iter()
+                .map(|t| (t["type"].as_str().unwrap().to_owned(), t["id"].as_u64().unwrap()))
+                .collect()
+        };
+        let pair = |kind: &str, id: u64| (kind.to_owned(), id);
+        let all = ask(&indexes, Scope::All, Route::People, "order=name");
+        assert_eq!(
+            known(&all, "Bob"),
+            [pair("movie", 1), pair("series", 4), pair("movie", 2)],
+            "film 1 tops the films and series 4 the series; film 2 is the films' second"
+        );
+        let bob = all["people"].as_array().unwrap().iter().find(|p| p["name"] == "Bob").unwrap();
+        assert_eq!(bob["knownFor"][0], json!({ "type": "movie", "id": 1, "title": "A title", "year": 2020 }));
+        let directing = ask(&indexes, Scope::All, Route::People, "traits=role:director");
+        assert_eq!(known(&directing, "Bob"), [pair("movie", 2)], "he directs film 2 alone");
+        let nineties = ask(&indexes, Movie, Route::People, "sel=decade:1990");
+        assert_eq!(known(&nineties, "Ann"), [pair("movie", 3)], "the selection's titles alone");
+
+        let unpopular = orders_store("known-for-unpopular", false);
+        let answer = ask(&unpopular, Movie, Route::People, "");
+        assert!(answer["people"][0].get("knownFor").is_none(), "no order to tell the biggest by: {answer}");
+        let popular = orders_store("known-for-popular", true);
+        let answer = ask(&popular, Movie, Route::People, "order=credits");
+        assert_eq!(known(&answer, "Amy"), [pair("movie", 6), pair("movie", 7), pair("movie", 8)]);
+    }
+
     /// A store with no trait sections answers the credits and roles, and names the person traits it cannot
     /// apply — a property of the dataset version, so the answer is not degraded.
     #[test]
@@ -1231,7 +1411,24 @@ mod tests {
                     .map(|p| format!("{} ({})", p["name"].as_str().unwrap_or("?"), p["credits"]))
                     .collect();
                 eprintln!("{query} order={order} → {} in {took:?}: {}", answer["order"], first.join(" | "));
+                eprintln!("  first knownFor: {}", answer["people"][0]["knownFor"]);
             }
+        }
+        for (kind, query) in [
+            ("citizenship", "sel=decade:2020&q=iceland"),
+            ("citizenship", "sel=decade:2020&traits=role:director"),
+            ("occupation", "traits=gender:Q6581072&q=compos"),
+        ] {
+            let scope: Scope = Movie.into();
+            let request = Request::parse(Route::PeopleValues(kind), scope, query).unwrap();
+            let started = std::time::Instant::now();
+            let answer = Context::new(&indexes, scope, None).people_values(kind, &request).0;
+            eprintln!(
+                "people/values/{kind} {query} in {:?}: {} (complete {})",
+                started.elapsed(),
+                answer["values"],
+                answer["complete"]
+            );
         }
     }
 
