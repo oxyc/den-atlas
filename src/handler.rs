@@ -249,12 +249,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return serve_json(
             &method,
             &headers,
-            manifest_json(
-                &config,
-                state.titles.is_some(),
-                state.motn.enabled(),
-                state.index.as_ref().is_some_and(|index| index.uses_imdb()),
-            ),
+            manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
             "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
             None,
         )
@@ -1456,9 +1451,11 @@ async fn filter_answer(
     rest: &str,
 ) -> Result<(String, &'static str, Option<String>, bool), String> {
     let export = state.titles.as_ref().and_then(|t| t.index());
-    let location = (!request.canonical)
-        .then(|| format!("{}{}", rest.rsplit('/').next().unwrap_or(rest), request.query()));
-    let canonical = request.canonical;
+    // The path is part of the key too: `counts` without `.json` answers, but as a second spelling.
+    let segment = rest.rsplit('/').next().unwrap_or(rest);
+    let canonical = request.canonical && segment.ends_with(".json");
+    let location = (!canonical)
+        .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
     let (body, degraded) = tokio::task::spawn_blocking(move || {
         let context = crate::filter::Context::new(&indexes, media_type, export);
         let (body, degraded) = match route {
@@ -2765,20 +2762,31 @@ mod tests {
             assert_eq!(resp.status(), 200, "{other}");
             assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, max-age=60", "{other}");
             let location = resp.headers()[header::CONTENT_LOCATION].to_str().unwrap().to_owned();
-            assert!(location.ends_with("?sel=country:KR,subgenre:Heist"), "{other}: {location}");
+            assert_eq!(location, "counts.json?sel=country:KR,subgenre:Heist", "{other}");
             assert_eq!(body_of(resp).await, korean_body, "{other}");
         }
         let emptied = get(&state, "/index/filter/movie/counts.json?sel=").await;
         assert_eq!(emptied.headers()[header::CONTENT_LOCATION], "counts.json");
+        // The path is part of the key: without `.json` even a canonical query is a second spelling.
+        let bare = get(&state, "/index/filter/movie/counts?sel=country:KR,subgenre:Heist").await;
+        assert_eq!(bare.headers()[header::CACHE_CONTROL], "private, max-age=60");
+        assert_eq!(bare.headers()[header::CONTENT_LOCATION], "counts.json?sel=country:KR,subgenre:Heist");
 
-        // A kind this atlas does not know is answered around, and said so.
+        // A kind this atlas does not know is answered around, and said so; so is a value its kind lacks.
         let unknown = json(body_of(get(&state, "/index/filter/movie/counts.json?sel=nope:1").await).await);
         assert_eq!((&unknown["total"], &unknown["ignored"]), (&3.into(), &serde_json::json!(["nope"])));
+        let typo = json(
+            body_of(get(&state, "/index/filter/movie/counts.json?sel=mood:tense,tone:blaek").await).await,
+        );
+        assert_eq!(typo["total"], 0);
+        assert_eq!(typo["unknownValues"], serde_json::json!(["mood:tense", "tone:blaek"]));
 
         for path in [
             "/index/filter/movie/counts.json?sel=genre:action",
             "/index/filter/movie/counts.json?sel=person:bob",
             "/index/filter/movie/counts.json?sel=genre",
+            "/index/filter/movie/counts.json?sel=:1",
+            "/index/filter/movie/counts.json?sel=-:x",
         ] {
             let resp = get(&state, path).await;
             assert_eq!(resp.status(), 400, "{path}");
@@ -2894,6 +2902,11 @@ mod tests {
             json(body_of(get(&state, "/index/filter/movie/values/decade.json?sel=country:KR").await).await);
         assert_eq!(korean["values"].as_array().unwrap().len(), 2, "{korean}");
         assert_eq!(get(&state, "/index/filter/movie/values/person.json?q=b").await.status(), 400);
+        // A page of people without a prefix: the top of the counts, the rest counted but not named.
+        let two = json(body_of(get(&state, "/index/filter/movie/values/person.json?limit=2").await).await);
+        assert_eq!((two["values"].as_array().unwrap().len(), &two["complete"]), (2, &false.into()));
+        let all = json(body_of(get(&state, "/index/filter/movie/values/person.json").await).await);
+        assert_eq!(all["values"].as_array().unwrap()[..2], two["values"].as_array().unwrap()[..], "a prefix");
     }
 
     /// A household's taste REORDERS a row and does nothing else: the same total, the same titles, a

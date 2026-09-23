@@ -443,11 +443,6 @@ impl IndexQueries {
         self.facts_unusable.load(Ordering::Relaxed)
     }
 
-    /// Whether answers draw on IMDb's datasets (ratings or characters), which their terms ask to be credited.
-    pub fn uses_imdb(&self) -> bool {
-        self.ratings.is_some() || self.characters.is_some()
-    }
-
     /// Whether the last load ended with no facet rows: every browse row is then empty.
     pub fn rows_unusable(&self) -> bool {
         self.rows_unusable.load(Ordering::Relaxed)

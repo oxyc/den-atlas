@@ -23,8 +23,15 @@
 //! selection is an AND of bitsets and a count a popcount. Entity kinds (people, studios, subjects, places)
 //! have far too many values for that: they keep posting lists (entity → rows) for selecting, and count by
 //! walking the matched rows' own entity lists — read in place from the mapped store — then take the top
-//! `TOP_K`. The empty selection's counts are worked out once. What depends on IMDb's daily ratings (the
-//! `rating` kind and the popularity order `titles.json` walks) is rebuilt when a new ratings join lands.
+//! `TOP_K`. The empty selection's counts are worked out once. What depends on the rating provider (the
+//! `rating` kind and the popularity order `titles.json` walks) is rebuilt when it swaps in new votes.
+//!
+//! # The providers are a seam
+//!
+//! Votes and ratings are read through `Indexes::ratings` (a `ratings::Ratings`, whose `RatingsIndex` answers
+//! `votes(row)` and `of(row)`), and character names through `Indexes::characters`. Whatever fills those — the
+//! source is moving from IMDb's dumps to TMDB — this module reads nothing else, so the swap does not touch it.
+//! Either signal is only a filter and a sort here, never learned from or published.
 //!
 //! # The URL is the cache key
 //!
@@ -60,9 +67,9 @@ pub const CHARACTER_LIMIT: usize = 5;
 /// The shortest prefix a values search takes, and a character search.
 pub const MIN_PREFIX: usize = 2;
 pub const CHARACTER_MIN_PREFIX: usize = 3;
-/// A rating counts only on this many IMDb votes.
+/// A rating counts only on this many votes.
 pub const MIN_VOTES: u32 = 10;
-/// The `rating` kind's values: IMDb's average at or above each.
+/// The `rating` kind's values: the provider's average, out of 10, at or above each.
 const RATING_THRESHOLDS: [u32; 3] = [6, 7, 8];
 /// The `runtime` kind's buckets, in minutes: [from, to). A series' runtime is per episode.
 const RUNTIME_BUCKETS: [(&str, u32, u32); 4] =
@@ -127,11 +134,12 @@ impl Id {
 enum Data {
     /// A bitset per value, built at load.
     Bits,
-    /// IMDb's rating thresholds, rebuilt with each ratings join.
+    /// The rating provider's thresholds, rebuilt when it swaps in new votes.
     Rating,
     /// Posting lists into `ENTITY_KINDS[i]`.
     Entity(usize),
-    /// IMDb's character names (`characters.rs`), rebuilt with each principals join. Search-only.
+    /// The character provider's names (`characters.rs`), rebuilt with each build of its links. Search-only,
+    /// and not offered until the provider has built them.
     Character,
     /// More Like This for a title of the route's type: the set `/index/similar` answers.
     Like,
@@ -286,7 +294,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
 /// `audience` at 0.5, between made-for-children's 4,965 titles at 0.4 and 3,303 at 0.6. `critique` at 0.6: at
 /// 0.4 "the self" claims 24,513 titles, half the corpus; at 0.6, 9,083 and the rest 1–7k. `warning` at 0.5
 /// finds nothing on that store — its highest score on any title is 0.28 (graphic violence 0.17) — so it is
-/// reported unavailable there rather than answering every exclusion with "all clean". Those were title-only
+/// not offered there rather than answering every exclusion with "all clean". Those were title-only
 /// scores; a store with the article-based ones reaches the floor and offers `warning` on load, with nothing to
 /// switch — availability is read off the loaded table, never declared.
 const DENSE_KINDS: [(&str, &str, &str, u8, &str); 4] = [
@@ -322,7 +330,7 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
             Mode::Single,
             Id::Integer,
             Rating,
-            "IMDb's average at or above 6, 7 or 8, on 10+ votes",
+            "the rating provider's average at or above 6, 7 or 8 out of 10, on 10+ votes",
         ),
     ];
     for (name, _, _, _, about) in DENSE_KINDS {
@@ -370,6 +378,9 @@ impl Item {
 fn normalise(kind: &str, id: &str) -> Result<(String, String), String> {
     let kind = kind.trim().to_ascii_lowercase();
     let id = id.trim();
+    if kind.is_empty() {
+        return Err(format!(":{id}: an empty kind"));
+    }
     if id.is_empty() {
         return Err(format!("{kind}: an empty id"));
     }
@@ -588,7 +599,7 @@ impl EntityKind {
     }
 }
 
-/// What depends on IMDb's daily ratings join and on TMDB's daily export: rebuilt when either swaps.
+/// What depends on the rating provider and on TMDB's daily export: rebuilt when either swaps.
 struct Derived {
     ratings: Option<Arc<RatingsIndex>>,
     export: Option<Arc<TitleIndex>>,
@@ -607,14 +618,13 @@ pub struct FilterIndex {
     /// Each type's rows with a card, as counts, totals and the grid all count them: [movie, series].
     types: [Bits; 2],
     bits: BTreeMap<&'static str, Valued>,
-    /// Per `ENTITY_KINDS` row; `None` when its sections did not read.
+    /// Per `ENTITY_KINDS` row; `None` when the store does not carry its sections, and then not offered.
     entities: Vec<Option<EntityKind>>,
-    /// Kinds this store should answer and whose source did not read.
+    /// Kinds this atlas should answer and cannot, through a failure at load: the facts or the facet rows did
+    /// not read. A kind this dataset version cannot answer — a section the store does not carry, a score
+    /// table no title reaches the floor of — is not here: it is not offered, as a kind the store has no data
+    /// for, and it turns up by itself with the store that has.
     unavailable: Vec<&'static str>,
-    /// Those of `unavailable` that are a property of this dataset version — a section the store does not
-    /// carry, a score table no title reaches the floor of — rather than a failure at runtime. Reported, but
-    /// no reason to cache an answer briefly: it will not change until the next dataset.
-    stable: Vec<&'static str>,
     derived: Mutex<Option<Arc<Derived>>>,
     names: OnceLock<NameIndex>,
     build_bytes: usize,
@@ -678,7 +688,6 @@ impl FilterIndex {
 
         let mut bits: BTreeMap<&'static str, Valued> = BTreeMap::new();
         let mut unavailable: Vec<&'static str> = Vec::new();
-        let mut stable: Vec<&'static str> = Vec::new();
         let add =
             |bits: &mut BTreeMap<&'static str, Valued>, kind: &'static str, value: String, row: usize| {
                 let valued =
@@ -709,9 +718,6 @@ impl FilterIndex {
         let runtime = view.per_row::<u16>("runtime").ok();
         if runtime.is_some() {
             open(&mut bits, "runtime");
-        } else {
-            unavailable.push("runtime");
-            stable.push("runtime");
         }
 
         let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
@@ -784,16 +790,10 @@ impl FilterIndex {
                 let strings = strings.as_ref()?;
                 (cells.len() == rows * names.len()).then_some((cells, names, strings))
             })();
-            let Some((cells, names, strings)) = read else {
-                unavailable.push(kind);
-                stable.push(kind);
-                continue;
-            };
-            // A vocabulary no title reaches the floor of can answer nothing, and an exclusion over it would
-            // call every title clean.
+            // A table the store does not carry, or one no title reaches the floor of, is not offered: it can
+            // answer nothing, and an exclusion over it would call every title clean.
+            let Some((cells, names, strings)) = read else { continue };
             if !names.is_empty() && !cells.iter().any(|&score| score >= floor) {
-                unavailable.push(kind);
-                stable.push(kind);
                 continue;
             }
             open(&mut bits, kind);
@@ -865,13 +865,8 @@ impl FilterIndex {
                     None => break,
                 }
             }
-            if postings.len() == entity.sections.len() {
-                entities.push(Some(EntityKind { postings, known }));
-            } else {
-                unavailable.push(entity.name);
-                stable.push(entity.name);
-                entities.push(None);
-            }
+            entities
+                .push((postings.len() == entity.sections.len()).then_some(EntityKind { postings, known }));
         }
 
         let bitset = |b: &Bits| b.len() * 8;
@@ -891,7 +886,6 @@ impl FilterIndex {
             bits,
             entities,
             unavailable,
-            stable,
             derived: Mutex::new(None),
             names: OnceLock::new(),
             build_bytes,
@@ -908,7 +902,7 @@ impl FilterIndex {
         self.bits.values().map(|v| v.values.len()).sum()
     }
 
-    /// The IMDb- and export-dependent part, rebuilt when either has swapped since it was last built.
+    /// The provider- and export-dependent part, rebuilt when either has swapped since it was last built.
     fn derived(&self, indexes: &Indexes, export: Option<Arc<TitleIndex>>) -> Arc<Derived> {
         let ratings = indexes.ratings.as_ref().and_then(|r| r.index());
         let same = |a: &Option<Arc<RatingsIndex>>, b: &Option<Arc<RatingsIndex>>| match (a, b) {
@@ -1085,7 +1079,7 @@ enum Status {
     NotOffered,
 }
 
-/// One request's view of the index: the live IMDb- and export-dependent parts, and the store.
+/// One request's view of the index: the live provider- and export-dependent parts, and the store.
 pub struct Context<'a> {
     filter: &'a FilterIndex,
     indexes: &'a Indexes,
@@ -1124,10 +1118,11 @@ impl<'a> Context<'a> {
                 Status::NotOffered
             }
             Data::Entity(i) if self.filter.entities[i].is_some() => Status::Ready,
-            Data::Entity(_) => Status::Unavailable,
-            Data::Character if self.indexes.characters.is_none() => Status::NotOffered,
+            Data::Entity(_) => Status::NotOffered,
+            // Character links come from whichever provider feeds `Characters`, and until it has, the kind
+            // is simply absent: it is search-only, so nothing a client lists goes missing.
             Data::Character if self.characters.is_some() => Status::Ready,
-            Data::Character => Status::Unavailable,
+            Data::Character => Status::NotOffered,
             Data::Like => Status::Ready,
         }
     }
@@ -1414,16 +1409,38 @@ impl<'a> Context<'a> {
         (Value::Object(kinds), total)
     }
 
-    fn envelope(&self, answer: &mut Value, ignored: Vec<String>) -> bool {
+    /// Whether a value is one its kind holds at all, so a typo (`tone:blaek`, `mood:tense` for `Tense`) is told
+    /// apart from a real zero.
+    fn known_value(&self, spec: &Spec, id: &str) -> bool {
+        match spec.data {
+            Data::Bits => self.filter.bits.get(spec.name).is_some_and(|v| v.values.contains_key(id)),
+            Data::Rating => self.derived.rating.as_ref().is_some_and(|v| v.values.contains_key(id)),
+            Data::Entity(_) => self.entity_of(id).is_some(),
+            Data::Character => {
+                self.characters.as_ref().is_some_and(|c| !c.named().rows(&id.replace('-', " ")).is_empty())
+            }
+            Data::Like => id.parse::<u32>().is_ok_and(|tmdb_id| {
+                let media = u8::from(self.media_type == MediaType::Tv);
+                self.view.row_of(media, tmdb_id).ok().flatten().is_some()
+            }),
+        }
+    }
+
+    /// What every answer carries: the kinds it did not apply, the values it did not know, and the kinds this
+    /// atlas should answer and cannot. The flag says the answer is degraded: a failure at runtime (the facts
+    /// or facet rows did not load, a ratings join has not landed), so it should be cached briefly.
+    fn envelope(&self, answer: &mut Value, applied: &[(&'static Spec, &Item)], ignored: Vec<String>) -> bool {
         answer["ignored"] = json!(ignored);
+        let unknown: Vec<String> =
+            applied.iter().filter(|(s, i)| !self.known_value(s, &i.id)).map(|(_, i)| i.spelled()).collect();
+        if !unknown.is_empty() {
+            answer["unknownValues"] = json!(unknown);
+        }
         let unavailable = self.unavailable();
         if !unavailable.is_empty() {
             answer["kindsUnavailable"] = json!(unavailable);
         }
-        // Degraded — a short cache and the header — only for a failure at runtime (the facts or facet rows
-        // did not load, a ratings or principals join has not landed). A kind this dataset version cannot
-        // answer is reported, but answers about it will not change until the next dataset does.
-        unavailable.iter().any(|kind| !self.filter.stable.contains(kind))
+        !unavailable.is_empty()
     }
 
     /// `counts.json`. The flag says a kind this atlas should answer is unavailable.
@@ -1431,7 +1448,7 @@ impl<'a> Context<'a> {
         let (applied, ignored) = self.split(&request.items);
         let (kinds, total) = self.kinds(&applied);
         let mut answer = json!({ "total": total, "kinds": kinds, "coverage": self.coverage(&applied) });
-        let degraded = self.envelope(&mut answer, ignored);
+        let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
 
@@ -1474,7 +1491,7 @@ impl<'a> Context<'a> {
         let mut answer = json!({
             "titles": titles, "total": total, "order": order_id, "coverage": self.coverage(&applied),
         });
-        let degraded = self.envelope(&mut answer, ignored);
+        let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
 
@@ -1497,6 +1514,8 @@ impl<'a> Context<'a> {
         };
         // (id, name, count, tiebreak, tmdb)
         let mut found: Vec<(String, String, usize, usize, Option<u32>)> = Vec::new();
+        // Values counted but left unnamed past the page, so `complete` still counts them.
+        let mut beyond = 0;
         if self.status(spec) == Status::Ready {
             match spec.data {
                 Data::Bits | Data::Rating => {
@@ -1537,9 +1556,19 @@ impl<'a> Context<'a> {
                                 .map(|(e, n)| (e, n as usize))
                                 .collect(),
                         };
-                        for (e, n) in candidates {
+                        // A person kind can count hundreds of thousands of values, so only those that can
+                        // reach the page are named: the top `limit` by count and titles, and any tied with
+                        // the last of them (the name decides among those, below).
+                        let mut ranked: Vec<(u32, usize, usize)> =
+                            candidates.into_iter().map(|(e, n)| (e, n, kind.titles(e))).collect();
+                        beyond += ranked.len().saturating_sub(request.limit);
+                        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+                        if let Some(&(_, n, titles)) = ranked.get(request.limit.saturating_sub(1)) {
+                            ranked.retain(|&(_, rn, rt)| (rn, rt) >= (n, titles));
+                        }
+                        for (e, n, titles) in ranked {
                             let name = self.label(e).unwrap_or_default().to_owned();
-                            found.push((self.qid(e), name, n, kind.titles(e), self.tmdb(e)));
+                            found.push((self.qid(e), name, n, titles, self.tmdb(e)));
                         }
                     }
                 }
@@ -1557,7 +1586,7 @@ impl<'a> Context<'a> {
             }
         }
         found.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
-        let complete = found.len() <= request.limit;
+        let complete = found.len() <= request.limit && beyond == 0;
         let values: Vec<Value> = found
             .into_iter()
             .take(request.limit)
@@ -1571,7 +1600,7 @@ impl<'a> Context<'a> {
             .collect();
         let mut answer =
             json!({ "kind": spec.name, "mode": spec.mode.name(), "values": values, "complete": complete });
-        let degraded = self.envelope(&mut answer, ignored);
+        let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
 }
@@ -1623,7 +1652,11 @@ pub fn schema() -> Value {
         "runtimeBuckets": RUNTIME_BUCKETS.iter().map(|b| b.0).collect::<Vec<_>>(),
         "ratingThresholds": RATING_THRESHOLDS,
         "ratingMinVotes": MIN_VOTES,
-        "exclude": "-<kind>:<id>: the titles known for the kind and not carrying the value",
+        "exclude": "-<kind>:<id>: the titles known for the kind and not carrying the value. Stricter than a \
+                    search's negation (/index/query.json, \"not british\"), which drops the titles on record as \
+                    carrying the value and keeps the unknown ones: the two can answer different sets",
+        "unknownValues": "selected items whose value the kind does not hold (a typo, a label's wrong case): \
+                          they match nothing, and are named so a client can tell them from a real zero",
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
                       excluded, then id as strings, each once, joined by ','; ids encoded as encodeURIComponent \
                       does, ':' ',' '-' literal. Then skip and limit (titles) or q and limit (values), each only \
@@ -1799,8 +1832,8 @@ mod tests {
 
     /// Whether `warning` answers is read off the loaded store, not declared: a store whose `depicts` scores
     /// reach the floor offers it (the route fixture's movie 1 scores 0.85), and one whose scores all stay under
-    /// it — as the title-only scores of store 5b1c3213b6a1 did — reports it unavailable, without calling the
-    /// answer degraded: that is the dataset version, not a failure, and it lasts until the next one.
+    /// it — as the title-only scores of store 5b1c3213b6a1 did — does not offer it at all: not listed, not
+    /// unavailable, the answer not degraded. That is the dataset version, not a failure.
     #[test]
     fn warning_is_offered_exactly_when_the_store_s_depicts_reach_the_floor() {
         let reaching = fixture("warning-reaching");
@@ -1831,9 +1864,10 @@ mod tests {
         let ds = crate::dataset::Dataset::load(&dir).expect("the low-scoring store loads");
         let low = crate::queries::load_for_tools(&ds).expect("its indexes load");
         let context = Context::new(&low, Movie, None);
-        assert_eq!(context.status(spec("warning").unwrap()), Status::Unavailable);
+        assert_eq!(context.status(spec("warning").unwrap()), Status::NotOffered);
         let (answer, degraded) = context.counts(&request(Route::Counts, "sel=-warning:graphic_violence"));
-        assert_eq!(answer["kindsUnavailable"], json!(["warning"]));
+        assert!(answer.get("kindsUnavailable").is_none(), "{answer}");
+        assert!(answer["kinds"].get("warning").is_none(), "nothing to offer");
         assert_eq!(answer["ignored"], json!(["warning"]), "not answered with every title clean");
         assert!(!degraded, "a property of the dataset, not an outage");
     }
@@ -1857,12 +1891,12 @@ mod tests {
         let tsv = "tconst\taverageRating\tnumVotes\ntt0000001\t8.4\t9000\n";
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut gz, tsv.as_bytes()).unwrap();
-        ratings.swap(crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).unwrap());
+        ratings.set(Some(crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).unwrap()));
         let after = counts(&indexes, Movie, "sel=rating:8");
         assert!(after.get("kindsUnavailable").is_none(), "{after}");
         assert_eq!(after["total"], 1);
         let reordered = Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "")).0;
-        assert_eq!(ids(&reordered), vec![1, 2, 3], "IMDb's 9,000 votes");
+        assert_eq!(ids(&reordered), vec![1, 2, 3], "the provider's 9,000 votes");
         assert_ne!(reordered["order"], order["order"], "a new order says so");
     }
 
@@ -2028,6 +2062,11 @@ mod tests {
                 &format!("{query}{}limit=40", if query.is_empty() { "" } else { "&" }),
             );
             time(&format!("titles {query:?} limit=40"), &|| context.titles(&parsed).0.to_string());
+        }
+        for (kind, query) in [("person", ""), ("person", "sel=-genre:99999"), ("cast", "sel=genre:18")] {
+            let spec = spec(kind).unwrap();
+            let parsed = request(Route::Values(spec), query);
+            time(&format!("values/{kind} {query:?}"), &|| context.values(spec, &parsed).0.to_string());
         }
         for (kind, q) in [
             ("person", "nolan"),

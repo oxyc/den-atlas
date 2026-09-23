@@ -68,13 +68,6 @@ const MOVIE_OF_THE_NIGHT: Attribution = Attribution {
     link: "Streaming Availability API by Movie of the Night",
     url: "https://www.movieofthenight.com/about/api",
 };
-/// IMDb's own wording for its non-commercial datasets (help.imdb.com, "Can I use IMDb data in my software?"):
-/// the ratings that order rows and the character names titles are filtered by.
-const IMDB: Attribution = Attribution {
-    text: "Information courtesy of IMDb (https://www.imdb.com). Used with permission.",
-    link: "IMDb",
-    url: "https://www.imdb.com",
-};
 const JUSTWATCH: Attribution = Attribution {
     text: "Streaming availability by JustWatch.",
     link: "JustWatch",
@@ -101,8 +94,7 @@ struct Manifest {
 
 /// `title_search` adds the fuzzy title-search catalogs (one per type, `search` required, so a client that
 /// browses catalogs as rows skips them). `soon` adds each service's leaving and coming rows (Movie of the Night on).
-/// `imdb` says answers draw on IMDb's datasets, which credits them.
-pub fn manifest_json(config: &Config, title_search: bool, soon: bool, imdb: bool) -> String {
+pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String {
     // Region `auto` → each catalog accepts a `country` extra the app forwards; a fixed country needs none.
     let auto = config.region == Region::Auto;
     let mut catalogs: Vec<Catalog> = catalog::catalog_entries(&config.providers, soon)
@@ -141,9 +133,6 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool, imdb: bool
     // The dataset is always derived from Wikipedia; the streaming rows credit only the sources this operator has on —
     // Movie of the Night's lists with its key, JustWatch's catalogs with any provider configured.
     let mut den_attribution = vec![WIKIPEDIA];
-    if imdb {
-        den_attribution.push(IMDB);
-    }
     if soon {
         den_attribution.push(MOVIE_OF_THE_NIGHT);
     }
@@ -174,7 +163,7 @@ mod tests {
 
     #[test]
     fn catalogs_publish_the_tmdb_provider_id() {
-        let json = manifest_json(&Config::default_config(), false, false, false);
+        let json = manifest_json(&Config::default_config(), false, false);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let cats = v["catalogs"].as_array().unwrap();
         let by = |id: &str| cats.iter().find(|c| c["id"] == id).unwrap_or_else(|| panic!("missing {id}"));
@@ -200,21 +189,18 @@ mod tests {
                 .map(|a| a["text"].as_str().unwrap().to_owned())
                 .collect()
         };
-        let with_motn = texts(manifest_json(&Config::default_config(), false, true, false));
+        let with_motn = texts(manifest_json(&Config::default_config(), false, true));
         assert_eq!(with_motn.len(), 3);
         assert!(with_motn[0].contains("Wikipedia"));
         assert!(with_motn[1].contains("Movie of the Night"));
         assert!(with_motn[2].contains("JustWatch"));
-        let without = texts(manifest_json(&Config::default_config(), false, false, false));
+        let without = texts(manifest_json(&Config::default_config(), false, false));
         assert!(!without.iter().any(|t| t.contains("Movie of the Night")), "{without:?}");
         let none = Config { providers: Vec::new(), ..Config::default_config() };
-        assert_eq!(texts(manifest_json(&none, false, false, false)).len(), 1, "Wikipedia alone");
-        // IMDb's datasets, when ratings or characters are joined, in IMDb's own words.
-        let imdb = texts(manifest_json(&none, false, false, true));
-        assert_eq!(imdb[1], "Information courtesy of IMDb (https://www.imdb.com). Used with permission.");
+        assert_eq!(texts(manifest_json(&none, false, false)).len(), 1, "Wikipedia alone");
         // Each link is a part of its statement, so a client can find it there.
         let v: serde_json::Value =
-            serde_json::from_str(&manifest_json(&Config::default_config(), false, true, false)).unwrap();
+            serde_json::from_str(&manifest_json(&Config::default_config(), false, true)).unwrap();
         for a in v["denAttribution"].as_array().unwrap() {
             assert!(a["text"].as_str().unwrap().contains(a["link"].as_str().unwrap()), "{a}");
         }
@@ -224,10 +210,10 @@ mod tests {
     /// client that shows catalogs as rows (the tvOS app's Browse) never tries to render it as one.
     #[test]
     fn title_search_catalogs_are_declared_only_when_on() {
-        let off = manifest_json(&Config::default_config(), false, false, false);
+        let off = manifest_json(&Config::default_config(), false, false);
         assert!(!off.contains(titles::CATALOG_ID));
         let on: serde_json::Value =
-            serde_json::from_str(&manifest_json(&Config::default_config(), true, false, false)).unwrap();
+            serde_json::from_str(&manifest_json(&Config::default_config(), true, false)).unwrap();
         let search: Vec<&serde_json::Value> =
             on["catalogs"].as_array().unwrap().iter().filter(|c| c["id"] == titles::CATALOG_ID).collect();
         assert_eq!(search.len(), 2);
