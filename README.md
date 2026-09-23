@@ -192,8 +192,10 @@ pins url → canonical url pairs a client can test against.
   `crates/den-index/src/regions.rs`, published as the schema's `regions`), `decade` (first year; a series' first air date), `mood`,
   `subgenre`, `primary` (the labels' primary genre), `animated` (`yes`/`no`), `runtime` (`under-90`, `90-120`,
   `120-150`, `over-150`; a series per episode), `source` (adapted from), `rating` (the rating provider's average ≥ 6,
-  7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the twelve
-  plot axes (`structure` resolves by value; the merged rows count their members' union), the entity kinds
+  7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the
+  plot axes known for enough of the titles people browse — `era` and `ensemble` everywhere, `setting` and
+  `chronology` for films, `continuity` for series (`offeredFor` in the schema; the other seven are rows only,
+  measured in oxyc/den-atlas#35; `structure` resolves by value; the merged rows count their members' union), the entity kinds
   `person` (anyone credited), `made`, `cast`, `company`, `network` (series), `subject`, `place` and `format`
   (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles, formats from a curated
   list), `character` (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set

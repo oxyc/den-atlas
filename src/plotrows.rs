@@ -2,8 +2,9 @@
 //! it is set, how it is told — which cut across genre in a way a primary genre can't. A row may also name a
 //! mood or subgenre from the labels, alone or with the facets.
 //!
-//! Rows only, never filters. A title the corpus does not describe is unknown, not a negative: a row lists
-//! what is known, and nothing may read it as exhaustive. Not `facets.bin`, which is country, language and
+//! Every axis is a row. A title the corpus does not describe is unknown, not a negative: a row lists what is
+//! known, and nothing may read it as exhaustive. Only the axes in `FILTERABLE` are also offered as a hard
+//! filter (`filter.rs`), for the media types listed there. Not `facets.bin`, which is country, language and
 //! year for attribute search.
 //!
 //! # These used to come from `plotFacetsFile`
@@ -93,6 +94,50 @@ pub const MERGED_ROWS: &[MergedRow] = &[
         members: &["nonlinear", "framed", "parallel-strands"],
     },
 ];
+
+/// The plot axes a hard filter may apply, and for which media types: `(axis, movie, series)`. Every other
+/// axis is a row only.
+///
+/// A row lists the titles known to carry a value and loses nothing by it. A filter drops every title with
+/// the axis missing, and stacked on other kinds that reads as "no such titles". So an axis is a filter for
+/// a type only where it is known for most of what people browse: among the 2,000 most-voted titles of the
+/// type (TMDB `vote_count`, the order rows and filters walk), at least two in three carry a value, AND the
+/// axis's minority values — everything but its most common one, which is what anyone filters for — keep
+/// at least 60% of the titles whose top answer they are (published over published plus withheld as
+/// uncertain). The second test is the one that decides most axes: the publication gates withhold the
+/// uncertain answers, and those are disproportionately the interesting values (an ambiguous ending, a
+/// nonlinear telling). Measured on store b2c60751c955 (oxyc/den-atlas#35):
+///
+/// | axis | movie coverage / minority kept | series |
+/// |---|---|---|
+/// | era | 82% / 76% | 75% / 73% |
+/// | setting | 72% / 65% | 58% / 64% |
+/// | chronology | 89% / 61% | 47% / 47% |
+/// | ensemble | 80% / 73% | 67% / 69% |
+/// | continuity | 95% / 22% | 71% / 66% |
+///
+/// and under both thresholds on every type: scope, ending, pacing, conflict, tone, timespan, archetype.
+/// Under `all` an axis is offered only when it is filterable for both types, so a filter never keeps one
+/// type's titles while silently dropping the other's.
+pub const FILTERABLE: &[(&str, bool, bool)] = &[
+    ("era", true, true),
+    ("setting", true, false),
+    ("chronology", true, false),
+    ("ensemble", true, true),
+    ("continuity", false, true),
+];
+
+/// Whether `axis` may be a hard filter over `media_type`; `None` is films and series together.
+pub fn filterable(axis: &str, media_type: Option<MediaType>) -> bool {
+    FILTERABLE.iter().any(|&(name, movie, series)| {
+        name == axis
+            && match media_type {
+                Some(MediaType::Movie) => movie,
+                Some(MediaType::Tv) => series,
+                None => movie && series,
+            }
+    })
+}
 
 /// The axis a constraint really names, after the alias above.
 pub(crate) fn resolve_axis(axis: &str, value: &str) -> String {

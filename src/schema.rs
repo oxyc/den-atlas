@@ -193,7 +193,14 @@ pub fn document(indexes: &Indexes) -> Value {
                     })
                 })
                 .collect();
-            let mut entry = field("enum", true, facet.known, population, facet.values);
+            // A plot axis is a hard filter only for the types it is known for enough of (`plotrows::FILTERABLE`).
+            let types: Vec<&str> = [(MediaType::Movie, "movie"), (MediaType::Tv, "series")]
+                .into_iter()
+                .filter(|&(media_type, _)| crate::plotrows::filterable(&facet.axis, Some(media_type)))
+                .map(|(_, name)| name)
+                .collect();
+            let mut entry = field("enum", !types.is_empty(), facet.known, population, facet.values);
+            entry["filterableFor"] = json!(types);
             if !merged.is_empty() {
                 entry["merged"] = json!(merged);
             }
@@ -296,6 +303,10 @@ pub fn document(indexes: &Indexes) -> Value {
         "fields": fields,
         "semantics": {
             "missing": "unknown",
+            "filterable": "whether a hard filter may use the field. A plot-facet axis is filterable only for the \
+                           types in its filterableFor: where at least two in three of the 2,000 most-voted \
+                           titles carry a value and its less common values keep at least 60% of their titles. \
+                           Every axis still answers as a row, which lists only titles known to carry it",
             "resultTotal": "retrievedCandidatesNotCorpusCount",
             "groupBy": false,
             "counts": {
@@ -735,6 +746,9 @@ mod tests {
         assert_eq!(schema["fields"]["subgenre"]["coverage"]["denominator"], 12);
         assert_eq!(schema["fields"]["mood"]["coverage"]["count"], 1);
         assert_eq!(schema["fields"]["tone"]["coverage"]["count"], 3);
+        // A row-only plot axis says so (`plotrows::FILTERABLE`).
+        assert_eq!(schema["fields"]["tone"]["filterable"], false);
+        assert_eq!(schema["fields"]["tone"]["filterableFor"], json!([]));
         assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 12);
         assert_eq!(schema["semantics"]["groupBy"], false);
     }

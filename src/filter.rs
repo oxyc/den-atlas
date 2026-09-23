@@ -366,7 +366,14 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
         specs.push(spec(name, Mode::And, Id::Lower, B, about));
     }
     for &axis in den_store::FACET_AXES.iter() {
-        specs.push(spec(axis, Mode::Single, Id::Lower, B, "a plot-facet axis"));
+        specs.push(spec(
+            axis,
+            Mode::Single,
+            Id::Lower,
+            B,
+            "a plot-facet axis; offered only on the routes in offeredFor, the rest are rows alone \
+             (/index/row/{type}.json)",
+        ));
     }
     for (i, entity) in ENTITY_KINDS.iter().enumerate() {
         specs.push(spec(entity.name, Mode::And, Id::Qid, Entity(i), entity.about));
@@ -801,8 +808,8 @@ impl FilterIndex {
     /// Genre, country and language come from the facts, and are unavailable without them: the labels alone name
     /// one genre a title, and counting from them would hide options the facts would show. Decade reads the
     /// card's year (a series' first air date), else the facts' release. Mood, subgenre, primary genre and
-    /// animation are the labels, at the display floor `/index/row` uses; the plot axes the facet rows, the
-    /// merged rows included; the score tables their `DENSE_KINDS` floors.
+    /// animation are the labels, at the display floor `/index/row` uses; the filterable plot axes the facet
+    /// rows, the merged rows included; the score tables their `DENSE_KINDS` floors.
     pub fn build(indexes: &Indexes) -> FilterIndex {
         let view = indexes.store.view();
         let packed = view.per_row::<u64>("keys").unwrap_or(&[]);
@@ -970,12 +977,14 @@ impl FilterIndex {
             }
         }
 
+        // Only the axes some type may filter on (`plotrows::FILTERABLE`); the rest are rows alone.
+        let filter_axes = || crate::plotrows::FILTERABLE.iter().map(|&(axis, _, _)| axis);
         if let Some(plot_facets) = &indexes.plot_facets {
-            for &axis in den_store::FACET_AXES.iter() {
+            for axis in filter_axes() {
                 open(&mut bits, axis);
             }
             for (axis, value, titles) in plot_facets.values() {
-                let Some(axis) = den_store::FACET_AXES.iter().copied().find(|a| *a == axis) else { continue };
+                let Some(axis) = filter_axes().find(|a| *a == axis) else { continue };
                 for (key, _) in titles {
                     if let Some(&row) = row_of.get(key) {
                         add(&mut bits, axis, value.to_owned(), row);
@@ -992,7 +1001,7 @@ impl FilterIndex {
                 valued.values.insert(merged.value.to_owned(), union);
             }
         } else {
-            unavailable.extend(den_store::FACET_AXES.iter().copied());
+            unavailable.extend(filter_axes());
         }
 
         // Entity kinds: each section inverted once, shared by the kinds that read it.
@@ -1296,7 +1305,19 @@ impl<'a> Context<'a> {
     }
 
     fn status(&self, spec: &Spec) -> Status {
+        let media_type = match self.scope {
+            Scope::Type(media_type) => Some(media_type),
+            Scope::All => None,
+        };
         match spec.data {
+            // A plot axis is a filter only where it is known for enough of what people browse; elsewhere
+            // it is a row alone (`plotrows::FILTERABLE`).
+            Data::Bits
+                if den_store::FACET_AXES.contains(&spec.name)
+                    && !crate::plotrows::filterable(spec.name, media_type) =>
+            {
+                Status::NotOffered
+            }
             Data::Bits if self.filter.bits.contains_key(spec.name) => Status::Ready,
             Data::Bits if self.filter.unavailable.contains(&spec.name) => Status::Unavailable,
             Data::Bits => Status::NotOffered,
@@ -1813,6 +1834,14 @@ pub fn schema() -> Value {
                     about["appliesTo"] = json!("series");
                 }
             }
+            if den_store::FACET_AXES.contains(&spec.name) {
+                let offered: Vec<&str> = [(Some(MediaType::Movie), "movie"), (Some(MediaType::Tv), "series"), (None, "all")]
+                    .into_iter()
+                    .filter(|&(media_type, _)| crate::plotrows::filterable(spec.name, media_type))
+                    .map(|(_, route)| route)
+                    .collect();
+                about["offeredFor"] = json!(offered);
+            }
             if let Some(&(_, _, _, floor, _)) = DENSE_KINDS.iter().find(|d| d.0 == spec.name) {
                 about["minScore"] = json!(f64::from(floor) / 100.0);
             }
@@ -1914,7 +1943,7 @@ mod tests {
         assert_eq!(kinds["country"]["complete"], true);
         assert_eq!(kinds["decade"]["values"], json!({ "1980": 2, "1990": 1 }), "the card's year");
         assert_eq!(kinds["subgenre"]["values"], json!({ "Campy/Cult": 1, "Heist": 3 }));
-        assert_eq!(kinds["ending"]["values"], json!({ "bittersweet": 3, "unhappy": 3 }), "a merged row");
+        assert!(kinds.get("ending").is_none() && kinds.get("tone").is_none(), "row-only plot axes");
         assert_eq!(kinds["runtime"]["values"], json!({ "90-120": 1, "120-150": 1, "over-150": 1 }));
         assert_eq!(kinds["primary"]["values"], json!({ "Comedy": 1, "Drama": 2 }));
         assert_eq!(kinds["warning"]["values"], json!({ "violence": 1 }), "at the floor, not under it");
@@ -1927,7 +1956,7 @@ mod tests {
         assert_eq!(korean["kinds"]["subgenre"]["values"], json!({ "Heist": 2 }));
         assert_eq!(korean["kinds"]["country"]["selected"], json!(["KR"]));
 
-        let stacked = counts(&indexes, Movie, "sel=country:KR,tone:bleak,mood:Tense");
+        let stacked = counts(&indexes, Movie, "sel=country:KR,mood:Tense");
         assert_eq!(stacked["total"], 1);
         assert_eq!(
             counts(&indexes, Tv, "sel=country:KR")["kinds"]["subgenre"]["values"],
@@ -2005,11 +2034,52 @@ mod tests {
         indexes.facts = None;
         indexes.plot_facets = None;
         let filter = FilterIndex::build(&indexes);
-        for kind in ["genre", "country", "language", "tone", "ending"] {
+        for kind in ["genre", "country", "language", "era", "chronology"] {
             assert!(filter.unavailable.contains(&kind), "{kind}");
             assert!(!filter.bits.contains_key(kind), "{kind}");
         }
+        assert!(!filter.unavailable.contains(&"tone"), "a row-only axis is never a filter, loaded or not");
         assert!(filter.bits.contains_key("decade"), "the cards still date them");
+    }
+
+    /// A plot axis is a filter only for the types `plotrows::FILTERABLE` names, and under `all` only when it
+    /// names both; the rest answer as rows alone, and a selection naming one is ignored, never read as zero.
+    #[test]
+    fn a_plot_axis_is_offered_only_where_it_is_filterable() {
+        let indexes = fixture("filterable").with_plot_facets(
+            crate::plotrows::PlotFacets::from_bytes(
+                br#"{"schema": 1, "facets": {
+                  "movie:1": {"era": {"value": "contemporary"}, "chronology": {"value": "nonlinear"},
+                              "tone": {"value": "bleak"}},
+                  "movie:3": {"era": {"value": "medieval"}, "chronology": {"value": "framed"}},
+                  "tv:4": {"era": {"value": "contemporary"}, "chronology": {"value": "linear"},
+                           "continuity": {"value": "anthology"}}}}"#,
+            )
+            .unwrap(),
+        );
+        let offered = |scope: Scope| {
+            let kinds = counts(&indexes, scope, "")["kinds"].clone();
+            ["era", "setting", "chronology", "ensemble", "continuity", "tone", "ending", "pacing"]
+                .into_iter()
+                .filter(|axis| kinds.get(*axis).is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offered(Scope::Type(Movie)), ["era", "setting", "chronology", "ensemble"]);
+        assert_eq!(offered(Scope::Type(Tv)), ["era", "ensemble", "continuity"]);
+        assert_eq!(offered(Scope::All), ["era", "ensemble"]);
+
+        let movies = counts(&indexes, Movie, "");
+        assert_eq!(movies["kinds"]["chronology"]["values"]["out-of-order"], 2, "a merged row");
+        assert_eq!(movies["kinds"]["era"]["values"], json!({ "contemporary": 1, "medieval": 1 }));
+        let bleak = counts(&indexes, Movie, "sel=tone:bleak");
+        assert_eq!((&bleak["total"], &bleak["ignored"]), (&3.into(), &json!(["tone"])));
+        let told = counts(&indexes, Scope::All, "sel=chronology:nonlinear");
+        assert_eq!((&told["total"], &told["ignored"]), (&4.into(), &json!(["chronology"])));
+
+        let schema = schema();
+        assert_eq!(schema["kinds"]["era"]["offeredFor"], json!(["movie", "series", "all"]));
+        assert_eq!(schema["kinds"]["continuity"]["offeredFor"], json!(["series"]));
+        assert_eq!(schema["kinds"]["tone"]["offeredFor"], json!([]));
     }
 
     #[tokio::test]

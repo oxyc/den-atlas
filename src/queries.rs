@@ -212,6 +212,14 @@ impl Indexes {
         self.filter.get_or_init(|| FilterIndex::build(self))
     }
 
+    /// The same indexes over other plot facets, the filters rebuilt from them.
+    #[cfg(test)]
+    pub fn with_plot_facets(mut self, facets: PlotFacets) -> Indexes {
+        self.plot_facets = Some(facets);
+        self.filter = OnceLock::new();
+        self
+    }
+
     /// A title's vote count — what every browse row is ORDERED by.
     ///
     /// TMDB's `vote_count` where the ratings index names the row, else the store's own `votes` column,

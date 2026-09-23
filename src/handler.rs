@@ -3000,10 +3000,10 @@ mod tests {
         let unknown = json(body_of(get(&state, "/index/filter/movie/counts.json?sel=nope:1").await).await);
         assert_eq!((&unknown["total"], &unknown["ignored"]), (&3.into(), &serde_json::json!(["nope"])));
         let typo = json(
-            body_of(get(&state, "/index/filter/movie/counts.json?sel=mood:tense,tone:blaek").await).await,
+            body_of(get(&state, "/index/filter/movie/counts.json?sel=mood:tense,era:blaek").await).await,
         );
         assert_eq!(typo["total"], 0);
-        assert_eq!(typo["unknownValues"], serde_json::json!(["mood:tense", "tone:blaek"]));
+        assert_eq!(typo["unknownValues"], serde_json::json!(["era:blaek", "mood:tense"]));
 
         for path in [
             "/index/filter/movie/counts.json?sel=genre:action",
