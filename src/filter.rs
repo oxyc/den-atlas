@@ -1,6 +1,7 @@
-//! `/index/filter/<movie|series>/…` — stackable filters over the corpus, for Den Web's Search (oxyc/den#133,
-//! oxyc/den#134): a selection of values from many kinds (genre, language, decade, a mood, a plot axis, a
-//! person, a studio, a rating, …) AND-ed together, and three questions about it.
+//! `/index/filter/<movie|series|all>/…` — stackable filters over the corpus, for Den Web's Search
+//! (oxyc/den#133, oxyc/den#134): a selection of values from many kinds (genre, language, decade, a mood, a plot
+//! axis, a person, a studio, a rating, …) AND-ed together, and three questions about it. `all` asks them of
+//! films and series together (`Scope`).
 //!
 //! - `counts.json` — for every value of every kind, how many titles carry the selection AND that value, so an
 //!   option that would leave nothing is hidden instead of spending TMDB discover calls to find out.
@@ -10,7 +11,10 @@
 //!
 //! # What a count is
 //!
-//! Titles of the type, with a card, on record as carrying every selected value and the counted one. A title
+//! Titles of the type (of both, under `all`), with a card, on record as carrying every selected value and the
+//! counted one. Every kind's values are held over the store's rows of both types, so `all` is the same count
+//! over both types' rows: a film genre id matches the series filed under it too (a series' genres are read as
+//! films'), a series-only genre or kind (`network`) matches only series, and a composite id only series. A title
 //! the corpus does not describe is unknown, not a negative, so a count is a floor on the corpus: 0 means
 //! "nothing Den would show you". The facts' countries and languages count under EVERY value a title lists, so
 //! a count errs high rather than hiding an option a title does carry. An exclusion (`-kind:id`) keeps only the
@@ -114,6 +118,9 @@ enum Id {
     Qid,
     /// A character name, normalised (`characters::normalise`), its spaces written `-`.
     Character,
+    /// A title: its TMDB id, and under `all`, which type it is as well — `movie-550`, `series-1396`, the
+    /// `{type, id}` a mixed More Like This row names.
+    Title,
 }
 
 impl Id {
@@ -126,6 +133,7 @@ impl Id {
             Id::Label => "the label exactly as atlas names it",
             Id::Qid => "Wikidata Q-id",
             Id::Character => "the normalised name, lowercase, words joined by -",
+            Id::Title => "a TMDB id of the route's type; under all, movie-<TMDB id> or series-<TMDB id>",
         }
     }
 }
@@ -141,7 +149,8 @@ enum Data {
     /// The character provider's names (`characters.rs`), rebuilt with each build of its links. Search-only,
     /// and not offered until the provider has built them.
     Character,
-    /// More Like This for a title of the route's type: the set `/index/similar` answers.
+    /// More Like This for a title: under one type the set `/index/similar` answers as `ids`, under `all` the
+    /// one it answers as `mixed`.
     Like,
 }
 
@@ -309,7 +318,14 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
     use Data::{Bits as B, Character, Entity, Like, Rating};
     let spec = |name, mode, id, data, about| Spec { name, mode, id, data, about };
     let mut specs = vec![
-        spec("genre", Mode::And, Id::Integer, B, "TMDB genre id; a series also under TMDB's composites"),
+        spec(
+            "genre",
+            Mode::And,
+            Id::Integer,
+            B,
+            "TMDB genre id; a series also under TMDB's composites, and under all a film id matches the \
+             series filed under it too",
+        ),
         spec("language", Mode::And, Id::Lower, B, "ISO 639-1, every original language"),
         spec("country", Mode::And, Id::Upper, B, "ISO 3166-1, every country of origin"),
         spec(
@@ -353,9 +369,9 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
     specs.push(spec(
         "like",
         Mode::Single,
-        Id::Integer,
+        Id::Title,
         Like,
-        "More Like This for a TMDB id of the route's type",
+        "More Like This for a title of the route's type; under all, for a typed title, films and series mixed",
     ));
     specs
 });
@@ -380,9 +396,53 @@ impl Item {
     }
 }
 
+/// Which titles a filter route asks about: one type's, or films and series together (`all`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    Type(MediaType),
+    All,
+}
+
+impl Scope {
+    /// The type segment of a filter path, shared by every filter route: `movie`, `series` or `all`.
+    pub fn parse(segment: &str) -> Option<Scope> {
+        match segment {
+            "movie" => Some(Scope::Type(MediaType::Movie)),
+            "series" => Some(Scope::Type(MediaType::Tv)),
+            "all" => Some(Scope::All),
+            _ => None,
+        }
+    }
+
+    /// Its slot in the per-scope tables: [movie, series, all].
+    fn index(self) -> usize {
+        match self {
+            Scope::Type(media_type) => type_index(media_type),
+            Scope::All => 2,
+        }
+    }
+}
+
+impl From<MediaType> for Scope {
+    fn from(media_type: MediaType) -> Scope {
+        Scope::Type(media_type)
+    }
+}
+
+/// A typed title as `Id::Title` writes it under `all`: `movie-550`, `series-1396`.
+fn typed_title(id: &str) -> Option<Key> {
+    let (media, tmdb_id) = id.split_once('-')?;
+    let media_type = match media {
+        "movie" => MediaType::Movie,
+        "series" => MediaType::Tv,
+        _ => return None,
+    };
+    Some((media_type, tmdb_id.parse().ok()?))
+}
+
 /// A kind and an id as their canonical pair. An unknown kind is kept — lowercased, its id as sent — so a
 /// client built for a newer atlas still gets an answer, with the kind reported as ignored.
-fn normalise(kind: &str, id: &str) -> Result<(String, String), String> {
+fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), String> {
     let kind = kind.trim().to_ascii_lowercase();
     let id = id.trim();
     if kind.is_empty() {
@@ -419,6 +479,19 @@ fn normalise(kind: &str, id: &str) -> Result<(String, String), String> {
             }
             name.replace(' ', "-")
         }
+        Id::Title => match scope {
+            Scope::Type(_) => number()?.to_string(),
+            // Both types share TMDB ids' number space, so a bare id names no title here.
+            Scope::All => match typed_title(&id.to_ascii_lowercase()) {
+                Some((MediaType::Movie, n)) => format!("movie-{n}"),
+                Some((MediaType::Tv, n)) => format!("series-{n}"),
+                None => {
+                    return Err(format!(
+                        "{kind}: {id:?} names no typed title; under all, movie-<TMDB id> or series-<TMDB id>"
+                    ))
+                }
+            },
+        },
     };
     Ok((kind, id))
 }
@@ -457,9 +530,10 @@ impl Request {
     /// - `q` normalised as the kind's names are (folded and lowercased, words joined by single spaces), encoded
     ///   like an id.
     ///
-    /// The error is a request that cannot be answered as sent: a malformed item, an id its kind cannot read,
-    /// too many values, a query too long, a `skip` that is not a page boundary, a prefix too short.
-    pub fn parse(route: Route, query: &str) -> Result<Request, String> {
+    /// The error is a request that cannot be answered as sent: a malformed item, an id its kind cannot read
+    /// (a `like` under `all` without its type), too many values, a query too long, a `skip` that is not a page
+    /// boundary, a prefix too short.
+    pub fn parse(route: Route, scope: Scope, query: &str) -> Result<Request, String> {
         if query.len() > MAX_QUERY {
             return Err(format!("a query of at most {MAX_QUERY} bytes"));
         }
@@ -489,7 +563,7 @@ impl Request {
                 None => (false, item),
             };
             let (kind, id) = item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
-            let (kind, id) = normalise(kind, id)?;
+            let (kind, id) = normalise(kind, id, scope)?;
             items.push(Item { kind, exclude, id });
         }
         items.sort();
@@ -611,19 +685,20 @@ struct Derived {
     ratings: Option<Arc<RatingsIndex>>,
     export: Option<Arc<TitleIndex>>,
     rating: Option<Valued>,
-    /// Each type's rows with a card, most voted first then by TMDB id — the order `titles.json` walks.
-    order: [Vec<u32>; 2],
+    /// Each scope's rows with a card, most voted first then by TMDB id — the order `titles.json` walks:
+    /// [movie, series, all], `all` the two merged by rank within their type (`interleave`).
+    order: [Vec<u32>; 3],
     /// A fingerprint of each order, so a client paging while it changes can tell.
-    order_id: [String; 2],
-    /// Each type's counts for the empty selection, worked out once.
-    empty: [OnceLock<(Value, usize)>; 2],
+    order_id: [String; 3],
+    /// Each scope's counts for the empty selection, worked out once.
+    empty: [OnceLock<(Value, usize)>; 3],
 }
 
 /// Every kind's values over the store's rows (`FilterIndex::build`).
 pub struct FilterIndex {
     keys: Vec<Key>,
-    /// Each type's rows with a card, as counts, totals and the grid all count them: [movie, series].
-    types: [Bits; 2],
+    /// Each scope's rows with a card, as counts, totals and the grid all count them: [movie, series, all].
+    types: [Bits; 3],
     bits: BTreeMap<&'static str, Valued>,
     /// Per `ENTITY_KINDS` row; `None` when the store does not carry its sections, and then not offered.
     entities: Vec<Option<EntityKind>>,
@@ -666,6 +741,29 @@ fn type_index(media_type: MediaType) -> usize {
     usize::from(media_type == MediaType::Tv)
 }
 
+/// The `all` order: the two types' own orders merged by each title's rank within its type as a share of that
+/// type's size (i/films against j/series), films first on a tie. Series then run at their share of the corpus,
+/// spread evenly, and each type's most popular titles sit beside the other's — where raw votes, which run far
+/// higher for films, would push series pages down. A selection under `all` walks this order filtered, which
+/// is the two types' filtered orders merged by the same keys. The shares are compared as exact fractions
+/// (i·m against j·n), so the order is deterministic.
+fn interleave(movies: &[u32], series: &[u32]) -> Vec<u32> {
+    let (n, m) = (movies.len() as u64, series.len() as u64);
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(movies.len() + series.len());
+    while i < movies.len() || j < series.len() {
+        let film_first = j == series.len() || (i < movies.len() && i as u64 * m <= j as u64 * n);
+        if film_first {
+            out.push(movies[i]);
+            i += 1;
+        } else {
+            out.push(series[j]);
+            j += 1;
+        }
+    }
+    out
+}
+
 impl FilterIndex {
     /// Every kind's values over the store's rows.
     ///
@@ -686,10 +784,11 @@ impl FilterIndex {
             .collect();
         let row_of: HashMap<Key, usize> = keys.iter().enumerate().map(|(row, &key)| (key, row)).collect();
 
-        let mut types = [zeros(), zeros()];
+        let mut types = [zeros(), zeros(), zeros()];
         for (row, key) in keys.iter().enumerate() {
             if indexes.cards.as_ref().is_none_or(|cards| cards.contains_key(key)) {
                 set(&mut types[type_index(key.0)], row);
+                set(&mut types[Scope::All.index()], row);
             }
         }
 
@@ -901,7 +1000,7 @@ impl FilterIndex {
             + entities.iter().flatten().map(|e| bitset(&e.known)).sum::<usize>()
             + postings_bytes
             + keys.len() * std::mem::size_of::<Key>()
-            + 2 * bitset(&types[0]);
+            + 3 * bitset(&types[0]);
         unavailable.sort_unstable();
         unavailable.dedup();
         FilterIndex {
@@ -978,7 +1077,7 @@ impl FilterIndex {
             }
             valued
         });
-        let order = [0, 1].map(|t| {
+        let [movies, series] = [0, 1].map(|t| {
             let mut ranked: Vec<(u32, f64, u32)> = ones(&self.types[t])
                 .map(|row| {
                     let key = self.keys[row];
@@ -988,16 +1087,21 @@ impl FilterIndex {
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)));
             ranked.into_iter().map(|(row, _, _)| row).collect::<Vec<u32>>()
         });
-        let order_id = [0, 1].map(|t| {
+        let all = interleave(&movies, &series);
+        let order = [movies, series, all];
+        let order_id = [0, 1, 2].map(|t| {
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for &row in &order[t] {
-                for byte in self.keys[row as usize].1.to_le_bytes() {
+                let (media_type, id) = self.keys[row as usize];
+                // Under `all` the type is part of what a position holds.
+                let typed = (t == Scope::All.index()).then_some(type_index(media_type) as u8);
+                for byte in id.to_le_bytes().into_iter().chain(typed) {
                     hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
                 }
             }
             format!("{hash:016x}")
         });
-        Derived { ratings, export, rating, order, order_id, empty: [OnceLock::new(), OnceLock::new()] }
+        Derived { ratings, export, rating, order, order_id, empty: std::array::from_fn(|_| OnceLock::new()) }
     }
 
     /// Entity labels and aliases, folded, for `values/<kind>.json?q=`. Built on the first search.
@@ -1109,25 +1213,55 @@ pub struct Context<'a> {
     indexes: &'a Indexes,
     derived: Arc<Derived>,
     characters: Option<Arc<CharacterIndex>>,
-    media_type: MediaType,
+    scope: Scope,
     view: den_store::Store<'a>,
 }
 
 impl<'a> Context<'a> {
-    pub fn new(indexes: &'a Indexes, media_type: MediaType, export: Option<Arc<TitleIndex>>) -> Context<'a> {
+    pub fn new(
+        indexes: &'a Indexes,
+        scope: impl Into<Scope>,
+        export: Option<Arc<TitleIndex>>,
+    ) -> Context<'a> {
         let filter = indexes.filter();
         Context {
             filter,
             indexes,
             derived: filter.derived(indexes, export),
             characters: indexes.characters.as_ref().and_then(|c| c.index()),
-            media_type,
+            scope: scope.into(),
             view: indexes.store.view(),
         }
     }
 
     fn t(&self) -> usize {
-        type_index(self.media_type)
+        self.scope.index()
+    }
+
+    /// The title a `like` id names: under one type a TMDB id of it, under `all` a typed one.
+    fn like_key(&self, id: &str) -> Option<Key> {
+        match self.scope {
+            Scope::Type(media_type) => Some((media_type, id.parse().ok()?)),
+            Scope::All => typed_title(id),
+        }
+    }
+
+    /// The rows of a `like`'s similar set, in its order: the seed's type alone, or under `all` the row that
+    /// mixes films and series (`/index/similar`'s `mixed`).
+    fn like_rows(&self, id: &str) -> Vec<u32> {
+        let Some((media_type, tmdb_id)) = self.like_key(id) else { return Vec::new() };
+        let keys: Vec<Key> = match self.scope {
+            Scope::Type(_) => {
+                self.indexes.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
+            }
+            Scope::All => self.indexes.more_like_this_mixed(tmdb_id, media_type).to_vec(),
+        };
+        keys.into_iter()
+            .filter_map(|(media_type, id)| {
+                self.view.row_of(u8::from(media_type == MediaType::Tv), id).ok().flatten()
+            })
+            .map(|row| row.0 as u32)
+            .collect()
     }
 
     fn status(&self, spec: &Spec) -> Status {
@@ -1138,7 +1272,8 @@ impl<'a> Context<'a> {
             Data::Rating if self.indexes.ratings.is_none() => Status::NotOffered,
             Data::Rating if self.derived.rating.is_some() => Status::Ready,
             Data::Rating => Status::Unavailable,
-            Data::Entity(i) if ENTITY_KINDS[i].series_only && self.media_type == MediaType::Movie => {
+            // Under `all` a series-only kind is offered, and matches only series.
+            Data::Entity(i) if ENTITY_KINDS[i].series_only && self.scope == Scope::Type(MediaType::Movie) => {
                 Status::NotOffered
             }
             Data::Entity(i) if self.filter.entities[i].is_some() => Status::Ready,
@@ -1221,16 +1356,7 @@ impl<'a> Context<'a> {
             }
             Data::Like => {
                 let known = self.filter.types[self.t()].clone();
-                let Ok(tmdb_id) = id.parse::<u32>() else { return (vec![0; words], known) };
-                let similar = self.indexes.more_like_this(tmdb_id, self.media_type);
-                let rows: Vec<usize> = similar
-                    .iter()
-                    .filter_map(|&id| {
-                        self.view.row_of(u8::from(self.media_type == MediaType::Tv), id).ok().flatten()
-                    })
-                    .map(|row| row.0)
-                    .collect();
-                (from_rows(&mut rows.into_iter()), known)
+                (from_rows(&mut self.like_rows(id).into_iter().map(|row| row as usize)), known)
             }
         }
     }
@@ -1452,9 +1578,8 @@ impl<'a> Context<'a> {
             Data::Character => {
                 self.characters.as_ref().is_some_and(|c| !c.named().rows(&id.replace('-', " ")).is_empty())
             }
-            Data::Like => id.parse::<u32>().is_ok_and(|tmdb_id| {
-                let media = u8::from(self.media_type == MediaType::Tv);
-                self.view.row_of(media, tmdb_id).ok().flatten().is_some()
+            Data::Like => self.like_key(id).is_some_and(|(media_type, tmdb_id)| {
+                self.view.row_of(u8::from(media_type == MediaType::Tv), tmdb_id).ok().flatten().is_some()
             }),
         }
     }
@@ -1493,19 +1618,10 @@ impl<'a> Context<'a> {
         let total: usize = matched.iter().map(|w| w.count_ones() as usize).sum();
         let like = applied
             .iter()
-            .find(|(s, i)| s.data == Data::Like && !i.exclude)
-            .and_then(|(_, i)| i.id.parse().ok());
+            .find(|(s, i)| s.data == Data::Like && !i.exclude && self.like_key(&i.id).is_some())
+            .map(|(_, i)| i.id.as_str());
         let (order, order_id): (Vec<u32>, String) = match like {
-            Some(tmdb_id) => {
-                let similar = self.indexes.more_like_this(tmdb_id, self.media_type);
-                let media = u8::from(self.media_type == MediaType::Tv);
-                let rows = similar
-                    .iter()
-                    .filter_map(|&id| self.view.row_of(media, id).ok().flatten())
-                    .map(|row| row.0 as u32)
-                    .collect();
-                (rows, format!("like:{tmdb_id}"))
-            }
+            Some(id) => (self.like_rows(id), format!("like:{id}")),
             None => (self.derived.order[self.t()].clone(), self.derived.order_id[self.t()].clone()),
         };
         let titles: Vec<Value> = match self.indexes.cards.as_ref() {
@@ -1681,6 +1797,14 @@ pub fn schema() -> Value {
         .map(|m| (format!("{}:{}", m.axis, m.value), json!(m.members)))
         .collect();
     json!({
+        "types": ["movie", "series", "all"],
+        "all": "films and series together: counts and values over both; titles are the two types' own orders \
+                merged by rank within type (a title's position in its type's order over that type's size, \
+                ascending, films first on a tie), so series run at their share, spread evenly, and each card \
+                names its type. Every kind answers for both; a kind or value only one type has \
+                (network, a series-only genre, a composite genre) matches only that type's titles, and a film \
+                genre id matches the series filed under it too. like names its title's type: \
+                like:movie-550, like:series-1396; a bare id is a 400 there",
         "kinds": kinds,
         "aliases": {
             "structure": {
@@ -1727,12 +1851,18 @@ mod tests {
         crate::queries::load_for_tools(&dataset(name)).expect("the fixture loads")
     }
 
+    /// A request to a one-type route: movie and series parse alike.
     fn request(route: Route, query: &str) -> Request {
-        Request::parse(route, query).expect("a well-formed request")
+        Request::parse(route, Scope::Type(Movie), query).expect("a well-formed request")
     }
 
-    fn counts(indexes: &Indexes, media_type: MediaType, query: &str) -> Value {
-        Context::new(indexes, media_type, None).counts(&request(Route::Counts, query)).0
+    fn request_all(route: Route, query: &str) -> Request {
+        Request::parse(route, Scope::All, query).expect("a well-formed request")
+    }
+
+    fn counts(indexes: &Indexes, scope: impl Into<Scope>, query: &str) -> Value {
+        let scope = scope.into();
+        Context::new(indexes, scope, None).counts(&Request::parse(Route::Counts, scope, query).unwrap()).0
     }
 
     fn ids(answer: &Value) -> Vec<u64> {
@@ -1962,8 +2092,8 @@ mod tests {
         assert_eq!(found["values"], json!([{ "id": "walter-white", "name": "walter white", "count": 2 }]));
         let none = context.values(spec, &request(Route::Values(spec), "q=jes")).0;
         assert_eq!(none["values"], json!([]), "a name played in one title is not one to filter by");
-        assert!(Request::parse(Route::Values(spec), "q=wa").is_err());
-        assert!(Request::parse(Route::Values(spec), "").is_err());
+        assert!(Request::parse(Route::Values(spec), Scope::Type(Movie), "q=wa").is_err());
+        assert!(Request::parse(Route::Values(spec), Scope::Type(Movie), "").is_err());
 
         let all = context.counts(&request(Route::Counts, "")).0;
         assert!(all["kinds"].get("character").is_none(), "never listed");
@@ -1985,6 +2115,199 @@ mod tests {
         let counted = context.counts(&request(Route::Counts, "sel=like:1")).0;
         assert_eq!(counted["total"], similar.len());
         assert_eq!(counted["kinds"]["like"]["mode"], "single");
+    }
+
+    fn typed(answer: &Value) -> Vec<(String, u64)> {
+        let titles = answer["titles"].as_array().unwrap();
+        titles.iter().map(|t| (t["type"].as_str().unwrap().to_owned(), t["id"].as_u64().unwrap())).collect()
+    }
+
+    fn pair(media: &str, id: u64) -> (String, u64) {
+        (media.to_owned(), id)
+    }
+
+    /// `all` merges the types' own orders by rank within type: films 2, 1, 3 sit at 0, 1/3 and 2/3, series 4
+    /// (the only one) at 0, after the film it ties with. Pages of it are slices of that one order, and a
+    /// selection merges the filtered lists by the same keys.
+    #[test]
+    fn all_merges_the_types_by_rank_within_type() {
+        let indexes = fixture("all-order");
+        let context = Context::new(&indexes, Scope::All, None);
+        let whole = context.titles(&request_all(Route::Titles, "")).0;
+        let order = vec![pair("movie", 2), pair("series", 4), pair("movie", 1), pair("movie", 3)];
+        assert_eq!(typed(&whole), order);
+        assert_eq!(whole["total"], 4);
+        let movies = Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "")).0;
+        assert_eq!(ids(&movies), vec![2, 1, 3], "the films' own order, which all interleaves");
+        assert_ne!(whole["order"], movies["order"]);
+        assert_eq!(whole["order"].as_str().map(str::len), Some(16));
+
+        let mut paged = Vec::new();
+        for skip in [0, 1, 2, 3, 4] {
+            let page = context.titles(&request_all(Route::Titles, &format!("skip={skip}&limit=1"))).0;
+            assert_eq!(page["order"], whole["order"], "every page is a slice of the same order");
+            paged.extend(typed(&page));
+        }
+        assert_eq!(paged, order, "paging one at a time walks the whole order once");
+        let second = context.titles(&request_all(Route::Titles, "skip=2&limit=2")).0;
+        assert_eq!(typed(&second), order[2..]);
+        let korean = context.titles(&request_all(Route::Titles, "sel=country:KR")).0;
+        assert_eq!(typed(&korean), vec![pair("movie", 2), pair("series", 4), pair("movie", 1)]);
+    }
+
+    /// `all` counts over both types' rows: the union, each title once, and `values` alike.
+    #[test]
+    fn all_counts_the_union_of_both_types() {
+        let indexes = fixture("all-counts");
+        let all = counts(&indexes, Scope::All, "");
+        assert_eq!(all["total"], 4, "three films and the one series with a card");
+        assert_eq!(all["kinds"]["country"]["values"], json!({ "DK": 1, "ES": 1, "KR": 3 }));
+        assert_eq!(all["kinds"]["subgenre"]["values"]["Heist"], 4);
+        let korean = counts(&indexes, Scope::All, "sel=country:KR");
+        assert_eq!(korean["total"], 3);
+        assert_eq!(korean["coverage"]["country"]["denominator"], 4, "out of both types");
+        let (movie, series) =
+            (counts(&indexes, Movie, "sel=country:KR"), counts(&indexes, Tv, "sel=country:KR"));
+        assert_eq!(movie["total"].as_u64().unwrap() + series["total"].as_u64().unwrap(), 3);
+
+        let spec = spec("decade").unwrap();
+        let context = Context::new(&indexes, Scope::All, None);
+        let decades = context.values(spec, &request_all(Route::Values(spec), "sel=country:KR")).0;
+        let ids: Vec<&str> =
+            decades["values"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 3, "the films' 1980 and 1990 and the series' 2010: {decades}");
+        assert!(ids.contains(&"2010"));
+    }
+
+    /// The indexes of a store holding these titles.
+    fn store_of(
+        name: &str,
+        titles: &[crate::store::fixture::Title],
+        entities: &[crate::store::fixture::Entity],
+    ) -> Indexes {
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, titles, entities);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the store loads");
+        crate::queries::load_for_tools(&ds).expect("its indexes load")
+    }
+
+    /// Series run at their share, spread evenly — here 1 in 6 — even when every series outvotes every film,
+    /// where raw votes would put all five first.
+    #[test]
+    fn all_spreads_series_at_their_share() {
+        let title = |media, tmdb_id, votes| crate::store::fixture::Title {
+            media,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            votes,
+            ..crate::store::fixture::Title::default()
+        };
+        let mut titles: Vec<_> = (1..=25).map(|id| title(0, id, 1000 - id)).collect();
+        titles.extend((101..=105).map(|id| title(1, id, 5000 - id)));
+        let indexes = store_of("all-spread", &titles, &[]);
+        let context = Context::new(&indexes, Scope::All, None);
+        let first = typed(&context.titles(&request_all(Route::Titles, "limit=30")).0);
+        let positions: Vec<usize> =
+            first.iter().enumerate().filter(|(_, (m, _))| m == "series").map(|(i, _)| i + 1).collect();
+        assert_eq!(positions, vec![2, 8, 14, 20, 26], "{first:?}");
+        let series: Vec<u64> = first.iter().filter(|(m, _)| m == "series").map(|&(_, id)| id).collect();
+        assert_eq!(series, vec![101, 102, 103, 104, 105], "each type keeps its own order");
+        assert_eq!(first[0], pair("movie", 1), "the most popular film, then the most popular series");
+    }
+
+    /// Films 1 (action) and 4, series 2 (Action & Adventure, and kids) and 3 (kids), both on network Q70.
+    fn mixed_genres(name: &str) -> Indexes {
+        let title =
+            |media, tmdb_id, votes, genres: Vec<u32>, broadcasters: Vec<u32>| crate::store::fixture::Title {
+                media,
+                tmdb_id,
+                primary_genre: "Drama",
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A title", None, Some(2000))),
+                votes,
+                genres,
+                broadcasters,
+                ..crate::store::fixture::Title::default()
+            };
+        let titles = [
+            title(0, 1, 100, vec![28], vec![]),
+            title(1, 2, 300, vec![10759, 10762], vec![70]),
+            title(1, 3, 50, vec![10762], vec![70]),
+            title(0, 4, 200, vec![18], vec![]),
+        ];
+        let network =
+            crate::store::fixture::Entity { qid: 70, name: "A Network", tmdb: None, aliases: vec![] };
+        store_of(name, &titles, &[network])
+    }
+
+    /// A series' genres are read as films', so under `all` a film genre id matches the films and the series
+    /// filed under it; a series-only genre, and a composite, only their series.
+    #[test]
+    fn all_folds_series_genres_into_film_ones() {
+        let indexes = mixed_genres("all-genres");
+        let genres = &counts(&indexes, Scope::All, "")["kinds"]["genre"]["values"];
+        assert_eq!(genres["28"], 2, "action film 1 and Action & Adventure series 2: {genres}");
+        assert_eq!(genres["10759"], 1, "the composite: the series alone");
+        assert_eq!(genres["10762"], 2, "kids: series 2 and 3");
+        let context = Context::new(&indexes, Scope::All, None);
+        let action = context.titles(&request_all(Route::Titles, "sel=genre:28")).0;
+        assert_eq!(typed(&action), vec![pair("series", 2), pair("movie", 1)]);
+        let kids = context.titles(&request_all(Route::Titles, "sel=genre:10762")).0;
+        assert_eq!(typed(&kids), vec![pair("series", 2), pair("series", 3)]);
+        assert_eq!(counts(&indexes, Movie, "sel=genre:28")["total"], 1);
+        assert_eq!(counts(&indexes, Movie, "sel=genre:10762")["total"], 0, "no film is a kids' series");
+    }
+
+    /// A kind only one type has keeps working under `all`, matching that type's titles alone.
+    #[test]
+    fn a_series_only_kind_answers_under_all_with_its_series() {
+        let indexes = mixed_genres("all-network");
+        let all = counts(&indexes, Scope::All, "");
+        assert_eq!(all["kinds"]["network"]["values"], json!({ "Q70": 2 }));
+        assert_eq!(all["kinds"]["network"]["labels"], json!({ "Q70": "A Network" }));
+        let context = Context::new(&indexes, Scope::All, None);
+        let aired = context.titles(&request_all(Route::Titles, "sel=network:Q70")).0;
+        assert_eq!(typed(&aired), vec![pair("series", 2), pair("series", 3)]);
+        assert_eq!(aired["ignored"], json!([]));
+        let action = counts(&indexes, Scope::All, "sel=genre:28,network:Q70");
+        assert_eq!(action["total"], 1, "series 2 only");
+        let off = context.titles(&request_all(Route::Titles, "sel=-network:Q70")).0;
+        assert_eq!(off["total"], 0, "no title is known to be on another network");
+        let films = counts(&indexes, Movie, "sel=network:Q70");
+        assert_eq!((&films["total"], &films["ignored"]), (&2.into(), &json!(["network"])));
+    }
+
+    /// Under `all` a `like` names its title's type, and answers the row `/index/similar` serves as `mixed`,
+    /// in its order; a bare id is refused, since both types use the same numbers.
+    #[test]
+    fn like_under_all_is_the_typed_mixed_row() {
+        let indexes = fixture("all-like");
+        let context = Context::new(&indexes, Scope::All, None);
+        let mixed: Vec<(String, u64)> = indexes
+            .more_like_this_mixed(1, Movie)
+            .iter()
+            .filter(|&&(_, id)| id <= 4)
+            .map(|&(m, id)| pair(if m == Tv { "series" } else { "movie" }, u64::from(id)))
+            .collect();
+        assert!(mixed.iter().any(|(m, _)| m == "series"), "the fixture's row mixes: {mixed:?}");
+        let like = context.titles(&request_all(Route::Titles, "sel=like:movie-1")).0;
+        assert_eq!(typed(&like), mixed);
+        assert_eq!(like["order"], "like:movie-1");
+        assert_eq!(context.counts(&request_all(Route::Counts, "sel=like:movie-1")).0["total"], mixed.len());
+        assert!(Request::parse(Route::Titles, Scope::All, "sel=like:1").is_err());
+        assert!(Request::parse(Route::Titles, Scope::All, "sel=like:anime-1").is_err());
+        assert!(Request::parse(Route::Titles, Scope::Type(Movie), "sel=like:movie-1").is_err());
+        let nobody = context.counts(&request_all(Route::Counts, "sel=like:series-1")).0;
+        assert_eq!(nobody["unknownValues"], json!(["like:series-1"]));
     }
 
     /// A region is the union of its countries: a title with two members counts once. One pick at a time, its
@@ -2068,33 +2391,34 @@ mod tests {
     fn the_canonical_fixture_holds() {
         let fixture: Value =
             serde_json::from_str(include_str!("../tests/fixtures/facets-canonical.json")).unwrap();
-        let split = |url: &str| -> (Route, String, String) {
+        let split = |url: &str| -> (Route, Scope, String, String) {
             let (path, query) = url.split_once('?').unwrap_or((url, ""));
             let parts: Vec<&str> = path.trim_start_matches("/index/filter/").split('/').collect();
+            let scope = Scope::parse(parts[0]).unwrap_or_else(|| panic!("{url}"));
             let route = match parts[1..] {
                 ["counts.json"] => Route::Counts,
                 ["titles.json"] => Route::Titles,
                 ["values", kind] => Route::Values(spec(kind.trim_end_matches(".json")).unwrap()),
                 _ => panic!("{url}"),
             };
-            (route, path.to_owned(), query.to_owned())
+            (route, scope, path.to_owned(), query.to_owned())
         };
         for case in fixture["cases"].as_array().unwrap() {
             let (url, canonical) = (case["url"].as_str().unwrap(), case["canonical"].as_str().unwrap());
-            let (route, path, query) = split(url);
-            let parsed = Request::parse(route, &query).unwrap_or_else(|e| panic!("{url}: {e}"));
+            let (route, scope, path, query) = split(url);
+            let parsed = Request::parse(route, scope, &query).unwrap_or_else(|e| panic!("{url}: {e}"));
             assert_eq!(format!("{path}{}", parsed.query()), canonical, "{url}");
             assert_eq!(parsed.canonical, url == canonical, "{url}");
-            let (route, _, query) = split(canonical);
+            let (route, scope, _, query) = split(canonical);
             assert!(
-                Request::parse(route, &query).unwrap().canonical,
+                Request::parse(route, scope, &query).unwrap().canonical,
                 "{canonical} is its own canonical form"
             );
         }
         for url in fixture["refused"].as_array().unwrap() {
             let url = url.as_str().unwrap();
-            let (route, _, query) = split(url);
-            assert!(Request::parse(route, &query).is_err(), "{url} should be refused");
+            let (route, scope, _, query) = split(url);
+            assert!(Request::parse(route, scope, &query).is_err(), "{url} should be refused");
         }
     }
 
@@ -2149,6 +2473,53 @@ mod tests {
         let derived = std::time::Instant::now();
         drop(Context::new(&indexes, Movie, None));
         eprintln!("derived (rating kind, vote order) already built: {:?}", derived.elapsed());
+        let rebuilt = std::time::Instant::now();
+        let fresh = filter.derive(&indexes, indexes.ratings.as_ref().and_then(|r| r.index()), None);
+        eprintln!(
+            "derive from scratch (rating kind, three orders): {:?}; orders {} + {} = all {}",
+            rebuilt.elapsed(),
+            fresh.order[0].len(),
+            fresh.order[1].len(),
+            fresh.order[2].len()
+        );
+        let both = Context::new(&indexes, Scope::All, None);
+        for query in [
+            "",
+            "sel=genre:28",
+            "sel=country:US,decade:1990,genre:28",
+            "sel=genre:10762",
+            "sel=like:movie-550",
+        ] {
+            let parsed = request_all(Route::Counts, query);
+            time(&format!("all counts {query:?}"), &|| both.counts(&parsed).0.to_string());
+            let parsed = request_all(
+                Route::Titles,
+                &format!("{query}{}limit=40", if query.is_empty() { "" } else { "&" }),
+            );
+            let body =
+                time(&format!("all titles {query:?} limit=40"), &|| both.titles(&parsed).0.to_string());
+            let answer: Value = serde_json::from_str(&body).unwrap();
+            let first: Vec<String> = answer["titles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(12)
+                .map(|t| format!("{} {}", t["type"].as_str().unwrap(), t["title"]))
+                .collect();
+            eprintln!("  total {}, first {first:?}", answer["total"]);
+        }
+        let genres = both.counts(&request_all(Route::Counts, "")).0["kinds"]["genre"]["values"].clone();
+        eprintln!("  all genre counts {genres}");
+        let top = both.titles(&request_all(Route::Titles, "limit=100")).0;
+        let series: Vec<usize> = top["titles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t["type"] == "series")
+            .map(|(i, _)| i + 1)
+            .collect();
+        eprintln!("  all: series at positions {series:?} of the first 100");
         for query in [
             "",
             "sel=genre:18",
