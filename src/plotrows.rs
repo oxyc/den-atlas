@@ -102,9 +102,16 @@ pub(crate) fn resolve_axis(axis: &str, value: &str) -> String {
     STRUCTURE_ALIAS.iter().find(|(v, _)| *v == value).map_or("chronology", |(_, axis)| *axis).to_owned()
 }
 
+/// axis → value → the titles carrying it, each with a byte the tier gives meaning to.
+type Tier = HashMap<String, HashMap<String, Vec<(Key, u8)>>>;
+
 pub struct PlotFacets {
     /// axis → value → the titles carrying it, each with its confidence: 3 high, 2 medium, 1 low.
-    by_value: HashMap<String, HashMap<String, Vec<(Key, u8)>>>,
+    by_value: Tier,
+    /// The tentative tier (`facet_tv`/`facet_tp`): axis → value → the titles the writer's gates refused only
+    /// as uncertain, each with its probability in hundredths. Empty for a store without the tier. Never
+    /// the same cell as `by_value`: the writer writes a cell to one tier or neither.
+    tentative: Tier,
     titles: usize,
 }
 
@@ -135,14 +142,26 @@ impl PlotFacets {
             ));
         }
 
+        let tier = store.tentative_facets().map_err(|e| e.to_string())?;
         let floor = (FACET_FLOOR * 100.0).round() as u8;
         let mut by_value: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
+        let mut tentative: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
         let mut described = 0usize;
         for (row, &packed) in keys.iter().enumerate() {
             let media = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
             let key = (media, packed as u32);
             let mut any = false;
             for (axis, name) in den_store::FACET_AXES.iter().enumerate() {
+                if let Some(guess) = tier.get(den_store::Row(row), axis) {
+                    if let Some(value) = strings.get(guess.value) {
+                        tentative
+                            .entry((*name).to_owned())
+                            .or_default()
+                            .entry(value.to_owned())
+                            .or_default()
+                            .push((key, guess.probability));
+                    }
+                }
                 let at = row * axes + axis;
                 let (value, conf) = (values[at], confs[at]);
                 // A declined axis is stored absent, never as a value, and a value under the floor is one
@@ -169,7 +188,7 @@ impl PlotFacets {
                 described += 1;
             }
         }
-        Ok(PlotFacets { by_value, titles: described })
+        Ok(PlotFacets { by_value, tentative, titles: described })
     }
 
     /// The old `plotFacetsFile` sidecar.
@@ -197,7 +216,7 @@ impl PlotFacets {
                 by_value.entry(axis).or_default().entry(value).or_default().push((key, confidence));
             }
         }
-        Ok(PlotFacets { by_value, titles })
+        Ok(PlotFacets { by_value, tentative: HashMap::new(), titles })
     }
 
     pub fn len(&self) -> usize {
@@ -257,24 +276,78 @@ impl PlotFacets {
         self.by_value.contains_key(&resolve_axis(axis, value))
     }
 
+    /// Whether the store carries a tentative tier at all. Without one every answer here reads as before it.
+    pub fn has_tentative(&self) -> bool {
+        !self.tentative.is_empty()
+    }
+
+    /// Every `(axis, value)` of the tentative tier and the titles carrying it, each with its probability in
+    /// hundredths, for the filters (`filter.rs`).
+    pub fn tentative_values(&self) -> impl Iterator<Item = (&str, &str, &[(Key, u8)])> {
+        self.tentative.iter().flat_map(|(axis, values)| {
+            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles.as_slice()))
+        })
+    }
+
+    /// The titles one tier holds for `axis=value`, the merged display rows included; `None` for an axis or
+    /// value the tier does not have.
+    fn titles_in<'s>(tier: &'s Tier, axis: &str, value: &str) -> Option<std::borrow::Cow<'s, [(Key, u8)]>> {
+        // `structure=…` is the old sidecar's spelling; resolve it to whichever axis answers it.
+        let axis = &resolve_axis(axis, value);
+        let values = tier.get(axis)?;
+        if let Some(merged) = MERGED_ROWS.iter().find(|m| m.axis == axis && m.value == value) {
+            // A title holds one value per axis, so the members are disjoint and their concatenation is
+            // the union, each title at the confidence it carries its one member with.
+            let union: Vec<(Key, u8)> =
+                merged.members.iter().filter_map(|m| values.get(*m)).flatten().copied().collect();
+            return Some(union.into());
+        }
+        values.get(value).map(|list| list.as_slice().into())
+    }
+
+    /// The titles of `media_type` carrying every `(axis, value)` only once the tentative tier is read too:
+    /// each constraint matched confidently or tentatively, at least one tentatively. Each comes with the
+    /// lowest probability among its tentative matches, which is what orders them. Disjoint from `matching`.
+    pub fn likely(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
+        if self.tentative.is_empty() || constraints.is_empty() {
+            return Vec::new();
+        }
+        // Per constraint: title → `None` where it matches confidently, `Some(p)` where tentatively.
+        let mut tiers: Vec<HashMap<Key, Option<u8>>> = Vec::with_capacity(constraints.len());
+        for (axis, value) in constraints {
+            let sure = Self::titles_in(&self.by_value, axis, value);
+            let guessed = Self::titles_in(&self.tentative, axis, value);
+            let mut tier: HashMap<Key, Option<u8>> = HashMap::new();
+            tier.extend(guessed.iter().flat_map(|list| list.iter()).map(|&(key, p)| (key, Some(p))));
+            tier.extend(sure.iter().flat_map(|list| list.iter()).map(|&(key, _)| (key, None)));
+            tiers.push(tier);
+        }
+        let Some((first, rest)) = tiers.split_first() else { return Vec::new() };
+        first
+            .iter()
+            .filter(|(key, _)| key.0 == media_type)
+            .filter_map(|(&key, &tier)| {
+                rest.iter()
+                    .try_fold(tier, |lowest, other| {
+                        let &tier = other.get(&key)?;
+                        Some(match (lowest, tier) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        })
+                    })
+                    .flatten()
+                    .map(|lowest| (key, lowest))
+            })
+            .collect()
+    }
+
     /// The titles of `media_type` carrying every `(axis, value)`, each at the lowest confidence it carries any
     /// of them. Empty when a constraint names an axis or value the file doesn't have.
     pub fn matching(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
         let mut lists: Vec<std::borrow::Cow<'_, [(Key, u8)]>> = Vec::with_capacity(constraints.len());
         for (axis, value) in constraints {
-            // `structure=…` is the old sidecar's spelling; resolve it to whichever axis answers it.
-            let axis = &resolve_axis(axis, value);
-            let Some(values) = self.by_value.get(axis) else { return Vec::new() };
-            if let Some(merged) = MERGED_ROWS.iter().find(|m| m.axis == axis && m.value == value) {
-                // A title holds one value per axis, so the members are disjoint and their concatenation is
-                // the union, each title at the confidence it carries its one member with.
-                let union: Vec<(Key, u8)> =
-                    merged.members.iter().filter_map(|m| values.get(*m)).flatten().copied().collect();
-                lists.push(union.into());
-                continue;
-            }
-            match values.get(value) {
-                Some(list) => lists.push(list.as_slice().into()),
+            match Self::titles_in(&self.by_value, axis, value) {
+                Some(list) => lists.push(list),
                 None => return Vec::new(),
             }
         }
@@ -596,6 +669,9 @@ fn media_letter(media_type: MediaType) -> char {
 /// they combine. A title with no card is left out, since there is nothing to draw. "Most voted" reads TMDB's
 /// popularity in its daily `export` for a title facets.bin has no votes for.
 ///
+/// From a store with a tentative tier, the titles that carry a plot constraint only tentatively follow every
+/// confident one, most probable first, each card marked `likely`, and the answer counts them as `likely`.
+///
 /// `tilt` reorders the WHOLE row for a household before the page is cut, so a title the untilted order puts
 /// on page 3 can lead page 1 — the ceiling a client-side tilt over an already-loaded page cannot pass. It
 /// never filters and never changes `total`: the tilted order is a permutation of the untilted one, memoised
@@ -628,19 +704,61 @@ pub fn row(
         matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
         matched.into_iter().map(|(key, _, _)| key).collect()
     });
+    // The titles that carry the row only once the tentative tier is read, AFTER every confident one: by their
+    // lowest tentative probability, then as the confident ones are ordered. Empty for a store without the tier.
+    let tier = indexes.plot_facets.as_ref().is_some_and(PlotFacets::has_tentative);
+    let likely: std::sync::Arc<[Key]> = if !tier {
+        std::sync::Arc::from([])
+    } else {
+        indexes.row_order(format!("{row_key}|likely"), || {
+            let popularity = |key: Key| popularity(indexes, export, key);
+            let mut matched: Vec<(Key, u8, f64)> = likely_carrying(indexes, media_type, constraints)
+                .into_iter()
+                .filter(|(key, _)| cards.contains_key(key))
+                .map(|(key, lowest)| (key, lowest, popularity(key)))
+                .collect();
+            matched.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then(a.0 .1.cmp(&b.0 .1)));
+            matched.into_iter().map(|(key, _, _)| key).collect()
+        })
+    };
     // The household's order, memoised BESIDE the untilted one — per (row x taste fingerprint x weights), so
     // every page of this row for this household is a slice of one order and the two cannot disagree. The
     // untilted key is untouched, so a request that names no taste shares the entry every other one does.
-    let order = match tilt {
-        Some(tilt) => indexes.row_order(format!("{row_key}|t{}|w{}", tilt.taste, tilt.weights_key), || {
-            tilt.applied(indexes, &order, cards)
-        }),
-        None => order,
+    // Each tier is tilted on its own, so a likely title never moves above a confident one.
+    let (order, likely) = match tilt {
+        Some(tilt) => {
+            let tilted = |key: String, tier: &[Key]| {
+                indexes.row_order(format!("{key}|t{}|w{}", tilt.taste, tilt.weights_key), || {
+                    tilt.applied(indexes, tier, cards)
+                })
+            };
+            let likely =
+                if likely.is_empty() { likely } else { tilted(format!("{row_key}|likely"), &likely) };
+            (tilted(row_key, &order), likely)
+        }
+        None => (order, likely),
     };
-    let total = order.len();
-    let titles: Vec<serde_json::Value> =
-        order.iter().skip(skip).take(limit).map(|&key| title_json(indexes, key, &cards[&key])).collect();
+    let total = order.len() + likely.len();
+    let titles: Vec<serde_json::Value> = order
+        .iter()
+        .map(|key| (key, false))
+        .chain(likely.iter().map(|key| (key, true)))
+        .skip(skip)
+        .take(limit)
+        .map(|(&key, tentative)| {
+            let mut title = title_json(indexes, key, &cards[&key]);
+            if tentative {
+                title["likely"] = serde_json::json!(true);
+            }
+            title
+        })
+        .collect();
     let mut answer = serde_json::json!({ "titles": titles, "total": total, "coverage": coverage });
+    // How many of `total` are likely matches, and so come last. Only for a store with the tier, which keeps
+    // an answer from one without it byte-identical to what this route gave before the tier existed.
+    if tier {
+        answer["likely"] = serde_json::json!(likely.len());
+    }
     // Which order this page is a slice of, for a client that pages a row while the household's taste moves:
     // a page whose `taste` differs from the one before it came from a different order, so the two must not
     // be concatenated. Absent when no taste was sent, which keeps an untilted answer byte-identical to the
@@ -697,6 +815,26 @@ pub(crate) fn carrying(
                     label_confidence(indexes, key, family, label).map(|c| lowest.min(c))
                 })
                 .map(|lowest| (key, lowest))
+        })
+        .collect()
+}
+
+/// The titles of `media_type` a row lists after `carrying`'s: every plot constraint matched confidently or
+/// tentatively and at least one tentatively (`PlotFacets::likely`), every label constraint as `carrying`
+/// reads it. Each with its lowest tentative probability. Empty for a row with no plot constraint.
+fn likely_carrying(
+    indexes: &Indexes,
+    media_type: MediaType,
+    constraints: &[(String, String)],
+) -> Vec<(Key, u8)> {
+    let (labels, plot): (Vec<_>, Vec<_>) =
+        constraints.iter().cloned().partition(|(axis, _)| axis == "mood" || axis == "subgenre");
+    let Some(facets) = indexes.plot_facets.as_ref().filter(|_| !plot.is_empty()) else { return Vec::new() };
+    facets
+        .likely(media_type, &plot)
+        .into_iter()
+        .filter(|&(key, _)| {
+            labels.iter().all(|(family, label)| label_confidence(indexes, key, family, label).is_some())
         })
         .collect()
 }

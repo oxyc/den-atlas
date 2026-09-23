@@ -205,6 +205,9 @@ pub(crate) mod fixture {
         pub premise: Vec<i8>,
         /// (axis, value, confidence in hundredths). An axis left out is stored absent.
         pub facets: Vec<(&'a str, &'a str, u8)>,
+        /// (axis, value, probability in hundredths): the tentative tier. Its two sections are written when
+        /// any title has one, as a store written before the tier has neither.
+        pub tentative: Vec<(&'a str, &'a str, u8)>,
         /// (title, poster path, year). Absent ⇒ no card, which is how a row with no drawable name is held.
         pub card: Option<(&'a str, Option<&'a str>, Option<i16>)>,
         pub votes: u32,
@@ -513,6 +516,26 @@ pub(crate) mod fixture {
         }
         b.u32s("facet_v", &facet_v);
         b.u8s("facet_c", &facet_c);
+        if titles.iter().any(|t| !t.tentative.is_empty()) {
+            let mut facet_tv: Vec<u32> = Vec::with_capacity(rows * den_store::FACET_AXES.len());
+            let mut facet_tp: Vec<u8> = Vec::with_capacity(rows * den_store::FACET_AXES.len());
+            for title in &titles {
+                for axis in den_store::FACET_AXES {
+                    match title.tentative.iter().find(|(name, _, _)| *name == axis) {
+                        Some(&(_, value, probability)) => {
+                            facet_tv.push(b.intern(value));
+                            facet_tp.push(probability);
+                        }
+                        None => {
+                            facet_tv.push(den_store::NONE_U32);
+                            facet_tp.push(0);
+                        }
+                    }
+                }
+            }
+            b.u32s("facet_tv", &facet_tv);
+            b.u8s("facet_tp", &facet_tp);
+        }
 
         // Cards and votes.
         let card_title: Vec<u32> =

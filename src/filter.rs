@@ -773,7 +773,22 @@ struct Derived {
     /// A fingerprint of each order, so a client paging while it changes can tell.
     order_id: [String; 3],
     /// Each scope's counts for the empty selection, worked out once.
-    empty: [OnceLock<(Value, usize)>; 3],
+    empty: [OnceLock<(Value, Counted)>; 3],
+}
+
+/// The titles a selection matches. `sure` carries every plot axis it names confidently; `any` also counts the
+/// tentative tier, so `sure ⊆ any`, and `any \ sure` are its likely matches. The two are equal for a store
+/// without the tier, or a selection naming no plot axis.
+struct Matched {
+    sure: Bits,
+    any: Bits,
+}
+
+/// How many titles a selection or a value holds, and how many of those only through the tentative tier.
+#[derive(Clone, Copy)]
+struct Counted {
+    total: usize,
+    likely: usize,
 }
 
 /// A narrative location a query named (`FilterIndex::place_named`).
@@ -789,6 +804,9 @@ pub struct FilterIndex {
     /// Each scope's rows with a card, as counts, totals and the grid all count them: [movie, series, all].
     types: [Bits; 3],
     bits: BTreeMap<&'static str, Valued>,
+    /// The plot axes' tentative tier (`PlotFacets::tentative_values`): axis → value → the titles carrying it
+    /// only tentatively. Never overlaps the value's bits in `bits`. Empty for a store without the tier.
+    likely: BTreeMap<&'static str, BTreeMap<String, Bits>>,
     /// Per `ENTITY_KINDS` row; `None` when the store does not carry its sections, and then not offered.
     entities: Vec<Option<EntityKind>>,
     /// Kinds this atlas should answer and cannot, through a failure at load: the facts or the facet rows did
@@ -1032,6 +1050,7 @@ impl FilterIndex {
             }
         }
 
+        let mut likely: BTreeMap<&'static str, BTreeMap<String, Bits>> = BTreeMap::new();
         if let Some(plot_facets) = &indexes.plot_facets {
             for &axis in den_store::FACET_AXES.iter() {
                 open(&mut bits, axis);
@@ -1044,14 +1063,39 @@ impl FilterIndex {
                     }
                 }
             }
-            // The merged display rows `/index/row` answers (`ending:unhappy`), as the union of their members.
-            for merged in crate::plotrows::MERGED_ROWS {
-                let Some(valued) = bits.get_mut(merged.axis) else { continue };
-                let mut union = zeros();
-                for member in merged.members.iter().filter_map(|m| valued.values.get(*m)) {
-                    union.iter_mut().zip(member).for_each(|(u, m)| *u |= m);
+            // The tentative tier. It does not make a title KNOWN for the axis, so an exclusion never keeps a
+            // title on a tentative value; and a value only the tier holds is still a value of the axis, listed
+            // and selectable, with no confident titles.
+            for (axis, value, titles) in plot_facets.tentative_values() {
+                let Some(axis) = den_store::FACET_AXES.iter().copied().find(|a| *a == axis) else { continue };
+                let tier = likely.entry(axis).or_default().entry(value.to_owned()).or_insert_with(zeros);
+                for (key, _) in titles {
+                    if let Some(&row) = row_of.get(key) {
+                        set(tier, row);
+                    }
                 }
-                valued.values.insert(merged.value.to_owned(), union);
+                if let Some(valued) = bits.get_mut(axis) {
+                    valued.values.entry(value.to_owned()).or_insert_with(zeros);
+                }
+            }
+            // The merged display rows `/index/row` answers (`ending:unhappy`), as the union of their members,
+            // in each tier.
+            for merged in crate::plotrows::MERGED_ROWS {
+                let union = |values: &BTreeMap<String, Bits>| {
+                    let mut union = zeros();
+                    for member in merged.members.iter().filter_map(|m| values.get(*m)) {
+                        union.iter_mut().zip(member).for_each(|(u, m)| *u |= m);
+                    }
+                    union
+                };
+                if let Some(valued) = bits.get_mut(merged.axis) {
+                    let sure = union(&valued.values);
+                    valued.values.insert(merged.value.to_owned(), sure);
+                }
+                if let Some(values) = likely.get_mut(merged.axis) {
+                    let guessed = union(values);
+                    values.insert(merged.value.to_owned(), guessed);
+                }
             }
         } else {
             unavailable.extend(den_store::FACET_AXES.iter().copied());
@@ -1111,6 +1155,7 @@ impl FilterIndex {
             .map(|v| v.values.values().map(bitset).sum::<usize>() + bitset(&v.known))
             .sum::<usize>()
             + entities.iter().flatten().map(|e| bitset(&e.known)).sum::<usize>()
+            + likely.values().flat_map(|v| v.values()).map(bitset).sum::<usize>()
             + postings_bytes
             + keys.len() * std::mem::size_of::<Key>()
             + 3 * bitset(&types[0]);
@@ -1120,6 +1165,7 @@ impl FilterIndex {
             keys,
             types,
             bits,
+            likely,
             entities,
             unavailable,
             derived: Mutex::new(None),
@@ -1606,22 +1652,54 @@ impl<'a> Context<'a> {
         ids.get(entity as usize).copied().filter(|&id| id != den_store::NONE_U32)
     }
 
-    /// The titles of the route type carrying every applied item except those of `skip`: `-kind:id` keeps the
-    /// titles known for the kind and not carrying the value.
-    fn matched(&self, applied: &[(&'static Spec, &Item)], skip: Option<&str>) -> Bits {
-        let mut matched = self.filter.types[self.t()].clone();
+    /// Whether the store carries a tentative tier. The split fields are answered only then, which keeps an
+    /// answer from a store without one byte-identical to what it was before the tier existed.
+    fn tier(&self) -> bool {
+        !self.filter.likely.is_empty()
+    }
+
+    /// The titles carrying a value only tentatively: a plot axis's tier, `None` for any other kind.
+    fn likely_bits(&self, spec: &Spec, id: &str) -> Option<&Bits> {
+        match spec.data {
+            Data::Bits => self.filter.likely.get(spec.name)?.get(id),
+            _ => None,
+        }
+    }
+
+    /// A value's titles within `base` — its confident bits, and its tentative ones — and how many of them
+    /// count only through the tentative tier.
+    fn counted(&self, base: &Matched, bits: &[u64], likely: Option<&Bits>) -> Counted {
+        let total = and_count(&base.any, bits) + likely.map_or(0, |l| and_count(&base.any, l));
+        Counted { total, likely: total - and_count(&base.sure, bits) }
+    }
+
+    /// The titles of the route type carrying every applied item except those of `skip`, confidently and with
+    /// the tentative tier (`Matched`). `-kind:id` keeps the titles known for the kind and not carrying the
+    /// value, and on a plot axis "known" is the confident tier alone: an exclusion never keeps a title for a
+    /// tentative value, and a title whose axis is only tentative is dropped as unknown, whichever way it leans.
+    fn matched(&self, applied: &[(&'static Spec, &Item)], skip: Option<&str>) -> Matched {
+        let mut sure = self.filter.types[self.t()].clone();
+        let mut any = sure.clone();
         for (spec, item) in applied {
             if Some(spec.name) == skip {
                 continue;
             }
             let (value, known) = self.value_bits(spec, &item.id);
             if item.exclude {
-                matched.iter_mut().zip(value.iter().zip(&known)).for_each(|(m, (v, k))| *m &= k & !v);
-            } else {
-                matched.iter_mut().zip(&value).for_each(|(m, v)| *m &= v);
+                for matched in [&mut sure, &mut any] {
+                    matched.iter_mut().zip(value.iter().zip(&known)).for_each(|(m, (v, k))| *m &= k & !v);
+                }
+                continue;
+            }
+            sure.iter_mut().zip(&value).for_each(|(m, v)| *m &= v);
+            match self.likely_bits(spec, &item.id) {
+                Some(likely) => {
+                    any.iter_mut().zip(value.iter().zip(likely)).for_each(|(m, (v, l))| *m &= v | l)
+                }
+                None => any.iter_mut().zip(&value).for_each(|(m, v)| *m &= v),
             }
         }
-        matched
+        Matched { sure, any }
     }
 
     /// The titles of the route's type (of both, under `all`): what `total` and every coverage is out of.
@@ -1689,11 +1767,37 @@ impl<'a> Context<'a> {
                     .is_some_and(|q| spec.only.contains(&q)))
     }
 
-    /// One kind's object in `counts.json`.
-    fn kind_answer(&self, spec: &Spec, base: &[u64], selected: &[&Item]) -> Value {
+    /// Entity counts under `base`, each with how many of its titles are likely matches: the counts over `any`,
+    /// less those over `sure` where the two differ.
+    fn entity_tallies(&self, i: usize, base: &Matched) -> Vec<(u32, Counted)> {
+        let counted = self.entity_counts(i, &base.any);
+        let sure: HashMap<u32, u32> = if base.sure == base.any {
+            HashMap::new()
+        } else {
+            self.entity_counts(i, &base.sure).into_iter().collect()
+        };
+        counted
+            .into_iter()
+            .map(|(e, n)| {
+                let likely = if base.sure == base.any { 0 } else { n - sure.get(&e).copied().unwrap_or(0) };
+                (e, Counted { total: n as usize, likely: likely as usize })
+            })
+            .collect()
+    }
+
+    /// One kind's object in `counts.json`. `values` counts both tiers; `likely` says how many of each count
+    /// are likely matches, for a value that has any.
+    fn kind_answer(&self, spec: &Spec, base: &Matched, selected: &[&Item]) -> Value {
         let mut values = Map::new();
+        let mut likely = Map::new();
         let mut labels = Map::new();
         let mut complete = true;
+        let mut put = |values: &mut Map<String, Value>, id: String, tally: Counted| {
+            if tally.likely > 0 {
+                likely.insert(id.clone(), tally.likely.into());
+            }
+            values.insert(id, tally.total.into());
+        };
         match spec.data {
             Data::Bits | Data::Rating => {
                 let valued = if spec.data == Data::Rating {
@@ -1703,23 +1807,23 @@ impl<'a> Context<'a> {
                 };
                 if let Some(valued) = valued {
                     for (value, bits) in &valued.values {
-                        let n = and_count(base, bits);
-                        if n > 0 {
-                            values.insert(value.clone(), n.into());
+                        let tally = self.counted(base, bits, self.likely_bits(spec, value));
+                        if tally.total > 0 {
+                            put(&mut values, value.clone(), tally);
                         }
                     }
                 }
             }
             Data::Entity(i) => {
-                let mut counted = self.entity_counts(i, base);
-                counted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                let mut counted = self.entity_tallies(i, base);
+                counted.sort_unstable_by(|a, b| b.1.total.cmp(&a.1.total).then(a.0.cmp(&b.0)));
                 complete = counted.len() <= TOP_K;
-                for &(e, n) in counted.iter().take(TOP_K) {
+                for &(e, tally) in counted.iter().take(TOP_K) {
                     let id = self.qid(e);
                     if let Some(label) = self.label(e) {
                         labels.insert(id.clone(), label.into());
                     }
-                    values.insert(id, n.into());
+                    put(&mut values, id, tally);
                 }
             }
             Data::Character | Data::Like => complete = false,
@@ -1728,7 +1832,8 @@ impl<'a> Context<'a> {
         for item in selected {
             if !values.contains_key(&item.id) {
                 let (bits, _) = self.value_bits(spec, &item.id);
-                values.insert(item.id.clone(), and_count(base, &bits).into());
+                let tally = self.counted(base, &bits, self.likely_bits(spec, &item.id));
+                put(&mut values, item.id.clone(), tally);
             }
             match spec.data {
                 Data::Entity(_) => {
@@ -1759,8 +1864,11 @@ impl<'a> Context<'a> {
         // What the values are counted out of: the selection, or for a one-pick kind with its pick made, the
         // selection without that pick — so `tone.values.comic` may exceed `total`.
         let mut answer = json!({
-            "mode": spec.mode.name(), "complete": complete, "values": values, "denominator": popcount(base),
+            "mode": spec.mode.name(), "complete": complete, "values": values, "denominator": popcount(&base.any),
         });
+        if !likely.is_empty() {
+            answer["likely"] = Value::Object(likely);
+        }
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
         }
@@ -1777,16 +1885,17 @@ impl<'a> Context<'a> {
     }
 
     /// The kinds object and total for a selection; the empty selection's is worked out once per type.
-    fn kinds(&self, applied: &[(&'static Spec, &Item)]) -> (Value, usize) {
+    fn kinds(&self, applied: &[(&'static Spec, &Item)]) -> (Value, Counted) {
         if applied.is_empty() {
             return self.derived.empty[self.t()].get_or_init(|| self.work_kinds(&[])).clone();
         }
         self.work_kinds(applied)
     }
 
-    fn work_kinds(&self, applied: &[(&'static Spec, &Item)]) -> (Value, usize) {
+    fn work_kinds(&self, applied: &[(&'static Spec, &Item)]) -> (Value, Counted) {
         let matched = self.matched(applied, None);
-        let total = matched.iter().map(|w| w.count_ones() as usize).sum();
+        let total = popcount(&matched.any);
+        let tally = Counted { total, likely: total - popcount(&matched.sure) };
         let mut kinds = Map::new();
         for spec in SPECS.iter().filter(|s| self.status(s) == Status::Ready) {
             let selected: Vec<&Item> =
@@ -1802,7 +1911,16 @@ impl<'a> Context<'a> {
             };
             kinds.insert(spec.name.to_owned(), answer);
         }
-        (Value::Object(kinds), total)
+        (Value::Object(kinds), tally)
+    }
+
+    /// The overall split, beside `total`, for a store with the tier: `confident` titles match every plot axis
+    /// selected with a published value, `likely` ones need the tentative tier for at least one.
+    fn split_totals(&self, answer: &mut Value, tally: Counted) {
+        if self.tier() {
+            answer["confident"] = json!(tally.total - tally.likely);
+            answer["likely"] = json!(tally.likely);
+        }
     }
 
     /// Whether a value is one its kind holds at all, so a typo (`tone:blaek`, `mood:tense` for `Tense`) is told
@@ -1843,20 +1961,38 @@ impl<'a> Context<'a> {
     /// `counts.json`. The flag says a kind this atlas should answer is unavailable.
     pub fn counts(&self, request: &Request) -> (Value, bool) {
         let (applied, ignored) = self.split(&request.items);
-        let (kinds, total) = self.kinds(&applied);
+        let (kinds, tally) = self.kinds(&applied);
         let mut answer = json!({
-            "total": total, "denominator": self.population(), "kinds": kinds, "coverage": self.coverage(&applied),
+            "total": tally.total, "denominator": self.population(), "kinds": kinds,
+            "coverage": self.coverage(&applied),
         });
+        self.split_totals(&mut answer, tally);
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
 
+    /// A likely match's rank key: the lowest probability among the plot axes it carries only tentatively.
+    /// `plot` is each selected plot value that has a tier: its axis, and its confident titles.
+    fn lowest_tentative(
+        tier: &den_store::TentativeFacets<'_>,
+        plot: &[(usize, Option<&Bits>)],
+        row: usize,
+    ) -> u8 {
+        plot.iter()
+            .filter(|(_, sure)| !sure.is_some_and(|bits| has(bits, row)))
+            .filter_map(|&(axis, _)| tier.get(den_store::Row(row), axis).map(|t| t.probability))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// `titles.json`: the titles carrying the selection, most voted first — or, with a `like` selected, in
-    /// its similarity order — as `/index/row`'s cards.
+    /// its similarity order — as `/index/row`'s cards. Every confident match comes first; the likely ones
+    /// follow, by their lowest tentative probability and then in the same order, each card marked `likely`.
     pub fn titles(&self, request: &Request) -> (Value, bool) {
         let (applied, ignored) = self.split(&request.items);
         let matched = self.matched(&applied, None);
-        let total: usize = matched.iter().map(|w| w.count_ones() as usize).sum();
+        let total = popcount(&matched.any);
+        let confident = popcount(&matched.sure);
         let like = applied
             .iter()
             .find(|(s, i)| s.data == Data::Like && !i.exclude && self.like_key(&i.id).is_some())
@@ -1865,15 +2001,40 @@ impl<'a> Context<'a> {
             Some(id) => (self.like_rows(id), format!("like:{id}")),
             None => (self.derived.order[self.t()].clone(), self.derived.order_id[self.t()].clone()),
         };
-        let titles: Vec<Value> = match self.indexes.cards.as_ref() {
-            Some(cards) => order
+        let sure = order.iter().copied().filter(|&row| has(&matched.sure, row as usize));
+        // Ranked only when the page reaches past the confident matches.
+        let mut likely: Vec<(u8, usize, u32)> = Vec::new();
+        if request.skip + request.limit > confident && total > confident {
+            let tier = self.view.tentative_facets().unwrap_or_default();
+            let plot: Vec<(usize, Option<&Bits>)> = applied
                 .iter()
-                .filter(|&&row| has(&matched, row as usize))
+                .filter(|(spec, item)| !item.exclude && self.likely_bits(spec, &item.id).is_some())
+                .filter_map(|(spec, item)| {
+                    let axis = den_store::FACET_AXES.iter().position(|a| *a == spec.name)?;
+                    Some((axis, self.filter.bits.get(spec.name).and_then(|v| v.values.get(&item.id))))
+                })
+                .collect();
+            likely = order
+                .iter()
+                .enumerate()
+                .filter(|&(_, &row)| has(&matched.any, row as usize) && !has(&matched.sure, row as usize))
+                .map(|(at, &row)| (Self::lowest_tentative(&tier, &plot, row as usize), at, row))
+                .collect();
+            likely.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        }
+        let titles: Vec<Value> = match self.indexes.cards.as_ref() {
+            Some(cards) => sure
+                .map(|row| (row, false))
+                .chain(likely.iter().map(|&(_, _, row)| (row, true)))
                 .skip(request.skip)
                 .take(request.limit)
-                .filter_map(|&row| {
+                .filter_map(|(row, tentative)| {
                     let key = self.filter.keys[row as usize];
-                    cards.get(&key).map(|card| crate::plotrows::title_json(self.indexes, key, card))
+                    let mut title = crate::plotrows::title_json(self.indexes, key, cards.get(&key)?);
+                    if tentative {
+                        title["likely"] = json!(true);
+                    }
+                    Some(title)
                 })
                 .collect(),
             None => Vec::new(),
@@ -1882,6 +2043,7 @@ impl<'a> Context<'a> {
             "titles": titles, "total": total, "denominator": self.population(), "order": order_id,
             "coverage": self.coverage(&applied),
         });
+        self.split_totals(&mut answer, Counted { total, likely: total - confident });
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
     }
@@ -1902,8 +2064,13 @@ impl<'a> Context<'a> {
             Some(q) => match_tier(&crate::facts::name_key(name), q),
             None => Some(0),
         };
+        // How many of `rows` the selection holds, and how many of those only through the tentative tier.
+        let rows_tally = |rows: &[u32]| {
+            let total = rows.iter().filter(|&&r| has(&base.any, r as usize)).count();
+            Counted { total, likely: total - rows.iter().filter(|&&r| has(&base.sure, r as usize)).count() }
+        };
         // (match tier, id, name, count, tiebreak, tmdb)
-        let mut found: Vec<(u8, String, String, usize, usize, Option<u32>)> = Vec::new();
+        let mut found: Vec<(u8, String, String, Counted, usize, Option<u32>)> = Vec::new();
         // Values counted but left unnamed past the page, so `complete` still counts them.
         let mut beyond = 0;
         if self.status(spec) == Status::Ready {
@@ -1927,16 +2094,16 @@ impl<'a> Context<'a> {
                             }
                             None => tier(name),
                         };
-                        let n = and_count(&base, bits);
-                        if let (true, Some(matched)) = (n > 0, matched) {
+                        let tally = self.counted(&base, bits, self.likely_bits(spec, value));
+                        if let (true, Some(matched)) = (tally.total > 0, matched) {
                             let all = and_count(&self.filter.types[self.t()], bits);
-                            found.push((matched, value.clone(), name.to_owned(), n, all, None));
+                            found.push((matched, value.clone(), name.to_owned(), tally, all, None));
                         }
                     }
                 }
                 Data::Entity(i) => {
                     if let Some(kind) = self.filter.entities[i].as_ref() {
-                        let candidates: Vec<(u32, u8, usize)> = match q {
+                        let candidates: Vec<(u32, u8, Counted)> = match q {
                             Some(q) => self
                                 .filter
                                 .names(self.indexes)
@@ -1948,24 +2115,24 @@ impl<'a> Context<'a> {
                                         kind.postings.iter().flat_map(|p| p.of(e).iter().copied()).collect();
                                     rows.sort_unstable();
                                     rows.dedup();
-                                    let n = rows.iter().filter(|&&r| has(&base, r as usize)).count();
-                                    (n > 0).then_some((e, tier, n))
+                                    let tally = rows_tally(&rows);
+                                    (tally.total > 0).then_some((e, tier, tally))
                                 })
                                 .collect(),
                             None => self
-                                .entity_counts(i, &base)
+                                .entity_tallies(i, &base)
                                 .into_iter()
-                                .map(|(e, n)| (e, 0, n as usize))
+                                .map(|(e, tally)| (e, 0, tally))
                                 .collect(),
                         };
                         // A person kind can count hundreds of thousands of values, so only those that can
                         // reach the page are named: the top `limit` by match, count and titles, and any tied
                         // with the last of them (the name decides among those, below).
-                        let mut ranked: Vec<(u32, u8, usize, usize)> =
+                        let mut ranked: Vec<(u32, u8, Counted, usize)> =
                             candidates.into_iter().map(|(e, tier, n)| (e, tier, n, kind.titles(e))).collect();
                         beyond += ranked.len().saturating_sub(request.limit);
-                        let rank = |&(_, tier, n, titles): &(u32, u8, usize, usize)| {
-                            (tier, std::cmp::Reverse(n), std::cmp::Reverse(titles))
+                        let rank = |&(_, tier, n, titles): &(u32, u8, Counted, usize)| {
+                            (tier, std::cmp::Reverse(n.total), std::cmp::Reverse(titles))
                         };
                         ranked.sort_unstable_by_key(rank);
                         if let Some(last) = ranked.get(request.limit.saturating_sub(1)).map(rank) {
@@ -1980,13 +2147,13 @@ impl<'a> Context<'a> {
                 Data::Character => {
                     if let (Some(characters), Some(q)) = (self.characters.as_ref(), q) {
                         for (name, rows) in characters.named().with_prefix(q) {
-                            let n = rows.iter().filter(|&&r| has(&base, r as usize)).count();
-                            if let (true, Some(tier)) = (n > 0, match_tier(name, q)) {
+                            let tally = rows_tally(rows);
+                            if let (true, Some(tier)) = (tally.total > 0, match_tier(name, q)) {
                                 found.push((
                                     tier,
                                     name.replace(' ', "-"),
                                     name.to_owned(),
-                                    n,
+                                    tally,
                                     rows.len(),
                                     None,
                                 ));
@@ -1998,14 +2165,21 @@ impl<'a> Context<'a> {
             }
         }
         found.sort_by(|a, b| {
-            a.0.cmp(&b.0).then(b.3.cmp(&a.3)).then(b.4.cmp(&a.4)).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1))
+            a.0.cmp(&b.0)
+                .then(b.3.total.cmp(&a.3.total))
+                .then(b.4.cmp(&a.4))
+                .then(a.2.cmp(&b.2))
+                .then(a.1.cmp(&b.1))
         });
         let complete = found.len() <= request.limit && beyond == 0;
         let values: Vec<Value> = found
             .into_iter()
             .take(request.limit)
-            .map(|(_, id, name, count, _, tmdb)| {
-                let mut value = json!({ "id": id, "name": name, "count": count });
+            .map(|(_, id, name, tally, _, tmdb)| {
+                let mut value = json!({ "id": id, "name": name, "count": tally.total });
+                if tally.likely > 0 {
+                    value["likely"] = json!(tally.likely);
+                }
                 if let Some(tmdb) = tmdb {
                     value["tmdbId"] = json!(tmdb);
                 }
@@ -2014,7 +2188,7 @@ impl<'a> Context<'a> {
             .collect();
         let mut answer = json!({
             "kind": spec.name, "mode": spec.mode.name(), "values": values, "complete": complete,
-            "denominator": popcount(&base),
+            "denominator": popcount(&base.any),
         });
         let degraded = self.envelope(&mut answer, &applied, ignored);
         (answer, degraded)
@@ -2085,7 +2259,21 @@ pub fn schema() -> Value {
         "ratingMinVotes": MIN_VOTES,
         "exclude": "-<kind>:<id>: the titles known for the kind and not carrying the value. Stricter than a \
                     search's negation (/index/query.json, \"not british\"), which drops the titles on record as \
-                    carrying the value and keeps the unknown ones: the two can answer different sets",
+                    carrying the value and keeps the unknown ones: the two can answer different sets. On a plot \
+                    axis only a confident value makes a title known: a title whose axis is only likely is \
+                    dropped by an exclusion on that axis, whichever value it leans to, and an exclusion adds \
+                    no likely matches",
+        "likely": "plot axes carry two tiers. A confident value passed the dataset's publication gates; a likely \
+                   one is the model's best guess where it was not sure (probability 0.50 to 0.70, about 8 in \
+                   10 right against 9 to 10). A plot-axis selection matches both, and a title that needs a \
+                   likely value for any selected axis is a likely match. Where the store carries likely values: \
+                   counts.json and titles.json add confident and likely beside total (total = confident + \
+                   likely); each kind's likely map says how many of values[id] are likely matches, listing \
+                   only non-zero ones (confident = values - likely); a values/<kind>.json entry carries \
+                   likely the same way; titles.json lists every confident match first, then the likely ones, \
+                   highest lowest-probability first and then in the route's order, each card marked \
+                   likely: true; people.json counts people on both. A store without likely values answers \
+                   none of these fields, and every count is confident",
         "unknownValues": "selected items whose value the kind does not hold (a typo, a label's wrong case): \
                           they match nothing, and are named so a client can tell them from a real zero",
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
@@ -2328,6 +2516,194 @@ mod tests {
         assert!(answer["kinds"].get("warning").is_none(), "nothing to offer");
         assert_eq!(answer["ignored"], json!(["warning"]), "not answered with every title clean");
         assert!(!degraded, "a property of the dataset, not an outage");
+    }
+
+    /// Six films in both tiers, most voted first: 3 (1000 votes), 2 (500), 1 (100), 4 (50), 5 (10), 6 (5).
+    /// Confident: 1 ending=bittersweet, 4 ending=happy, 5 and 6 tone=bleak. Tentative: 2 bittersweet at 0.65,
+    /// 3 bittersweet at 0.55, 5 happy at 0.60, 6 open at 0.52. Films 1 and 2 are French, 3 American.
+    fn tentative_fixture(name: &str) -> Indexes {
+        use crate::store::fixture::Title;
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let film = |tmdb_id, votes, country| Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A film", None, Some(2000))),
+            votes,
+            countries: vec![country],
+            ..Title::default()
+        };
+        let titles = [
+            Title { facets: vec![("ending", "bittersweet", 90)], ..film(1, 100, "FR") },
+            Title { tentative: vec![("ending", "bittersweet", 65)], ..film(2, 500, "FR") },
+            Title { tentative: vec![("ending", "bittersweet", 55)], ..film(3, 1000, "US") },
+            Title { facets: vec![("ending", "happy", 90)], ..film(4, 50, "US") },
+            Title {
+                facets: vec![("tone", "bleak", 90)],
+                tentative: vec![("ending", "happy", 60)],
+                ..film(5, 10, "US")
+            },
+            Title {
+                facets: vec![("tone", "bleak", 90)],
+                tentative: vec![("ending", "open", 52)],
+                ..film(6, 5, "US")
+            },
+        ];
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &[]);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the fixture loads");
+        crate::queries::load_for_tools(&ds).expect("its indexes load")
+    }
+
+    /// A plot-axis selection matches both tiers: `total` counts every title, `confident` and `likely` split
+    /// it, and each kind's `likely` map says how much of each value's count is likely.
+    #[test]
+    fn a_plot_axis_counts_its_likely_titles_and_says_so() {
+        let indexes = tentative_fixture("likely-counts");
+        let bittersweet = counts(&indexes, Movie, "sel=ending:bittersweet");
+        assert_eq!(
+            (&bittersweet["total"], &bittersweet["confident"], &bittersweet["likely"]),
+            (&3.into(), &1.into(), &2.into())
+        );
+        // A one-pick kind counts its values without its own pick, so over all six films. The merged rows
+        // count too: `unhappy` holds bittersweet, `unresolved` holds open.
+        let ending = &bittersweet["kinds"]["ending"];
+        assert_eq!(
+            ending["values"],
+            json!({ "bittersweet": 3, "happy": 2, "open": 1, "unhappy": 3, "unresolved": 1 })
+        );
+        assert_eq!(
+            ending["likely"],
+            json!({ "bittersweet": 2, "happy": 1, "open": 1, "unhappy": 2, "unresolved": 1 })
+        );
+        // An AND kind counts under the whole selection, likely titles included.
+        assert_eq!(bittersweet["kinds"]["country"]["values"], json!({ "FR": 2, "US": 1 }));
+        assert_eq!(bittersweet["kinds"]["country"]["likely"], json!({ "FR": 1, "US": 1 }));
+
+        let french = counts(&indexes, Movie, "sel=country:FR,ending:bittersweet");
+        assert_eq!((&french["total"], &french["likely"]), (&2.into(), &1.into()));
+        // Stacked: film 5 is bleak confidently and happy only tentatively, so it is a likely match.
+        let stacked = counts(&indexes, Movie, "sel=ending:happy,tone:bleak");
+        assert_eq!(
+            (&stacked["total"], &stacked["confident"], &stacked["likely"]),
+            (&1.into(), &0.into(), &1.into())
+        );
+        // A value only the tentative tier holds is still a value, not an unknown one.
+        let open = counts(&indexes, Movie, "sel=ending:open");
+        assert_eq!((&open["total"], &open["likely"]), (&1.into(), &1.into()));
+        assert!(open.get("unknownValues").is_none(), "{open}");
+        // No plot axis selected: nothing is likely, and a kind lists no likely map.
+        let us = counts(&indexes, Movie, "sel=country:US");
+        assert_eq!((&us["total"], &us["likely"]), (&4.into(), &0.into()));
+        assert!(us["kinds"]["country"].get("likely").is_none());
+    }
+
+    /// An exclusion reads the confident tier alone: it keeps the titles confidently carrying another value,
+    /// and drops a title whose axis is only tentative, whichever way it leans.
+    #[test]
+    fn an_exclusion_on_a_plot_axis_reads_the_confident_tier_alone() {
+        let indexes = tentative_fixture("likely-exclude");
+        let not_happy = counts(&indexes, Movie, "sel=-ending:happy");
+        assert_eq!(
+            (&not_happy["total"], &not_happy["confident"], &not_happy["likely"]),
+            (&1.into(), &1.into(), &0.into()),
+            "film 1 alone: 2, 3 and 6 lean elsewhere and 5 leans happy, all only tentatively"
+        );
+        let titles =
+            Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "sel=-ending:happy")).0;
+        assert_eq!(ids(&titles), vec![1]);
+    }
+
+    /// Every confident match comes first, however popular a likely one is; the likely ones follow by their
+    /// probability, not their votes, each card marked.
+    #[test]
+    fn titles_list_confident_matches_first_then_likely_by_probability() {
+        let indexes = tentative_fixture("likely-titles");
+        let context = Context::new(&indexes, Movie, None);
+        let titles = context.titles(&request(Route::Titles, "sel=ending:bittersweet")).0;
+        assert_eq!(ids(&titles), vec![1, 2, 3], "3 has the most votes, and the lowest probability");
+        let likely: Vec<bool> =
+            titles["titles"].as_array().unwrap().iter().map(|t| t.get("likely").is_some()).collect();
+        assert_eq!(likely, vec![false, true, true]);
+        assert_eq!(
+            (&titles["total"], &titles["confident"], &titles["likely"]),
+            (&3.into(), &1.into(), &2.into())
+        );
+        // A page past the confident ones starts inside the likely tier, in the same order.
+        let second = context.titles(&request(Route::Titles, "sel=ending:bittersweet&skip=1&limit=1")).0;
+        assert_eq!(ids(&second), vec![2]);
+        // The merged row ranks its likely titles the same way.
+        let unhappy = context.titles(&request(Route::Titles, "sel=ending:unhappy")).0;
+        assert_eq!(ids(&unhappy), vec![1, 2, 3]);
+        // No plot axis selected: the route's own order, untouched.
+        assert_eq!(ids(&context.titles(&request(Route::Titles, "sel=country:US")).0), vec![3, 4, 5, 6]);
+    }
+
+    /// `values/<kind>.json` counts both tiers too, with each entry's likely share.
+    #[test]
+    fn values_count_likely_titles_and_say_so() {
+        let indexes = tentative_fixture("likely-values");
+        let spec = spec("ending").unwrap();
+        let answer = Context::new(&indexes, Movie, None)
+            .values(spec, &request(Route::Values(spec), "sel=country:FR"))
+            .0;
+        let bittersweet = answer["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == "bittersweet")
+            .expect("listed")
+            .clone();
+        assert_eq!((&bittersweet["count"], &bittersweet["likely"]), (&2.into(), &1.into()));
+    }
+
+    /// A browse row lists its confident titles first, then its likely ones by probability, and counts them.
+    #[test]
+    fn a_row_lists_likely_titles_after_confident_ones() {
+        let indexes = tentative_fixture("likely-row");
+        let row = |constraints: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> =
+                constraints.iter().map(|(a, v)| ((*a).to_owned(), (*v).to_owned())).collect();
+            crate::plotrows::row(&indexes, None, Movie, &owned, None, 0, 20)
+        };
+        let bittersweet = row(&[("ending", "bittersweet")]);
+        assert_eq!(ids(&bittersweet), vec![1, 2, 3]);
+        assert_eq!((&bittersweet["total"], &bittersweet["likely"]), (&3.into(), &2.into()));
+        assert_eq!(bittersweet["titles"][1]["likely"], true);
+        assert!(bittersweet["titles"][0].get("likely").is_none());
+        let stacked = row(&[("ending", "happy"), ("tone", "bleak")]);
+        assert_eq!(ids(&stacked), vec![5]);
+        assert_eq!(stacked["likely"], 1);
+    }
+
+    /// A store without the tier answers exactly as before it: no split fields, no likely maps, no marks.
+    #[test]
+    fn a_store_without_the_tier_answers_no_split() {
+        let indexes = fixture("no-tier");
+        let answer = counts(&indexes, Movie, "sel=ending:bittersweet");
+        for field in ["confident", "likely"] {
+            assert!(answer.get(field).is_none(), "{field}: {answer}");
+        }
+        assert!(!answer.to_string().contains("\"likely\""), "{answer}");
+        let titles =
+            Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "sel=ending:bittersweet")).0;
+        assert!(!titles.to_string().contains("likely"), "{titles}");
+        let row = crate::plotrows::row(
+            &indexes,
+            None,
+            Movie,
+            &[("ending".to_owned(), "bittersweet".to_owned())],
+            None,
+            0,
+            20,
+        );
+        assert!(row.get("likely").is_none(), "{row}");
     }
 
     /// Before any TMDB numbers are kept, `rating` is unavailable — said so, and a selection naming it is
