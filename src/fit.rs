@@ -41,7 +41,8 @@ const THIN: f64 = 0.5;
 const MIDPOINT: f64 = 2.0;
 /// How much closeness to a disliked title, beyond closeness to a liked one, takes away.
 const REPULSION: f64 = 0.5;
-/// How far towards a full fit a title carries for being the next of a franchise already followed.
+/// How far towards a full fit a title carries for being the next of a franchise already followed, at full
+/// evidence of the franchise (`Fit::franchise`).
 const FRANCHISE_LIFT: f64 = 0.5;
 /// Rarity-weighted shared credits at which the people signal is about two thirds of the way to one.
 const PEOPLE_SCALE: f64 = 12.0;
@@ -63,12 +64,14 @@ type Value = (usize, u64);
 
 /// What fit reads of a title, owned, so a sample of the index can be kept for the life of the indexes.
 pub struct Features {
+    key: Key,
     row: Option<u32>,
     /// Each family's values once, with the label's confidence (1 for the rest).
     values: Vec<(Value, f64)>,
     /// The people behind it, each once, with how much they count (`recommend::CAST_BILLED`).
     people: Vec<(u32, f64)>,
-    franchise: Option<u32>,
+    /// Every franchise series it is in.
+    series: Vec<u32>,
 }
 
 impl Features {
@@ -105,7 +108,13 @@ impl Features {
                 people.push((person, share));
             }
         }
-        Features { row: indexes.plot.row_of(id, media_type), values, people, franchise: title.franchise }
+        Features {
+            key: (media_type, id),
+            row: indexes.plot.row_of(id, media_type),
+            values,
+            people,
+            series: title.franchise.clone(),
+        }
     }
 
     /// Whether the plot index holds a vector for the title.
@@ -201,7 +210,12 @@ pub struct Fit<'a> {
     /// The lift of a value the library never carries, by family.
     unseen: [f64; 8],
     people: HashMap<u32, f64>,
+    /// Each series the library follows, with its strength (`series::SeriesStrength`): 0 for a catalogue or a
+    /// list, 1 for a story franchise.
     franchises: HashMap<u32, f64>,
+    /// Each title sharing a character with a liked title, with the strongest such link
+    /// (`CharacterLink::strength`).
+    linked: HashMap<Key, f64>,
     /// The sample's mean and standard deviation of similar, and of profile.
     similar: (f64, f64),
     profile: (f64, f64),
@@ -243,8 +257,9 @@ impl<'a> Fit<'a> {
             return None;
         }
         let (mut counts, mut carrying) = (HashMap::new(), [0.0; 8]);
-        let (mut liked, mut disliked, mut people, mut franchises) =
+        let (mut liked, mut disliked, mut people, mut followed) =
             (Vec::new(), Vec::new(), HashMap::new(), HashMap::new());
+        let mut linked: HashMap<Key, f64> = HashMap::new();
         for (features, weight) in library {
             let weight = *weight;
             match features.row {
@@ -252,8 +267,14 @@ impl<'a> Fit<'a> {
                 Some(row) => disliked.push(row),
                 None => {}
             }
-            if let Some(franchise) = features.franchise {
-                *franchises.entry(franchise).or_insert(0.0) += weight;
+            for &series in &features.series {
+                *followed.entry(series).or_insert(0.0) += weight;
+            }
+            if weight > 0.0 {
+                for (key, strength) in indexes.character_links(features.key.0, features.key.1) {
+                    let held = linked.entry(key).or_insert(0.0);
+                    *held = held.max(strength);
+                }
             }
             // A dislike takes away from a value's count, never below none.
             for &(value, confidence) in &features.values {
@@ -280,6 +301,14 @@ impl<'a> Fit<'a> {
             })
             .collect();
         let unseen = carrying.map(|carried| (LIFT_PRIOR / (carried + LIFT_PRIOR)).ln());
+        // A series counts as followed while the library likes it on balance, as far as the series is a
+        // franchise at all: sharing Walt Disney Animation's catalogue with a liked film says nothing.
+        let franchises = followed
+            .into_iter()
+            .filter(|&(_, weight)| weight > 0.0)
+            .map(|(series, _)| (series, indexes.series.series_strength(series)))
+            .filter(|&(_, strength)| strength > 0.0)
+            .collect();
         let mut fit = Fit {
             indexes,
             corpus,
@@ -289,6 +318,7 @@ impl<'a> Fit<'a> {
             unseen,
             people,
             franchises,
+            linked,
             similar: (0.0, 1.0),
             profile: (0.0, 1.0),
         };
@@ -318,14 +348,10 @@ impl<'a> Fit<'a> {
                 evidence -= REPULSION * (against - similar).max(0.0);
             }
         }
-        let franchise =
-            features.franchise.is_some_and(|f| self.franchises.get(&f).copied().unwrap_or(0.0) > 0.0);
-        let fitted = |evidence: f64, franchise: bool| {
-            let mut fit = 1.0 / (1.0 + (MIDPOINT - evidence).exp());
-            if franchise {
-                fit += (1.0 - fit) * FRANCHISE_LIFT;
-            }
-            fit
+        let franchise = self.franchise(features);
+        let fitted = |evidence: f64, franchise: f64| {
+            let fit = 1.0 / (1.0 + (MIDPOINT - evidence).exp());
+            fit + (1.0 - fit) * FRANCHISE_LIFT * franchise
         };
         let fit = fitted(evidence, franchise);
         // Every term below is the log lift it gives fit², the exact way fit enters the final score. Removing one
@@ -344,7 +370,7 @@ impl<'a> Fit<'a> {
             (FitReason::Similar, lift(similar_term)),
             (FitReason::Profile, lift(profile_term)),
             (FitReason::People, lift(people_term)),
-            (FitReason::Franchise, if franchise { 2.0 * (fit / fitted(evidence, false)).ln() } else { 0.0 }),
+            (FitReason::Franchise, 2.0 * (fit / fitted(evidence, 0.0)).ln()),
         ] {
             if candidate_lift > reason_lift {
                 reason = Some(candidate);
@@ -352,6 +378,15 @@ impl<'a> Fit<'a> {
             }
         }
         Fitted { fit, similar, profile, people, confidence, reason, reason_lift }
+    }
+
+    /// How surely a title continues something the library follows, in 0..=1: the strongest followed series it
+    /// is in, weighted by that series' strength, or the strongest character link to a liked title — full for
+    /// the same actor or a link a shared series confirms, half for a recast, a very common name weighted down.
+    fn franchise(&self, features: &Features) -> f64 {
+        let series = features.series.iter().filter_map(|s| self.franchises.get(s)).copied();
+        let linked = self.linked.get(&features.key).copied();
+        series.chain(linked).fold(0.0, f64::max)
     }
 
     /// What fit makes of a title before its plot is read: its profile and its people, weighed as `of` weighs them. The
@@ -485,11 +520,8 @@ mod tests {
                 evidence -= REPULSION * (against - similar).max(0.0);
             }
         }
-        let mut fit = 1.0 / (1.0 + (MIDPOINT - evidence - W_PEOPLE * people).exp());
-        if features.franchise.is_some_and(|f| taste.franchises.get(&f).copied().unwrap_or(0.0) > 0.0) {
-            fit += (1.0 - fit) * FRANCHISE_LIFT;
-        }
-        fit
+        let fit = 1.0 / (1.0 + (MIDPOINT - evidence - W_PEOPLE * people).exp());
+        fit + (1.0 - fit) * FRANCHISE_LIFT * taste.franchise(features)
     }
 
     #[test]
@@ -565,18 +597,21 @@ mod tests {
             unseen: [0.0; 8],
             people: HashMap::new(),
             franchises: HashMap::new(),
+            linked: HashMap::new(),
             similar: (0.0, 1.0),
             profile: (0.0, 1.0),
+        };
+        let bare = |row: Option<u32>| Features {
+            key: (MediaType::Movie, 77),
+            row,
+            values: Vec::new(),
+            people: Vec::new(),
+            series: Vec::new(),
         };
 
         let mut similar = blank();
         similar.liked.push((features(&indexes, ONE).row.unwrap(), 1.0));
-        let plot_only = Features {
-            row: features(&indexes, TWO).row,
-            values: Vec::new(),
-            people: Vec::new(),
-            franchise: None,
-        };
+        let plot_only = bare(features(&indexes, TWO).row);
         let raw = similar.nearest(plot_only.row.unwrap()).unwrap();
         similar.similar = (raw - 2.0, 1.0);
         assert_eq!(similar.of(&plot_only).reason, Some(FitReason::Similar));
@@ -584,24 +619,60 @@ mod tests {
         let mut profile = blank();
         let values = [(GENRE, 1), (LANGUAGE, 2), (COUNTRY, 3)];
         profile.lift.extend(values.into_iter().map(|value| (value, 2.0)));
-        let profile_only = Features {
-            row: None,
-            values: values.into_iter().map(|value| (value, 1.0)).collect(),
-            people: Vec::new(),
-            franchise: None,
-        };
+        let profile_only =
+            Features { values: values.into_iter().map(|value| (value, 1.0)).collect(), ..bare(None) };
         assert_eq!(profile.of(&profile_only).reason, Some(FitReason::Profile));
 
         let mut people = blank();
         people.people.insert(42, 2.0);
-        let people_only =
-            Features { row: None, values: Vec::new(), people: vec![(42, 1.0)], franchise: None };
+        let people_only = Features { people: vec![(42, 1.0)], ..bare(None) };
         assert_eq!(people.of(&people_only).reason, Some(FitReason::People));
 
         let mut franchise = blank();
         franchise.franchises.insert(7, 1.0);
-        let franchise_only =
-            Features { row: None, values: Vec::new(), people: Vec::new(), franchise: Some(7) };
+        let franchise_only = Features { series: vec![7], ..bare(None) };
         assert_eq!(franchise.of(&franchise_only).reason, Some(FitReason::Franchise));
+    }
+
+    /// The franchise lift is as strong as the evidence: a followed series by its strength, a character link
+    /// by its own (`CharacterLink::strength`), the stronger of the two — and nothing for a series the library
+    /// does not follow or one that is only a catalogue.
+    #[tokio::test]
+    async fn the_franchise_lift_follows_the_strength_of_the_evidence() {
+        let indexes = indexes("franchise").await;
+        let corpus = indexes.corpus();
+        let mut taste = Fit {
+            indexes: &indexes,
+            corpus,
+            liked: Vec::new(),
+            disliked: Vec::new(),
+            lift: HashMap::new(),
+            unseen: [0.0; 8],
+            people: HashMap::new(),
+            franchises: HashMap::from([(7, 1.0), (8, 0.4)]),
+            linked: HashMap::from([(TWO, 1.0), (THREE, crate::characters::RECAST)]),
+            similar: (0.0, 1.0),
+            profile: (0.0, 1.0),
+        };
+        let title = |key: Key, series: Vec<u32>| Features {
+            key,
+            row: None,
+            values: Vec::new(),
+            people: Vec::new(),
+            series,
+        };
+        assert_eq!(taste.franchise(&title(ONE, vec![7])), 1.0, "a story franchise followed");
+        assert_eq!(taste.franchise(&title(ONE, vec![8, 9])), 0.4, "a loose one, by its strength");
+        assert_eq!(taste.franchise(&title(ONE, vec![9])), 0.0, "a series nobody follows");
+        assert_eq!(taste.franchise(&title(TWO, Vec::new())), 1.0, "the same actor, no series");
+        assert_eq!(taste.franchise(&title(THREE, vec![8])), 0.5, "a recast beats the looser series");
+        let (full, half, none) = (
+            taste.of(&title(TWO, Vec::new())).fit,
+            taste.of(&title(THREE, Vec::new())).fit,
+            taste.of(&title(ONE, Vec::new())).fit,
+        );
+        assert!(full > half && half > none, "{full} {half} {none}");
+        taste.linked.clear();
+        assert_eq!(taste.of(&title(TWO, Vec::new())).fit, none);
     }
 }

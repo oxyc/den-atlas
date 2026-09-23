@@ -369,7 +369,8 @@ pub struct Title<'a> {
     pub countries: Vec<[u8; 2]>,
     /// Who made it and who is in it, each with how much it counts (see `CAST_BILLED`).
     pub people: Vec<(u32, f64)>,
-    pub franchise: Option<u32>,
+    /// Every franchise series it is in, most specific first.
+    pub franchise: Vec<u32>,
     /// Where a series aired.
     pub broadcasters: Vec<u32>,
     pub labels: Option<LabelSet<'a>>,
@@ -519,9 +520,8 @@ impl<'a> Knowledge<'a> {
             title.people = r.makers.iter().map(|&id| (id, 1.0)).collect();
             let each = if r.cast.is_empty() { 0.0 } else { (CAST_BILLED / r.cast.len() as f64).min(1.0) };
             title.people.extend(r.cast.iter().filter(|id| !r.makers.contains(*id)).map(|&id| (id, each)));
-            // The FIRST (most specific) series only, which is all the store held before it carried the list:
-            // the franchise lift in `fit.rs` reads this. oxyc/den-atlas#43 part D is what reads every series.
-            title.franchise = r.franchise.first().copied();
+            // Every series: The Batman and The Hobbit match a followed franchise only through their second.
+            title.franchise = r.franchise.clone();
             title.broadcasters = r.broadcasters.clone();
         }
         title.released = hint
@@ -853,7 +853,7 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
             languages: either(x.languages, y.languages),
             countries: either(x.countries, y.countries),
             people: either(x.people, y.people),
-            franchise: x.franchise.or(y.franchise),
+            franchise: either(x.franchise, y.franchise),
             broadcasters: either(x.broadcasters, y.broadcasters),
             labels: x.labels.or(y.labels),
             hint_genres: either(x.hint_genres, y.hint_genres),

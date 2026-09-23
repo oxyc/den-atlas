@@ -112,6 +112,9 @@ pub struct SimilarParams {
     pub cap_window: usize,
     pub max_row: usize,
     pub w_maker: f64,
+    /// A shared character (`Authorship::characters`). Above 0 the linked titles are also nominated into the
+    /// pool, as a shared maker's are.
+    pub w_character: f64,
     pub w_home: f64,
     pub w_facet: f64,
     pub w_world: f64,
@@ -212,6 +215,7 @@ impl Default for SimilarParams {
             cap_window: KEEP,
             max_row: MAX_ROW,
             w_maker: W_MAKER,
+            w_character: W_CHARACTER,
             w_home: W_HOME,
             w_facet: W_FACET,
             w_world: W_WORLD,
@@ -288,6 +292,14 @@ impl SimilarParams {
         ),
         knob("spread_high_pct", "pool", 51.0, 100.0, true, "... the upper percentile of that spread"),
         knob("w_maker", "signals", 0.0, 10.0, false, "shared director/writer/creator (share of the seed's)"),
+        knob(
+            "w_character",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "shared character (spin-offs, sequels); above 0 also nominates the linked titles",
+        ),
         knob("w_home", "signals", 0.0, 10.0, false, "shared broadcaster/production company"),
         knob("w_facet", "signals", 0.0, 10.0, false, "agreement on the twelve facet axes, rarity-weighted"),
         knob(
@@ -381,6 +393,7 @@ impl SimilarParams {
             "w_premise" => self.w_premise,
             "w_plot" => self.w_plot,
             "w_maker" => self.w_maker,
+            "w_character" => self.w_character,
             "w_home" => self.w_home,
             "w_facet" => self.w_facet,
             "w_world" => self.w_world,
@@ -429,6 +442,7 @@ impl SimilarParams {
             "w_premise" => self.w_premise = value,
             "w_plot" => self.w_plot = value,
             "w_maker" => self.w_maker = value,
+            "w_character" => self.w_character = value,
             "w_home" => self.w_home = value,
             "w_facet" => self.w_facet = value,
             "w_world" => self.w_world = value,
@@ -549,6 +563,28 @@ fn tone(seed: &Seed, theirs: &crate::Labels<'_>, min_confidence: f64) -> f64 {
 /// 0.8 above 1.6. The level is optimistic — most expected titles are expected BECAUSE they share a maker,
 /// so the scale flatters the weight — but the shape of the curve is what picks the knee, and it picks 1.20.
 const W_MAKER: f64 = 1.20;
+/// How hard a shared character pulls a candidate up, as a fraction of the pool's spread (the link's own
+/// strength, 0..=1, is what it multiplies): Frasier for Cheers, Better Call Saul for Breaking Bad, Picard
+/// for The Next Generation — sequels and spin-offs whose people and characters carry over and whose
+/// vectors often do not.
+///
+/// Chosen with `den-atlas rail-eval` on the judged set's dev half (nDCG@10 / condensed):
+///
+/// ```text
+/// w_character   dev nDCG   dev nDCG'
+///   0.00         0.790      0.800
+///   0.50         0.790      0.800
+///   0.75-3.00    0.792      0.802
+/// ```
+///
+/// A plateau from 0.75; 1.0 sits on it, a little under a shared maker. What it moves: Breaking Bad
+/// 0.752 → 0.801, The Next Generation 0.857 → 0.912; and it costs Friends 0.771 → 0.710 (Joey, judged
+/// only ok, rises to second) and Alien 0.775 → 0.766.
+///
+/// A linked title is nominated into the pool but is NOT exempt from the tonal floor as a same-maker one
+/// is. With the exemption, the Ewok TV films and the Star Wars Holiday Special — every character of the
+/// seed, none of the film — entered Star Wars' first five (nDCG 0.703 → 0.671); without it they stay out.
+const W_CHARACTER: f64 = 1.0;
 /// A shared home — the same broadcaster or production company — as a small tiebreak, never a lane of its
 /// own. HBO is 131 titles in this corpus, so it discriminates; "made for television" would not.
 const W_HOME: f64 = 0.15;
@@ -738,6 +774,11 @@ pub trait Authorship {
         let _ = tmdb_id;
         0.0
     }
+    /// The titles of the seed's type sharing a character with it, each with how strongly the link says the
+    /// two are one franchise, 0..=1 — a spin-off or a sequel the vectors may rank nowhere.
+    fn characters(&self) -> &[(u32, f64)] {
+        &[]
+    }
 }
 
 /// Neighbour ids for More Like This, best first — the pooled scorer.
@@ -794,6 +835,8 @@ pub struct Scored {
     pub critique: f64,
     pub coverage: f64,
     pub maker: f64,
+    /// The strongest character link to the seed (`Authorship::characters`), 0 without one.
+    pub character: f64,
     pub home: f64,
     pub facet: f64,
     pub world: f64,
@@ -869,6 +912,15 @@ pub fn more_like_this_with(
             pool.push(id);
         }
     }
+    // So do shared characters, while they are weighed at all: at `w_character = 0` the pool is exactly
+    // what it was before they were read.
+    if p.w_character > 0.0 {
+        for &(id, _) in authorship.map(Authorship::characters).unwrap_or_default() {
+            if id != tmdb_id && seen.insert(id) {
+                pool.push(id);
+            }
+        }
+    }
     if pool.is_empty() {
         return Vec::new();
     }
@@ -926,6 +978,8 @@ pub fn rank_pool<'l>(
     let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(tmdb_id)).unwrap_or_default();
     let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(tmdb_id)).unwrap_or_default();
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(tmdb_id)).unwrap_or_default();
+    let characters: &[(u32, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
+    let character = |id: u32| characters.iter().find(|&&(c, _)| c == id).map_or(0.0, |&(_, s)| s);
 
     let audience = extras.audience;
     // The request's filters. Each is skipped outright at its production value, so production's pool is
@@ -979,7 +1033,9 @@ pub fn rank_pool<'l>(
         let maker = authorship.map_or(0.0, |a| a.makers(id));
         // The floor is skipped when the candidate carries no confident labels at all — unknown is not none,
         // and filtering on it would silently drop every thinly-labelled title. A shared maker also exempts
-        // it: labels are a guess about a title, authorship is a fact about it, and the fact wins.
+        // it: labels are a guess about a title, authorship is a fact about it, and the fact wins. A shared
+        // character does NOT (`W_CHARACTER`): the Star Wars Holiday Special has every character of the seed
+        // and none of the film, and the floor is what keeps it out.
         let unlabelled =
             theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < p.min_confidence);
         if !unlabelled && maker <= 0.0 && t < p.tone_floor {
@@ -1035,6 +1091,7 @@ pub fn rank_pool<'l>(
                 _ => 0.0,
             };
             let popularity = popularity_of(id);
+            let ch = character(id);
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
             // against a pair, not merely absence of evidence for it.
@@ -1052,9 +1109,10 @@ pub fn rank_pool<'l>(
                         + p.w_facet * fa
                         - p.w_world * world
                         // Last, so at production's `w_year = 0` and `w_popularity = 0` each adds an exact 0.0
-                        // to the sum above.
+                        // to the sum above; `w_character` likewise at 0.
                         + p.w_year * year
-                        + p.w_popularity * popularity);
+                        + p.w_popularity * popularity
+                        + p.w_character * ch);
             Scored {
                 tmdb_id: id,
                 score,
@@ -1067,6 +1125,7 @@ pub fn rank_pool<'l>(
                 critique: cr,
                 coverage: cov,
                 maker,
+                character: ch,
                 home,
                 facet: fa,
                 world,
@@ -1276,6 +1335,54 @@ mod tests {
         assert_eq!(with.first(), Some(&3), "the same hand outranks a closer but unrelated title");
     }
 
+    /// The Cheers case. Frasier shares a character with the seed and its kind, but the vectors put it outside
+    /// the pool. At `w_character = 0` it is as absent as before characters were read; weighed, it is
+    /// nominated and leads. The Holiday Special case: a linked title of another kind is nominated too, and
+    /// the tonal floor still drops it.
+    #[test]
+    fn a_shared_character_nominates_and_lifts_a_spin_off_only_while_weighed() {
+        let seed_subs: &[(&str, f64)] = &[("Sitcom", 0.9)];
+        let seed_moods: &[(&str, f64)] = &[("Feel-good", 0.9)];
+        let premise = fixture(&[
+            (1, "tv", "Comedy", false, seed_subs, seed_moods, [100, 0, 0]),
+            (2, "tv", "Comedy", false, seed_subs, seed_moods, [95, 0, 0]),
+            (4, "tv", "Comedy", false, seed_subs, seed_moods, [88, 0, 0]),
+            (5, "tv", "Comedy", false, seed_subs, seed_moods, [70, 0, 0]),
+            (6, "tv", "Comedy", false, seed_subs, seed_moods, [50, 0, 0]),
+            // The spin-off: far on the vectors, the same kind of show.
+            (3, "tv", "Comedy", false, seed_subs, seed_moods, [0, 100, 0]),
+            // The variety special: the same characters, labelled as something else.
+            (7, "tv", "Drama", false, &[("Legal Drama", 0.9)], &[("Tense", 0.9)], [0, 100, 0]),
+        ]);
+        struct Spinoff;
+        impl Authorship for Spinoff {
+            fn nominate(&self) -> Vec<u32> {
+                Vec::new()
+            }
+            fn makers(&self, _: u32) -> f64 {
+                0.0
+            }
+            fn characters(&self) -> &[(u32, f64)] {
+                &[(3, 1.0), (7, 1.0)]
+            }
+        }
+        let mut p = SimilarParams::default();
+        p.set("pool_k", 4.0).unwrap();
+        let row = |p: &SimilarParams| -> Vec<Scored> {
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Tv, Some(&Spinoff), None, p)
+        };
+        p.set("w_character", 0.0).unwrap();
+        let off = row(&p);
+        let none = more_like_this_scored(None, Some(&premise), 1, MediaType::Tv, None, None, &p);
+        assert_eq!(off, none, "unweighed, the links change nothing");
+        assert!(off.iter().all(|s| s.tmdb_id != 3 && s.tmdb_id != 7));
+        p.set("w_character", 3.0).unwrap();
+        let on = row(&p);
+        assert_eq!(on[0].tmdb_id, 3, "{on:?}");
+        assert_eq!(on[0].character, 1.0);
+        assert!(on.iter().all(|s| s.tmdb_id != 7), "the tonal floor still applies: {on:?}");
+    }
+
     /// A candidate with no confident labels is not filtered out: unknown is not none.
     #[test]
     fn an_unlabelled_candidate_is_not_gated_by_the_tonal_floor() {
@@ -1312,7 +1419,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 43, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 44, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
         }

@@ -144,7 +144,15 @@ impl Indexes {
             .tuned(params);
         // Without the credit lists the rail ranks without authorship. The facts read the same lists, so a
         // store missing them also reaches `/health` as `facts_unusable`.
-        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id).ok();
+        let characters: Vec<(u32, f64)> = self
+            .character_links(media_type, tmdb_id)
+            .into_iter()
+            .filter(|&((media, _), _)| media == media_type)
+            .map(|((_, id), strength)| (id, strength))
+            .collect();
+        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
+            .ok()
+            .map(|authorship| authorship.with_characters(characters));
         den_index::more_like_this_with(
             Some(&self.plot),
             self.premise.as_ref(),
@@ -210,17 +218,29 @@ impl Indexes {
         ratings.of(row_of(&self.store, media_type, tmdb_id)?)
     }
 
-    /// The titles sharing a character with this one, by store row, strongest evidence first. Empty when the
-    /// store does not hold the title or no credits are kept.
-    // Read by the billboard's fit and More Like This once #43 wires the list into scoring.
-    #[allow(dead_code)]
-    pub fn character_links(
-        &self,
-        media_type: den_index::MediaType,
-        tmdb_id: u32,
-    ) -> Vec<crate::characters::CharacterLink> {
+    /// The titles sharing a character with this one, of either type, strongest evidence first, each with how
+    /// strongly the link says the two are one franchise (`CharacterLink::strength`: a shared series in the
+    /// facts confirms a recast link). Empty when the store does not hold the title or no credits are kept.
+    pub fn character_links(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Vec<(Key, f64)> {
         let Some(index) = self.characters.as_ref().and_then(|c| c.index()) else { return Vec::new() };
-        row_of(&self.store, media_type, tmdb_id).map(|row| index.of(row).to_vec()).unwrap_or_default()
+        let Some(row) = row_of(&self.store, media_type, tmdb_id) else { return Vec::new() };
+        let Ok(keys) = self.store.view().per_row::<u64>("keys") else { return Vec::new() };
+        let series = |(media, id): Key| {
+            self.facts.as_ref().and_then(|f| f.get(id, media)).map_or(&[][..], |r| r.franchise.as_slice())
+        };
+        let mine = series((media_type, tmdb_id));
+        index
+            .of(row)
+            .iter()
+            .filter_map(|link| {
+                let packed = *keys.get(link.row as usize)?;
+                let media =
+                    if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
+                let key = (media, packed as u32);
+                let shares_series = series(key).iter().any(|s| mine.contains(s));
+                Some((key, link.strength(shares_series)))
+            })
+            .collect()
     }
 
     /// Whether the store's own `votes` column holds a count for any row — the fallback source for row
@@ -1026,11 +1046,9 @@ mod tests {
         assert_eq!((title.rating, title.votes, title.estimated_votes), (Some(7.0), Some(9000.0), false));
     }
 
-    /// A title in two series ranks on the first, the most specific, exactly as it did when the store held only
-    /// that one. The rest are read — the facts carry them — but nothing ranks on them until oxyc/den-atlas#43
-    /// part D.
+    /// A title in two series ranks on both, in the store's order.
     #[tokio::test]
-    async fn recommend_ranks_on_the_first_of_several_series() {
+    async fn recommend_ranks_on_every_series() {
         use den_index::MediaType::Movie;
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-franchise-{}", std::process::id()));
         let ds = write_fixture(&dir);
@@ -1038,8 +1056,8 @@ mod tests {
         let record = indexes.facts.as_ref().and_then(|facts| facts.get(1, Movie)).expect("movie 1's facts");
         assert_eq!(record.franchise, vec![50, 51], "the store's list, in order");
         let known = crate::recommend::Knowledge { indexes: &indexes };
-        assert_eq!(known.title((Movie, 1), None, None).franchise, Some(50));
-        assert_eq!(known.title((Movie, 2), None, None).franchise, None, "no series is none");
+        assert_eq!(known.title((Movie, 1), None, None).franchise, [50, 51]);
+        assert!(known.title((Movie, 2), None, None).franchise.is_empty(), "no series is none");
     }
 
     /// `/recommend` read popularity from client hints alone, so every title from atlas's own lists scored no buzz.
@@ -1072,11 +1090,12 @@ mod tests {
         assert_eq!(attended(3, None), (None, false), "neither source knows it");
     }
 
-    /// A title's character neighbours through the indexes: by its store row (movie 1 is row 0), empty for
-    /// a title the store lacks and when there is no list.
+    /// A title's character neighbours through the indexes: read by its store row (movie 1 is row 0) and
+    /// named by key, empty for a title the store lacks and when there is no list. A recast link counts
+    /// half; the same link between titles sharing a series counts in full.
     #[tokio::test]
     async fn character_links_are_read_by_store_row() {
-        use crate::characters::{Characters, Tier};
+        use crate::characters::{Characters, RECAST};
         use den_index::MediaType::Movie;
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-chars-{}", std::process::id()));
         let ds = write_fixture(&dir);
@@ -1092,13 +1111,28 @@ mod tests {
         .unwrap();
         let queries = IndexQueries::new(&ds).with_characters(Some(Arc::new(Characters::with_index(list))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
-        let links = indexes.character_links(Movie, 1);
-        assert_eq!(links.len(), 1);
-        assert_eq!((links[0].row, links[0].tier, links[0].same_actor()), (1, Tier::SameActor, true));
+        assert_eq!(indexes.character_links(Movie, 1), [((Movie, 2), 1.0)], "one actor: in full");
         assert!(indexes.character_links(Movie, 999).is_empty(), "a title the store does not hold");
 
         let (bare, _) = IndexQueries::new(&ds).get(|| ()).await.unwrap();
         assert!(bare.character_links(Movie, 1).is_empty(), "no list, no links");
+
+        // Two shared names, recast: movie 2 shares no series with movie 1.
+        let recast = |person: u32| crate::tmdb::Credits {
+            fetched: 0,
+            roles: vec![
+                crate::tmdb::Role { order: 0, person, character: "Walter White".into() },
+                crate::tmdb::Role { order: 1, person: person + 1, character: "Jesse Pinkman".into() },
+            ],
+        };
+        let list = crate::characters::build(
+            &mapped.view(),
+            &HashMap::from([((0, 1), recast(100)), ((0, 2), recast(200))]),
+        )
+        .unwrap();
+        let queries = IndexQueries::new(&ds).with_characters(Some(Arc::new(Characters::with_index(list))));
+        let (indexes, _) = queries.get(|| ()).await.unwrap();
+        assert_eq!(indexes.character_links(Movie, 1), [((Movie, 2), RECAST)]);
     }
 
     /// The rail's authorship is read from the store's credit lists (`den_index::SeedAuthorship`); it used
