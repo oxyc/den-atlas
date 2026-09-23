@@ -397,7 +397,8 @@ fn routes() -> Value {
             "example": "/index/row/movie.json?tone=bleak",
             "alias": "/index/plot/{type}.json",
             "about": "A browse row: the titles of one type carrying every constraint, most confident then most \
-                      voted. The rows that count.",
+                      voted. The rows that count. Any other field (country, decade, language, …) is refused with \
+                      a 400 naming /index/filter/{type}/titles.json, which is where the facts are filtered.",
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path", "field": "mediaType" })),
                 with(
