@@ -661,6 +661,12 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // carry it and both indexes are stamped from the manifest. Miss this and `/index/schema.json`,
     // `/index/taxonomy.json` and the `atlas_dataset_info` metric all report an empty version.
     let plot = plot.map_err(|e| e.to_string())?.with_taxonomy_version(&sources.taxonomy_version);
+    if !plot.has_length_direction() {
+        eprintln!(
+            "plot vectors are {} dimensions, not the length direction's 1024 — plot_length_off does nothing",
+            plot.dimension()
+        );
+    }
     let premise = premise.map(|index| index.with_taxonomy_version(&sources.taxonomy_version));
     // `factsFile` was a 43 MB JSON blob that atlas alone read — nothing served it and no client fetched
     // it — and parsing it was 1.04 s of a 1.6 s load, against 0.38 s off the store.

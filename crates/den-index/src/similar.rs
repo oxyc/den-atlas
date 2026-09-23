@@ -174,7 +174,13 @@ pub struct SimilarParams {
     /// The percentiles of the pool's base scores whose difference is `spread`, the unit of every term.
     pub spread_low_pct: usize,
     pub spread_high_pct: usize,
+    /// Rank on plot vectors with the plot-length direction projected out (`Index::without_length`). Off.
+    pub plot_length_off: bool,
 }
+
+/// Production ranks on the plot vectors as published. Measured on store `b2c60751c955`, the direction the
+/// knob removes carries most of the plot index's length skew (oxyc/den-dataset#109).
+const PLOT_LENGTH_OFF: bool = false;
 
 /// Production filters on neither TMDB number nor popularity, and does not weigh popularity: More Like This
 /// is about the seed, and a popularity term would pull every row towards the same few titles.
@@ -268,6 +274,7 @@ impl Default for SimilarParams {
             pool_floor_pct: POOL_FLOOR_PCT,
             spread_low_pct: SPREAD_LOW_PCT,
             spread_high_pct: SPREAD_HIGH_PCT,
+            plot_length_off: PLOT_LENGTH_OFF,
         }
     }
 }
@@ -325,6 +332,14 @@ impl SimilarParams {
             "spread = base at spread_high_pct minus base at this",
         ),
         knob("spread_high_pct", "pool", 51.0, 100.0, true, "... the upper percentile of that spread"),
+        knob(
+            "plot_length_off",
+            "pool",
+            0.0,
+            1.0,
+            true,
+            "1: project the plot-length direction out of the plot vectors, seed and candidates alike",
+        ),
         knob("w_maker", "signals", 0.0, W_MAX, false, "shared director/writer/creator (share of the seed's)"),
         knob(
             "w_character",
@@ -499,6 +514,7 @@ impl SimilarParams {
             "pool_floor_pct" => self.pool_floor_pct as f64,
             "spread_low_pct" => self.spread_low_pct as f64,
             "spread_high_pct" => self.spread_high_pct as f64,
+            "plot_length_off" => f64::from(u8::from(self.plot_length_off)),
             _ => self.w_facet_axis[FACET_AXIS_KNOBS.iter().position(|k| *k == name)?],
         })
     }
@@ -552,6 +568,7 @@ impl SimilarParams {
             "pool_floor_pct" => self.pool_floor_pct = whole,
             "spread_low_pct" => self.spread_low_pct = whole,
             "spread_high_pct" => self.spread_high_pct = whole,
+            "plot_length_off" => self.plot_length_off = whole == 1,
             _ => {
                 let axis = FACET_AXIS_KNOBS
                     .iter()
@@ -1090,6 +1107,7 @@ pub fn more_like_this_with(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
+    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
     let seed: Key = (media_type, tmdb_id);
     let wanted = |key: Key| key != seed && (p.mix_types || key.0 == media_type);
     let mut pool: Vec<Key> = Vec::new();
@@ -1777,6 +1795,39 @@ mod tests {
         assert!(!regional(&[], Some(*b"sv")), "no known country");
     }
 
+    /// With the length direction removed, the plot cosine reads what is left of each vector. Along the
+    /// direction (here the third axis) title 2 matches the seed and title 3 does not; off the direction
+    /// title 3 matches and title 2 does not, so the knob swaps them. The premise index is another space
+    /// and is never touched.
+    #[test]
+    fn plot_length_off_ranks_on_the_plot_vectors_without_the_direction() {
+        let titles: &[crate::index::tests::Row<'_>] = &[
+            (1, "movie", "Drama", false, &[], &[], [60, 0, 80]),
+            (2, "movie", "Drama", false, &[], &[], [0, 60, 80]),
+            (3, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+        ];
+        let plot = fixture(titles).with_length_direction(&[0.0, 0.0, 1.0]);
+        let premise = fixture(titles);
+        assert!(std::ptr::eq(premise.without_length(), &premise), "no direction, nothing removed");
+        let cosines = |off: bool| -> Vec<(u32, Option<f64>)> {
+            let p = SimilarParams { plot_length_off: off, ..SimilarParams::default() };
+            let mut row: Vec<(u32, Option<f64>)> =
+                more_like_this_scored(Some(&plot), None, 1, MediaType::Movie, None, None, &p)
+                    .iter()
+                    .map(|s| (s.tmdb_id, s.plot))
+                    .collect();
+            row.sort_by_key(|&(id, _)| id);
+            row
+        };
+        let near = |c: Option<f64>, want: f64| c.is_some_and(|c| (c - want).abs() < 1e-3);
+        let on = cosines(true);
+        assert!(near(on[0].1, 0.0) && near(on[1].1, 1.0), "{on:?}");
+        let off = cosines(false);
+        assert!(near(off[0].1, 6400.0 / 16129.0) && near(off[1].1, 6000.0 / 16129.0), "{off:?}");
+        // The index the knob ranks on is built once and kept.
+        assert!(std::ptr::eq(plot.without_length(), plot.without_length()));
+    }
+
     /// A candidate with no confident labels is not filtered out: unknown is not none.
     #[test]
     fn an_unlabelled_candidate_is_not_gated_by_the_tonal_floor() {
@@ -1813,7 +1864,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 48, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 49, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {
