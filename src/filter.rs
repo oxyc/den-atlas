@@ -685,8 +685,8 @@ struct Derived {
     ratings: Option<Arc<RatingsIndex>>,
     export: Option<Arc<TitleIndex>>,
     rating: Option<Valued>,
-    /// Each scope's rows with a card, most voted first then by TMDB id (then type) — the order `titles.json`
-    /// walks: [movie, series, all], `all` one order over both types by the same measure.
+    /// Each scope's rows with a card, most voted first then by TMDB id — the order `titles.json` walks:
+    /// [movie, series, all], `all` the two merged by rank within their type (`interleave`).
     order: [Vec<u32>; 3],
     /// A fingerprint of each order, so a client paging while it changes can tell.
     order_id: [String; 3],
@@ -739,6 +739,29 @@ fn ones(bits: &[u64]) -> impl Iterator<Item = usize> + '_ {
 
 fn type_index(media_type: MediaType) -> usize {
     usize::from(media_type == MediaType::Tv)
+}
+
+/// The `all` order: the two types' own orders merged by each title's rank within its type as a share of that
+/// type's size (i/films against j/series), films first on a tie. Series then run at their share of the corpus,
+/// spread evenly, and each type's most popular titles sit beside the other's — where raw votes, which run far
+/// higher for films, would push series pages down. A selection under `all` walks this order filtered, which
+/// is the two types' filtered orders merged by the same keys. The shares are compared as exact fractions
+/// (i·m against j·n), so the order is deterministic.
+fn interleave(movies: &[u32], series: &[u32]) -> Vec<u32> {
+    let (n, m) = (movies.len() as u64, series.len() as u64);
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(movies.len() + series.len());
+    while i < movies.len() || j < series.len() {
+        let film_first = j == series.len() || (i < movies.len() && i as u64 * m <= j as u64 * n);
+        if film_first {
+            out.push(movies[i]);
+            i += 1;
+        } else {
+            out.push(series[j]);
+            j += 1;
+        }
+    }
+    out
 }
 
 impl FilterIndex {
@@ -1054,19 +1077,18 @@ impl FilterIndex {
             }
             valued
         });
-        // `all` is ranked by the same measure over both types' rows, so its films and series each keep their
-        // own type's order and interleave by popularity; a TMDB id both types use is settled by type.
-        let order = [0, 1, 2].map(|t| {
-            let mut ranked: Vec<(u32, f64, u32, usize)> = ones(&self.types[t])
+        let [movies, series] = [0, 1].map(|t| {
+            let mut ranked: Vec<(u32, f64, u32)> = ones(&self.types[t])
                 .map(|row| {
                     let key = self.keys[row];
-                    let popularity = crate::plotrows::popularity(indexes, export.as_deref(), key);
-                    (row as u32, popularity, key.1, type_index(key.0))
+                    (row as u32, crate::plotrows::popularity(indexes, export.as_deref(), key), key.1)
                 })
                 .collect();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
-            ranked.into_iter().map(|(row, _, _, _)| row).collect::<Vec<u32>>()
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.2.cmp(&b.2)));
+            ranked.into_iter().map(|(row, _, _)| row).collect::<Vec<u32>>()
         });
+        let all = interleave(&movies, &series);
+        let order = [movies, series, all];
         let order_id = [0, 1, 2].map(|t| {
             let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
             for &row in &order[t] {
@@ -1776,8 +1798,10 @@ pub fn schema() -> Value {
         .collect();
     json!({
         "types": ["movie", "series", "all"],
-        "all": "films and series together: counts and values over both, titles in one popularity order over \
-                both (each card names its type). Every kind answers for both; a kind or value only one type has \
+        "all": "films and series together: counts and values over both; titles are the two types' own orders \
+                merged by rank within type (a title's position in its type's order over that type's size, \
+                ascending, films first on a tie), so series run at their share, spread evenly, and each card \
+                names its type. Every kind answers for both; a kind or value only one type has \
                 (network, a series-only genre, a composite genre) matches only that type's titles, and a film \
                 genre id matches the series filed under it too. like names its title's type: \
                 like:movie-550, like:series-1396; a bare id is a 400 there",
@@ -2102,11 +2126,11 @@ mod tests {
         (media.to_owned(), id)
     }
 
-    /// `all` walks one order over both types by the same popularity the per-type orders use: the fixture's
-    /// votes put movie 2 (500) before series 4 (300) before movies 1 (100) and 3 (50). Each type keeps its own
-    /// order within it, and pages of it are slices of that one order.
+    /// `all` merges the types' own orders by rank within type: films 2, 1, 3 sit at 0, 1/3 and 2/3, series 4
+    /// (the only one) at 0, after the film it ties with. Pages of it are slices of that one order, and a
+    /// selection merges the filtered lists by the same keys.
     #[test]
-    fn all_is_one_popularity_order_over_both_types() {
+    fn all_merges_the_types_by_rank_within_type() {
         let indexes = fixture("all-order");
         let context = Context::new(&indexes, Scope::All, None);
         let whole = context.titles(&request_all(Route::Titles, "")).0;
@@ -2155,11 +2179,52 @@ mod tests {
         assert!(ids.contains(&"2010"));
     }
 
-    /// Films 1 (action) and 4, series 2 (Action & Adventure, and kids) and 3 (kids), both on network Q70.
-    fn mixed_genres(name: &str) -> Indexes {
+    /// The indexes of a store holding these titles.
+    fn store_of(
+        name: &str,
+        titles: &[crate::store::fixture::Title],
+        entities: &[crate::store::fixture::Entity],
+    ) -> Indexes {
         let dir = std::env::temp_dir().join(format!("den-atlas-filter-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, titles, entities);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the store loads");
+        crate::queries::load_for_tools(&ds).expect("its indexes load")
+    }
+
+    /// Series run at their share, spread evenly — here 1 in 6 — even when every series outvotes every film,
+    /// where raw votes would put all five first.
+    #[test]
+    fn all_spreads_series_at_their_share() {
+        let title = |media, tmdb_id, votes| crate::store::fixture::Title {
+            media,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            votes,
+            ..crate::store::fixture::Title::default()
+        };
+        let mut titles: Vec<_> = (1..=25).map(|id| title(0, id, 1000 - id)).collect();
+        titles.extend((101..=105).map(|id| title(1, id, 5000 - id)));
+        let indexes = store_of("all-spread", &titles, &[]);
+        let context = Context::new(&indexes, Scope::All, None);
+        let first = typed(&context.titles(&request_all(Route::Titles, "limit=30")).0);
+        let positions: Vec<usize> =
+            first.iter().enumerate().filter(|(_, (m, _))| m == "series").map(|(i, _)| i + 1).collect();
+        assert_eq!(positions, vec![2, 8, 14, 20, 26], "{first:?}");
+        let series: Vec<u64> = first.iter().filter(|(m, _)| m == "series").map(|&(_, id)| id).collect();
+        assert_eq!(series, vec![101, 102, 103, 104, 105], "each type keeps its own order");
+        assert_eq!(first[0], pair("movie", 1), "the most popular film, then the most popular series");
+    }
+
+    /// Films 1 (action) and 4, series 2 (Action & Adventure, and kids) and 3 (kids), both on network Q70.
+    fn mixed_genres(name: &str) -> Indexes {
         let title =
             |media, tmdb_id, votes, genres: Vec<u32>, broadcasters: Vec<u32>| crate::store::fixture::Title {
                 media,
@@ -2181,12 +2246,7 @@ mod tests {
         ];
         let network =
             crate::store::fixture::Entity { qid: 70, name: "A Network", tmdb: None, aliases: vec![] };
-        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &[network]);
-        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
-                           "quantization": "int8", "storeFile": "den-v1.store" });
-        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
-        let ds = crate::dataset::Dataset::load(&dir).expect("the mixed store loads");
-        crate::queries::load_for_tools(&ds).expect("its indexes load")
+        store_of(name, &titles, &[network])
     }
 
     /// A series' genres are read as films', so under `all` a film genre id matches the films and the series

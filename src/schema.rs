@@ -512,7 +512,7 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/filter/{type}/titles.json",
             "example": "/index/filter/movie/titles.json?sel=genre:18&limit=40",
-            "about": "The titles of one type (of both, under all: one order over both) carrying the selection, \
+            "about": "The titles of one type (of both, under all: merged by rank within type) carrying the selection, \
                       most voted first (in similarity order with a like selected), as /index/row/{type}.json \
                       draws them.",
             "parameters": [

@@ -3129,8 +3129,8 @@ mod tests {
         assert_eq!(all["values"].as_array().unwrap()[..2], two["values"].as_array().unwrap()[..], "a prefix");
     }
 
-    /// `all` at every filter route: films and series counted together, one popularity order over both paged
-    /// like a type's, values over both, and a `like` that names its title's type — the mixed row
+    /// `all` at every filter route: films and series counted together, the types merged by rank within type
+    /// and paged like a type's, values over both, and a `like` that names its title's type — the mixed row
     /// `/index/similar` serves. A bare `like` id there is a 400; a typed one spelled otherwise is answered and
     /// named canonically.
     #[tokio::test]
