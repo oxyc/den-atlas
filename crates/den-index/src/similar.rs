@@ -174,13 +174,24 @@ pub struct SimilarParams {
     /// The percentiles of the pool's base scores whose difference is `spread`, the unit of every term.
     pub spread_low_pct: usize,
     pub spread_high_pct: usize,
-    /// Rank on plot vectors with the plot-length direction projected out (`Index::without_length`). Off.
+    /// Rank on plot vectors with the plot-length direction projected out (`Index::without_length`). On.
     pub plot_length_off: bool,
 }
 
-/// Production ranks on the plot vectors as published. Measured on store `b2c60751c955`, the direction the
-/// knob removes carries most of the plot index's length skew (oxyc/den-dataset#109).
-const PLOT_LENGTH_OFF: bool = false;
+/// Production ranks on the plot vectors with the length direction projected out (oxyc/den-dataset#109).
+/// Short plots pulled short plots: on store `b2c60751c955` a seed under 400 characters had 49% of its served
+/// first twenty under 1,000 characters and a seed over 2,500 had 7%, against a corpus rate of 22%. `den-atlas
+/// rail-eval`, both judged files, and the served-row skew over the #109 seeds:
+///
+/// ```text
+///              dev nDCG'  dev bad  test nDCG'  test bad   short share <400 / 2500+   gap
+///   off         0.775       12       0.732        16          49.2% / 7.0%          42.2 pp
+///   on          0.777       12       0.732        16          40.0% / 12.1%         27.9 pp
+/// ```
+///
+/// A third of the served skew goes and the judged set does not move; 85–94% of each row's first twenty
+/// stays. `w_plot` stays at 0.45: with the direction removed, 0.35 and 0.55 scored no better.
+const PLOT_LENGTH_OFF: bool = true;
 
 /// Production filters on neither TMDB number nor popularity, and does not weigh popularity: More Like This
 /// is about the seed, and a popularity term would pull every row towards the same few titles.
