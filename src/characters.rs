@@ -262,15 +262,30 @@ impl CharacterIndex {
 }
 
 /// The live holder: `tmdb.rs` swaps a new list in whenever the credits it keeps change.
-#[derive(Default)]
 pub struct Characters {
     index: RwLock<Option<Arc<CharacterIndex>>>,
+    /// Whether the first build has finished, however it ended (`settled`). A holder made with `unsettled` is
+    /// waiting for one; any other has nothing to wait for.
+    settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Characters {
+    fn default() -> Self {
+        Characters { index: RwLock::new(None), settled: tokio::sync::watch::Sender::new(true) }
+    }
 }
 
 impl Characters {
     #[cfg(test)]
     pub fn with_index(index: CharacterIndex) -> Self {
-        Characters { index: RwLock::new(Some(Arc::new(index))) }
+        let holder = Characters::default();
+        holder.set(index);
+        holder
+    }
+
+    /// A holder whose first build is still to come: `settled` waits until `settle` says it has finished.
+    pub fn unsettled() -> Self {
+        Characters { settled: tokio::sync::watch::Sender::new(false), ..Characters::default() }
     }
 
     /// The current list; `None` until the first build lands.
@@ -280,6 +295,19 @@ impl Characters {
 
     pub fn set(&self, index: CharacterIndex) {
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(index));
+    }
+
+    /// The first build has finished — with a list, or without one.
+    pub fn settle(&self) {
+        self.settled.send_replace(true);
+    }
+
+    /// Once the first build has finished. The index loads wait here, because More Like This reads the links
+    /// and memoises what it ranks: a row ranked in the seconds before they landed would be served, without
+    /// them, until the indexes were next released.
+    pub async fn settled(&self) {
+        // The sender lives in `self`, so the channel cannot close while this waits.
+        let _ = self.settled.subscribe().wait_for(|settled| *settled).await;
     }
 }
 
@@ -350,12 +378,12 @@ fn parse<'a>(rows: impl Iterator<Item = (u32, &'a [Role])>, billed: u32) -> (Tit
     for (row, roles) in rows {
         // One principal per credited person, as IMDb lists one: a series' aggregate credits give a person
         // one role per character they played, and those are one person's names, not several people's.
-        let mut credited: Vec<((u32, u32), Vec<String>)> = Vec::new();
+        let mut credited: Vec<((u32, u32), Vec<&str>)> = Vec::new();
         for role in roles.iter().filter(|r| r.order < billed) {
             let at = (role.order, role.person);
             match credited.iter_mut().find(|(held, _)| *held == at) {
-                Some((_, characters)) => characters.push(role.character.to_string()),
-                None => credited.push((at, vec![role.character.to_string()])),
+                Some((_, characters)) => characters.push(&role.character),
+                None => credited.push((at, vec![&role.character])),
             }
         }
         let mut principals: Vec<Principal> = Vec::new();
@@ -763,7 +791,7 @@ fn index(row_count: usize, edges: &HashMap<Pair, (Tier, f32)>) -> CharacterIndex
 
 /// A role's character list as normalised names: "Bruce Wayne / Batman" gives both, "Joker (voice)" gives
 /// "joker", "Young Anakin" gives "anakin".
-fn names_of(characters: &[String]) -> Vec<String> {
+fn names_of(characters: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for character in characters {
         for part in character.split('/').flat_map(split_dash) {
@@ -813,24 +841,42 @@ const SUFFIXES: &[&str] = &["voice", "s voice", "narrator", "uncredited", "archi
 
 /// One name, normalised: bracketed notes dropped, diacritics folded, lowercased, punctuation to spaces, a
 /// trailing number ("Guard #2") and age, honorific and voice markers removed.
+///
+/// Every role name of the corpus passes through here on each build, so it allocates only where a step has to
+/// make new text: the folded, lowercased name, and the one output. Everything after the punctuation pass
+/// only ever shortens the name, so it works on slices of it.
 fn norm_one(s: &str) -> String {
-    let s: String = drop_brackets(s)
+    // `str::to_lowercase`, not per character: it lowercases a final sigma as `ς`.
+    let mut s: String = drop_brackets(s)
         .nfkd()
         .filter(|&c| canonical_combining_class(c) == 0)
         .collect::<String>()
-        .to_lowercase()
-        .replace("'s voice", "")
-        .replace('\u{2019}', "'");
-    let s: String = s
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' || c == '#' || c.is_whitespace() { c } else { ' ' })
-        .collect();
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut s = drop_number(&s).trim().to_owned();
+        .to_lowercase();
+    if s.contains("'s voice") {
+        s = s.replace("'s voice", "");
+    }
+    // Punctuation to spaces, and every run of whitespace to one space with none at either end — what
+    // `split_whitespace().join(" ")` over the mapped name gives, in one pass. A `’` becomes a space here like
+    // a `'`, so it needs no folding to one first.
+    let mut words = String::with_capacity(s.len());
+    let mut gap = false;
+    for c in s.chars() {
+        let c = if c.is_alphanumeric() || c == '_' || c == '#' || c.is_whitespace() { c } else { ' ' };
+        if c.is_whitespace() {
+            gap = !words.is_empty();
+        } else {
+            if gap {
+                words.push(' ');
+                gap = false;
+            }
+            words.push(c);
+        }
+    }
+    let mut s = drop_number(&words).trim();
     for _ in 0..2 {
-        s = drop_prefix(&s, PREFIXES);
-        s = drop_prefix(&s, HONORIFICS);
-        s = drop_suffix(&s);
+        s = drop_prefix(s, PREFIXES);
+        s = drop_prefix(s, HONORIFICS);
+        s = drop_suffix(s);
     }
     s.trim().to_owned()
 }
@@ -872,20 +918,20 @@ fn drop_number(s: &str) -> &str {
     s
 }
 
-fn drop_prefix(s: &str, words: &[&str]) -> String {
+fn drop_prefix<'a>(s: &'a str, words: &[&str]) -> &'a str {
     for word in words {
         if let Some(rest) = s.strip_prefix(word) {
             if rest.starts_with(char::is_whitespace) {
-                return rest.trim_start().to_owned();
+                return rest.trim_start();
             }
         }
     }
-    s.to_owned()
+    s
 }
 
 /// A trailing voice/narrator marker removed; the earliest-starting match wins, so "x s voice" loses
 /// " s voice" rather than " voice".
-fn drop_suffix(s: &str) -> String {
+fn drop_suffix(s: &str) -> &str {
     SUFFIXES
         .iter()
         .filter_map(|suffix| {
@@ -894,7 +940,6 @@ fn drop_suffix(s: &str) -> String {
         })
         .min_by_key(|before| before.len())
         .unwrap_or(s)
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -902,7 +947,7 @@ mod tests {
     use super::*;
 
     fn norm(characters: &[&str]) -> Vec<String> {
-        let mut names = names_of(&characters.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        let mut names = names_of(characters);
         names.sort();
         names
     }

@@ -384,10 +384,17 @@ async fn main() {
         tokio::spawn(queries::release_when_idle(Arc::clone(index)));
     }
     if let Some(tmdb) = &tmdb {
-        // Awaited, not spawned: a local read. The store carries no vote count of its own, so until this lands
-        // every browse row would answer in tmdb-id order — and `atlas-dataset-sync` restarts this process on
-        // every publish, so that window is not rare.
-        eprintln!("{}", tmdb.load().await);
+        // The vote counts are awaited, not spawned: a local read. The store carries no vote count of its own, so
+        // until this lands every browse row would answer in tmdb-id order — and `atlas-dataset-sync` restarts
+        // this process on every publish, so that window is not rare.
+        eprintln!("{}", tmdb.load_votes().await);
+        // The character links are most of the boot's TMDB work and nothing but the index routes reads them, so
+        // they are built while atlas already answers everything else. The first index load waits for them
+        // (`Characters::settled`).
+        tokio::spawn({
+            let tmdb = Arc::clone(tmdb);
+            async move { eprintln!("tmdb: {}", tmdb.load_characters().await) }
+        });
         tokio::spawn(tmdb::Tmdb::refresh_forever(Arc::clone(tmdb)));
     }
     if state.motn.enabled() {

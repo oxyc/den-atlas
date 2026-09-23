@@ -108,7 +108,11 @@ pub struct Credits {
 #[derive(Default)]
 struct Kept {
     votes: HashMap<Key, Votes>,
+    /// Empty while `credits_on_disk`: ~60,000 titles' roles are read from `CACHE_DIR` for each build and the
+    /// daily refresh rather than held between them.
     credits: HashMap<Key, Credits>,
+    /// Whether `CREDITS_FILE` holds the credits and `credits` does not; the next refresh reads them back.
+    credits_on_disk: bool,
 }
 
 impl Kept {
@@ -146,53 +150,54 @@ fn media_of(name: &str) -> Option<u8> {
     }
 }
 
-/// A kept file's lines after its header, or none when it is absent or in another layout.
-fn lines_of(path: &Path, header: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+/// Each of a kept file's lines after its header, borrowed from the one read of it; nothing when it is absent or
+/// in another layout.
+fn each_line(path: &Path, header: &str, mut line: impl FnMut(&str)) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
     let mut lines = text.lines();
     if lines.next() != Some(header) {
         eprintln!("tmdb: {} is not in the layout this build reads ({header:?}); ignoring it", path.display());
-        return Vec::new();
+        return;
     }
-    lines.map(str::to_owned).collect()
+    lines.for_each(&mut line);
 }
 
 /// The kept vote counts, without any past `MAX_AGE` at `now`.
 pub fn read_votes(path: &Path, now: u64) -> HashMap<Key, Votes> {
     let mut votes = HashMap::new();
-    for line in lines_of(path, VOTES_HEADER) {
+    each_line(path, VOTES_HEADER, |line| {
         let f: Vec<&str> = line.split('\t').collect();
-        let [media, id, average, count, fetched] = f[..] else { continue };
+        let [media, id, average, count, fetched] = f[..] else { return };
         let (Some(media), Ok(id), Ok(average), Ok(count), Ok(fetched)) =
             (media_of(media), id.parse(), average.parse(), count.parse(), fetched.parse())
         else {
-            continue;
+            return;
         };
         if fresh(fetched, now) {
             votes.insert((media, id), Votes { average, count, fetched });
         }
-    }
+    });
     votes
 }
 
 /// The kept credits, without any past `MAX_AGE` at `now`.
 pub fn read_credits(path: &Path, now: u64) -> HashMap<Key, Credits> {
     let mut credits: HashMap<Key, Credits> = HashMap::new();
-    for line in lines_of(path, CREDITS_HEADER) {
+    each_line(path, CREDITS_HEADER, |line| {
         let f: Vec<&str> = line.splitn(6, '\t').collect();
-        let [media, id, fetched, order, person, character] = f[..] else { continue };
+        let [media, id, fetched, order, person, character] = f[..] else { return };
         let (Some(media), Ok(id), Ok(fetched)) = (media_of(media), id.parse(), fetched.parse()) else {
-            continue;
+            return;
         };
         if !fresh(fetched, now) {
-            continue;
+            return;
         }
         let title = credits.entry((media, id)).or_insert(Credits { fetched, roles: Vec::new() });
         // A title with no named role is one line with the role's fields empty.
         if let (Ok(order), Ok(person)) = (order.parse(), person.parse()) {
             title.roles.push(Role { order, person, character: character.into() });
         }
-    }
+    });
     credits
 }
 
@@ -261,7 +266,7 @@ struct State {
 impl State {
     fn read(path: &Path) -> State {
         let mut state = State::default();
-        for line in lines_of(path, STATE_HEADER) {
+        each_line(path, STATE_HEADER, |line| {
             let f: Vec<&str> = line.split('\t').collect();
             let number = |i: usize| f.get(i).and_then(|v| v.parse::<i64>().ok());
             match (f.first().copied(), number(1)) {
@@ -279,7 +284,7 @@ impl State {
                 }
                 _ => {}
             }
-        }
+        });
         state
     }
 
@@ -391,7 +396,7 @@ impl Tmdb {
             state: Mutex::new(State::default()),
             proxy,
             ratings: Arc::new(Ratings::default()),
-            characters: Arc::new(Characters::default()),
+            characters: Arc::new(Characters::unsettled()),
         })
     }
 
@@ -411,27 +416,28 @@ impl Tmdb {
         self.dir.as_ref().map(|dir| dir.join(name))
     }
 
-    /// Read what is kept, drop what is past `MAX_AGE`, and build both indexes: the boot step, a local read
-    /// only. A line for the log.
+    /// Read what is kept, drop what is past `MAX_AGE`, and build both indexes: `load_votes`, then
+    /// `load_characters`, for a tool that wants both before it starts. A line for the log.
     pub async fn load(&self) -> String {
+        let votes = self.load_votes().await;
+        format!("{votes}; {}", self.load_characters().await)
+    }
+
+    /// The boot step's first half, a local read only: the kept vote counts and the refresh's state, and the
+    /// vote counts joined onto the store. Every browse row is ordered by them, so atlas awaits this before it
+    /// listens. A line for the log.
+    pub async fn load_votes(&self) -> String {
         let now = now_secs();
-        let (votes, credits, state) =
-            match (self.file(VOTES_FILE), self.file(CREDITS_FILE), self.file(STATE_FILE)) {
-                (Some(v), Some(c), Some(s)) => tokio::task::spawn_blocking(move || {
-                    (read_votes(&v, now), read_credits(&c, now), State::read(&s))
-                })
+        let (votes, state) = match (self.file(VOTES_FILE), self.file(STATE_FILE)) {
+            (Some(v), Some(s)) => tokio::task::spawn_blocking(move || (read_votes(&v, now), State::read(&s)))
                 .await
                 .unwrap_or_default(),
-                _ => Default::default(),
-            };
+            _ => Default::default(),
+        };
         let oldest = votes.values().map(|v| v.fetched).min();
-        {
-            let mut kept = crate::util::lock(&self.kept);
-            kept.votes = votes;
-            kept.credits = credits;
-        }
+        crate::util::lock(&self.kept).votes = votes;
         *crate::util::lock(&self.state) = state;
-        let built = self.rebuild().await;
+        let built = self.build_votes().await;
         let age = oldest
             .map_or_else(|| "none".to_owned(), |t| format!("oldest {} days", now.saturating_sub(t) / DAY));
         format!(
@@ -440,49 +446,97 @@ impl Tmdb {
         )
     }
 
-    /// Both indexes from what is kept now. A line for the log.
-    async fn rebuild(&self) -> String {
-        let (votes, credits) = {
-            let kept = crate::util::lock(&self.kept);
-            let votes: HashMap<Key, (f32, u32)> =
-                kept.votes.iter().map(|(&k, v)| (k, (v.average, v.count))).collect();
-            (votes, kept.credits.clone())
-        };
-        let store = Arc::clone(&self.store);
-        let built = tokio::task::spawn_blocking(move || {
-            let view = store.view();
-            let ratings = ratings::build(&view, &votes);
-            let characters = characters::build(&view, &credits);
-            (ratings, characters, credits.len())
-        })
-        .await
-        .map_err(|e| format!("tmdb build task: {e}"));
-        match built {
-            Ok((rated, linked, credited)) => {
-                let votes = match rated {
-                    Ok(index) => {
-                        let line =
-                            format!("vote counts for {} of {} store rows", index.matched(), index.rows());
-                        self.ratings.set(Some(index));
-                        line
-                    }
-                    Err(e) => {
-                        self.ratings.set(None);
-                        format!("no vote counts ({e})")
-                    }
-                };
-                let characters = match linked {
-                    Ok(index) => {
-                        let line = characters::describe(&index);
-                        self.characters.set(index);
-                        line
-                    }
-                    Err(e) => format!("no character links ({e})"),
-                };
-                format!("{votes}; credits for {credited} titles, {characters}")
+    /// The boot step's second half, a local read only: the kept credits, and the character links built from
+    /// them. Atlas runs it after it starts listening; until it has finished, `Characters::settled` holds back
+    /// the first index load, so no More Like This is ranked — and memoised — without the links. A line for
+    /// the log.
+    ///
+    /// With a `CACHE_DIR` the credits are read here, built from and dropped: the file holds them, and the
+    /// daily refresh reads it again (`Kept::credits_on_disk`). Without one they live in memory only.
+    pub async fn load_characters(&self) -> String {
+        let credits = match self.file(CREDITS_FILE) {
+            Some(c) => {
+                let now = now_secs();
+                crate::util::lock(&self.kept).credits_on_disk = true;
+                tokio::task::spawn_blocking(move || read_credits(&c, now)).await.unwrap_or_default()
             }
-            Err(e) => format!("indexes not rebuilt ({e}); the previous ones keep serving"),
+            None => crate::util::lock(&self.kept).credits.clone(),
+        };
+        self.build_characters(credits).await
+    }
+
+    /// Both indexes from what is kept now: the daily refresh's rebuild. `drop_credits` when the credits are
+    /// safely in `CACHE_DIR`, so the build takes them rather than a copy and the next refresh reads them back.
+    /// A line for the log.
+    async fn rebuild(&self, drop_credits: bool) -> String {
+        let votes = self.build_votes().await;
+        self.credits_in_memory().await;
+        let credits = {
+            let mut kept = crate::util::lock(&self.kept);
+            if drop_credits && self.dir.is_some() {
+                kept.credits_on_disk = true;
+                std::mem::take(&mut kept.credits)
+            } else {
+                kept.credits.clone()
+            }
+        };
+        format!("{votes}; {}", self.build_characters(credits).await)
+    }
+
+    /// Read the credits back from `CACHE_DIR` when they were dropped after the last build. Everything in the
+    /// file, however old: `Kept::expire` then drops, and counts, what has passed `MAX_AGE`.
+    async fn credits_in_memory(&self) {
+        if !crate::util::lock(&self.kept).credits_on_disk {
+            return;
         }
+        let Some(path) = self.file(CREDITS_FILE) else { return };
+        let credits = tokio::task::spawn_blocking(move || read_credits(&path, 0)).await.unwrap_or_default();
+        let mut kept = crate::util::lock(&self.kept);
+        kept.credits = credits;
+        kept.credits_on_disk = false;
+    }
+
+    /// The vote counts joined onto the store from what is kept now, and swapped in. A phrase for the log.
+    async fn build_votes(&self) -> String {
+        let votes: HashMap<Key, (f32, u32)> =
+            crate::util::lock(&self.kept).votes.iter().map(|(&k, v)| (k, (v.average, v.count))).collect();
+        let store = Arc::clone(&self.store);
+        match tokio::task::spawn_blocking(move || ratings::build(&store.view(), &votes)).await {
+            Ok(Ok(index)) => {
+                let line = format!("vote counts for {} of {} store rows", index.matched(), index.rows());
+                self.ratings.set(Some(index));
+                line
+            }
+            Ok(Err(e)) => {
+                self.ratings.set(None);
+                format!("no vote counts ({e})")
+            }
+            Err(e) => {
+                format!("vote counts not rebuilt (tmdb build task: {e}); the previous ones keep serving")
+            }
+        }
+    }
+
+    /// The character links from `credits`, swapped in, and the holder settled whatever the outcome — a build
+    /// that failed must not hold the index loads back for good. A phrase for the log.
+    async fn build_characters(&self, credits: HashMap<Key, Credits>) -> String {
+        let store = Arc::clone(&self.store);
+        let built =
+            tokio::task::spawn_blocking(move || (characters::build(&store.view(), &credits), credits.len()))
+                .await;
+        let line = match built {
+            Ok((Ok(index), credited)) => {
+                let line = format!("credits for {credited} titles, {}", characters::describe(&index));
+                self.characters.set(index);
+                line
+            }
+            Ok((Err(e), credited)) => format!("credits for {credited} titles, no character links ({e})"),
+            Err(e) => {
+                format!("character links not rebuilt (tmdb build task: {e}); the previous ones keep serving")
+            }
+        };
+        self.characters.settle();
+        line
     }
 
     /// Once a day: drop what expired, ask what is due, keep it, rebuild. Never returns.
@@ -520,6 +574,7 @@ impl Tmdb {
             let previous = std::mem::replace(&mut state.last_tick, now);
             (Budget { left: proxy.daily_max.saturating_sub(state.spent), asked: 0, stopped: None }, previous)
         };
+        self.credits_in_memory().await;
         let expired = crate::util::lock(&self.kept).expire(now);
 
         let (changed, changes_seen) = self.changes(proxy, &corpus, (previous, now), &mut budget).await;
@@ -548,8 +603,8 @@ impl Tmdb {
             let mut state = crate::util::lock(&self.state);
             state.spent += budget.asked;
         }
-        let kept = self.persist().await;
-        let built = self.rebuild().await;
+        let (kept, written) = self.persist().await;
+        let built = self.rebuild(written).await;
         format!(
             "tmdb: refreshed — {} questions ({} left today){}; changes: {changes_seen} titles, {} in the corpus, \
              {credited_changed} credits asked again; sweep: {pages} pages, {sweep}; {filled} counts asked by \
@@ -562,27 +617,41 @@ impl Tmdb {
         )
     }
 
-    /// Write what is kept to `CACHE_DIR`. A phrase for the log.
-    async fn persist(&self) -> String {
+    /// Write what is kept to `CACHE_DIR`. A phrase for the log, and whether all of it was written.
+    ///
+    /// The credits are moved to the writer and back rather than copied: nothing else changes them while the
+    /// refresh, their one writer, is here.
+    async fn persist(&self) -> (String, bool) {
         let (Some(v), Some(c), Some(s)) =
             (self.file(VOTES_FILE), self.file(CREDITS_FILE), self.file(STATE_FILE))
         else {
-            return "kept in memory only".to_owned();
+            return ("kept in memory only".to_owned(), false);
         };
         let (votes, credits, state) = {
-            let kept = crate::util::lock(&self.kept);
-            (kept.votes.clone(), kept.credits.clone(), crate::util::lock(&self.state).clone())
+            let mut kept = crate::util::lock(&self.kept);
+            let credits = std::mem::take(&mut kept.credits);
+            (kept.votes.clone(), credits, crate::util::lock(&self.state).clone())
         };
         let written = tokio::task::spawn_blocking(move || {
-            write_votes(&v, &votes)?;
-            write_credits(&c, &credits)?;
-            state.write(&s)
+            let written = write_votes(&v, &votes)
+                .and_then(|()| write_credits(&c, &credits))
+                .and_then(|()| state.write(&s));
+            (written, credits)
         })
         .await;
         match written {
-            Ok(Ok(())) => "kept in CACHE_DIR".to_owned(),
-            Ok(Err(e)) => format!("NOT kept ({e}); a restart asks again"),
-            Err(e) => format!("NOT kept ({e}); a restart asks again"),
+            Ok((written, credits)) => {
+                crate::util::lock(&self.kept).credits = credits;
+                match written {
+                    Ok(()) => ("kept in CACHE_DIR".to_owned(), true),
+                    Err(e) => (format!("NOT kept ({e}); a restart asks again"), false),
+                }
+            }
+            // The writer panicked and took the day's credits with it; the next refresh reads back the file.
+            Err(e) => {
+                crate::util::lock(&self.kept).credits_on_disk = true;
+                (format!("NOT kept ({e}); a restart asks again"), false)
+            }
         }
     }
 
@@ -1079,7 +1148,8 @@ mod tests {
             assert_eq!(kept.votes[&(0, 1)], Votes { average: 8.0, count: 100, fetched }, "Last-Modified");
             assert_eq!(kept.votes[&(1, 4)].count, 30);
             assert!(!kept.votes.contains_key(&(0, 424_242)), "a title the store lacks is never kept");
-            assert_eq!(kept.credits.len(), corpus.len(), "every corpus title's credits");
+            // Written, built from and dropped: the file below holds them until the next refresh.
+            assert!(kept.credits.is_empty() && kept.credits_on_disk, "the written credits stayed in memory");
         }
         let state = crate::util::lock(&tmdb.state).clone();
         assert!(state.slices.is_empty() && state.sweep_started == now && state.last_tick == now);
@@ -1091,12 +1161,57 @@ mod tests {
         assert!(tmdb.ratings().index().is_some_and(|i| i.matched() == corpus.len()));
         assert!(tmdb.characters().index().is_some_and(|i| i.links() > 0), "Walter White everywhere");
 
-        // The next day the sweep is idle, and only what is due is asked.
+        // The next day the sweep is idle, and only what is due is asked: the credits read back from the file
+        // are the ones asked yesterday, so none is missing, and the links are built from them again.
         let before = asked.load(std::sync::atomic::Ordering::SeqCst);
         let line = tmdb.tick(now + DAY).await;
         assert!(line.contains("idle, the next in 29 days"), "{line}");
+        assert!(line.contains("credits: 0 missing"), "{line}");
         assert!(asked.load(std::sync::atomic::Ordering::SeqCst) - before < corpus.len(), "{line}");
+        assert!(tmdb.characters().index().is_some_and(|i| i.links() > 0), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atlas listens once the vote counts are in and builds the character links after; the first index load
+    /// waits for them, so no More Like This row is ranked — and memoised — without them.
+    #[tokio::test]
+    async fn the_first_index_load_waits_for_the_character_links() {
+        use den_index::MediaType::Movie;
+        let dir = temp("split");
+        let ds = crate::queries::write_fixture(&dir.join("ds"));
+        let now = now_secs();
+        let walter = |id| ((0, id), Credits { fetched: now - DAY, roles: vec![role("Walter White")] });
+        write_credits(&dir.join(CREDITS_FILE), &HashMap::from([walter(1), walter(2)])).unwrap();
+        write_votes(
+            &dir.join(VOTES_FILE),
+            &HashMap::from([((0, 1), Votes { average: 8.4, count: 9000, fetched: now - DAY })]),
+        )
+        .unwrap();
+        let tmdb = Tmdb::new(ds.mapped.clone(), Some(dir.clone()), None, DEFAULT_DAILY_MAX).unwrap();
+
+        let line = tmdb.load_votes().await;
+        assert!(line.contains("vote counts for 1 of 12 store rows"), "{line}");
+        assert!(tmdb.characters().index().is_none(), "the links are the second half");
+        let queries = crate::queries::IndexQueries::new(&ds)
+            .with_ratings(Some(tmdb.ratings()))
+            .with_characters(Some(tmdb.characters()));
+        let load = tokio::spawn(async move {
+            let (indexes, _) = queries.get(|| ()).await.expect("the indexes load");
+            indexes.more_like_this(1, Movie).to_vec();
+            indexes.character_links(Movie, 1)
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!load.is_finished(), "the index load did not wait for the character links");
+
+        let line = tmdb.load_characters().await;
+        assert!(line.contains("credits for 2 titles"), "{line}");
+        assert_eq!(load.await.unwrap(), [((Movie, 2), 1.0)]);
+        assert!(crate::util::lock(&tmdb.kept).credits.is_empty(), "the credits are read, built and dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn role(character: &str) -> Role {
+        Role { order: 0, person: 100, character: character.into() }
     }
 
     /// The day's ceiling holds: a refresh stops when it is spent and a sweep carries on from where it stopped.

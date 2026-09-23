@@ -572,9 +572,13 @@ impl IndexQueries {
             ratings: self.ratings.clone(),
             characters: self.characters.clone(),
         };
-        let loaded = tokio::task::spawn_blocking(move || load(&sources))
-            .await
-            .map_err(|e| format!("load task: {e}"))?;
+        let loading = tokio::task::spawn_blocking(move || load(&sources));
+        // The character links are built after atlas starts listening, alongside this load. Nothing gets these
+        // indexes before they have landed: More Like This reads them and memoises what it ranks.
+        if let Some(characters) = &self.characters {
+            characters.settled().await;
+        }
+        let loaded = loading.await.map_err(|e| format!("load task: {e}"))?;
         // A failed load is now an OUTAGE of the query routes, not a degradation of one of them, because
         // the store is the only input left. Recorded before the `?` so `/health` reports it rather than
         // only the request that happened to trigger the load.
