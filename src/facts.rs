@@ -105,7 +105,7 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn civil_year(days: i64) -> i64 {
+pub(crate) fn civil_year(days: i64) -> i64 {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

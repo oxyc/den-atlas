@@ -8,6 +8,8 @@
 //! - `titles.json` — the titles carrying the selection, paged, as the cards `/index/row` draws.
 //! - `values/<kind>.json` — one kind's values under the selection, labelled, with a prefix search: the
 //!   typeahead for the kinds too big to list whole (people, studios, characters).
+//! - `people.json` and `people/counts.json` — the people credited on those titles, filtered by their own
+//!   traits, and the traits' counts (`people.rs`).
 //!
 //! # What a count is
 //!
@@ -53,8 +55,12 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
+mod people;
+
 type Bits = Vec<u64>;
 type Key = (MediaType, u32);
+/// A kind table's reading of `<kind>:<id>` as its canonical pair.
+type Normalise<'f> = &'f dyn Fn(&str, &str) -> Result<(String, String), String>;
 
 /// The most values one selection may name.
 pub const MAX_SELECTION: usize = 16;
@@ -458,8 +464,14 @@ fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), Str
         kind
     };
     let Some(spec) = spec(&kind) else { return Ok((kind, id.to_owned())) };
+    let id = normalise_id(&kind, id, spec.id, scope)?;
+    Ok((kind, id))
+}
+
+/// An id in its canonical form, as its kind's format says.
+fn normalise_id(kind: &str, id: &str, format: Id, scope: Scope) -> Result<String, String> {
     let number = || id.parse::<u32>().map_err(|_| format!("{kind}: {id:?} is not an integer"));
-    let id = match spec.id {
+    let id = match format {
         Id::Integer => number()?.to_string(),
         Id::Decade => (number()? / 10 * 10).to_string(),
         Id::Lower => id.to_ascii_lowercase(),
@@ -493,7 +505,7 @@ fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), Str
             },
         },
     };
-    Ok((kind, id))
+    Ok(id)
 }
 
 /// Which question a request asks.
@@ -502,6 +514,10 @@ pub enum Route {
     Counts,
     Titles,
     Values(&'static Spec),
+    /// `people.json`: the people credited on the matching titles (`people.rs`).
+    People,
+    /// `people/counts.json`: their traits' counts.
+    PeopleCounts,
 }
 
 /// A request's parameters, read and checked before anything loads.
@@ -509,6 +525,8 @@ pub enum Route {
 pub struct Request {
     /// Sorted by kind, then positive before excluded, then id; each once.
     pub items: Vec<Item>,
+    /// The people routes' person traits, ordered like `items`.
+    pub traits: Vec<Item>,
     pub skip: usize,
     pub limit: usize,
     /// A values search's prefix, normalised as the kind's names are.
@@ -521,8 +539,9 @@ pub struct Request {
 impl Request {
     /// A route's query string. The canonical spelling, byte for byte:
     ///
-    /// - `sel`, then (titles) `skip` and `limit`, or (values) `q` and `limit`; each only when it is not its
-    ///   default (no selection, 0, the route's page) and nothing else. No query at all when everything is.
+    /// - `sel`, then (people) `traits`, then (titles, people) `skip` and `limit`, or (values) `q` and `limit`;
+    ///   each only when it is not its default (no selection, 0, the route's page) and nothing else. No query at
+    ///   all when everything is. `traits` is written as `sel` is, with the person-trait kinds (`people.rs`).
     /// - `sel`: the items `[-]<kind>:<id>` joined by `,`, each id normalised as its kind says (`Id`), sorted by
     ///   kind, then positive before excluded, then id (compared as strings), each once. `:`, `,` and `-` are
     ///   literal; an id is percent-encoded as JavaScript's `encodeURIComponent` does.
@@ -541,6 +560,8 @@ impl Request {
             Route::Counts => &["sel"],
             Route::Titles => &["sel", "skip", "limit"],
             Route::Values(_) => &["sel", "q", "limit"],
+            Route::People => &["sel", "traits", "skip", "limit"],
+            Route::PeopleCounts => &["sel", "traits"],
         };
         let mut params: HashMap<&str, &str> = HashMap::new();
         for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -551,23 +572,30 @@ impl Request {
         }
         let decode = |v: &str| crate::handler::percent_decode(&v.replace('+', " "));
 
-        let sel = params.get("sel").map(|v| decode(v)).unwrap_or_default();
-        let raw: Vec<&str> = sel.split(',').filter(|i| !i.is_empty()).collect();
-        if raw.len() > MAX_SELECTION {
-            return Err(format!("at most {MAX_SELECTION} selected values"));
-        }
-        let mut items = Vec::with_capacity(raw.len());
-        for item in raw {
-            let (exclude, item) = match item.strip_prefix('-') {
-                Some(rest) => (true, rest),
-                None => (false, item),
-            };
-            let (kind, id) = item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
-            let (kind, id) = normalise(kind, id, scope)?;
-            items.push(Item { kind, exclude, id });
-        }
-        items.sort();
-        items.dedup();
+        // `sel` and `traits` share one grammar; each kind table normalises its own ids.
+        let read_items = |name: &str, normalise: Normalise<'_>| -> Result<Vec<Item>, String> {
+            let list = params.get(name).map(|v| decode(v)).unwrap_or_default();
+            let raw: Vec<&str> = list.split(',').filter(|i| !i.is_empty()).collect();
+            if raw.len() > MAX_SELECTION {
+                return Err(format!("{name}: at most {MAX_SELECTION} values"));
+            }
+            let mut items = Vec::with_capacity(raw.len());
+            for item in raw {
+                let (exclude, item) = match item.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, item),
+                };
+                let (kind, id) =
+                    item.split_once(':').ok_or_else(|| format!("{item:?} is not <kind>:<id>"))?;
+                let (kind, id) = normalise(kind, id)?;
+                items.push(Item { kind, exclude, id });
+            }
+            items.sort();
+            items.dedup();
+            Ok(items)
+        };
+        let items = read_items("sel", &|kind, id| normalise(kind, id, scope))?;
+        let traits = read_items("traits", &|kind, id| people::normalise(kind, id, scope))?;
 
         let count = |name: &str| -> Result<Option<usize>, String> {
             params
@@ -576,8 +604,8 @@ impl Request {
                 .transpose()
         };
         let (default_limit, max_limit) = match route {
-            Route::Counts => (0, 0),
-            Route::Titles => (PAGE, MAX_PAGE),
+            Route::Counts | Route::PeopleCounts => (0, 0),
+            Route::Titles | Route::People => (PAGE, MAX_PAGE),
             Route::Values(spec) => (spec.values_limit(), spec.values_limit()),
         };
         let limit = count("limit")?.unwrap_or(default_limit).clamp(default_limit.min(1), max_limit);
@@ -607,6 +635,9 @@ impl Request {
         if !items.is_empty() {
             parts.push(format!("sel={}", items.iter().map(Item::spelled).collect::<Vec<_>>().join(",")));
         }
+        if !traits.is_empty() {
+            parts.push(format!("traits={}", traits.iter().map(Item::spelled).collect::<Vec<_>>().join(",")));
+        }
         if skip != 0 {
             parts.push(format!("skip={skip}"));
         }
@@ -618,7 +649,7 @@ impl Request {
         }
         let canonical_query = parts.join("&");
         let canonical = query == canonical_query;
-        Ok(Request { items, skip, limit, q, canonical, canonical_query })
+        Ok(Request { items, traits, skip, limit, q, canonical, canonical_query })
     }
 
     /// The canonical query, with its `?`, or nothing.
@@ -1827,9 +1858,10 @@ pub fn schema() -> Value {
                           they match nothing, and are named so a client can tell them from a real zero",
         "canonical": "sel items [-]<kind>:<id>, ids normalised per kind, sorted by kind, then positive before \
                       excluded, then id as strings, each once, joined by ','; ids encoded as encodeURIComponent \
-                      does, ':' ',' '-' literal. Then skip and limit (titles) or q and limit (values), each only \
-                      when not its default. Any other spelling answers privately with Content-Location naming \
-                      this one.",
+                      does, ':' ',' '-' literal. Then traits (people), written the same way; then skip and limit \
+                      (titles, people) or q and limit (values), each only when not its default. Any other \
+                      spelling answers privately with Content-Location naming this one.",
+        "traits": people::schema(),
         "maxSelection": MAX_SELECTION,
         "maxQuery": MAX_QUERY,
     })
@@ -2244,8 +2276,7 @@ mod tests {
             title(1, 3, 50, vec![10762], vec![70]),
             title(0, 4, 200, vec![18], vec![]),
         ];
-        let network =
-            crate::store::fixture::Entity { qid: 70, name: "A Network", tmdb: None, aliases: vec![] };
+        let network = crate::store::fixture::Entity { qid: 70, name: "A Network", ..Default::default() };
         store_of(name, &titles, &[network])
     }
 
@@ -2398,6 +2429,8 @@ mod tests {
             let route = match parts[1..] {
                 ["counts.json"] => Route::Counts,
                 ["titles.json"] => Route::Titles,
+                ["people.json"] => Route::People,
+                ["people", "counts.json"] => Route::PeopleCounts,
                 ["values", kind] => Route::Values(spec(kind.trim_end_matches(".json")).unwrap()),
                 _ => panic!("{url}"),
             };

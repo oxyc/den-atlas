@@ -555,6 +555,68 @@ fn routes() -> Value {
             "returns": "{kind, mode, values: [{id, name, count, tmdbId?}], complete, ignored, kindsUnavailable?}",
         },
         {
+            "method": "GET",
+            "path": "/index/filter/{type}/people.json",
+            "example": "/index/filter/movie/people.json?sel=decade:1980&traits=role:cast",
+            "about": "The people credited on the titles of one type (of both, under all) carrying the selection, \
+                      holding every person trait, most matching titles first, then most titles in the corpus, \
+                      then by Q-id. filter.traits in this document describes the trait kinds.",
+            "parameters": [
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
+                with(
+                    param("sel", "string", "the titles, as counts.json"),
+                    json!({ "max": crate::filter::MAX_SELECTION }),
+                ),
+                with(
+                    param("traits", "string", "[-]<trait>:<id>, comma-separated, in canonical order"),
+                    json!({ "max": crate::filter::MAX_SELECTION }),
+                ),
+                with(param("skip", "integer", "a multiple of limit; left out when 0"), json!({ "default": 0 })),
+                with(
+                    param("limit", "integer", "people in the page; left out when the default"),
+                    json!({ "default": crate::filter::PAGE, "max": crate::filter::MAX_PAGE }),
+                ),
+            ],
+            "returns": "{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, \
+                        occupation?}], total, labels, coverage, ignored, ignoredTraits?, unknownValues?, \
+                        unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
+            "counts": {
+                "people[].credits": "matching titles the person's counted credits are on",
+                "people[].born": "{precision: day|month|year|decade|century, date?, year?, century?}: as far as \
+                                  Wikidata dates it",
+                "labels": "the name of every gender, citizenship and occupation id on the page",
+            },
+        },
+        {
+            "method": "GET",
+            "path": "/index/filter/{type}/people/counts.json",
+            "example": "/index/filter/movie/people/counts.json?sel=decade:1980",
+            "about": "For every value of every person trait, the people credited under the selection and the \
+                      other traits holding it; a one-pick trait (gender, born) counted without its own pick.",
+            "parameters": [
+                with(
+                    param("type", "enum", "movie, series or all (films and series together)"),
+                    json!({ "in": "path", "field": "mediaType" }),
+                ),
+                with(
+                    param("sel", "string", "the titles, as counts.json"),
+                    json!({ "max": crate::filter::MAX_SELECTION }),
+                ),
+                with(param("traits", "string", "as people.json"), json!({ "max": crate::filter::MAX_SELECTION })),
+            ],
+            "returns": "{total, traits: {<trait>: {mode, complete, values: {<id>: n}, labels?, selected?, \
+                        excluded?}}, traitCoverage, coverage, ignored, ignoredTraits?, unknownValues?, \
+                        unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
+            "counts": {
+                "total": "people credited on the matching titles and holding every trait",
+                "traitCoverage": "per applied trait, the credited people it is on record for (count) out of \
+                                  every person credited under the selection and role (denominator)",
+            },
+        },
+        {
             "method": "GET", "path": "/index/taxonomy.json", "example": "/index/taxonomy.json",
             "about": "The label names alone, kept for the TV app. Use this document instead.",
         },
