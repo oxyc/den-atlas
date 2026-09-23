@@ -624,15 +624,21 @@ impl<'a> Context<'a> {
     /// `people/values/<trait>.json`: one entity trait's values, counted as `people/counts.json` counts them —
     /// the people credited under the selection and the other traits holding each, a one-pick trait (gender)
     /// without its own pick — but every value rather than the top `TOP_K`, labelled, most people first, then
-    /// by name; with `q`, only those with a name or alias having a word starting `q`. So a value past the top
+    /// by name; with `q`, only those with a name or alias having a word starting `q`, the value it names exactly
+    /// first, then those holding it as whole words, then the rest (`match_tier`). So a value past the top
     /// (citizenship:Iceland among the films of the 2020s) can be found by name.
     pub fn people_values(&self, kind: &str, request: &Request) -> (Value, bool) {
         let people = self.people_of(request, false);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let i = TRAITS.iter().position(|t| t.name == kind).unwrap_or(0);
         let (spec, own) = (&TRAITS[i], 1u8 << i);
-        let named: Option<Vec<u32>> =
+        // (entity, match tier), by entity.
+        let named: Option<Vec<(u32, u8)>> =
             request.q.as_deref().map(|q| self.filter.names(self.indexes).matching(q));
+        let tier = |v: u32| match &named {
+            Some(named) => named.binary_search_by_key(&v, |&(e, _)| e).ok().map(|at| named[at].1),
+            None => Some(0),
+        };
         let mut counted: HashMap<u32, u32> = HashMap::new();
         let mut denominator = 0usize;
         if sources.status == Status::Ready {
@@ -651,23 +657,27 @@ impl<'a> Context<'a> {
                     Trait::Born | Trait::Role => &[],
                 };
                 for &v in values {
-                    if named.as_ref().is_none_or(|named| named.binary_search(&v).is_ok()) {
+                    if tier(v).is_some() {
                         *counted.entry(v).or_default() += 1;
                     }
                 }
             }
         }
-        // (id, name, people)
-        let mut found: Vec<(String, String, u32)> = counted
+        // (match tier, id, name, people): the value `q` names first, as `values/<kind>.json` orders them.
+        let mut found: Vec<(u8, String, String, u32)> = counted
             .into_iter()
-            .map(|(v, n)| (self.qid(v), self.label(v).unwrap_or_default().to_owned(), n))
+            .map(|(v, n)| {
+                (tier(v).unwrap_or(0), self.qid(v), self.label(v).unwrap_or_default().to_owned(), n)
+            })
             .collect();
-        found.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        found.sort_by(|a, b| {
+            a.0.cmp(&b.0).then(b.3.cmp(&a.3)).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1))
+        });
         let complete = found.len() <= request.limit;
         let values: Vec<Value> = found
             .into_iter()
             .take(request.limit)
-            .map(|(id, name, count)| json!({ "id": id, "name": name, "count": count }))
+            .map(|(_, id, name, count)| json!({ "id": id, "name": name, "count": count }))
             .collect();
         let mut answer = people.envelope;
         answer["kind"] = json!(spec.name);

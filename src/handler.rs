@@ -1128,7 +1128,8 @@ async fn query_answer(
     {
         parsed.set_broadcaster(qid);
     }
-    let (ignored, unknown) = query_unapplied(&indexes, query);
+    let (ignored, mut unknown) = query_unapplied(&indexes, query);
+    unknown.extend(parsed.unapplied_exclusions().iter().map(|phrase| format!("not:{phrase}")));
     let parsed_in = parsing.elapsed();
     let embedding = Instant::now();
     let unembedded = |e: String| eprintln!("search query left unembedded: {e}");
@@ -2840,6 +2841,10 @@ mod tests {
             nowhere["coverage"]["fields"]["language"]["applied"], "filter",
             "still applied, and named"
         );
+
+        // A ruled-out phrase that names nothing atlas holds rules nothing out, and is named the same way.
+        let scary = json(body_of(get(&state, "/index/query.json?q=heist+not+too+scary").await).await);
+        assert_eq!(scary["unknownValues"], serde_json::json!(["not:too scary"]), "{scary}");
     }
 
     /// A hit the corpus has no card for is named from TMDB's export, and says so; a carded hit does not.

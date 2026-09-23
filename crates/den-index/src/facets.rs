@@ -263,7 +263,7 @@ pub struct Negation {
 }
 
 /// Words that open a ruled-out phrase.
-const NEGATIONS: &[&str] = &["not", "no", "without", "except", "excluding"];
+const NEGATIONS: &[&str] = &["not", "no", "nothing", "without", "except", "excluding"];
 /// A word that only joins a negation to what came before it: the "but" of "horror but not gory".
 const JOINERS: &[&str] = &["but", "and"];
 
@@ -926,8 +926,16 @@ mod tests {
             "each negation opens its own phrase"
         );
         assert_eq!(split("horror movies not from the 80s"), ruled("horror movies", &["from the 80s"]));
+        assert_eq!(split("dramas nothing with animal death"), ruled("dramas", &["with animal death"]));
         // A negation word with nothing on one side of it is a title's word.
-        for title in ["no time to die", "not another teen movie", "ready or not", "dr no", "without"] {
+        for title in [
+            "no time to die",
+            "not another teen movie",
+            "ready or not",
+            "dr no",
+            "without",
+            "much ado about nothing",
+        ] {
             assert_eq!(split(title), ruled(title, &[]), "{title}");
         }
         // The facet parser never sees a ruled-out word: "not british" used to read as `country: GB`.

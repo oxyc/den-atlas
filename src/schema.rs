@@ -71,6 +71,7 @@ pub fn known(indexes: &Indexes, field: &str, scope: Option<MediaType>) -> usize 
         "broadcaster" => on_record(indexes, scope, |r| !r.broadcasters.is_empty()),
         "people" => on_record(indexes, scope, |r| !r.makers.is_empty() || !r.cast.is_empty()),
         "genre" => genre_keys(indexes, scope).len(),
+        "place" => indexes.filter().entity_known("place", scope),
         axis => indexes.plot_facets.as_ref().map_or(0, |facets| facets.coverage_for(axis, scope)),
     }
 }
@@ -405,11 +406,13 @@ fn routes() -> Value {
         "path": "/index/query.json",
         "example": "/index/query.json?q=bleak%20finnish%201980s%20films",
         "about": "Search in one request: the query is read for what it names (country, decade, type, genre, \
-                  label, plot facet, person, adaptation source) and every candidate is scored on every signal.",
+                  label, plot facet, person, adaptation source, a place after \"set in\" or \"takes place \
+                  in\") and every candidate is scored on every signal.",
         "parameters": [
             param("q", "string", "the query; words it does not read as a constraint are in parse.leftover and \
-                                  are matched as prose. Words after not, no, without, except or excluding \
-                                  drop every title on record as having what they name (parse.excluded)"),
+                                  are matched as prose. Words after not, no, nothing, without, except or \
+                                  excluding drop every title on record as having what they name, a content \
+                                  warning included (\"without gore\"; parse.excluded)"),
             with(param("type", "enum", "movie or series"), json!({ "field": "mediaType" })),
             skip,
             limit,
@@ -429,7 +432,8 @@ fn routes() -> Value {
         "ignored": "parameters the route does not read, or whose value it could not read: the answer is as \
                     though they were not sent",
         "unknownValues": "language:<code> for a language no title is in; it still filters, leaving the titles \
-                          with no language on record",
+                          with no language on record. not:<phrase> for a ruled-out phrase that names nothing \
+                          atlas holds (\"not too scary\"): it drops no title",
     });
     use crate::handler::{
         FACET_LIMIT, MAX_NEIGHBOUR_K, MAX_ROW_PAGE, MAX_SEEDS, MAX_TITLES, NEIGHBOUR_K, ROW_PAGE, SEMANTIC_K,
