@@ -1240,65 +1240,41 @@ fn query_unapplied(indexes: &crate::queries::Indexes, query: &str) -> (Vec<Strin
     (ignored, unknown)
 }
 
-/// The facet lane — the tvOS app's facet search: titles matching the query's country, decade and type,
-/// most-voted first, with any leftover words ranked semantically to the front. `facet` is null when the query
-/// names none. Without den-embed the matches still come back, unranked, and the flag says the ranking was skipped.
-async fn facets_answer(state: &AppState, indexes: &crate::queries::Indexes, query: &str) -> (String, bool) {
-    // A ruled-out word is neither a facet nor a theme: "crime series not british" read `country: GB`, and
-    // `not horror` ranked the facet's horror first.
-    let negation = den_index::split_negation(&query_text(query, "q"));
-    let facet = den_index::FacetQuery::parse(&negation.kept);
-    let (Some(facets), true) = (indexes.facets.as_ref(), facet.has_facet()) else {
-        return (serde_json::json!({ "facet": null, "titles": [] }).to_string(), false);
-    };
-    let mut unranked = false;
-    let mut titles = facets.filter(facet.media_type, facet.country, facet.decade);
-    let ruled_out: Vec<den_index::FacetQuery> =
-        negation.excluded.iter().map(|phrase| den_index::FacetQuery::parse(phrase)).collect();
-    titles.retain(|&(id, kind)| {
-        let known = facets.title(id, kind);
-        !ruled_out.iter().any(|out| {
-            out.media_type == Some(kind)
-                || out
-                    .country
-                    .is_some_and(|c| known.and_then(|t| t.country).is_some_and(|k| c.as_bytes() == k))
-                || out.decade.is_some_and(|d| known.and_then(|t| t.year).is_some_and(|y| y / 10 * 10 == d))
-        })
-    });
-    if !facet.leftover.is_empty() && !titles.is_empty() {
-        match embed_query(state, &facet.leftover).await {
-            Ok(vector) => {
-                // Ranked within the facet's own titles. Taking the corpus-wide nearest and keeping those that
-                // match the facet left "korean heist" with a title or two lifted and the rest in vote order.
-                let matched: std::collections::HashSet<_> = titles.iter().copied().collect();
-                let head: Vec<_> = indexes
-                    .plot
-                    .scan_vector(&vector, |id, kind| matched.contains(&(id, kind)), FACET_LIMIT)
-                    .0
-                    .into_iter()
-                    .map(|n| (n.tmdb_id, n.media_type))
-                    .collect();
-                let lifted: std::collections::HashSet<_> = head.iter().copied().collect();
-                titles = head.into_iter().chain(titles.into_iter().filter(|t| !lifted.contains(t))).collect();
-            }
-            Err(e) => {
-                eprintln!("facet leftover left unranked: {e}");
-                unranked = true;
-            }
-        }
+/// The facet lane — the tvOS app's attribute search: `/index/query.json`'s answer to the same words, its first
+/// `FACET_LIMIT` hits as ids. One reading and one ranking serve both routes, so a negated genre, a label, a
+/// person or a contested title reading means the same thing on each. `facet` is null, and nothing is ranked,
+/// when the words name no type, country, decade or year. The flag says den-embed was asked and did not answer.
+async fn facets_answer(
+    state: &AppState,
+    indexes: Arc<crate::queries::Indexes>,
+    query: &str,
+) -> Result<(String, bool), String> {
+    let none = || serde_json::json!({ "facet": null, "titles": [] }).to_string();
+    let text = query_text(query, "q");
+    if !crate::search::parse(&text, &indexes).names_a_facet() {
+        return Ok((none(), false));
     }
-    titles.truncate(FACET_LIMIT);
+    let asked = format!("q={}&limit={FACET_LIMIT}", query_param(query, "q").unwrap_or_default());
+    let (body, _, unranked) = query_answer(state, indexes, &asked, None).await?;
+    let answer: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let parse = &answer["parse"];
+    let titles: Vec<serde_json::Value> = answer["hits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|hit| serde_json::json!({ "type": hit["type"], "id": hit["id"] }))
+        .collect();
     let body = serde_json::json!({
         "facet": {
-            "mediaType": facet.media_type.map(stremio_type),
-            "country": facet.country,
-            "decade": facet.decade,
-            "leftover": facet.leftover,
+            "mediaType": parse["mediaType"],
+            "country": parse["country"],
+            "decade": parse["decade"],
+            "leftover": parse["leftover"],
         },
-        "titles": titles_json(&titles),
+        "titles": titles,
     })
     .to_string();
-    (body, unranked)
+    Ok((body, unranked))
 }
 
 /// A title named in a POST body: `{"type":"movie"|"series","id":…}`.
@@ -1790,11 +1766,16 @@ async fn handle_index(
                 return unavailable_response(r#"{"error":"embed_unavailable"}"#, RELOAD_WAIT);
             }
         },
-        IndexQuestion::Facets => {
-            let (body, unranked) = facets_answer(state, &indexes, query).await;
-            unembedded(unranked);
-            body
-        }
+        IndexQuestion::Facets => match facets_answer(state, Arc::clone(&indexes), query).await {
+            Ok((body, unranked)) => {
+                unembedded(unranked);
+                body
+            }
+            Err(e) => {
+                eprintln!("facet search failed: {e}");
+                return json_response(r#"{"error":"search_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        },
         IndexQuestion::Query => match query_answer(state, Arc::clone(&indexes), query, early).await {
             Ok((body, timing, missed)) => {
                 unembedded(missed);
@@ -2627,18 +2608,22 @@ mod tests {
         assert_eq!(search["titles"][0]["score"], 10_000);
         assert!(search["mean"].is_f64() && search["sd"].as_f64().unwrap() > 0.0, "{search}");
 
-        let korean = json(body_of(get(&state, "/index/facets.json?q=korean%20movies").await).await);
-        assert_eq!(korean["facet"]["country"], "KR");
-        assert_eq!(
-            korean["titles"],
-            serde_json::json!([{"type": "movie", "id": 2}, {"type": "movie", "id": 1}])
-        );
-        // By votes the Korean titles are 2, 4, 1; the leftover theme ranks them toward the query: 2, 1, 4.
-        let themed = json(body_of(get(&state, "/index/facets.json?q=korean+heist").await).await);
-        assert_eq!(
-            themed["titles"],
-            serde_json::json!([{"type": "movie", "id": 2}, {"type": "movie", "id": 1}, {"type": "series", "id": 4}])
-        );
+        // The facet lane is /index/query.json's answer as ids: one reading and one ranking, not a second copy.
+        // `not bleak` drops movies 1 and 2 by a plot facet, which the lane's own reading used to have no table for.
+        for q in ["korean%20movies", "korean+heist", "korean+not+bleak"] {
+            let lane = json(body_of(get(&state, &format!("/index/facets.json?q={q}")).await).await);
+            let query = json(body_of(get(&state, &format!("/index/query.json?q={q}&limit=50")).await).await);
+            let ids: Vec<serde_json::Value> = query["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| serde_json::json!({"type": h["type"], "id": h["id"]}))
+                .collect();
+            assert!(!ids.is_empty(), "{q}: {query}");
+            assert_eq!(lane["titles"], serde_json::Value::from(ids), "{q}");
+            assert_eq!(lane["facet"]["country"], "KR");
+            assert_eq!(lane["facet"]["leftover"], query["parse"]["leftover"]);
+        }
         let none = json(body_of(get(&state, "/index/facets.json?q=heist").await).await);
         assert_eq!(none["facet"], serde_json::Value::Null);
     }

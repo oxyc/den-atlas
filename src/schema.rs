@@ -587,7 +587,8 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/facets.json",
             "example": "/index/facets.json?q=korean%20heist",
-            "about": "The titles matching the country, decade and type the query names, most voted first.",
+            "about": "/index/query.json's answer to the same words, as ids, when they name a type, country, \
+                      decade or year; facet is null and titles empty when they name none.",
             "parameters": [param("q", "string", "the query")],
             "returns": format!("{{facet, titles}}: at most {FACET_LIMIT} titles"),
         },

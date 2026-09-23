@@ -384,6 +384,11 @@ impl Parsed {
         &self.excluded.unapplied
     }
 
+    /// True when the words name a type, country, decade or year: what the facet lane answers.
+    pub fn names_a_facet(&self) -> bool {
+        self.facet.has_facet()
+    }
+
     /// True when the query named anything the facts or labels can answer directly.
     fn names_something(&self) -> bool {
         !self.people.is_empty()
