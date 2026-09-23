@@ -12,9 +12,11 @@
 //! most 0.6 + 0.25 + 0.10 + 0.15 = 1.10); semantic vectors count for more the more of the query is left over (λ),
 //! and far less once an exact title answered, since they hold no titles and would only add what sounds alike.
 //! A country or date inferred from the same words cannot discount an exact title: ambiguous text keeps both
-//! readings alive, while explicit request constraints still filter normally.
-//! A near title match counts only for the leftover's share (T·λ): a query of words atlas reads ("bleak") asks for
-//! the theme, not for "Leak" or "Bleach". Popularity counts only as far as the title is relevant at all (R, the
+//! readings alive, while explicit request constraints still filter normally. When those words are, whole, the
+//! name of a popular title (`russian doll`), the facet reading is contested: it still proposes and lifts its
+//! titles, but discounts nothing and bounds nothing, and the vectors read the whole query.
+//! A near title match counts only for the share of words no table reads (T·λₜ): a query of words atlas reads
+//! ("bleak") asks for the theme, not for "Leak" or "Bleach". Popularity counts only as far as the title is relevant at all (R, the
 //! strongest of its other signals), so a famous title that merely sounds alike doesn't pass a closer one.
 //! A candidate relevant to nothing is dropped. The weights are starting values, to be tuned against a judged
 //! query set.
@@ -101,11 +103,15 @@ const GENRES: &[(&str, u16)] = &[
     ("historical", 36),
     ("history", 36),
     ("horror", 27),
+    // A kind of film, not a title: `love stories` answered with six films called Love Story.
+    ("love story", 10749),
+    ("love stories", 10749),
     ("musical", 10402),
     ("musicals", 10402),
     ("mystery", 9648),
     ("mysteries", 9648),
     ("romance", 10749),
+    ("romances", 10749),
     ("romantic", 10749),
     ("sci fi", 878),
     ("scifi", 878),
@@ -130,30 +136,51 @@ const MAX_PHRASE_WORDS: usize = 5;
 /// Phrases are matched against up to `MAX_PHRASE_WORDS` folded words, so articles are spelled out rather
 /// than stripped; both forms are listed because both get typed. A phrase longer than that limit can never
 /// match — `every_source_phrase_is_reachable` holds the two together.
+///
+/// The bare plurals `books` and `novels` name the kind too: nobody browsing films types `books` for titles with
+/// the word in them, and `q=books` answered with Circus of Books, Book Club and Booksmart. The singular stays out
+/// (The Book Thief, Book Club), and so do `comics` (comedians) and `video games` (films about them).
 const SOURCE_PHRASES: &[(&str, u16)] = &[
     ("based on a book", SourceKinds::BOOK),
     ("based on book", SourceKinds::BOOK),
+    ("based on books", SourceKinds::BOOK),
     ("based on a novel", SourceKinds::BOOK),
     ("based on novel", SourceKinds::BOOK),
+    ("based on novels", SourceKinds::BOOK),
     ("book adaptation", SourceKinds::BOOK),
+    ("book adaptations", SourceKinds::BOOK),
     ("novel adaptation", SourceKinds::BOOK),
+    ("novel adaptations", SourceKinds::BOOK),
     ("literary adaptation", SourceKinds::BOOK),
+    ("literary adaptations", SourceKinds::BOOK),
     ("from a book", SourceKinds::BOOK),
     ("from a novel", SourceKinds::BOOK),
+    ("books", SourceKinds::BOOK),
+    ("novels", SourceKinds::BOOK),
     ("based on a comic", SourceKinds::COMIC),
     ("based on comic", SourceKinds::COMIC),
+    ("based on comics", SourceKinds::COMIC),
+    ("based on a comic book", SourceKinds::COMIC),
     ("based on a manga", SourceKinds::COMIC),
     ("based on manga", SourceKinds::COMIC),
     ("comic adaptation", SourceKinds::COMIC),
+    ("comic adaptations", SourceKinds::COMIC),
     ("manga adaptation", SourceKinds::COMIC),
+    ("manga adaptations", SourceKinds::COMIC),
+    ("comic book", SourceKinds::COMIC),
+    ("comic books", SourceKinds::COMIC),
     ("graphic novel", SourceKinds::COMIC),
+    ("graphic novels", SourceKinds::COMIC),
     ("based on a play", SourceKinds::PLAY),
     ("based on play", SourceKinds::PLAY),
     ("stage adaptation", SourceKinds::PLAY),
     ("based on a video game", SourceKinds::GAME),
     ("based on a game", SourceKinds::GAME),
+    ("based on video games", SourceKinds::GAME),
     ("video game adaptation", SourceKinds::GAME),
+    ("video game adaptations", SourceKinds::GAME),
     ("game adaptation", SourceKinds::GAME),
+    ("game adaptations", SourceKinds::GAME),
 ];
 
 /// Phrases that name a plot facet value (`plotrows.rs`). They only ever lift a title: the facets cover part of the
@@ -225,6 +252,15 @@ pub struct Parsed {
     leftover: String,
     /// The share of the query's words left over: how thematic it is.
     lambda: f64,
+    /// The share of the query's words no table reads, which is what a near title match counts for. A genre,
+    /// label or plot-facet word stays in the leftover for the vectors, but a query made of such words asks for
+    /// the theme: `bleak` is not asking for *Leak*, nor `love stories` for five films called *Love Story*.
+    title_lambda: f64,
+    /// True when the words that named a country, decade or year are also, whole, the name of a popular title
+    /// (`russian doll`, `the french connection`). Both readings are then kept: the facet proposes its titles
+    /// and lifts them, but no longer bounds the vectors or discounts what it does not hold, and the vectors are
+    /// asked about the whole query.
+    contested: bool,
     /// The words asked for — the query without what it rules out — folded.
     kept: String,
     excluded: Excluded,
@@ -323,6 +359,8 @@ struct Names {
     source_kinds: u16,
     people: Vec<u32>,
     rest: Vec<String>,
+    /// How many of `rest` no genre, label or plot-facet phrase covers.
+    unread: usize,
 }
 
 impl Names {
@@ -368,18 +406,12 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
     let mut negation = den_index::split_negation(&whole);
     // A title that contains a negation is a title: `do not disturb` asks for the film, not for things without
     // a disturbance.
-    let is_a_title = || {
-        indexes.display.as_ref().is_some_and(|display| {
-            display
-                .search_with(&whole, None, TITLE_LANE, MIN_COVERAGE)
-                .iter()
-                .any(|h| title_query.score(h.title).1)
-        })
-    };
-    if !negation.excluded.is_empty() && is_a_title() {
+    if !negation.excluded.is_empty() && !exact_titles(indexes, &whole).is_empty() {
         negation = den_index::Negation { kept: whole.clone(), excluded: Vec::new() };
     }
     let facet = FacetQuery::parse(&negation.kept);
+    let contested = facet.has_strong_facet()
+        && exact_titles(indexes, &negation.kept).into_iter().any(|pop| pop >= EXACT_POPULAR);
     let total = words(&negation.kept).len().max(1);
     let label_names: Vec<(String, &str, bool)> = indexes
         .plot
@@ -391,8 +423,29 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         .collect();
     let tokens = words(&facet.leftover);
     let one_word_names = tokens.len() == 1;
-    let Names { genres, labels, plot, source_kinds, people, rest } =
+    let Names { genres, labels, plot, source_kinds, people, mut rest, unread } =
         read_names(&tokens, one_word_names, indexes, &label_names);
+    if contested {
+        // A contested facet gives its words back to the leftover, so the vectors read `russian doll` rather
+        // than `doll`. Nothing else is read from them — `the italian` is also somebody's alias — and they stay
+        // out of `unread`: `the french connection` is not asking for every title with "french" in it.
+        let mut consumed = tokens;
+        for word in &rest {
+            if let Some(at) = consumed.iter().position(|c| c == word) {
+                consumed.remove(at);
+            }
+        }
+        rest = words(&negation.kept)
+            .into_iter()
+            .filter(|word| match consumed.iter().position(|c| c == word) {
+                Some(at) => {
+                    consumed.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .collect();
+    }
     let excluded = read_excluded(&negation.excluded, indexes, &label_names);
     let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
         .facts
@@ -412,6 +465,8 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
         kept: normalized(&negation.kept),
         credits,
         lambda: rest.len() as f64 / total as f64,
+        title_lambda: unread as f64 / total as f64,
+        contested,
         leftover: rest.join(" "),
         facet,
         genres,
@@ -451,6 +506,20 @@ fn read_excluded(phrases: &[String], indexes: &Indexes, label_names: &[(String, 
         into.people.extend(names.people);
     }
     out
+}
+
+/// The popularity of every title the text is exactly the name of (a leading article aside), by the displayed
+/// titles and the names they also go by.
+fn exact_titles(indexes: &Indexes, text: &str) -> Vec<f64> {
+    let Some(display) = &indexes.display else { return Vec::new() };
+    let title_query = TitleQuery::new(text);
+    let votes = |kind, id| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
+    display
+        .search_with(text, None, TITLE_LANE, MIN_COVERAGE)
+        .iter()
+        .filter(|h| title_query.score(h.title).1)
+        .map(|h| popularity(votes(title_type(h.media_type), h.tmdb_id), None))
+        .collect()
 }
 
 fn trim_filler(phrase: &[String]) -> &[String] {
@@ -508,6 +577,9 @@ fn read_names(
     let (mut genres, mut labels, mut plot, mut rest) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut source_kinds: u16 = 0;
     let mut people: Vec<u32> = Vec::new();
+    // Where the last boost-only phrase read so far ends: a word before it was read, even though it stays.
+    let mut read_until = 0;
+    let mut unread = 0;
     let mut at = 0;
     // A matcher that can only LIFT a title claims its facet without eating the word; one that decides which
     // titles are eligible at all consumes it.
@@ -530,20 +602,33 @@ fn read_names(
                     matched = true;
                 }
             }
+            let mut read = false;
             for &(words, axis, value) in PLOT_PHRASES {
-                if words == phrase && !plot.contains(&(axis, value)) {
-                    plot.push((axis, value));
+                if words == phrase {
+                    read = true;
+                    if !plot.contains(&(axis, value)) {
+                        plot.push((axis, value));
+                    }
                 }
             }
             for &(words, genre) in GENRES {
-                if words == phrase && !genres.contains(&genre) {
-                    genres.push(genre);
+                if words == phrase {
+                    read = true;
+                    if !genres.contains(&genre) {
+                        genres.push(genre);
+                    }
                 }
             }
             for (folded, name, mood) in label_names {
-                if *folded == phrase && !labels.iter().any(|(n, m)| n == name && m == mood) {
-                    labels.push(((*name).to_owned(), *mood));
+                if *folded == phrase {
+                    read = true;
+                    if !labels.iter().any(|(n, m)| n == name && m == mood) {
+                        labels.push(((*name).to_owned(), *mood));
+                    }
                 }
+            }
+            if read {
+                read_until = read_until.max(at + span);
             }
             // A one-word name ("Nolan", "Common") counts only as the whole query: inside a longer one it is more
             // likely just a word. Even then it only lifts, and keeps the word: names are matched with their
@@ -563,10 +648,13 @@ fn read_names(
                 continue 'words;
             }
         }
+        if at >= read_until {
+            unread += 1;
+        }
         rest.push(tokens[at].clone());
         at += 1;
     }
-    Names { genres, labels, plot, source_kinds, people, rest }
+    Names { genres, labels, plot, source_kinds, people, rest, unread }
 }
 
 /// What the lanes found about a candidate before scoring.
@@ -730,14 +818,16 @@ pub fn answer(
             found.entry(key).or_default();
         }
     }
-    // The plot and premise vectors' nearest to the leftover, within the facet when there is one. Each scan is
-    // standardised against its own corpus distribution; taking their stronger normalised answer below lets the
-    // premise representation propose a title without doubling the semantic term's weight.
+    // The plot and premise vectors' nearest to the leftover, within the facet when there is one and it is not
+    // contested. Each scan is standardised against its own corpus distribution; taking their stronger normalised
+    // answer below lets the premise representation propose a title without doubling the semantic term's weight.
+    //
+    // A contested facet does not bound them: `russian doll` read RU, and the time-loop shows the words also
+    // describe were unreachable because none of them is Russian.
     if let Some(vector) = vector {
+        let bound = facet_set.as_ref().filter(|_| !parsed.contested);
         let eligible = |id: u32, kind: MediaType| {
-            wanted(kind)
-                && facet_set.as_ref().is_none_or(|set| set.contains(&(kind, id)))
-                && allowed((kind, id))
+            wanted(kind) && bound.is_none_or(|set| set.contains(&(kind, id))) && allowed((kind, id))
         };
         let (near, stats) = indexes.plot.scan_vector(vector, eligible, LANE);
         if stats.sd > 0.0 {
@@ -869,6 +959,8 @@ pub fn answer(
             "broadcaster": parsed.broadcaster,
             "leftover": parsed.leftover,
             "lambda": round(parsed.lambda),
+            "titleLambda": round(parsed.title_lambda),
+            "facetContested": parsed.contested,
             "excluded": excluded_json(&parsed.excluded),
         },
         "people": people,
@@ -919,15 +1011,17 @@ fn applied(parsed: &Parsed, media_type: Option<MediaType>) -> Vec<crate::schema:
     if let Some(t) = media_type.or(parsed.facet.media_type) {
         push("mediaType", json!(kind(t)), "filter", None);
     }
+    // Read from the words, a facet discounts what it does not hold; contested by a title, it only lifts.
+    let inferred = if parsed.contested { "boost" } else { "discount" };
     if let Some(country) = parsed.facet.country {
-        push("country", json!(country), "discount", None);
+        push("country", json!(country), inferred, None);
     }
     if let Some(decade) = parsed.facet.decade {
-        push("decade", json!(decade), "discount", None);
+        push("decade", json!(decade), inferred, None);
     }
     if parsed.facet.year_min.is_some() || parsed.facet.year_max.is_some() {
         let window = json!({ "min": parsed.facet.year_min, "max": parsed.facet.year_max });
-        push("year", window, if parsed.year_from_param { "filter" } else { "discount" }, None);
+        push("year", window, if parsed.year_from_param { "filter" } else { inferred }, None);
     }
     if let Some(language) = &parsed.facet.language {
         push("language", json!(language), "filter", None);
@@ -1079,10 +1173,11 @@ fn rules_out(indexes: &Indexes, parsed: &Parsed, ruled_out: &HashSet<Key>, key: 
 }
 
 /// A facet guessed from query text is an interpretation, not an explicit constraint. Keep its mismatch penalty
-/// for ordinary candidates, but never let it break the exact-title floor. Any penalty already in `phi` came from
-/// another constraint or unknown data and remains intact.
-fn discount_text_facet(phi: f64, exact: bool) -> f64 {
-    if exact {
+/// for ordinary candidates, but never let it break the exact-title floor, nor apply it when the same words also
+/// name a title (`spared`). Any penalty already in `phi` came from another constraint or unknown data and
+/// remains intact.
+fn discount_text_facet(phi: f64, spared: bool) -> f64 {
+    if spared {
         phi
     } else {
         phi * WRONG_TEXT_FACET
@@ -1106,14 +1201,17 @@ fn features(
     // T is known before applying inferred facet penalties because an exact name resolves that ambiguity. A
     // caller-supplied constraint still filters below; only a facet guessed from these same words yields to it.
     let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
-    let mut t: f64 = 0.0;
+    let mut near: f64 = 0.0;
     let mut exact = false;
     let also_named = found.names.iter().map(String::as_str);
     for title in found.export.as_ref().map(|e| e.0.as_str()).into_iter().chain(card).chain(also_named) {
         let (score, is_exact) = parsed.title_query.score(title);
         exact |= is_exact;
-        t = t.max(if is_exact { EXACT_TITLE + 0.4 * pop } else { score * parsed.lambda });
+        near = near.max(score);
     }
+    // Neither an exact title nor any title of a query whose facet reading is contested is discounted for
+    // contradicting a facet read from the words.
+    let spared = exact || parsed.contested;
 
     // Φ: a country or decade the title is on record as not having removes it; one it has no record of discounts it.
     let mut phi = 1.0;
@@ -1130,7 +1228,7 @@ fn features(
             // Read out of the words, so it may only discount. A demonym is as often part of a TITLE as it is
             // a claim about origin, and the corpus shows the guess is wrong about half the time: "spanish" as
             // a country misses 1,138 Spanish-LANGUAGE titles. An exact title keeps both readings alive.
-            phi = discount_text_facet(phi, exact);
+            phi = discount_text_facet(phi, spared);
         }
     }
     // The broadcaster, from a parameter, so it drops — but only for series, since a film has no such fact
@@ -1201,7 +1299,7 @@ fn features(
                     if parsed.year_from_param {
                         return None;
                     }
-                    phi = discount_text_facet(phi, exact);
+                    phi = discount_text_facet(phi, spared);
                 }
             }
             None => phi *= UNKNOWN_FACET,
@@ -1214,7 +1312,7 @@ fn features(
             .or_else(|| record.and_then(|r| r.released).map(|r| r.year_of()));
         match year {
             Some(year) if year.div_euclid(10) * 10 != i64::from(decade) => {
-                phi = discount_text_facet(phi, exact);
+                phi = discount_text_facet(phi, spared);
             }
             Some(_) => {}
             None => phi = UNKNOWN_FACET,
@@ -1227,7 +1325,10 @@ fn features(
     // A title with NO basedOn statement is unknown, not an original work: Wikidata is open-world, and only
     // 19% of records carry the property at all. Discounting rather than dropping keeps the other 81%
     // reachable, which is the difference between a working row and an empty one.
-    if parsed.source_kinds != 0 {
+    //
+    // Read from the words like a country, so it yields to an exact title the same way: `black books` names
+    // the sitcom, which is adapted from nothing.
+    if parsed.source_kinds != 0 && !exact {
         match record.map(|r| r.source_kinds) {
             Some(kinds) if kinds.is_empty() => phi *= UNKNOWN_FACET,
             Some(kinds) if kinds.raw() & parsed.source_kinds != 0 => {}
@@ -1244,6 +1345,7 @@ fn features(
     {
         lab = 1.0;
     }
+    let mut labelled = false;
     if !parsed.labels.is_empty() {
         if let Some(labels) = indexes.plot.labels(id, kind) {
             for (name, mood) in &parsed.labels {
@@ -1251,12 +1353,18 @@ fn features(
                 if let Some(&(_, confidence)) = pairs.iter().find(|(n, _)| *n == name.as_str()) {
                     if confidence >= LABEL_FLOOR {
                         lab = lab.max(confidence);
+                        labelled = true;
                     }
                 }
             }
         }
     }
     let pf = plot_confidence.get(&key).copied().unwrap_or(0.0);
+    // A near title match counts for the words no table reads — unless the title also carries the label or plot
+    // facet those words named, when name and theme agree: The Time Traveler's Wife is a time-travel film, where
+    // Leak is not bleak. A genre is too broad to agree with: every film called Love Story is a romance.
+    let share = if labelled || pf > 0.0 { parsed.lambda } else { parsed.title_lambda };
+    let t = if exact { EXACT_TITLE + 0.4 * pop } else { near * share };
     // A maker's title they made, an actor's title they appear in: their own role. Anyone named, otherwise: the other.
     let in_role = |qids: &[u32], making: bool| {
         qids.iter().any(|q| parsed.people.contains(q) && parsed.makers.contains(q) == making)
@@ -1456,6 +1564,75 @@ mod tests {
             "an unrelated unknown-data penalty remains"
         );
         assert_eq!(discount_text_facet(1.0, false), WRONG_TEXT_FACET);
+    }
+
+    /// The fixture store's indexes, with movie 1 (Korean and Danish, adapted from a book and a play, a Heist
+    /// film carrying tone=bleak) displayed as `movie_one`.
+    fn fixture(name: &str, movie_one: &str) -> Indexes {
+        let dir = std::env::temp_dir().join(format!("den-atlas-search-{name}-{}", std::process::id()));
+        crate::queries::load_for_tools(&crate::queries::write_fixture_titled(&dir, movie_one)).unwrap()
+    }
+
+    fn hit<'a>(answer: &'a serde_json::Value, kind: &str, id: u32) -> &'a serde_json::Value {
+        let hits = answer["hits"].as_array().unwrap();
+        hits.iter().find(|h| h["type"] == kind && h["id"] == id).unwrap_or_else(|| panic!("{answer}"))
+    }
+
+    /// `spanish heist` reads ES. When no title is called that, a Korean heist contradicts the facet and is
+    /// discounted; when movie 1 is called Spanish Heist, the words are a title as much as a facet, so nothing
+    /// is discounted for not being Spanish and the vectors are asked about both words.
+    #[test]
+    fn a_facet_the_words_share_with_a_popular_title_is_contested() {
+        let plain = fixture("uncontested", "One");
+        let parsed = parse("spanish heist", &plain);
+        assert!(!parsed.contested);
+        assert_eq!((parsed.facet.country, parsed.leftover.as_str()), (Some("ES"), "heist"));
+        let discounted = answer(&plain, None, &parsed, None, None, 0, PAGE);
+        assert_eq!(hit(&discounted, "movie", 2)["f"]["phi"], WRONG_TEXT_FACET);
+
+        let titled = fixture("contested", "Spanish Heist");
+        let parsed = parse("spanish heist", &titled);
+        assert!(parsed.contested);
+        assert_eq!(parsed.facet.country, Some("ES"), "the facet reading is kept");
+        assert_eq!(parsed.embed_text(), Some("spanish heist"));
+        let both = answer(&titled, None, &parsed, None, None, 0, PAGE);
+        assert_eq!(both["hits"][0]["id"], 1, "{both}");
+        assert_eq!(hit(&both, "movie", 2)["f"]["phi"], 1.0);
+        assert_eq!(both["coverage"]["fields"]["country"]["applied"], "boost");
+    }
+
+    /// A near title match counts for the words no table reads: `bleak` asks for the theme, not for Leak.
+    #[test]
+    fn words_a_table_reads_do_not_ask_for_titles_that_contain_them() {
+        let indexes = fixture("title-lambda", "One");
+        let bleak = parse("bleak", &indexes);
+        assert_eq!((bleak.lambda, bleak.title_lambda), (1.0, 0.0), "the word stays for the vectors");
+        assert_eq!(parse("bleak zzzz", &indexes).title_lambda, 0.5);
+        assert_eq!(parse("slow burn zzzz", &indexes).title_lambda, 1.0 / 3.0);
+        assert_eq!(parse("zzzz", &indexes).title_lambda, 1.0);
+    }
+
+    /// `books` and `love stories` name kinds of film.
+    #[test]
+    fn a_kind_of_film_is_read_as_one() {
+        let indexes = fixture("kinds", "One");
+        let books = parse("books", &indexes);
+        assert_eq!((books.source_kinds, books.leftover.as_str()), (SourceKinds::BOOK, ""));
+        assert_eq!(books.embed_text(), None, "a source kind is nothing to ask the vectors");
+        assert_eq!(parse("comic book movies", &indexes).source_kinds, SourceKinds::COMIC);
+        assert_eq!(parse("love stories", &indexes).genres, vec![10749]);
+    }
+
+    /// A source kind read from the words yields to an exact title like a country does: movie 1 is adapted
+    /// from a book and a play, and used to be dropped outright for `graphic novels`.
+    #[test]
+    fn a_source_kind_read_from_the_words_keeps_an_exact_title() {
+        let indexes = fixture("source-exact", "Graphic Novels");
+        let parsed = parse("graphic novels", &indexes);
+        assert_eq!(parsed.source_kinds, SourceKinds::COMIC);
+        let found = answer(&indexes, None, &parsed, None, None, 0, PAGE);
+        assert_eq!(found["hits"][0]["id"], 1, "{found}");
+        assert!(found["hits"][0]["score"].as_f64().unwrap() >= W_TITLE * EXACT_TITLE, "{found}");
     }
 
     #[test]
