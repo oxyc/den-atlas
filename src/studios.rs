@@ -305,7 +305,7 @@ mod tests {
         let ds = crate::dataset::Dataset::load(dir).expect("the dataset loads");
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let tmdb = std::env::var("CACHE_DIR").ok().map(|kept| {
-            let tmdb = crate::tmdb::Tmdb::new(ds.store.clone(), Some(kept.into()), None, 0).unwrap();
+            let tmdb = crate::tmdb::Tmdb::new(ds.mapped.clone(), Some(kept.into()), None, 0).unwrap();
             eprintln!("{}", runtime.block_on(tmdb.load()));
             tmdb
         });

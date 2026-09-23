@@ -19,12 +19,23 @@
 use den_store::{Store, StoreError, StoreTable};
 use memmap2::Mmap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A mapped store, and the table proving it was verified.
 ///
+/// Opened ONCE per process, by `Dataset::load`, and shared (`Arc`) with everything that reads it: the
+/// catalog's posters, TMDB's joins and every index load. Each of those used to open the file itself, and
+/// each open hashed all of it again — three times at boot, again on every index reload after an idle
+/// release, and twice a day for TMDB.
+///
+/// Holding the mapping also pins the GENERATION: `atlas-dataset-sync` renames a new store over the old one
+/// and then restarts this process, so a reload in between reads the store this process verified, never a
+/// newer file beside a manifest that does not describe it.
+///
 /// `Debug` names the store, never its contents — 131 MB in a test failure helps nobody.
 pub struct MappedStore {
+    path: PathBuf,
     map: Mmap,
     table: StoreTable,
 }
@@ -32,6 +43,7 @@ pub struct MappedStore {
 impl std::fmt::Debug for MappedStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MappedStore")
+            .field("path", &self.path)
             .field("dataset_version", &self.table.dataset_version())
             .field("rows", &self.table.rows())
             .field("bytes", &self.map.len())
@@ -47,9 +59,27 @@ impl MappedStore {
         // SAFETY: the store is a file we published and the box treats as read-only. A concurrent writer
         // truncating it would be undefined behaviour, which is why `atlas-dataset-sync` stages a new
         // generation beside the old one and renames, rather than writing in place.
-        let map = unsafe { Mmap::map(&file) }.map_err(|e| format!("{}: {e}", path.display()))?;
-        let table = StoreTable::open(&map).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { map, table })
+        let map = || unsafe { Mmap::map(&file) }.map_err(|e| format!("{}: {e}", path.display()));
+        // Verified through a mapping of its own, which is then dropped. The hash reads every page of the
+        // file, so every page ends up resident in the mapping it read through: ~143 MB charged to the
+        // process for as long as that mapping lives — which, for the one this returns, is the life of the
+        // process. The mapping kept is made afresh from the same open file, so it is the same bytes and
+        // holds only the pages later reads touch.
+        let (table, verified) = {
+            let verifying = map()?;
+            let table = StoreTable::open(&verifying).map_err(|e| format!("{}: {e}", path.display()))?;
+            (table, verifying.len())
+        };
+        let map = map()?;
+        if map.len() != verified {
+            return Err(format!("{}: changed size while it was being opened", path.display()));
+        }
+        Ok(Self { path: path.to_owned(), map, table })
+    }
+
+    /// The file this was opened from, for messages.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// A view for reading. Free — the hash was checked when this was opened.
@@ -103,17 +133,22 @@ impl MappedStore {
 /// each is a property of the whole corpus and recomputing one per request would mean scanning per
 /// request.
 pub struct LoadedStore {
-    pub store: MappedStore,
+    pub store: Arc<MappedStore>,
     pub aggregates: den_index::RailAggregates,
 }
 
 impl LoadedStore {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        let store = MappedStore::open(path)?;
+    /// The aggregates over a store this process already verified, and proof the rail can read it.
+    pub fn of(store: Arc<MappedStore>) -> Result<Self, String> {
         // The aggregates first: `check` proves the rail can be built, and the rail borrows them.
         let aggregates = den_index::RailAggregates::build(&store.view())?;
-        store.check(&aggregates).map_err(|e| format!("{}: {e}", path.display()))?;
+        store.check(&aggregates).map_err(|e| format!("{}: {e}", store.path().display()))?;
         Ok(Self { store, aggregates })
+    }
+
+    #[cfg(test)]
+    pub fn open(path: &Path) -> Result<Self, String> {
+        Self::of(Arc::new(MappedStore::open(path)?))
     }
 
     pub fn view(&self) -> Store<'_> {

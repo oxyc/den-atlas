@@ -20,11 +20,11 @@ use crate::filter::FilterIndex;
 use crate::fit::Corpus;
 use crate::plotrows::{cards_from_store, Card, PlotFacets};
 use crate::ratings::{Ratings, RatingsIndex};
+use crate::store::MappedStore;
 use crate::util::lock;
 use den_index::{FacetIndex, Index};
 use den_titlesearch::{TitleIndex, TitleRecord};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -465,13 +465,15 @@ fn memoised<K: Eq + std::hash::Hash, V: ?Sized>(
 pub struct IndexQueries {
     dataset_version: String,
     taxonomy_version: String,
-    store: PathBuf,
+    /// The process's one verified mapping (`Dataset::mapped`): every load reads it, none hashes it again.
+    store: Arc<MappedStore>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
     /// Whether the last load couldn't read the store's facts sections (`/health`).
     facts_unusable: AtomicBool,
-    /// Whether the last load failed outright: the store would not open, so every index route answers 503.
+    /// Whether the last load failed outright: the rail could not read the store, so every index route
+    /// answers 503.
     ///
     /// It used to mean something softer — "no store, so More Like This falls back to the pre-pooled
     /// scorer" — because the store was one input among several and the rest could carry a degraded
@@ -497,7 +499,7 @@ impl IndexQueries {
         IndexQueries {
             dataset_version: ds.meta.dataset_version.clone(),
             taxonomy_version: ds.meta.taxonomy_version.clone(),
-            store: ds.store.clone(),
+            store: Arc::clone(&ds.mapped),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
@@ -566,7 +568,7 @@ impl IndexQueries {
         let sources = Sources {
             dataset_version: self.dataset_version.clone(),
             taxonomy_version: self.taxonomy_version.clone(),
-            store: self.store.clone(),
+            store: Arc::clone(&self.store),
             ratings: self.ratings.clone(),
             characters: self.characters.clone(),
         };
@@ -645,7 +647,7 @@ struct Sources {
     /// The labelling pass's version. It is NOT in the store — the store is the corpus, and the taxonomy
     /// is a property of the pass that labelled it — so both indexes are stamped with it here.
     taxonomy_version: String,
-    store: PathBuf,
+    store: Arc<MappedStore>,
     /// TMDB's kept counts and scores (`tmdb`). The indexes keep the holder — not the index it currently
     /// has — so a rebuild that lands between two loads reaches the rows in between.
     ratings: Option<Arc<Ratings>>,
@@ -663,7 +665,7 @@ pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
     let sources = Sources {
         dataset_version: ds.meta.dataset_version.clone(),
         taxonomy_version: ds.meta.taxonomy_version.clone(),
-        store: ds.store.clone(),
+        store: Arc::clone(&ds.mapped),
         // No ratings fetch for a one-shot tool: it would download 8 MB to rank the run it then exits
         // from. A tool measures row order off the store's own `votes` column, and says so here.
         ratings: None,
@@ -686,17 +688,18 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
 
 /// The indexes, and how long each part took.
 ///
-/// The store is opened FIRST and a failure ends the load: it is the only input, so there is nothing to
-/// build the other parts out of and nothing to serve if it will not open. Everything after it is a read
-/// of a section of that one mapping, so the parallel phase is what can genuinely run side by side — both
-/// vector indexes and the cards — while the facts, the facet rows, the facet index and the display index
-/// follow in the order they depend on each other.
+/// The store's rail aggregates are built FIRST and a failure ends the load: it is the only input, so there
+/// is nothing to build the other parts out of and nothing to serve if the rail cannot read it. The mapping
+/// itself was verified once, when the process loaded the dataset. Everything after it is a read of a
+/// section of that one mapping, so the parallel phase is what can genuinely run side by side — both vector
+/// indexes and the cards — while the facts, the facet rows, the facet index and the display index follow in
+/// the order they depend on each other.
 fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // Name the file and the reason. "could not load the dataset" is the message that cost nineteen
     // minutes of quiet degradation the last time a blob went bad.
     let (store, store_took) = timed(|| {
-        crate::store::LoadedStore::open(&sources.store)
-            .map_err(|e| format!("store {} is unusable: {e}", sources.store.display()))
+        crate::store::LoadedStore::of(Arc::clone(&sources.store))
+            .map_err(|e| format!("store {} is unusable: {e}", sources.store.path().display()))
     });
     let store = store?;
     let population = store.store.rows();
@@ -1061,17 +1064,43 @@ mod tests {
         assert_eq!(loads.get(), 2);
     }
 
-    /// A store swapped for something that is not one fails the load and SAYS SO through `/health`, rather
-    /// than panicking or answering a degraded row. It is the only input, so there is nothing else to serve
-    /// from — which is the difference from every optional blob this used to fall back through.
+    /// A store that verifies but that the rail cannot read — here, one without its `world` column — fails
+    /// the load and SAYS SO through `/health`, rather than panicking or answering a degraded row. It is the
+    /// only input, so there is nothing else to serve from — which is the difference from every optional
+    /// blob this used to fall back through.
     #[tokio::test]
     async fn a_store_that_does_not_read_is_an_error_not_a_panic() {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-bad-{}", std::process::id()));
-        let ds = write_fixture(&dir);
-        std::fs::write(&ds.store, b"not a store").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let title =
+            crate::store::fixture::Title { media: 0, tmdb_id: 1, plot: vec![1, 0, 0], ..Default::default() };
+        crate::store::fixture::write_omitting(&dir.join("den-v1.store"), "v1", 3, &[title], &[], &["world"]);
+        let meta = serde_json::json!({
+            "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+            "quantization": "int8", "storeFile": "den-v1.store",
+        });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = Dataset::load(&dir).expect("the store itself verifies");
         let queries = IndexQueries::new(&ds);
         assert!(queries.get(|| ()).await.is_err());
         assert!(queries.store_unusable(), "a failed load must reach /health");
+    }
+
+    /// Every load reads the mapping the process verified when it loaded the dataset, never the path again:
+    /// a file renamed over the store afterwards — what `atlas-dataset-sync` does just before it restarts the
+    /// process — is not read, so a reload in that window serves the generation its manifest describes.
+    #[tokio::test]
+    async fn a_load_reads_the_verified_mapping_not_the_path() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-renamed-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let other = dir.join("other.store");
+        std::fs::write(&other, b"not a store").unwrap();
+        std::fs::rename(&other, &ds.store).unwrap();
+        let queries = IndexQueries::new(&ds);
+        let (indexes, _) = queries.get(|| ()).await.expect("the verified mapping still loads");
+        assert_eq!(indexes.plot.len(), 12);
+        assert!(!queries.store_unusable());
     }
 
     /// TMDB's kept counts, joined onto a real store. Only movie 1 has one kept, and every other row must
