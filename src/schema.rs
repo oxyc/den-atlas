@@ -318,7 +318,16 @@ pub fn document(indexes: &Indexes) -> Value {
                 "filterTotal": "total on the filter routes: titles on record as carrying every selected value, \
                                 out of denominator, the titles of the route's type. A title with a selected kind \
                                 unknown is not counted, so it is a floor: coverage says how much of the type \
-                                each selected kind is known for",
+                                each selected kind is known for. A plot axis's likely values count: see \
+                                filterLikely",
+                "filterLikely": "where the store carries likely plot-facet values (filter.likely): confident \
+                                 and likely beside total, total = confident + likely, likely being the titles \
+                                 that need a likely value for some selected plot axis; kinds.<kind>.likely.<id> \
+                                 and values[].likely the same share of a value's count, listed only when not 0. \
+                                 Absent from a store without them",
+                "rowLikely": "likely on /index/row: how many of total carry some plot constraint only through a \
+                              likely value (filter.likely). They are the last titles of the row, each card \
+                              marked likely: true. Absent from a store without likely values",
                 "filterValueCount": "kinds.<kind>.values.<id> on counts.json, and values[].count on \
                                      values/{kind}.json: titles carrying the selection and that value, out of \
                                      that answer's denominator (the selection's titles, or for a single-mode kind \
@@ -473,8 +482,10 @@ fn routes() -> Value {
                 param("tilt.disliked", "string", "as tilt.liked"),
                 param("tilt.era", "string", "<center>,<spread> in calendar years"),
             ],
-            "returns": "{titles, total, coverage}",
-            "counts": { "total": "rowTotal", "coverage": "per field, out of the titles of {type}" },
+            "returns": "{titles, total, likely?, coverage}",
+            "counts": {
+                "total": "rowTotal", "likely": "rowLikely", "coverage": "per field, out of the titles of {type}",
+            },
         },
         {
             "method": "GET",
@@ -582,9 +593,13 @@ fn routes() -> Value {
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
             ],
-            "returns": "{total, denominator, kinds: {<kind>: {mode, complete, values: {<id>: n}, denominator, \
-                        labels?, selected?, excluded?}}, coverage, ignored, unknownValues?, kindsUnavailable?}",
-            "counts": { "total": "filterTotal", "kinds.<kind>.values": "filterValueCount" },
+            "returns": "{total, confident?, likely?, denominator, kinds: {<kind>: {mode, complete, values: {<id>: n}, \
+                        likely?: {<id>: n}, denominator, labels?, selected?, excluded?}}, coverage, ignored, \
+                        unknownValues?, kindsUnavailable?}",
+            "counts": {
+                "total": "filterTotal", "confident": "filterLikely", "likely": "filterLikely",
+                "kinds.<kind>.values": "filterValueCount", "kinds.<kind>.likely": "filterLikely",
+            },
         },
         {
             "method": "GET",
@@ -605,8 +620,10 @@ fn routes() -> Value {
                     json!({ "default": crate::filter::PAGE, "max": crate::filter::MAX_PAGE }),
                 ),
             ],
-            "returns": "{titles, total, denominator, order, coverage, ignored, unknownValues?, kindsUnavailable?}",
-            "counts": { "total": "filterTotal" },
+            "returns": "{titles, total, confident?, likely?, denominator, order, coverage, ignored, \
+                        unknownValues?, kindsUnavailable?}: every confident match before any likely one, a likely \
+                        card marked likely: true",
+            "counts": { "total": "filterTotal", "confident": "filterLikely", "likely": "filterLikely" },
         },
         {
             "method": "GET",
@@ -631,9 +648,9 @@ fn routes() -> Value {
                             "maxCharacter": crate::filter::CHARACTER_LIMIT }),
                 ),
             ],
-            "returns": "{kind, mode, values: [{id, name, count, tmdbId?}], complete, denominator, ignored, \
+            "returns": "{kind, mode, values: [{id, name, count, likely?, tmdbId?}], complete, denominator, ignored, \
                         unknownValues?, kindsUnavailable?}",
-            "counts": { "values[].count": "filterValueCount" },
+            "counts": { "values[].count": "filterValueCount", "values[].likely": "filterLikely" },
         },
         {
             "method": "GET",

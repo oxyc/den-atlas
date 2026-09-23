@@ -464,7 +464,8 @@ impl<'a> Context<'a> {
     /// The title selection, the traits, and who is credited under them; with `weigh`, how prominently.
     fn people_of<'r>(&self, request: &'r Request, weigh: bool) -> People<'a, 'r> {
         let (applied, ignored) = self.split(&request.items);
-        let base = self.matched(&applied, None);
+        // The titles `total` counts: likely matches included, as `titles.json` lists them.
+        let base = self.matched(&applied, None).any;
         let sources = self.sources();
         let split = self.split_traits(&sources, &request.traits);
         let tally = self.tally(&sources, &base, split.want, split.avoid, weigh);
