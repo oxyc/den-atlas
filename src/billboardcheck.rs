@@ -1,13 +1,13 @@
 //! Slate checks for the billboard (`/recommend`), over made-up households kept in `fixtures/billboard/`.
 //!
-//!   den-atlas billboard-check <dataset dir>
-//!   BILLBOARD_FIXTURES=<dir> den-atlas billboard-check <dataset dir>   # another set of households
+//!   CACHE_DIR=<dir> den-atlas billboard-check <dataset dir>
+//!   BILLBOARD_FIXTURES=<dir> CACHE_DIR=<dir> den-atlas billboard-check <dataset dir>   # other households
 //!
 //! Each fixture is a `den-atlas replay` file (`recommend::fixture`): a household's request, the service lists it was
 //! ranked with and the moment it was ranked at. The households are invented — one taste each, on three services in
 //! one country — because the repository is public and a real library is not ours to publish. The lists carry no
-//! rating: IMDb's scores are joined at runtime only, so this downloads IMDb's `title.ratings` dump and TMDB's daily
-//! exports exactly as serving does, and the numbers move a little from day to day with them.
+//! rating: TMDB's scores are kept on the box only (`tmdb.rs`), so this reads them from `CACHE_DIR` and downloads
+//! TMDB's daily exports exactly as serving does, and the numbers move a little from day to day with them.
 //!
 //! Nothing here is a judgement of whether a slide is good. These are properties of the slate as a whole that a
 //! viewer notices without knowing the household, each read over the first `LEAD` slides — the ones a billboard
@@ -156,15 +156,22 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    // IMDb's ratings and TMDB's exports, fetched as serving fetches them: the checks are about the scorer as it
-    // runs in production, which has both.
-    let ratings = match crate::ratings::Ratings::new(dataset.store.clone(), crate::ratings::RATINGS_URL) {
-        Ok(r) => std::sync::Arc::new(r),
+    // TMDB's kept vote counts and its daily exports, read as serving reads them: the checks are about the scorer
+    // as it runs in production, which has both. The counts are whatever `CACHE_DIR` keeps — the box's, or a seed
+    // (`scripts/tmdb-seed.py`); this asks TMDB for nothing.
+    let cache_dir = std::env::var("CACHE_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let Some(cache_dir) = cache_dir else {
+        eprintln!("billboard-check: CACHE_DIR names no directory of kept TMDB numbers (tmdb-votes.tsv)");
+        return 1;
+    };
+    let tmdb = match crate::tmdb::Tmdb::new(dataset.store.clone(), Some(cache_dir), None, 0) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("billboard-check: {e}");
             return 1;
         }
     };
+    eprintln!("{}", tmdb.load().await);
     let export = match crate::titles::TitleSearch::new(crate::titles::EXPORT_BASE) {
         Ok(t) => t,
         Err(e) => {
@@ -172,17 +179,14 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    let (rated, exported) = tokio::join!(ratings.refresh(), export.refresh());
-    for fetched in [rated, exported] {
-        match fetched {
-            Ok(line) => eprintln!("{line}"),
-            Err(e) => {
-                eprintln!("billboard-check: {e}");
-                return 1;
-            }
+    match export.refresh().await {
+        Ok(line) => eprintln!("{line}"),
+        Err(e) => {
+            eprintln!("billboard-check: {e}");
+            return 1;
         }
     }
-    let queries = crate::queries::IndexQueries::new(&dataset).with_ratings(Some(ratings));
+    let queries = crate::queries::IndexQueries::new(&dataset).with_ratings(Some(tmdb.ratings()));
     let indexes = match queries.get(|| ()).await {
         Ok((indexes, _)) => indexes,
         Err(e) => {

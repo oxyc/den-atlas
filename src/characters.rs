@@ -1,4 +1,4 @@
-//! Titles that share a character, from IMDb's public `title.principals` dump (oxyc/den-atlas#43).
+//! Titles that share a character, from TMDB's credits (oxyc/den-atlas#43).
 //!
 //! Two titles whose casts play the same named character are almost always the same franchise, and this
 //! finds the links Wikidata's "part of the series" lacks — above all TV spin-offs and films of a series, which
@@ -6,36 +6,27 @@
 //! "Max", "Mother"), so a link needs one of five kinds of evidence (`Tier`), measured against a hand-judged
 //! sample: ~85% of the links it makes are the same franchise and ~96% are genuinely related.
 //!
-//! IMDb's licence allows this data to be joined at runtime and never shipped, so atlas builds the list on the
-//! box, the way it joins `title.ratings` (`ratings.rs`): the store's `imdb` column names the rows, and
-//! everything the dump says about a title the corpus lacks is dropped as it is read. The dump is ~780 MB
-//! gzipped, so unlike the ratings it is STREAMED through the gunzip and the filter rather than downloaded
-//! whole, and what survives the filter (~24 MB) is kept in `CACHE_DIR` when there is one, so a restart
-//! rebuilds from that instead of downloading the dump again. The list is refreshed weekly.
+//! The credits are TMDB's (`/movie/{id}/credits`, `/tv/{id}/aggregate_credits`), fetched and kept on the box
+//! by `tmdb.rs`; this builds the list from what it keeps, joined onto the store by its own `keys` column.
+//! Character-link evidence is one of the uses TMDB's terms leave open, and the rules on that are at the top
+//! of `tmdb.rs`. The tiers were measured on IMDb's principals, which name a title's first ten or so people;
+//! TMDB lists a film's whole cast, so only the first `BILLED` of it are read (see `BILLED` for the parity).
 //!
 //! What stays resident is one short list per store row — a neighbour's row, the tier, and how rare the
 //! shared name is — never cluster ids: crossovers chain over a thousand titles into one connected
 //! component, so "in the same cluster" would say nothing.
 
-use crate::ratings::{imdb_rows, tconst};
+use crate::ratings::Key;
+use crate::tmdb::{Credits, Role};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Read};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
 use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
-/// IMDb's daily dump: public, unauthenticated.
-pub const PRINCIPALS_URL: &str = "https://datasets.imdbws.com/title.principals.tsv.gz";
-/// The dump's header line, checked for the same reason `ratings.rs` checks its own: a moved column would
-/// otherwise be read as something else and link titles on it.
-const HEADER: &str = "tconst\tordering\tnconst\tcategory\tjob\tcharacters";
-/// A character list changes slowly — new titles, the odd correction — and the dump is large.
-const REFRESH_EVERY: Duration = Duration::from_secs(7 * 24 * 3600);
-const RETRY_AFTER: Duration = Duration::from_secs(3600);
-/// The filtered rows, in `CACHE_DIR`: IMDb's own lines for the corpus's titles, in the dump's format.
-const CACHE_FILE: &str = "imdb-principals.tsv";
+/// Billing positions read per title (TMDB's `order`, from 0). IMDb's principals — what the tiers were measured
+/// on — carry about this many people per title, and a whole cast list multiplies the pairs sharing a generic
+/// name without adding evidence.
+pub const BILLED: u32 = 10;
 
 /// A name shared by more titles than this is not evidence of anything (`Doctor`, `Himself`).
 const MAX_DF: u32 = 80;
@@ -259,41 +250,16 @@ impl CharacterIndex {
     }
 }
 
+/// The live holder: `tmdb.rs` swaps a new list in whenever the credits it keeps change.
+#[derive(Default)]
 pub struct Characters {
     index: RwLock<Option<Arc<CharacterIndex>>>,
-    client: reqwest::Client,
-    url: String,
-    /// The store the dump is filtered against, by path: opened per build, never held (see `ratings.rs`).
-    store: PathBuf,
-    /// Where the filtered rows are kept between restarts; `None` keeps nothing and downloads on every boot.
-    cache: Option<PathBuf>,
 }
 
 impl Characters {
-    pub fn new(store: PathBuf, url: &str, cache_dir: Option<&Path>) -> Result<Self, reqwest::Error> {
-        // No overall timeout: the body is ~780 MB. A stalled read still fails.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(120))
-            .build()?;
-        Ok(Characters {
-            index: RwLock::new(None),
-            client,
-            url: url.to_owned(),
-            store,
-            cache: cache_dir.map(|dir| dir.join(CACHE_FILE)),
-        })
-    }
-
     #[cfg(test)]
     pub fn with_index(index: CharacterIndex) -> Self {
-        Characters {
-            index: RwLock::new(Some(Arc::new(index))),
-            client: reqwest::Client::new(),
-            url: String::new(),
-            store: PathBuf::new(),
-            cache: None,
-        }
+        Characters { index: RwLock::new(Some(Arc::new(index))) }
     }
 
     /// The current list; `None` until the first build lands.
@@ -301,229 +267,23 @@ impl Characters {
         self.index.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Download the dump, filter it to the corpus as it streams, keep the filtered rows, build the list and
-    /// swap it in. Returns a line for the log.
-    pub async fn refresh(&self) -> Result<String, String> {
-        let started = Instant::now();
-        let store = self.store.clone();
-        let (rows, row_count) = tokio::task::spawn_blocking(move || {
-            let mapped = crate::store::MappedStore::open(&store)?;
-            imdb_rows(&mapped.view())
-        })
-        .await
-        .map_err(|e| format!("characters task: {e}"))??;
-        let rows = Arc::new(rows);
-        let (filtered, downloaded) = self.download(Arc::clone(&rows)).await?;
-        if let Some(path) = &self.cache {
-            if let Err(e) = keep(path, &filtered) {
-                eprintln!("imdb characters: could not keep the filtered rows at {} ({e})", path.display());
-            }
-        }
-        let source = format!("{:.0} MB downloaded", downloaded as f64 / 1_000_000.0);
-        self.build_from((rows, row_count), filtered, source, started).await
-    }
-
-    /// Build from the kept rows when they are younger than `REFRESH_EVERY`; how old they were, or `None`
-    /// when there were none to use.
-    async fn build_from_kept(&self) -> Option<Duration> {
-        let path = self.cache.as_ref()?;
-        let age = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-        let age = SystemTime::now().duration_since(age).unwrap_or_default();
-        if age >= REFRESH_EVERY {
-            return None;
-        }
-        let started = Instant::now();
-        let (store, path) = (self.store.clone(), path.clone());
-        let read = tokio::task::spawn_blocking(move || {
-            let mapped = crate::store::MappedStore::open(&store)?;
-            let rows = imdb_rows(&mapped.view())?;
-            let filtered = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            Ok::<_, String>((rows, filtered))
-        })
-        .await;
-        let built = match read {
-            Ok(Ok(((rows, row_count), filtered))) => {
-                let source = format!("kept rows {}h old", age.as_secs() / 3600);
-                self.build_from((Arc::new(rows), row_count), filtered, source, started).await
-            }
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("characters task: {e}")),
-        };
-        match built {
-            Ok(line) => {
-                eprintln!("{line}");
-                Some(age)
-            }
-            Err(e) => {
-                eprintln!("imdb characters: the kept rows did not build ({e}); downloading");
-                None
-            }
-        }
-    }
-
-    async fn build_from(
-        &self,
-        (rows, row_count): (Arc<HashMap<u32, u32>>, usize),
-        filtered: Vec<u8>,
-        source: String,
-        started: Instant,
-    ) -> Result<String, String> {
-        let kept = filtered.len();
-        let index = tokio::task::spawn_blocking(move || build(&rows, row_count, filtered.as_slice()))
-            .await
-            .map_err(|e| format!("characters task: {e}"))??;
-        let tiers: Vec<String> = index.per_tier().map(|(tier, n)| format!("{} {n}", tier.name())).collect();
-        let line = format!(
-            "imdb characters: {} links over {} of {} store rows ({}), {} filterable names, {:.1} MB of rows \
-             from {source}, {:.1} MB resident, in {:.1}s",
-            index.links(),
-            index.linked(),
-            index.rows(),
-            tiers.join(", "),
-            index.named().len(),
-            kept as f64 / 1_000_000.0,
-            index.bytes() as f64 / 1_000_000.0,
-            started.elapsed().as_secs_f64()
-        );
+    pub fn set(&self, index: CharacterIndex) {
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(index));
-        Ok(line)
-    }
-
-    /// The dump, gunzipped and filtered on a blocking thread as the body arrives, so neither the 780 MB
-    /// body nor the multi-GB text is ever held. The filtered rows, and the bytes downloaded.
-    async fn download(&self, rows: Arc<HashMap<u32, u32>>) -> Result<(Vec<u8>, u64), String> {
-        let mut resp = self.client.get(&self.url).send().await.map_err(|e| format!("{}: {e}", self.url))?;
-        if !resp.status().is_success() {
-            return Err(format!("{}: HTTP {}", self.url, resp.status()));
-        }
-        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
-        let filtering = tokio::task::spawn_blocking(move || {
-            let gz = flate2::read::GzDecoder::new(ChannelReader { rx, pending: bytes::Bytes::new() });
-            let mut out = Vec::new();
-            filter(&rows, std::io::BufReader::new(gz), &mut out).map(|_| out)
-        });
-        let mut downloaded = 0u64;
-        let mut fetched = Ok(());
-        loop {
-            match resp.chunk().await {
-                Ok(Some(chunk)) => {
-                    downloaded += chunk.len() as u64;
-                    // The filter stopped early; its own error says why.
-                    if tx.send(chunk).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    fetched = Err(format!("{}: {e}", self.url));
-                    break;
-                }
-            }
-        }
-        drop(tx);
-        let filtered = filtering.await.map_err(|e| format!("characters task: {e}"))?;
-        // A body cut short reads to the filter as a truncated gzip; the network error is the real cause.
-        fetched?;
-        Ok((filtered?, downloaded))
     }
 }
 
-/// The response body as a `Read`, for the gunzip on the blocking side.
-struct ChannelReader {
-    rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
-    pending: bytes::Bytes,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        while self.pending.is_empty() {
-            match self.rx.blocking_recv() {
-                Some(chunk) => self.pending = chunk,
-                None => return Ok(0),
-            }
-        }
-        let n = buf.len().min(self.pending.len());
-        buf[..n].copy_from_slice(&self.pending[..n]);
-        self.pending = self.pending.slice(n..);
-        Ok(n)
-    }
-}
-
-/// Written beside and renamed over, so a crash mid-write never leaves a half file that looks fresh.
-fn keep(path: &Path, filtered: &[u8]) -> std::io::Result<()> {
-    let partial = path.with_extension("tsv.partial");
-    std::fs::write(&partial, filtered)?;
-    std::fs::rename(&partial, path)
-}
-
-/// Build from the kept rows if they are fresh, else download; then weekly. A failed download retries hourly
-/// and the previous list keeps serving. Not a boot gate: nothing a request answers waits on this list.
-pub async fn refresh_forever(characters: Arc<Characters>) {
-    let mut wait = match characters.build_from_kept().await {
-        Some(age) => REFRESH_EVERY.saturating_sub(age),
-        None => Duration::ZERO,
-    };
-    loop {
-        tokio::time::sleep(wait).await;
-        wait = match characters.refresh().await {
-            Ok(line) => {
-                eprintln!("{line}");
-                REFRESH_EVERY
-            }
-            Err(e) => {
-                let serving =
-                    if characters.index().is_some() { "keeping the previous list" } else { "no list yet" };
-                eprintln!("imdb characters refresh failed ({e}); {serving}; retrying in an hour");
-                RETRY_AFTER
-            }
-        };
-    }
-}
-
-/// The dump's lines that can matter: a corpus title, an on-screen role, a character named. Written with the
-/// header, so the kept file reads back through `build` like the dump itself. How many lines were kept.
-pub(crate) fn filter(
-    rows: &HashMap<u32, u32>,
-    tsv: impl BufRead,
-    out: &mut Vec<u8>,
-) -> Result<usize, String> {
-    let mut lines = tsv.lines();
-    check_header(lines.next())?;
-    out.extend_from_slice(HEADER.as_bytes());
-    out.push(b'\n');
-    let mut kept = 0;
-    for line in lines {
-        let line = line.map_err(|e| format!("reading the dump: {e}"))?;
-        let mut fields = line.split('\t');
-        let Some(id) = fields.next().and_then(tconst) else { continue };
-        if !rows.contains_key(&id) {
-            continue;
-        }
-        let (Some(_), Some(_), Some(category), Some(_), Some(characters)) =
-            (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if !matches!(category, "actor" | "actress" | "self") || characters == "\\N" {
-            continue;
-        }
-        out.extend_from_slice(line.as_bytes());
-        out.push(b'\n');
-        kept += 1;
-    }
-    if kept == 0 {
-        return Err(format!("the dump named a character for none of the store's {} titles", rows.len()));
-    }
-    Ok(kept)
-}
-
-fn check_header(head: Option<std::io::Result<String>>) -> Result<(), String> {
-    match head {
-        Some(Ok(head)) if head.trim_end() == HEADER => Ok(()),
-        Some(Ok(head)) => Err(format!("unexpected header {head:?}, wanted {HEADER:?}")),
-        Some(Err(e)) => Err(format!("reading the dump: {e}")),
-        None => Err("the dump was empty".to_owned()),
-    }
+/// The line the log gets for a built list.
+pub fn describe(index: &CharacterIndex) -> String {
+    let tiers: Vec<String> = index.per_tier().map(|(tier, n)| format!("{} {n}", tier.name())).collect();
+    format!(
+        "{} links over {} of {} store rows ({}), {} filterable names, {:.1} MB resident",
+        index.links(),
+        index.linked(),
+        index.rows(),
+        tiers.join(", "),
+        index.named().len(),
+        index.bytes() as f64 / 1_000_000.0
+    )
 }
 
 /// One credited, named role.
@@ -538,64 +298,81 @@ struct Principal {
 /// Each corpus title's store row and named roles, in billing order.
 type Titles = Vec<(u32, Vec<Principal>)>;
 
-/// The neighbour list from `title.principals` lines — the dump itself or `filter`'s output — against a
-/// store's IMDb ids (`imdb_rows`).
-pub(crate) fn build(
-    rows: &HashMap<u32, u32>,
-    row_count: usize,
-    tsv: impl BufRead,
+/// A role played as oneself — IMDb's `self` category, which TMDB has no field for.
+const SELF: &[&str] = &["self", "himself", "herself", "themselves"];
+
+/// The neighbour list from the credits `tmdb.rs` keeps, joined onto a store's rows by its `keys` column.
+pub fn build(view: &den_store::Store<'_>, credits: &HashMap<Key, Credits>) -> Result<CharacterIndex, String> {
+    build_billed(view, credits, BILLED)
+}
+
+fn build_billed(
+    view: &den_store::Store<'_>,
+    credits: &HashMap<Key, Credits>,
+    billed: u32,
 ) -> Result<CharacterIndex, String> {
-    let (titles, names) = parse(rows, tsv)?;
+    let keys = view.per_row::<u64>("keys").map_err(|e| e.to_string())?;
+    let rows = keys.iter().enumerate().filter_map(|(row, &packed)| {
+        let kept = credits.get(&(u8::from(packed >> 32 == 1), packed as u32))?;
+        Some((u32::try_from(row).ok()?, kept.roles.as_slice()))
+    });
+    Ok(from_roles(keys.len(), rows, billed))
+}
+
+/// The neighbour list from each row's roles, reading the first `billed` of each.
+fn from_roles<'a>(
+    row_count: usize,
+    rows: impl Iterator<Item = (u32, &'a [Role])>,
+    billed: u32,
+) -> CharacterIndex {
+    let (titles, names) = parse(rows, billed);
     let named = NamedCharacters::build(&titles, &names, row_count);
     let edges = link(titles, &names);
-    Ok(CharacterIndex { named, ..index(row_count, &edges) })
+    CharacterIndex { named, ..index(row_count, &edges) }
 }
 
 /// Every named role per corpus title, its names normalised and interned.
-fn parse(rows: &HashMap<u32, u32>, tsv: impl BufRead) -> Result<(Titles, Vec<String>), String> {
-    let mut lines = tsv.lines();
-    check_header(lines.next())?;
+fn parse<'a>(rows: impl Iterator<Item = (u32, &'a [Role])>, billed: u32) -> (Titles, Vec<String>) {
     let mut interned: HashMap<String, u32> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
-    let mut by_row: HashMap<u32, Vec<Principal>> = HashMap::new();
-    for line in lines {
-        let line = line.map_err(|e| format!("reading the dump: {e}"))?;
-        let f: Vec<&str> = line.split('\t').collect();
-        let [tt, ordering, nconst, category, _job, characters] = f[..] else { continue };
-        let Some(&row) = tconst(tt).and_then(|id| rows.get(&id)) else { continue };
-        let is_self = match category {
-            "actor" | "actress" => false,
-            "self" => true,
-            _ => continue,
-        };
-        let (Ok(ordering), Some(nconst)) = (ordering.parse(), person(nconst)) else { continue };
-        let Ok(characters) = serde_json::from_str::<Vec<String>>(characters) else { continue };
-        let mut ids: Vec<u32> = names_of(&characters)
-            .into_iter()
-            .map(|n| {
-                *interned.entry(n).or_insert_with_key(|n| {
-                    names.push(n.clone());
-                    (names.len() - 1) as u32
-                })
-            })
-            .collect();
-        if ids.is_empty() {
-            continue;
+    let mut titles: Titles = Vec::new();
+    for (row, roles) in rows {
+        // One principal per credited person, as IMDb lists one: a series' aggregate credits give a person
+        // one role per character they played, and those are one person's names, not several people's.
+        let mut credited: Vec<((u32, u32), Vec<String>)> = Vec::new();
+        for role in roles.iter().filter(|r| r.order < billed) {
+            let at = (role.order, role.person);
+            match credited.iter_mut().find(|(held, _)| *held == at) {
+                Some((_, characters)) => characters.push(role.character.to_string()),
+                None => credited.push((at, vec![role.character.to_string()])),
+            }
         }
-        ids.sort_unstable();
-        by_row.entry(row).or_default().push(Principal { ordering, nconst, is_self, names: ids });
+        let mut principals: Vec<Principal> = Vec::new();
+        for ((order, person), characters) in credited {
+            let found = names_of(&characters);
+            let is_self = !found.is_empty() && found.iter().all(|n| SELF.contains(&n.as_str()));
+            let mut ids: Vec<u32> = found
+                .into_iter()
+                .map(|n| {
+                    *interned.entry(n).or_insert_with_key(|n| {
+                        names.push(n.clone());
+                        (names.len() - 1) as u32
+                    })
+                })
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            ids.sort_unstable();
+            principals.push(Principal { ordering: order, nconst: person, is_self, names: ids });
+        }
+        if !principals.is_empty() {
+            principals.sort_by_key(|p| (p.ordering, p.nconst));
+            titles.push((row, principals));
+        }
     }
-    let mut titles: Titles = by_row.into_iter().collect();
     titles.sort_unstable_by_key(|(row, _)| *row);
-    for (_, principals) in &mut titles {
-        principals.sort_by_key(|p| (p.ordering, p.nconst));
-    }
-    Ok((titles, names))
-}
-
-/// The numeric part of a person id.
-fn person(id: &str) -> Option<u32> {
-    id.strip_prefix("nm").filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))?.parse().ok()
+    (titles, names)
 }
 
 /// A title's non-self names: best billing position (1-based over its named roles, self roles included) and
@@ -1112,7 +889,6 @@ fn drop_suffix(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     fn norm(characters: &[&str]) -> Vec<String> {
         let mut names = names_of(&characters.iter().map(|c| c.to_string()).collect::<Vec<_>>());
@@ -1143,21 +919,19 @@ mod tests {
         assert_ne!(norm(&["Jesse"]), norm(&["Jesse Pinkman"]));
     }
 
-    /// Rows for a synthetic dump. Each tuple: title number, billing position, person number, character.
-    fn dump(roles: &[(u32, u32, u32, &str)]) -> String {
-        let mut s = format!("{HEADER}\n");
-        for &(title, ordering, person, character) in roles {
-            let chars = serde_json::to_string(&[character]).unwrap();
-            s.push_str(&format!("tt{title:07}\t{ordering}\tnm{person:07}\tactor\t\\N\t{chars}\n"));
+    /// Synthetic credits. Each tuple: store row, billing position, person, character.
+    fn credits(roles: &[(u32, u32, u32, &str)]) -> HashMap<u32, Vec<Role>> {
+        let mut by_row: HashMap<u32, Vec<Role>> = HashMap::new();
+        for &(row, order, person, character) in roles {
+            by_row.entry(row).or_default().push(Role { order, person, character: character.into() });
         }
-        s
+        by_row
     }
 
-    /// Title `tt000000n` is store row n, for every title named in the dump.
     fn built(roles: &[(u32, u32, u32, &str)]) -> CharacterIndex {
-        let rows: HashMap<u32, u32> = roles.iter().map(|r| (r.0, r.0)).collect();
+        let by_row = credits(roles);
         let row_count = roles.iter().map(|r| r.0 as usize + 1).max().unwrap_or(0).max(10);
-        build(&rows, row_count, Cursor::new(dump(roles))).expect("a synthetic dump builds")
+        from_roles(row_count, by_row.iter().map(|(&row, roles)| (row, roles.as_slice())), BILLED)
     }
 
     fn tier(index: &CharacterIndex, a: usize, b: u32) -> Option<Tier> {
@@ -1307,158 +1081,81 @@ mod tests {
         assert_eq!(index.linked(), 2);
     }
 
+    /// TMDB has no `self` category: a role named Himself is one, and its name is never a character.
     #[test]
-    fn filters_to_the_corpus_and_to_named_on_screen_roles() {
-        let tsv = format!(
-            "{HEADER}\n\
-             tt0000001\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n\
-             tt0000001\t2\tnm0000101\tdirector\t\\N\t\\N\n\
-             tt0000001\t3\tnm0000102\tactress\t\\N\t\\N\n\
-             tt0000009\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n\
-             tt0000002\t1\tnm0000103\tself\t\\N\t[\"Self\"]\n"
-        );
-        let rows = HashMap::from([(1, 0), (2, 1)]);
-        let mut out = Vec::new();
-        assert_eq!(filter(&rows, Cursor::new(tsv), &mut out), Ok(2));
-        let kept = String::from_utf8(out).unwrap();
-        assert!(kept.starts_with(HEADER), "the kept rows read back like the dump");
-        assert!(kept.contains("Walter White") && kept.contains("Self"));
-        assert!(!kept.contains("tt0000009") && !kept.contains("director"));
-        assert!(build(&rows, 2, Cursor::new(kept)).is_ok());
+    fn a_role_played_as_oneself_is_not_a_character() {
+        let index = built(&[
+            (1, 1, 100, "Himself"),
+            (1, 2, 101, "Self"),
+            (2, 1, 100, "Himself"),
+            (2, 2, 101, "Self"),
+        ]);
+        assert!(index.of(1).is_empty(), "{:?}", index.of(1));
     }
 
+    /// A series' aggregate credits give one person a role per character; they are that person's names, read
+    /// together as IMDb read one principal's list.
     #[test]
-    fn a_changed_header_or_an_empty_match_fails() {
-        let moved = "tconst\tnconst\tordering\tcategory\tjob\tcharacters\n";
-        let rows = HashMap::from([(1, 0)]);
-        assert!(filter(&rows, Cursor::new(moved), &mut Vec::new())
-            .unwrap_err()
-            .contains("unexpected header"));
-        assert!(build(&rows, 1, Cursor::new(moved)).is_err());
-        let none = format!("{HEADER}\ntt0000009\t1\tnm0000100\tactor\t\\N\t[\"X\"]\n");
-        assert!(filter(&rows, Cursor::new(none), &mut Vec::new()).is_err());
+    fn one_persons_several_roles_are_one_principal() {
+        let index = built(&[
+            (1, 1, 100, "Bruce Wayne"),
+            (1, 1, 100, "Batman"),
+            (1, 2, 101, "Alfred Pennyworth"),
+            (2, 1, 100, "Batman"),
+            (2, 3, 101, "Alfred Pennyworth"),
+        ]);
+        assert_eq!(tier(&index, 1, 2), Some(Tier::SameActor));
+        // Past `BILLED` a role is not read at all.
+        let deep = built(&[(1, BILLED, 100, "Walter White"), (2, BILLED, 100, "Walter White")]);
+        assert!(deep.of(1).is_empty());
     }
 
-    /// Over a real store: its `imdb` column names the rows. The route fixture holds one IMDb id, so its
-    /// one title has nobody to share a character with.
+    /// Over a real store: its `keys` column names the rows (movie 1 is row 0, movie 2 row 1).
     #[test]
     fn builds_against_a_real_store() {
         let dir = std::env::temp_dir().join(format!("den-atlas-characters-{}", std::process::id()));
         let ds = crate::queries::write_fixture(&dir);
         let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");
-        let (rows, row_count) = imdb_rows(&mapped.view()).unwrap();
-        let tsv = dump(&[(1, 1, 100, "Walter White"), (1, 2, 101, "Jesse Pinkman")]);
-        let index = build(&rows, row_count, Cursor::new(tsv)).unwrap();
+        let credits = |character: &str| Credits {
+            fetched: 0,
+            roles: vec![Role { order: 0, person: 100, character: character.into() }],
+        };
+        let kept = HashMap::from([
+            ((0, 1), credits("Walter White")),
+            ((0, 2), credits("Walter White")),
+            ((0, 999_999), credits("Walter White")),
+        ]);
+        let index = build(&mapped.view(), &kept).unwrap();
         assert_eq!(index.rows(), 12);
-        assert_eq!(index.links(), 0);
+        assert_eq!(index.links(), 1, "the title the store lacks links nothing: {index:?}");
+        assert_eq!(tier(&index, 0, 1), Some(Tier::SameActor));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The serving path end to end: the gzipped dump streamed from a server in pieces, gunzipped and
-    /// filtered as it arrives, the filtered rows kept, and a restart building from them without asking.
-    #[tokio::test]
-    async fn streams_the_dump_keeps_the_filtered_rows_and_rebuilds_from_them() {
-        use std::io::Write;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("den-atlas-characters-stream-{}", std::process::id()));
-        let ds = crate::queries::write_fixture(&dir);
-        // The fixture's one IMDb id, among thousands the store lacks, so the body spans many reads.
-        let mut roles = vec![(1, 1, 100, "Walter White")];
-        roles.extend((1000..30_000).map(|t| (t, 1, t, "Somebody Else")));
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(dump(&roles).as_bytes()).unwrap();
-        let body = gz.finish().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&asks);
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let _ = sock.read(&mut [0u8; 4096]).await;
-                let head =
-                    format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
-                let _ = sock.write_all(head.as_bytes()).await;
-                for piece in body.chunks(1024) {
-                    let _ = sock.write_all(piece).await;
-                    let _ = sock.flush().await;
-                }
-                let _ = sock.shutdown().await;
-            }
-        });
-        let url = format!("http://{addr}/title.principals.tsv.gz");
-        let cache = dir.join("cache");
-        std::fs::create_dir_all(&cache).unwrap();
-
-        let characters = Characters::new(ds.store.clone(), &url, Some(&cache)).unwrap();
-        let line = characters.refresh().await.expect("the streamed dump builds");
-        assert!(line.contains("0 links over 0 of 12 store rows"), "{line}");
-        let kept = std::fs::read_to_string(cache.join(CACHE_FILE)).unwrap();
-        assert_eq!(kept.lines().count(), 2, "the header and the corpus's one role: {kept}");
-
-        let restarted = Characters::new(ds.store.clone(), &url, Some(&cache)).unwrap();
-        assert!(restarted.build_from_kept().await.is_some());
-        assert_eq!(restarted.index().map(|index| index.rows()), Some(12));
-        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1, "the restart did not download");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The whole corpus, for measuring: `CHARACTERS_TSV=<filtered principals> cargo test --release
-    /// characters::tests::measure -- --ignored --nocapture`. Every title in the file is its own row. With
-    /// `CHARACTERS_EDGES_OUT` set, writes one `tt… tt… tier weight` line per link for comparing with another
-    /// build.
+    /// The whole corpus, for measuring: `STORE=<den-….store> CREDITS=<tmdb-credits.tsv> cargo test --release
+    /// characters::tests::measure -- --ignored --nocapture`, with `CHARACTERS_BILLED` to read another depth.
+    /// With `CHARACTERS_EDGES_OUT` set, writes one `tt… tt… tier weight` line per link, by the store's IMDb
+    /// ids, for comparing with another build.
     #[test]
-    #[ignore = "needs IMDb's principals, which are never committed"]
+    #[ignore = "needs a real store and TMDB's credits, which are never committed"]
     fn measure() {
-        let path = std::env::var("CHARACTERS_TSV").expect("CHARACTERS_TSV names a principals file");
-        let text = std::fs::read(&path).unwrap();
-        let mut rows: HashMap<u32, u32> = HashMap::new();
-        for line in text.split(|&b| b == b'\n').skip(1) {
-            let id = line.split(|&b| b == b'\t').next().and_then(|id| std::str::from_utf8(id).ok());
-            if let Some(id) = id.and_then(tconst) {
-                let next = rows.len() as u32;
-                rows.entry(id).or_insert(next);
-            }
-        }
-        // With `CHARACTERS_GZ` naming the whole dump, time the gunzip and filter that serving streams it
-        // through, against the titles in `CHARACTERS_TSV`.
-        if let Ok(gz) = std::env::var("CHARACTERS_GZ") {
-            let started = Instant::now();
-            let file = std::fs::File::open(gz).unwrap();
-            let mut out = Vec::new();
-            let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(file));
-            let kept = filter(&rows, reader, &mut out).unwrap();
-            println!(
-                "filtered the dump in {:.1}s: {kept} lines, {} bytes",
-                started.elapsed().as_secs_f64(),
-                out.len()
-            );
-        }
-        let started = Instant::now();
-        let index = build(&rows, rows.len(), text.as_slice()).unwrap();
-        println!(
-            "built in {:.2}s: {} links over {} of {} rows, {} bytes resident",
-            started.elapsed().as_secs_f64(),
-            index.links(),
-            index.linked(),
-            index.rows(),
-            index.bytes()
-        );
-        for (tier, n) in index.per_tier() {
-            println!("  {} {n}", tier.name());
-        }
+        let store = std::env::var("STORE").expect("STORE names a store");
+        let mapped = crate::store::MappedStore::open(std::path::Path::new(&store)).unwrap();
+        let view = mapped.view();
+        let credits = crate::tmdb::read_credits(std::path::Path::new(&std::env::var("CREDITS").unwrap()), 0);
+        let billed = std::env::var("CHARACTERS_BILLED").ok().and_then(|b| b.parse().ok()).unwrap_or(BILLED);
+        let started = std::time::Instant::now();
+        let index = build_billed(&view, &credits, billed).unwrap();
+        println!("billed {billed}, built in {:.2}s: {}", started.elapsed().as_secs_f64(), describe(&index));
         if let Ok(out) = std::env::var("CHARACTERS_EDGES_OUT") {
-            let tt: HashMap<u32, u32> = rows.iter().map(|(&id, &row)| (row, id)).collect();
+            let imdb = view.per_row::<u32>("imdb").unwrap();
+            let strings = view.strings().unwrap();
+            let tt = |row: usize| strings.get(imdb[row]).unwrap_or("-").to_owned();
             let mut lines = String::new();
             for row in 0..index.rows() {
                 for link in index.of(row).iter().filter(|l| l.row as usize > row) {
-                    lines.push_str(&format!(
-                        "tt{:07} tt{:07} {} {}\n",
-                        tt[&(row as u32)],
-                        tt[&link.row],
-                        link.tier.name(),
-                        link.weight
-                    ));
+                    let (a, b) = (tt(row), tt(link.row as usize));
+                    lines.push_str(&format!("{a} {b} {} {}\n", link.tier.name(), link.weight));
                 }
             }
             std::fs::write(out, lines).unwrap();

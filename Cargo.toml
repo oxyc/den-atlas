@@ -38,7 +38,7 @@ den-titlesearch = { path = "crates/den-titlesearch" }
 # Index queries (INDEX_QUERIES): label rows and More Like This over the dataset, the portable crate.
 den-index = { path = "crates/den-index" }
 flate2 = "1"
-# IMDb character names folded as the franchise audit folded them (NFKD, combining marks dropped).
+# Character names folded as the franchise audit folded them (NFKD, combining marks dropped).
 unicode-normalization = "0.1"
 
 [workspace]

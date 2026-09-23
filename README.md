@@ -163,15 +163,20 @@ plot-only behaviour. The facet lane reads the store's country, language, year an
 read a `facets.bin` sidecar, which covered 9,086 fewer titles. Taste weights stay with the client:
 `score` returns the raw boosts.
 
-Vote counts — what every browse row is ORDERED by — come from IMDb's public
-[`title.ratings`](https://datasets.imdbws.com/) dump (`IMDB_RATINGS`), downloaded once a day and joined onto
-the store's `imdb` column as it is read, so what stays resident is one `u32` and one `f32` per store row
-rather than the dump's 1.7 M. 47,562 of the corpus's 47,618 rows match it. The store's own `votes` column is
-the fallback for a row the dump does not name and for the window before the first fetch lands — which is
-stated in the load line (`row order: …`) rather than left to be inferred. When NEITHER source has a count,
-`/health` reports `votes_unusable`: rows still come back full, in tmdb-id order, which is the one degradation
-here that looks like a working addon. `/recommend` reads the same dump's `averageRating` where no upstream
-list scored a title, in place of the flat prior it used to rate those with.
+Vote counts — what every browse row is ORDERED by — are TMDB's `vote_count`, with its `vote_average` the score
+`/recommend` rates a title with where no upstream list scored it, and TMDB's credits give the list of titles
+that share a character. None of it is in the published dataset: atlas asks den-edge's TMDB proxy for it
+(`TMDB_PROXY`) and keeps it in `CACHE_DIR` on the box — vote counts in bulk from `/discover`, sliced by date,
+about once a month; credits a share of the corpus a day, and at once for a title TMDB's changes feed names.
+Every kept value is dropped six months after TMDB gave it. `src/tmdb.rs` opens with the rules on what these
+numbers may be used for: sort keys, filters, floors, merit and popularity terms and character-link evidence at
+runtime — never an embedding, a model or a file that leaves the box. A first boot reads a seed made from
+den-dataset's own TMDB cache (`scripts/tmdb-seed.py`). The store's own `votes` column, where an older store
+carries one, is the fallback for a row nothing is kept for — stated in the load line (`row order: …`) rather
+than left to be inferred. When NEITHER source has a count, `/health` reports `votes_unusable`: rows still come
+back full, in tmdb-id order, which is the one degradation here that looks like a working addon.
+
+This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ### Filters
 
@@ -211,7 +216,7 @@ pins url → canonical url pairs a client can test against.
   `warning` is not offered (its `depicts` scores are title-only, the highest 0.28); a store with article-based
   scores offers it on load. `character` is offered once its provider has built the names.
 - **Providers.** `rating` and the vote order read whichever provider fills atlas's ratings holder, and
-  `character` its character links: IMDb's dumps today, TMDB on the way (as a filter and a sort only).
+  `character` its character links: TMDB's, kept on the box (`src/tmdb.rs`), as a filter and a sort only.
 - **Cost** on that store: 509 values in bitsets plus posting lists for the entity kinds, 11 MB, built at load in
   ~0.1 s; the name index for `values/…?q=` is built on the first search, 7.7 MB. The empty selection's counts
   are kept (0.1 ms); a three-kind selection answers in under 1 ms, the broadest single genre in ~6 ms, a titles
@@ -277,11 +282,11 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_COUNTRY` | `US` | catalog country when an `auto` install forwards none |
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
-| `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. Unset ⇒ memory only |
+| `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. TMDB's kept numbers and credits live here too (`tmdb-votes.tsv`, `tmdb-credits.tsv`, `tmdb-sweep.tsv`), and nowhere else. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
-| `IMDB_RATINGS` | on | IMDb's daily `title.ratings` dump joined onto the store's `imdb` column — the vote count browse rows are ordered by and the score `/recommend` rates a title with. Only alongside `INDEX_QUERIES`. Empty or `0` ⇒ off, and row order comes from the store's own `votes` column alone; with that column gone too, rows come back in tmdb-id order and `/health` reports `votes_unusable` |
-| `IMDB_CHARACTERS` | on | IMDb's `title.principals` dump, streamed and filtered to the store's `imdb` ids, built into a per-title list of titles that share a character (spin-offs, sequels). Built in the background, weekly; the filtered rows (~24 MB) are kept in `CACHE_DIR`, so a restart within the week rebuilds from them rather than downloading the ~780 MB dump. Only alongside `INDEX_QUERIES`. Empty or `0` ⇒ off. Nothing ranks on it yet (oxyc/den-atlas#43) |
+| `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |
+| `TMDB_DAILY_MAX` | `1500` | questions atlas asks the proxy in a UTC day, two seconds apart. A full vote sweep is ~4,800, so it spreads over a few days; den-edge's own ceiling (`TMDB_DAILY_MAX` there) is shared with the web app's guests and must leave room for this |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
 | `RECOMMEND_FIXTURES` | unset | a writable directory each `POST /recommend` is kept in as `<surface>.json` (a service channel's as `<surface>-service-<id>[-<country>].json`): the body as sent (the household's library included), atlas's lists for it and the moment it was ranked. `den-atlas replay <file>` ranks one again against `DATA_DIR` with that binary's scoring and prints every slide with why. Unset ⇒ nothing kept |
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |

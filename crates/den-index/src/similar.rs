@@ -128,10 +128,10 @@ pub struct SimilarParams {
     pub year_halflife: f64,
     /// A multiplier on `w_facet` per facet axis, in `den_store::FACET_AXES` order (`FACET_AXIS_KNOBS`).
     pub w_facet_axis: [f64; 12],
-    /// Drop a candidate IMDb rates below this (0: off). A title IMDb has no rating for is kept.
-    pub min_imdb_rating: f64,
-    /// Drop a candidate with fewer IMDb votes than this (0: off). A title IMDb has no count for is kept.
-    pub min_imdb_votes: f64,
+    /// Drop a candidate TMDB rates below this (0: off). A title with no rating is kept.
+    pub min_rating: f64,
+    /// Drop a candidate with fewer TMDB votes than this (0: off). A title with no count is kept.
+    pub min_votes: f64,
     /// Weight of TMDB export popularity, log-scaled against the pool's most popular (`Audience`). Off.
     pub w_popularity: f64,
     /// Drop a candidate whose TMDB export popularity is below this (0: off). Unknown is kept.
@@ -147,10 +147,10 @@ pub struct SimilarParams {
     pub spread_high_pct: usize,
 }
 
-/// Production filters on neither IMDb number nor popularity, and does not weigh popularity: More Like This
+/// Production filters on neither TMDB number nor popularity, and does not weigh popularity: More Like This
 /// is about the seed, and a popularity term would pull every row towards the same few titles.
-const MIN_IMDB_RATING: f64 = 0.0;
-const MIN_IMDB_VOTES: f64 = 0.0;
+const MIN_RATING: f64 = 0.0;
+const MIN_VOTES: f64 = 0.0;
 const W_POPULARITY: f64 = 0.0;
 const MIN_POPULARITY: f64 = 0.0;
 /// Production's critique floor and holds share: `rail::CRITIQUE_FLOOR` and `rail::HOLDS`, whose doc
@@ -225,8 +225,8 @@ impl Default for SimilarParams {
             w_year: W_YEAR,
             year_halflife: YEAR_HALFLIFE,
             w_facet_axis: [1.0; 12],
-            min_imdb_rating: MIN_IMDB_RATING,
-            min_imdb_votes: MIN_IMDB_VOTES,
+            min_rating: MIN_RATING,
+            min_votes: MIN_VOTES,
             w_popularity: W_POPULARITY,
             min_popularity: MIN_POPULARITY,
             critique_floor: CRITIQUE_FLOOR,
@@ -353,8 +353,8 @@ impl SimilarParams {
         knob("year_halflife", "floors", 1.0, 100.0, false, "years apart at which the year term halves"),
         knob("same_animation", "filters", 0.0, 1.0, true, "1: never mix animated with live action"),
         knob("tone_floor", "filters", 0.0, 1.0, false, "drop a labelled candidate covering less of the seed"),
-        knob("min_imdb_rating", "filters", 0.0, 10.0, false, "drop below this IMDb rating (unrated kept)"),
-        knob("min_imdb_votes", "filters", 0.0, 1_000_000.0, true, "drop below this many IMDb votes"),
+        knob("min_rating", "filters", 0.0, 10.0, false, "drop below this TMDB rating (unrated kept)"),
+        knob("min_votes", "filters", 0.0, 100_000.0, true, "drop below this many TMDB votes"),
         knob(
             "min_popularity",
             "filters",
@@ -400,8 +400,8 @@ impl SimilarParams {
             "same_animation" => f64::from(u8::from(self.same_animation)),
             "w_year" => self.w_year,
             "year_halflife" => self.year_halflife,
-            "min_imdb_rating" => self.min_imdb_rating,
-            "min_imdb_votes" => self.min_imdb_votes,
+            "min_rating" => self.min_rating,
+            "min_votes" => self.min_votes,
             "w_popularity" => self.w_popularity,
             "min_popularity" => self.min_popularity,
             "critique_floor" => self.critique_floor,
@@ -448,8 +448,8 @@ impl SimilarParams {
             "same_animation" => self.same_animation = whole == 1,
             "w_year" => self.w_year = value,
             "year_halflife" => self.year_halflife = value,
-            "min_imdb_rating" => self.min_imdb_rating = value,
-            "min_imdb_votes" => self.min_imdb_votes = value,
+            "min_rating" => self.min_rating = value,
+            "min_votes" => self.min_votes = value,
             "w_popularity" => self.w_popularity = value,
             "min_popularity" => self.min_popularity = value,
             "critique_floor" => self.critique_floor = value,
@@ -807,12 +807,12 @@ pub struct Scored {
     pub held: bool,
 }
 
-/// What viewers make of a title — IMDb's rating and vote count, TMDB's popularity — for the filters and
-/// the popularity term. Supplied by the caller for the same reason as `Authorship`: `den-index` does not
-/// know where a rating comes from. `None` is unknown, and an unknown title is kept by every filter.
+/// What viewers make of a title — its rating and vote count, TMDB's popularity — for the filters and the
+/// popularity term. Supplied by the caller for the same reason as `Authorship`: `den-index` does not know
+/// where a rating comes from. `None` is unknown, and an unknown title is kept by every filter.
 pub trait Audience {
-    /// IMDb's (rating, vote count).
-    fn imdb(&self, tmdb_id: u32) -> Option<(f64, f64)>;
+    /// (rating, vote count).
+    fn rating(&self, tmdb_id: u32) -> Option<(f64, f64)>;
     /// TMDB's popularity in its daily export: unbounded, most titles under 50.
     fn popularity(&self, tmdb_id: u32) -> Option<f64>;
 }
@@ -929,14 +929,14 @@ pub fn rank_pool<'l>(
 
     let audience = extras.audience;
     // The request's filters. Each is skipped outright at its production value, so production's pool is
-    // never even asked about them. Unknown passes: a title IMDb has not rated is not a badly rated one.
+    // never even asked about them. Unknown passes: a title nobody has rated is not a badly rated one.
     let admitted = |id: u32| -> bool {
         if extras.keep.is_some_and(|keep| !keep(id)) {
             return false;
         }
-        if p.min_imdb_rating > 0.0 || p.min_imdb_votes > 0.0 {
-            if let Some((rating, votes)) = audience.and_then(|a| a.imdb(id)) {
-                if rating < p.min_imdb_rating || votes < p.min_imdb_votes {
+        if p.min_rating > 0.0 || p.min_votes > 0.0 {
+            if let Some((rating, votes)) = audience.and_then(|a| a.rating(id)) {
+                if rating < p.min_rating || votes < p.min_votes {
                     return false;
                 }
             }
@@ -1501,12 +1501,12 @@ mod tests {
         assert_eq!(year_proximity(2000.0, 2000.0, 10.0), 1.0);
     }
 
-    /// Title 2 is rated 5.0 on 100 votes with popularity 1; title 3 has no IMDb record and popularity 1,000;
+    /// Title 2 is rated 5.0 on 100 votes with popularity 1; title 3 has no rating and popularity 1,000;
     /// every other title has popularity 1.
     struct Viewers;
 
     impl Audience for Viewers {
-        fn imdb(&self, id: u32) -> Option<(f64, f64)> {
+        fn rating(&self, id: u32) -> Option<(f64, f64)> {
             (id == 2).then_some((5.0, 100.0))
         }
         fn popularity(&self, id: u32) -> Option<f64> {
@@ -1543,9 +1543,9 @@ mod tests {
             p.set(knob, value).unwrap();
             audience_row(&p, None)
         };
-        assert!(!with("min_imdb_rating", 6.0).contains(&2), "rated 5.0: dropped");
-        assert!(with("min_imdb_rating", 6.0).contains(&3), "unrated: kept");
-        assert!(!with("min_imdb_votes", 101.0).contains(&2), "100 votes: dropped");
+        assert!(!with("min_rating", 6.0).contains(&2), "rated 5.0: dropped");
+        assert!(with("min_rating", 6.0).contains(&3), "unrated: kept");
+        assert!(!with("min_votes", 101.0).contains(&2), "100 votes: dropped");
         assert_eq!(with("min_popularity", 5.0), [3], "only the popular title clears the floor");
         assert_eq!(with("w_popularity", 10.0)[0], 3, "popularity lifts 3 over 2");
         let not_two = |id: u32| id != 2;

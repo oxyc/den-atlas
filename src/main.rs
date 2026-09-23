@@ -29,6 +29,7 @@ mod search;
 mod series;
 mod store;
 mod titles;
+mod tmdb;
 mod tos;
 mod util;
 
@@ -331,46 +332,33 @@ async fn main() {
         .is_ok_and(|v| !v.is_empty() && v != "0")
         .then(|| dataset.as_ref().map(queries::IndexQueries::new))
         .flatten();
-    // IMDb's daily `title.ratings` dump, joined onto the store by its `imdb` column: the vote count every
-    // browse row is ordered by, and the score /recommend rates a title with. ON unless IMDB_RATINGS is
-    // empty or 0 — the inverse of TITLE_SEARCH above, because this changes no catalog the TV can see, it
-    // only replaces a number atlas already sorts on.
-    //
-    // OFF, atlas orders rows by the store's `votes` column alone. That is exactly today's behaviour and
-    // costs nothing while the producer still writes the column; once it stops, off means every browse row
-    // comes back in tmdb-id order and /health reports `votes_unusable`.
-    //
-    // Only alongside the index routes: nothing else reads a vote count, so an atlas serving catalogs alone
-    // would be downloading 8 MB a day for no reader.
-    let ratings_off = std::env::var("IMDB_RATINGS").is_ok_and(|v| v.is_empty() || v == "0");
-    let ratings = (index.is_some() && !ratings_off)
-        .then(|| dataset.as_ref().map(|ds| ratings::Ratings::new(ds.store.clone(), ratings::RATINGS_URL)))
-        .flatten()
-        .and_then(|built| {
-            built.map_err(|e| eprintln!("imdb ratings disabled (reqwest build failed: {e})")).ok()
-        })
-        .map(Arc::new);
-    // IMDb's `title.principals`, filtered to the corpus: which titles share a character (a spin-off, a
-    // sequel). ON unless IMDB_CHARACTERS is empty or 0, like IMDB_RATINGS and only alongside the index
-    // routes for the same reason. Built in the background — nothing waits on it — and weekly after that.
-    let characters_off = std::env::var("IMDB_CHARACTERS").is_ok_and(|v| v.is_empty() || v == "0");
-    let characters = (index.is_some() && !characters_off)
+    // TMDB's vote counts, scores and credits for the corpus (`tmdb.rs`, whose top says what they may be used
+    // for): the count every browse row is ordered by, the score /recommend rates a title with, and which
+    // titles share a character. Kept in CACHE_DIR, and asked of den-edge's TMDB proxy when TMDB_PROXY names
+    // it; without it atlas serves what is kept and asks for nothing. Only alongside the index routes: nothing
+    // else reads them.
+    let tmdb = index
+        .is_some()
         .then(|| {
             dataset.as_ref().map(|ds| {
-                characters::Characters::new(
+                tmdb::Tmdb::new(
                     ds.store.clone(),
-                    characters::PRINCIPALS_URL,
-                    cache_dir.as_deref().map(std::path::Path::new),
+                    cache_dir.as_deref().map(std::path::PathBuf::from),
+                    env_opt("TMDB_PROXY"),
+                    env_opt("TMDB_DAILY_MAX").and_then(|v| v.parse().ok()).unwrap_or(tmdb::DEFAULT_DAILY_MAX),
                 )
             })
         })
         .flatten()
-        .and_then(|built| {
-            built.map_err(|e| eprintln!("imdb characters disabled (reqwest build failed: {e})")).ok()
-        })
+        .and_then(|built| built.map_err(|e| eprintln!("tmdb disabled (reqwest build failed: {e})")).ok())
         .map(Arc::new);
-    let index = index
-        .map(|queries| Arc::new(queries.with_ratings(ratings.clone()).with_characters(characters.clone())));
+    let index = index.map(|queries| {
+        Arc::new(
+            queries
+                .with_ratings(tmdb.as_ref().map(|t| t.ratings()))
+                .with_characters(tmdb.as_ref().map(|t| t.characters())),
+        )
+    });
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
@@ -396,15 +384,12 @@ async fn main() {
     if let Some(index) = &state.index {
         tokio::spawn(queries::release_when_idle(Arc::clone(index)));
     }
-    if let Some(ratings) = &ratings {
-        // Awaited, not spawned. The store carries no vote count of its own any more, so until this lands
-        // there is none from any source and every browse row would answer in tmdb-id order — and
-        // `atlas-dataset-sync` restarts this process on every publish, so that window is not rare.
-        ratings::wait_for_first_join(ratings).await;
-        tokio::spawn(ratings::refresh_forever(Arc::clone(ratings)));
-    }
-    if let Some(characters) = &characters {
-        tokio::spawn(characters::refresh_forever(Arc::clone(characters)));
+    if let Some(tmdb) = &tmdb {
+        // Awaited, not spawned: a local read. The store carries no vote count of its own, so until this lands
+        // every browse row would answer in tmdb-id order — and `atlas-dataset-sync` restarts this process on
+        // every publish, so that window is not rare.
+        eprintln!("{}", tmdb.load().await);
+        tokio::spawn(tmdb::Tmdb::refresh_forever(Arc::clone(tmdb)));
     }
     if state.motn.enabled() {
         tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
@@ -448,8 +433,8 @@ async fn main() {
     };
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} imdb_ratings={} \
-         imdb_characters={} motn={} playground={}",
+         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} motn={} \
+         playground={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -460,8 +445,11 @@ async fn main() {
         on(state.embed.is_some()),
         on(state.titles.is_some()),
         on(state.index.is_some()),
-        on(ratings.is_some()),
-        on(characters.is_some()),
+        match &tmdb {
+            Some(t) if t.asks() => "proxy",
+            Some(_) => "kept-only",
+            None => "off",
+        },
         on(state.motn.enabled()),
         on(state.playground && state.index.is_some()),
     );
@@ -495,7 +483,7 @@ async fn replay(dir: &str, path: &str) -> i32 {
         Ok((indexes, _)) => indexes,
         Err(e) => return fail(format!("indexes: {e}")),
     };
-    // Without TMDB's export or IMDb's ratings, which serving downloads: `billboard-check` fetches both.
+    // Without TMDB's export or its kept vote counts, which serving reads: `billboard-check` reads both.
     let answer = recommend::answer(&indexes, None, &request, &lists, now);
     println!("{}", recommend::summary(&indexes, &request, &answer));
     for (at, slide) in answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {

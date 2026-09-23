@@ -357,7 +357,7 @@ pub struct Title<'a> {
     pub estimated_votes: bool,
     /// TMDB's popularity: a client hint's, else TMDB's daily export (`attend`). Both are ~30-day activity scores.
     pub popularity: Option<f64>,
-    /// Whether `popularity` is IMDb's all-time vote count on TMDB's scale (`search::VOTES_PER_POPULARITY`), for a
+    /// Whether `popularity` is TMDB's all-time vote count on the export's scale (`search::VOTES_PER_POPULARITY`), for a
     /// title the export doesn't hold. It says how widely a title was seen, never that it is popular now, so it
     /// counts towards buzz but is never given as the reason.
     pub popularity_from_votes: bool,
@@ -530,11 +530,11 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
-        // IMDb's own score and count for this title, out of the daily dump joined onto the store
-        // (`ratings`): a real rating for 99.9% of the corpus, where the branches below used to depend on
-        // some upstream list having named the title at all. Asked for only where it is needed — this runs
-        // once per candidate, and the first arm below has a counted rating already.
-        let imdb = || self.indexes.imdb_rating(media_type, id);
+        // TMDB's own score and count for this title, kept on the box and joined onto the store (`ratings`,
+        // `tmdb`): a real rating for 99.9% of the corpus, where the branches below used to depend on some
+        // upstream list having named the title at all. Asked for only where it is needed — this runs once per
+        // candidate, and the first arm below has a counted rating already.
+        let kept = || self.indexes.rating(media_type, id);
         let hinted = hinted_rating(hint);
         match (hinted, listed.and_then(|l| l.rating)) {
             // A transient TMDB score replaces an upstream score only when enough votes stand behind it.
@@ -543,7 +543,7 @@ impl<'a> Knowledge<'a> {
                 title.votes = votes;
             }
             // JustWatch gives IMDb's score without its vote count. The facets' count for the title, where
-            // they hold one, says how far it stands, then IMDb's own; without either it is trusted as far
+            // they hold one, says how far it stands, then TMDB's kept one; without either it is trusted as far
             // as the prior's own weight, and `estimated_votes` says the number is a stand-in.
             (_, Some(rating)) => {
                 title.rating = Some(rating);
@@ -551,7 +551,7 @@ impl<'a> Knowledge<'a> {
                     .map(|f| f.votes)
                     .filter(|&votes| votes > 0)
                     .map(f64::from)
-                    .or_else(|| imdb().map(|(votes, _)| f64::from(votes)));
+                    .or_else(|| kept().map(|(votes, _)| f64::from(votes)));
                 match stands {
                     Some(votes) => title.votes = Some(votes),
                     None => {
@@ -562,9 +562,9 @@ impl<'a> Knowledge<'a> {
             }
             // Nothing upstream scored it. Its rating stayed `None`, and `quality` then read RATING_PRIOR
             // for it — the same 6.6 for every title no list happened to name, which is a guess dressed as
-            // a score. IMDb's is a real one, on a real count, so nothing here is estimated.
+            // a score. TMDB's is a real one, on a real count, so nothing here is estimated.
             _ => {
-                if let Some((votes, rating)) = imdb() {
+                if let Some((votes, rating)) = kept() {
                     title.rating = Some(f64::from(rating));
                     title.votes = Some(f64::from(votes));
                 }
@@ -586,7 +586,7 @@ impl<'a> Knowledge<'a> {
 /// this five to seven of every ten slides scored no buzz at all — every title from atlas's lists and the personal pool.
 ///
 /// TMDB's daily export first: the same ~30-day activity score a hint carries, so the two share `buzz`'s scale. Else
-/// IMDb's vote count, on that scale by the factor search measured (`search::VOTES_PER_POPULARITY`) and never above
+/// TMDB's kept vote count, on that scale by the factor search measured (`search::VOTES_PER_POPULARITY`) and never above
 /// what search calls fully popular (`search::POPULAR_VOTES`): an all-time count otherwise puts a decades-old classic
 /// far above anything anyone is watching this month, and flattens every other title's buzz under it.
 pub fn attend(indexes: &Indexes, export: Option<&TitleIndex>, candidate: &mut Candidate<'_>) {
@@ -601,7 +601,7 @@ pub fn attend(indexes: &Indexes, export: Option<&TitleIndex>, candidate: &mut Ca
     };
     if let Some(popularity) = export.and_then(|e| e.popularity_of(kind, id)) {
         title.popularity = Some(popularity);
-    } else if let Some((votes, _)) = indexes.imdb_rating(media_type, id) {
+    } else if let Some((votes, _)) = indexes.rating(media_type, id) {
         let votes = f64::from(votes).min(crate::search::POPULAR_VOTES);
         title.popularity = Some(votes / crate::search::VOTES_PER_POPULARITY);
         title.popularity_from_votes = true;

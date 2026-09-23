@@ -56,13 +56,12 @@ pub struct Indexes {
     /// The mapped store and its corpus-wide aggregates: the artifact everything above was read out of,
     /// kept because the rail addresses its columns per candidate rather than copying them.
     pub store: crate::store::LoadedStore,
-    /// IMDb's daily `title.ratings` dump, joined onto the store's rows (`ratings`). The LIVE holder, not a
-    /// snapshot: the indexes outlive a refresh, and a vote count that reached the process should reach the
-    /// next row it orders rather than waiting for an idle release. `None` when the fetch is switched off,
-    /// and empty until the first one lands — see `votes_of`.
+    /// TMDB's vote counts and scores, joined onto the store's rows (`ratings`, kept by `tmdb`). The LIVE
+    /// holder, not a snapshot: the indexes outlive a refresh, and a vote count that reached the process should
+    /// reach the next row it orders rather than waiting for an idle release. `None` without the index routes'
+    /// TMDB half, and empty while nothing is kept — see `votes_of`.
     pub ratings: Option<Arc<Ratings>>,
-    /// Titles that share a character, from IMDb's `title.principals` (`characters`). The live holder, like
-    /// `ratings`; `None` when the fetch is switched off, empty until the first build lands.
+    /// Titles that share a character, from TMDB's credits (`characters`). The live holder, like `ratings`.
     pub characters: Option<Arc<Characters>>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
@@ -194,8 +193,8 @@ impl Indexes {
 
     /// A title's vote count — what every browse row is ORDERED by.
     ///
-    /// IMDb's `numVotes` where the ratings index names the row, else the store's own `votes` column
-    /// (TMDB's count). It used to come from `facets.bin`, which fell 9,007 titles behind the corpus
+    /// TMDB's `vote_count` where the ratings index names the row, else the store's own `votes` column,
+    /// which older stores carry. It used to come from `facets.bin`, which fell 9,007 titles behind the corpus
     /// because nothing rebuilt it, and a title with no row there sorts by tmdbId — which is how *La Job*
     /// (tv:5) came to sit next to *Game of Thrones*. 0 only when NEITHER source has a count, which
     /// `IndexQueries::votes_unusable` reports to `/health` rather than leaving to be noticed on a screen.
@@ -204,15 +203,15 @@ impl Indexes {
         votes_of(&self.store, ratings.as_deref(), media_type, tmdb_id)
     }
 
-    /// IMDb's own score and vote count for a title, where the dump named it. `/recommend` reads this where
-    /// it used to substitute a prior for a rating nobody supplied.
-    pub fn imdb_rating(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<(u32, f32)> {
+    /// TMDB's own vote count and score for a title, where one is kept. `/recommend` reads this where it used
+    /// to substitute a prior for a rating nobody supplied.
+    pub fn rating(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<(u32, f32)> {
         let ratings = self.ratings.as_ref()?.index()?;
         ratings.of(row_of(&self.store, media_type, tmdb_id)?)
     }
 
     /// The titles sharing a character with this one, by store row, strongest evidence first. Empty when the
-    /// store does not hold the title, the list has not landed, or the fetch is off.
+    /// store does not hold the title or no credits are kept.
     // Read by the billboard's fit and More Like This once #43 wires the list into scoring.
     #[allow(dead_code)]
     pub fn character_links(
@@ -233,23 +232,21 @@ impl Indexes {
 
     /// Which source is ordering browse rows, for the load line.
     ///
-    /// Stated at EVERY load, including the ordinary one. Until the first IMDb fetch lands the order comes
-    /// from the store's `votes` column, which is deliberate — it is the only source atlas has in that
-    /// window — and costs nothing while the producer still writes the column. When the producer stops,
-    /// the same window means "ordered by nothing", and a state that is only ever visible by its absence
-    /// from a log is one nobody sees.
+    /// Stated at EVERY load, including the ordinary one. With no TMDB counts kept the order comes from the
+    /// store's `votes` column where an older store has one; without either it means "ordered by nothing",
+    /// and a state that is only ever visible by its absence from a log is one nobody sees.
     fn row_order_source(&self) -> String {
         let ratings = self.ratings.as_ref().and_then(|r| r.index());
         match (ratings, self.store_has_votes()) {
             (Some(index), store_votes) => format!(
-                "row order: IMDb numVotes for {} of {} rows, the store's `votes` for the rest ({})",
+                "row order: TMDB vote_count for {} of {} rows, the store's `votes` for the rest ({})",
                 index.matched(),
                 self.population,
                 if store_votes { "which it has" } else { "which it has NOT" }
             ),
-            (None, true) => "row order: the store's `votes` column — no IMDb ratings index yet".to_owned(),
-            (None, false) => "row order: NOTHING — no IMDb ratings index and no `votes` column in the \
-                              store; every browse row falls back to tmdb-id order"
+            (None, true) => "row order: the store's `votes` column — no TMDB counts kept".to_owned(),
+            (None, false) => "row order: NOTHING — no TMDB counts kept and no `votes` column in the store; \
+                              every browse row falls back to tmdb-id order"
                 .to_owned(),
         }
     }
@@ -275,12 +272,12 @@ fn row_of(
     loaded.view().row_of(media, tmdb_id).ok().flatten().map(|row| row.0)
 }
 
-/// A title's vote count: IMDb's `numVotes` first, the store's `votes` column after it. Shared by
+/// A title's vote count: TMDB's kept `vote_count` first, the store's `votes` column after it. Shared by
 /// `Indexes::votes` and the display index's ranking, which used to read the column with two copies of the
 /// same four lines.
 ///
 /// The store's column is read with `.ok()`, so a store that no longer carries it still orders rows off
-/// IMDb rather than failing the load. That tolerance is exactly what used to make the failure silent when
+/// TMDB's kept counts rather than failing the load. That tolerance is exactly what used to make the failure silent when
 /// there was only ONE source — hence `Indexes::store_has_votes` and `IndexQueries::votes_unusable`, which
 /// ask once, at load, whether either source has anything at all.
 fn votes_of(
@@ -306,11 +303,11 @@ fn votes_of(
 /// The country and language taken are the FIRST each title lists, which is what the blob held: one code per
 /// title. A title with several origins is findable by the one Wikidata lists first, exactly as it was.
 ///
-/// The vote count is IMDb's where the ratings index names the row, the store's column otherwise — the same
+/// The vote count is TMDB's where the ratings index names the row, the store's column otherwise — the same
 /// order `votes_of` uses, so attribute search and a browse row rank on one number rather than two. A
 /// SNAPSHOT of the ratings index, unlike `votes_of`: this builds a table, and the table is rebuilt on the
 /// next index load. The store's column is optional here (`.unwrap_or(&[])`) so a store that has dropped it
-/// still yields a facet index off IMDb instead of turning every browse row empty.
+/// still yields a facet index off TMDB's counts instead of turning every browse row empty.
 fn facet_index_from(
     facts: &Facts,
     store: &den_store::Store<'_>,
@@ -381,11 +378,11 @@ pub struct IndexQueries {
     /// else wrong. That had no health reason at all, so a whole screen could go blank on a green addon.
     rows_unusable: AtomicBool,
     /// Whether the store's own `votes` column held a count for no row at the last load. Half of
-    /// `votes_unusable`; the other half is whether the IMDb ratings index has landed, which is live.
+    /// `votes_unusable`; the other half is whether TMDB counts are kept, which is live.
     store_votes_absent: AtomicBool,
-    /// IMDb's ratings, joined onto this store's rows. `None` when `IMDB_RATINGS` is off.
+    /// TMDB's counts and scores, joined onto this store's rows (`tmdb`).
     ratings: Option<Arc<Ratings>>,
-    /// IMDb's character neighbour list over this store's rows. `None` when `IMDB_CHARACTERS` is off.
+    /// The character neighbour list from TMDB's credits over this store's rows (`tmdb`).
     characters: Option<Arc<Characters>>,
 }
 
@@ -406,27 +403,27 @@ impl IndexQueries {
         }
     }
 
-    /// The IMDb ratings these indexes order rows by. Separate from `new` because the fetch is switchable
-    /// (`IMDB_RATINGS`) and every test that only wants a dataset should not have to name it.
+    /// The TMDB counts these indexes order rows by. Separate from `new` because they live in `tmdb`, and
+    /// every test that only wants a dataset should not have to name them.
     pub fn with_ratings(mut self, ratings: Option<Arc<Ratings>>) -> Self {
         self.ratings = ratings;
         self
     }
 
-    /// The IMDb character neighbour list, for the same reason as `with_ratings` (`IMDB_CHARACTERS`).
+    /// The character neighbour list, for the same reason as `with_ratings`.
     pub fn with_characters(mut self, characters: Option<Arc<Characters>>) -> Self {
         self.characters = characters;
         self
     }
 
     /// Whether NEITHER vote source can order a browse row: the store's `votes` column held nothing at the
-    /// last load, and no IMDb ratings index has landed.
+    /// last load, and no TMDB counts are kept.
     ///
     /// This is the signal the silent-zero failure never had. `votes_of` answered 0 for every row when the
     /// column could not be read, so every browse row collapsed into tmdb-id order — *La Job* beside *Game
     /// of Thrones* — while every request answered 200 and nothing was logged. It is deliberately LIVE on
-    /// the ratings side: a fetch that lands clears it without waiting for an idle release. An index that
-    /// exists always names at least one row, since `ratings::join` refuses one that matched nothing.
+    /// the ratings side: a refresh that lands clears it without waiting for an idle release. An index that
+    /// exists always names at least one row, since `ratings::build` refuses one that matched nothing.
     pub fn votes_unusable(&self) -> bool {
         self.store_votes_absent.load(Ordering::Relaxed)
             && self.ratings.as_ref().and_then(|r| r.index()).is_none()
@@ -543,10 +540,10 @@ struct Sources {
     /// is a property of the pass that labelled it — so both indexes are stamped with it here.
     taxonomy_version: String,
     store: PathBuf,
-    /// IMDb's ratings, when the fetch is on. The indexes keep the holder — not the index it currently
-    /// has — so a refresh that lands between two loads reaches the rows in between.
+    /// TMDB's kept counts and scores (`tmdb`). The indexes keep the holder — not the index it currently
+    /// has — so a rebuild that lands between two loads reaches the rows in between.
     ratings: Option<Arc<Ratings>>,
-    /// IMDb's character neighbour list, when the fetch is on; the holder, like `ratings`.
+    /// The character neighbour list from TMDB's credits; the holder, like `ratings`.
     characters: Option<Arc<Characters>>,
 }
 
@@ -951,22 +948,22 @@ mod tests {
         assert!(queries.store_unusable(), "a failed load must reach /health");
     }
 
-    /// The IMDb dump, joined onto a real store. Movie 1 is the fixture's only row with a `tt…` id, so it
-    /// is the one the dump can name, and every other row must still be ordered by the store's own column.
+    /// TMDB's kept counts, joined onto a real store. Only movie 1 has one kept, and every other row must
+    /// still be ordered by the store's own column.
     #[tokio::test]
-    async fn imdb_vote_counts_win_and_the_store_s_column_is_the_fallback() {
+    async fn tmdb_vote_counts_win_and_the_store_s_column_is_the_fallback() {
         use den_index::MediaType::{Movie, Tv};
-        let dir = std::env::temp_dir().join(format!("den-atlas-queries-imdb-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-tmdb-{}", std::process::id()));
         let ds = write_fixture(&dir);
-        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(kept(&ds)))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
 
-        assert_eq!(indexes.votes(Movie, 1), 9000, "IMDb's numVotes, not the store's 100");
-        assert_eq!(indexes.votes(Movie, 2), 500, "no IMDb id on this row: the store's column");
+        assert_eq!(indexes.votes(Movie, 1), 9000, "TMDB's kept vote_count, not the store's 100");
+        assert_eq!(indexes.votes(Movie, 2), 500, "nothing kept for this row: the store's column");
         assert_eq!(indexes.votes(Tv, 4), 300);
         assert_eq!(indexes.votes(Movie, 999), 0, "a title the store does not hold");
-        assert_eq!(indexes.imdb_rating(Movie, 1), Some((9000, 8.4)));
-        assert_eq!(indexes.imdb_rating(Movie, 2), None, "no score where the dump named no row");
+        assert_eq!(indexes.rating(Movie, 1), Some((9000, 8.4)));
+        assert_eq!(indexes.rating(Movie, 2), None, "no score where nothing is kept");
 
         // Attribute search ranks on the same number a browse row does, so the facet index takes the join
         // too rather than reading the store's column on its own.
@@ -977,8 +974,8 @@ mod tests {
     }
 
     /// The silent-zero failure, as `/health` now sees it: a store with no usable `votes` column and no
-    /// IMDb index orders every browse row by tmdb id, and must SAY so. The same store with the dump
-    /// joined on is ordered again — so the flag is live on the ratings side, not frozen at load.
+    /// TMDB counts kept orders every browse row by tmdb id, and must SAY so. The same store with counts
+    /// kept is ordered again — so the flag is live on the ratings side, not frozen at load.
     #[tokio::test]
     async fn no_vote_counts_from_either_source_is_reported() {
         use den_index::MediaType::Movie;
@@ -992,37 +989,37 @@ mod tests {
         assert_eq!(indexes.votes(Movie, 1), 0);
         assert!(queries.votes_unusable(), "no source at all must reach /health");
 
-        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(kept(&ds)))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
-        assert_eq!(indexes.votes(Movie, 1), 9000, "IMDb alone orders the rows it names");
+        assert_eq!(indexes.votes(Movie, 1), 9000, "TMDB's counts alone order the rows they name");
         assert!(!queries.votes_unusable(), "one source is enough");
     }
 
     /// `/recommend` used to rate a title no upstream list had scored with `RATING_PRIOR` — the same 6.6
-    /// for every one of them. IMDb's dump has a real score for 99.9% of the corpus, and a real count to
-    /// stand it on, so neither number is a guess any more and `estimated_votes` stays truthful.
+    /// for every one of them. TMDB's kept numbers give a real score for 99.9% of the corpus, and a real
+    /// count to stand it on, so neither number is a guess any more and `estimated_votes` stays truthful.
     #[tokio::test]
-    async fn recommend_rates_a_title_no_list_scored_with_imdb_s_own_score() {
+    async fn recommend_rates_a_title_no_list_scored_with_tmdb_s_own_score() {
         use den_index::MediaType::Movie;
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-rate-{}", std::process::id()));
         let ds = write_fixture(&dir);
-        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(kept(&ds)))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
         let known = crate::recommend::Knowledge { indexes: &indexes };
 
         let title = known.title((Movie, 1), None, None);
-        assert_eq!(title.rating, Some(f64::from(8.4f32)), "IMDb's score, where there was none");
+        assert_eq!(title.rating, Some(f64::from(8.4f32)), "TMDB's score, where there was none");
         assert_eq!(title.votes, Some(9000.0));
         assert!(!title.estimated_votes, "a real count is not an estimate");
         assert!(crate::recommend::quality(&title) > 0.3, "a real 8.4 beats the 6.6 prior's 0.3");
 
-        // A title the dump does not name is unchanged: no score, and `quality` still reads the prior.
+        // A title nothing is kept for is unchanged: no score, and `quality` still reads the prior.
         let title = known.title((Movie, 2), None, None);
         assert_eq!((title.rating, title.votes, title.estimated_votes), (None, None, false));
         assert!((crate::recommend::quality(&title) - 0.3).abs() < 1e-9, "still the prior's 0.3");
 
-        // And where JustWatch does supply an IMDb score, the count under it is IMDb's own rather than the
-        // store's TMDB count — the facet index carries the same join.
+        // And where JustWatch does supply an IMDb score, the count under it is TMDB's kept one rather than
+        // the store's — the facet index carries the same join.
         let listed =
             crate::recommend::Listed { key: (Movie, 1), imdb_id: None, rating: Some(7.0), year: None };
         let title = known.title(listed.key, None, Some(&listed));
@@ -1046,15 +1043,15 @@ mod tests {
     }
 
     /// `/recommend` read popularity from client hints alone, so every title from atlas's own lists scored no buzz.
-    /// TMDB's export fills it where it holds the title, IMDb's count (capped, and marked) where only that does, and a
-    /// hint is never overwritten.
+    /// TMDB's export fills it where it holds the title, TMDB's kept count (capped, and marked) where only that does,
+    /// and a hint is never overwritten.
     #[tokio::test]
-    async fn recommend_reads_popularity_from_the_export_then_imdb_s_count() {
+    async fn recommend_reads_popularity_from_the_export_then_the_vote_count() {
         use crate::recommend::{attend, Candidate, Title};
         use den_index::MediaType::Movie;
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-attend-{}", std::process::id()));
         let ds = write_fixture(&dir);
-        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(dump(&ds)))));
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::new(Ratings::with_index(kept(&ds)))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
         let export = TitleIndex::build(vec![TitleRecord {
             tmdb_id: 2,
@@ -1070,7 +1067,7 @@ mod tests {
         };
         assert_eq!(attended(2, None), (Some(42.0), false), "the export's own score");
         let capped = crate::search::POPULAR_VOTES / crate::search::VOTES_PER_POPULARITY;
-        assert_eq!(attended(1, None), (Some(capped), true), "IMDb's 9,000 votes, capped at fully popular");
+        assert_eq!(attended(1, None), (Some(capped), true), "9,000 votes, capped at fully popular");
         assert_eq!(attended(2, Some(7.0)), (Some(7.0), false), "a hint stands");
         assert_eq!(attended(3, None), (None, false), "neither source knows it");
     }
@@ -1083,11 +1080,16 @@ mod tests {
         use den_index::MediaType::Movie;
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-chars-{}", std::process::id()));
         let ds = write_fixture(&dir);
-        let tsv = "tconst\tordering\tnconst\tcategory\tjob\tcharacters\n\
-                   tt0000001\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n\
-                   tt0000002\t1\tnm0000100\tactor\t\\N\t[\"Walter White\"]\n";
-        let rows = HashMap::from([(1, 0), (2, 1)]);
-        let list = crate::characters::build(&rows, 12, std::io::Cursor::new(tsv)).unwrap();
+        let credits = || crate::tmdb::Credits {
+            fetched: 0,
+            roles: vec![crate::tmdb::Role { order: 0, person: 100, character: "Walter White".into() }],
+        };
+        let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");
+        let list = crate::characters::build(
+            &mapped.view(),
+            &HashMap::from([((0, 1), credits()), ((0, 2), credits())]),
+        )
+        .unwrap();
         let queries = IndexQueries::new(&ds).with_characters(Some(Arc::new(Characters::with_index(list))));
         let (indexes, _) = queries.get(|| ()).await.unwrap();
         let links = indexes.character_links(Movie, 1);
@@ -1158,12 +1160,10 @@ mod tests {
         assert!(seeds > 400, "a real corpus, got {seeds} seeds");
     }
 
-    /// A one-line `title.ratings` dump naming the fixture's movie 1, joined onto its store.
-    fn dump(ds: &Dataset) -> crate::ratings::RatingsIndex {
+    /// TMDB numbers kept for the fixture's movie 1 alone, joined onto its store.
+    fn kept(ds: &Dataset) -> crate::ratings::RatingsIndex {
         let mapped = crate::store::MappedStore::open(&ds.store).expect("the fixture store maps");
-        let tsv = "tconst\taverageRating\tnumVotes\ntt0000001\t8.4\t9000\n";
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut gz, tsv.as_bytes()).unwrap();
-        crate::ratings::build(&mapped.view(), &gz.finish().unwrap()).expect("the dump names movie 1")
+        crate::ratings::build(&mapped.view(), &HashMap::from([((0, 1), (8.4, 9000))]))
+            .expect("movie 1 is kept")
     }
 }

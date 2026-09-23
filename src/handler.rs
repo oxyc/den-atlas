@@ -601,13 +601,13 @@ pub(crate) fn health_state(
         Some(("rows_unusable", "the dataset's facet rows did not read; every browse row is empty"))
     } else if votes_unusable {
         // A row that is FULL and in the wrong order, which is the one failure here that looks like a
-        // working addon. Neither vote source has a count — IMDb's daily dump has not landed and the
+        // working addon. Neither vote source has a count — no TMDB counts are kept (`tmdb.rs`) and the
         // store's `votes` column reads nothing — so every browse row falls back to tmdb-id order, which
         // is how *La Job* came to sit beside *Game of Thrones*. It shipped once, silently, because
         // `votes_of` answered 0 for every title and said nothing.
         Some((
             "votes_unusable",
-            "no vote counts from IMDb or the store; every browse row falls back to tmdb-id order",
+            "no vote counts kept from TMDB or in the store; every browse row falls back to tmdb-id order",
         ))
     } else {
         None

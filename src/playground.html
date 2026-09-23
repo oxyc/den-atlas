@@ -286,6 +286,9 @@
        Import restores the titles and settings.</p>
     <p id="end-note" role="status" aria-live="polite"></p>
   </section>
+  <p class="hint">The rating and vote settings read TMDB's numbers. This product uses the
+     <a href="https://www.themoviedb.org/" target="_blank" rel="noopener">TMDB</a> API but is not endorsed or
+     certified by TMDB.</p>
 </div>
 <script>
 "use strict";
@@ -340,8 +343,8 @@ const KNOBS = {
   w_year: ["era", "Released around the same time", "Bonus for close release years. Off in production."],
   year_halflife: ["era", "Year closeness half-life", "Years apart at which the release-year bonus halves."],
   same_animation: ["filters", "Keep animation and live action apart", "Never mixes animated titles with live action."],
-  min_imdb_rating: ["filters", "Minimum IMDb rating", "Drops titles rated below this. Unrated titles stay. Needs IMDb ratings on the server."],
-  min_imdb_votes: ["filters", "Minimum IMDb votes", "Drops titles with fewer votes. Needs IMDb ratings on the server."],
+  min_rating: ["filters", "Minimum TMDB rating", "Drops titles rated below this. Unrated titles stay. Needs TMDB's numbers kept on the server."],
+  min_votes: ["filters", "Minimum TMDB votes", "Drops titles with fewer votes. Needs TMDB's numbers kept on the server."],
   w_popularity: ["filters", "Favour popular titles", "Bonus for TMDB popularity. Off in production. Needs title search on the server."],
   min_popularity: ["filters", "Minimum popularity", "Drops titles below this TMDB popularity. Unknown stays. Needs title search on the server."],
   pool_k: ["advanced", "Candidates considered", "How many nearest titles each vector index hands to the scorer."],
