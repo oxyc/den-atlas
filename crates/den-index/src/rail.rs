@@ -17,7 +17,7 @@
 //! into a mapped column, and the only owned state is the aggregates below, which cannot be columns
 //! because they are corpus-wide statistics.
 
-use crate::{Axis, MediaType, SimilarParams, ValueId, Weighted};
+use crate::{Axis, Key, MediaType, SimilarParams, ValueId, Weighted};
 use den_store::{Row, Store, StoreError};
 use std::collections::HashMap;
 
@@ -155,7 +155,8 @@ impl RailAggregates {
     }
 }
 
-/// One seed's view of the store — the shape `Facets` wants.
+/// One seed's view of the store — the shape `Facets` wants. A candidate of either type is read from its
+/// own row; the corpus statistics (prevalence, idf, the critique means) are always the SEED's type's.
 ///
 /// Holds the COLUMNS, not the store. `Store::column` finds a section by scanning the section table and
 /// comparing 16-byte names, and every method below is called once per CANDIDATE — `pool_k` is 400, so
@@ -229,8 +230,8 @@ impl<'a> SeedFacets<'a> {
         })
     }
 
-    fn row(&self, tmdb_id: u32) -> Option<Row> {
-        row_in(self.keys, self.media, tmdb_id)
+    fn row(&self, (media, tmdb_id): Key) -> Option<Row> {
+        row_in(self.keys, media_code(media), tmdb_id)
     }
 
     /// The raw critique profile of a row, as (name id, probability), floored.
@@ -252,8 +253,8 @@ impl<'a> SeedFacets<'a> {
 }
 
 impl crate::Facets for SeedFacets<'_> {
-    fn facets(&self, tmdb_id: u32) -> Vec<(Axis, ValueId, f64)> {
-        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+    fn facets(&self, key: Key) -> Vec<(Axis, ValueId, f64)> {
+        let Some(row) = self.row(key) else { return Vec::new() };
         let n = den_store::FACET_AXES.len();
         (0..n)
             .filter_map(|axis| {
@@ -272,8 +273,8 @@ impl crate::Facets for SeedFacets<'_> {
         self.agg.prevalence.get(&(self.media, axis, value)).copied().unwrap_or(1.0)
     }
 
-    fn world(&self, tmdb_id: u32) -> f64 {
-        let Some(row) = self.row(tmdb_id) else { return 0.0 };
+    fn world(&self, key: Key) -> f64 {
+        let Some(row) = self.row(key) else { return 0.0 };
         let raw = self.world.get(row.0).map_or(0.0, |&v| f64::from(v) / 100.0);
         if raw >= self.world_floor {
             raw
@@ -282,13 +283,13 @@ impl crate::Facets for SeedFacets<'_> {
         }
     }
 
-    fn year(&self, tmdb_id: u32) -> Option<f64> {
-        let &year = self.card_year.get(self.row(tmdb_id)?.0)?;
+    fn year(&self, key: Key) -> Option<f64> {
+        let &year = self.card_year.get(self.row(key)?.0)?;
         (year != den_store::NONE_I16).then(|| f64::from(year))
     }
 
-    fn nouls(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+    fn nouls(&self, key: Key) -> Vec<Weighted> {
+        let Some(row) = self.row(key) else { return Vec::new() };
         let (ks, vs) = (self.noul_k.get(row), self.noul_v.get(row));
         ks.iter()
             .zip(vs)
@@ -299,8 +300,8 @@ impl crate::Facets for SeedFacets<'_> {
             .collect()
     }
 
-    fn critique(&self, tmdb_id: u32) -> Vec<Weighted> {
-        let Some(row) = self.row(tmdb_id) else { return Vec::new() };
+    fn critique(&self, key: Key) -> Vec<Weighted> {
+        let Some(row) = self.row(key) else { return Vec::new() };
         let media = self.media;
         // Centered here rather than stored centered, because the mean is a property of the corpus and the
         // store is a property of a title.
@@ -316,13 +317,13 @@ impl crate::Facets for SeedFacets<'_> {
             .collect()
     }
 
-    fn critique_raw(&self, tmdb_id: u32) -> Vec<Weighted> {
-        self.row(tmdb_id).map(|row| self.critique_at(row)).unwrap_or_default()
+    fn critique_raw(&self, key: Key) -> Vec<Weighted> {
+        self.row(key).map(|row| self.critique_at(row)).unwrap_or_default()
     }
 
-    fn critique_defining(&self, tmdb_id: u32) -> Vec<Weighted> {
+    fn critique_defining(&self, key: Key) -> Vec<Weighted> {
         let media = self.media;
-        self.critique_raw(tmdb_id)
+        self.critique_raw(key)
             .into_iter()
             .filter(|(_, p)| *p >= self.defining)
             .filter_map(|(name, _)| {
@@ -350,7 +351,7 @@ pub struct SeedAuthorship<'a> {
     mine_makers: Vec<u32>,
     mine_homes: Vec<u32>,
     /// The titles sharing a character with the seed (`with_characters`): not in the store, so the caller's.
-    characters: Vec<(u32, f64)>,
+    characters: Vec<(Key, f64)>,
 }
 
 impl<'a> SeedAuthorship<'a> {
@@ -373,9 +374,9 @@ impl<'a> SeedAuthorship<'a> {
         Ok(out)
     }
 
-    /// The titles of the seed's type sharing a character with it, each with its strength
-    /// (`Authorship::characters`). The links are built from credits the store does not carry.
-    pub fn with_characters(mut self, characters: Vec<(u32, f64)>) -> Self {
+    /// The titles sharing a character with the seed, each with its strength (`Authorship::characters`).
+    /// The links are built from credits the store does not carry.
+    pub fn with_characters(mut self, characters: Vec<(Key, f64)>) -> Self {
         self.characters = characters;
         self
     }
@@ -393,45 +394,45 @@ impl<'a> SeedAuthorship<'a> {
         hit as f64 / mine.len() as f64
     }
 
-    fn list_of(&self, list: &den_store::List<'a, u32>, tmdb_id: u32) -> &'a [u32] {
-        row_in(self.keys, self.media, tmdb_id).map_or(&[], |row| list.get(row))
+    fn list_of(&self, list: &den_store::List<'a, u32>, (media, tmdb_id): Key) -> &'a [u32] {
+        row_in(self.keys, media_code(media), tmdb_id).map_or(&[], |row| list.get(row))
     }
 }
 
 impl crate::Authorship for SeedAuthorship<'_> {
-    /// Every title of the seed's type crediting one of its makers, by id — the seed's own siblings,
-    /// whatever the vectors think of them. The Wire and The Deuce share a creator and The Deuce is premise
-    /// rank 764, plot 628, outside any sane pool.
+    /// Every title crediting one of the seed's makers, of either type — the seed's own siblings, whatever
+    /// the vectors think of them. The Wire and The Deuce share a creator and The Deuce is premise rank 764,
+    /// plot 628, outside any sane pool; El Camino is Breaking Bad's writer-director's film.
     ///
     /// Makers only. Nominating everything sharing a HOME floods the pool — HBO alone is 131 titles — and
     /// measured worse: it kept The Deuce but pushed Show Me a Hero out entirely, and raised mean
     /// same-genre share from 46% to 48%. A home is where a title lived, not evidence that it is the same
     /// kind of thing.
-    fn nominate(&self) -> Vec<u32> {
+    fn nominate(&self) -> Vec<Key> {
         if self.mine_makers.is_empty() {
             return Vec::new();
         }
-        // Keys are sorted, so one type's ids come out ascending.
+        // Keys are sorted, so each type's ids come out ascending, films first.
         self.keys
             .iter()
             .enumerate()
-            .filter(|&(row, &key)| {
-                (key >> 32) as u8 == self.media
-                    && self.qids(self.makers.get(Row(row))).any(|q| self.mine_makers.contains(&q))
+            .filter(|&(row, _)| self.qids(self.makers.get(Row(row))).any(|q| self.mine_makers.contains(&q)))
+            .map(|(_, &key)| {
+                let media = if key >> 32 == 1 { MediaType::Tv } else { MediaType::Movie };
+                (media, key as u32)
             })
-            .map(|(_, &key)| key as u32)
             .collect()
     }
 
-    fn makers(&self, tmdb_id: u32) -> f64 {
-        self.share(&self.mine_makers, self.list_of(&self.makers, tmdb_id))
+    fn makers(&self, key: Key) -> f64 {
+        self.share(&self.mine_makers, self.list_of(&self.makers, key))
     }
 
-    fn home(&self, tmdb_id: u32) -> f64 {
-        self.share(&self.mine_homes, self.list_of(&self.broadcasters, tmdb_id))
+    fn home(&self, key: Key) -> f64 {
+        self.share(&self.mine_homes, self.list_of(&self.broadcasters, key))
     }
 
-    fn characters(&self) -> &[(u32, f64)] {
+    fn characters(&self) -> &[(Key, f64)] {
         &self.characters
     }
 }
