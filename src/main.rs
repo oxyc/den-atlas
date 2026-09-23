@@ -28,6 +28,7 @@ mod schema;
 mod search;
 mod series;
 mod store;
+mod studios;
 mod titles;
 mod tmdb;
 mod tos;

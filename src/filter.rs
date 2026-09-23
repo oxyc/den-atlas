@@ -382,6 +382,14 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
     for (i, entity) in ENTITY_KINDS.iter().enumerate() {
         specs.push(spec(entity.name, Mode::And, Id::Qid, Entity(i), entity.about));
     }
+    specs.push(spec(
+        "studio",
+        Mode::And,
+        Id::Qid,
+        B,
+        "an iconic studio by its own item (/index/studios.json): a title crediting any item the studio is, \
+         its TV or animation arm included",
+    ));
     specs.push(spec("character", Mode::And, Id::Character, Character, "a character; search-only"));
     specs.push(spec(
         "like",
@@ -1010,6 +1018,26 @@ impl FilterIndex {
             unavailable.extend(den_store::FACET_AXES.iter().copied());
         }
 
+        // The iconic studios (`studios.rs`): each the union of the items it is credited as, known wherever a
+        // company is. A store without the studio sections does not offer the kind.
+        if let (false, Ok(companies)) =
+            (indexes.studios.is_empty(), view.list::<u32>("companies_v", "companies_o"))
+        {
+            open(&mut bits, "studio");
+            for row in 0..rows {
+                let credited = companies.get(den_store::Row(row));
+                if credited.is_empty() {
+                    continue;
+                }
+                if let Some(valued) = bits.get_mut("studio") {
+                    set(&mut valued.known, row);
+                }
+                for studio in indexes.studios.credited(credited) {
+                    add(&mut bits, "studio", studio.id(), row);
+                }
+            }
+        }
+
         // Entity kinds: each section inverted once, shared by the kinds that read it.
         let entity_count = view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
         let mut inverted: HashMap<&'static str, Option<(Arc<Postings>, Bits)>> = HashMap::new();
@@ -1069,6 +1097,12 @@ impl FilterIndex {
     /// Values across the bitset kinds, for the measurement.
     pub fn value_count(&self) -> usize {
         self.bits.values().map(|v| v.values.len()).sum()
+    }
+
+    /// Titles with a card carrying one value of a bitset kind, [films, series]; none for a kind not offered.
+    pub fn typed_count(&self, kind: &str, value: &str) -> [usize; 2] {
+        let Some(bits) = self.bits.get(kind).and_then(|v| v.values.get(value)) else { return [0, 0] };
+        [0, 1].map(|t| and_count(bits, &self.types[t]))
     }
 
     /// The provider- and export-dependent part, rebuilt when either has swapped since it was last built.
@@ -1572,6 +1606,13 @@ impl<'a> Context<'a> {
                 }
             }
         }
+        if spec.name == "studio" {
+            for id in values.keys() {
+                if let Some(studio) = self.indexes.studios.get(id) {
+                    labels.insert(id.clone(), studio.name.clone().into());
+                }
+            }
+        }
         // What the values are counted out of: the selection, or for a one-pick kind with its pick made, the
         // selection without that pick — so `tone.values.comic` may exceed `total`.
         let mut answer = json!({
@@ -1732,12 +1773,15 @@ impl<'a> Context<'a> {
                         self.filter.bits.get(spec.name)
                     };
                     for (value, bits) in valued.map(|v| &v.values).into_iter().flatten() {
-                        // A region is named by its label and found by its label, slug or aliases.
+                        // A region is named by its label and found by its label, slug or aliases; a studio
+                        // by its name.
                         let region = den_index::region(value).filter(|_| spec.name == "region");
-                        let name = region.map_or(value.as_str(), |r| r.label);
+                        let studio = self.indexes.studios.get(value).filter(|_| spec.name == "studio");
+                        let name = region
+                            .map_or_else(|| studio.map_or(value.as_str(), |s| s.name.as_str()), |r| r.label);
                         let matches = match region {
                             Some(r) => [r.label, r.slug].iter().chain(r.aliases).any(|n| words_match(n)),
-                            None => words_match(value),
+                            None => words_match(name),
                         };
                         let n = and_count(&base, bits);
                         if n > 0 && matches {

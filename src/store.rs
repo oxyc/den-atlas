@@ -258,6 +258,15 @@ pub(crate) mod fixture {
         pub died: Option<(i32, u8)>,
     }
 
+    /// One iconic studio: its own item, what a viewer calls it, and every item credited as it — Q-ids, interned
+    /// into the entity table like a title's companies. The `studio_*` sections are written when any is given.
+    #[derive(Clone, Default)]
+    pub(crate) struct Studio<'a> {
+        pub qid: u32,
+        pub name: &'a str,
+        pub items: Vec<u32>,
+    }
+
     impl Entity<'_> {
         fn has_traits(&self) -> bool {
             !self.genders.is_empty()
@@ -347,6 +356,18 @@ pub(crate) mod fixture {
         write_omitting(path, dataset_version, dim, titles, entities, &[]);
     }
 
+    /// `write`, with the iconic studios' sections.
+    pub(crate) fn write_with_studios(
+        path: &std::path::Path,
+        dataset_version: &str,
+        dim: usize,
+        titles: &[Title<'_>],
+        entities: &[Entity<'_>],
+        studios: &[Studio<'_>],
+    ) {
+        write_all(path, dataset_version, dim, titles, entities, studios, &[]);
+    }
+
     /// `write`, without the named sections — for a reader that must tolerate one being dropped.
     pub(crate) fn write_omitting(
         path: &std::path::Path,
@@ -354,6 +375,18 @@ pub(crate) mod fixture {
         dim: usize,
         titles: &[Title<'_>],
         entities: &[Entity<'_>],
+        omit: &'static [&'static str],
+    ) {
+        write_all(path, dataset_version, dim, titles, entities, &[], omit);
+    }
+
+    fn write_all(
+        path: &std::path::Path,
+        dataset_version: &str,
+        dim: usize,
+        titles: &[Title<'_>],
+        entities: &[Entity<'_>],
+        studios: &[Studio<'_>],
         omit: &'static [&'static str],
     ) {
         let mut titles = titles.to_vec();
@@ -391,6 +424,12 @@ pub(crate) mod fixture {
                     named.push(qid);
                     extra.push(format!("Q{qid}"));
                 }
+            }
+        }
+        for &qid in studios.iter().flat_map(|s| &s.items) {
+            if !named.contains(&qid) {
+                named.push(qid);
+                extra.push(format!("Q{qid}"));
             }
         }
         for (qid, name) in named[table.len()..].iter().zip(&extra) {
@@ -647,6 +686,18 @@ pub(crate) mod fixture {
                 );
                 b.u8s(precision, &dates.iter().map(|d| d.map_or(0xFF, |(_, p)| p)).collect::<Vec<u8>>());
             }
+        }
+
+        // The iconic studios, sorted by their own item as den-spec has them; keyed by studio, not by title row.
+        if !studios.is_empty() {
+            let mut studios = studios.to_vec();
+            studios.sort_by_key(|s| s.qid);
+            b.u32s("studio_qid", &studios.iter().map(|s| s.qid).collect::<Vec<u32>>());
+            let names: Vec<u32> = studios.iter().map(|s| b.intern(s.name)).collect();
+            b.u32s("studio_name", &names);
+            let items: Vec<Vec<u32>> =
+                studios.iter().map(|s| s.items.iter().map(|&qid| at(qid)).collect()).collect();
+            b.list("studio_ent_v", "studio_ent_o", &items);
         }
 
         // The rail's own columns. The fixture declares no critique axis and no noul, so the pooled scorer
