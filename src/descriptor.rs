@@ -72,10 +72,24 @@ mod tests {
     use crate::dataset::Meta;
     use std::path::PathBuf;
 
+    /// A one-title store, mapped, for a `Dataset` built by hand. Removed once mapped: the mapping outlives
+    /// the name.
+    fn mapped() -> std::sync::Arc<crate::store::MappedStore> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("den-atlas-desc-bare-{}-{n}.store", std::process::id()));
+        let title = crate::store::fixture::Title { media: 0, tmdb_id: 1, ..Default::default() };
+        crate::store::fixture::write(&path, "v1", 2, &[title], &[]);
+        let mapped = crate::store::MappedStore::open(&path).expect("the fixture maps");
+        let _ = std::fs::remove_file(&path);
+        std::sync::Arc::new(mapped)
+    }
+
     /// The only release shape there is: a store and the facts about it that are not in it.
     fn dataset(signature: Option<&str>) -> Dataset {
         Dataset {
             store: PathBuf::from("den-v1.store"),
+            mapped: mapped(),
             store_rows: 100,
             meta: Meta {
                 dataset_version: "v1".into(),

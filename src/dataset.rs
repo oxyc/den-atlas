@@ -13,9 +13,11 @@
 //! `vectorsFile`, `metadataFile`, the premise pair, `facetsFile`) were served to an app that no longer
 //! fetches them and are gone: no field describes them and no route streams them (#113).
 
+use crate::store::MappedStore;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Deserialize, Clone)]
 pub struct Meta {
@@ -74,6 +76,8 @@ pub struct Dataset {
     pub meta: Meta,
     /// The one artifact the serving path reads (`den-spec wire/store-v1`; never served).
     pub store: PathBuf,
+    /// That store, mapped and verified here, once, for everything in the process that reads it.
+    pub mapped: Arc<MappedStore>,
     /// Titles in that store, from its verified header.
     ///
     /// The only title count anything can check. The manifest's `count` was the LABELLED subset (47,539
@@ -107,13 +111,13 @@ impl Dataset {
             serde_json::from_value(value).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
         meta.sha256 = sha256;
 
-        // Verified here and the mapping dropped, so the row count below is the store's OWN — the one
-        // number about this dataset that has been checked against the bytes rather than claimed by the
-        // manifest.
+        // Verified here, once for the process, so the row count below is the store's OWN — the one number
+        // about this dataset that has been checked against the bytes rather than claimed by the manifest —
+        // and every later reader shares this mapping rather than hashing the file again.
         let store = safe_blob_path(dir, &meta.store_file)?;
-        let store_rows = crate::store::MappedStore::open(&store)
-            .map_err(|e| format!("store {} is unusable: {e}", meta.store_file))?
-            .rows();
+        let mapped =
+            MappedStore::open(&store).map_err(|e| format!("store {} is unusable: {e}", meta.store_file))?;
+        let store_rows = mapped.rows();
         let last_modified = meta.last_modified_http.clone();
         // Writers withdraw the descriptor before replacing the store and publish it last. A load
         // that overlaps that interval must not bind a new store to a descriptor read before it.
@@ -122,7 +126,7 @@ impl Dataset {
         if current_meta.as_ref().ok() != Some(&meta_identity) {
             return Err("dataset changed while loading; retry after the refresh completes".into());
         }
-        Ok(Dataset { meta, store, store_rows, last_modified })
+        Ok(Dataset { meta, store, mapped: Arc::new(mapped), store_rows, last_modified })
     }
 }
 

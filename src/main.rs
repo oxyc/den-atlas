@@ -196,7 +196,7 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
     };
     // The store. This check is what `atlas-dataset-sync` runs against a STAGED generation, so a bad one
     // is refused before it replaces a good one rather than after. `Dataset::load` above already mapped
-    // and verified it; this opens it the way SERVING does, which additionally builds the rail's
+    // and verified it; this reads that mapping the way SERVING does, which additionally builds the rail's
     // aggregates and proves every column the scorer reads.
     //
     // A dataset that declares no store used to be DEGRADED — it served, and merely ranked More Like This
@@ -204,7 +204,7 @@ fn check_dataset(dir: &std::path::Path) -> i32 {
     // read, so a dataset without one has nothing behind any query route and `Dataset::load` refuses it
     // above. DEGRADED now has no way to fire; it is kept only so the exit codes `atlas-dataset-sync`
     // switches on keep their meanings.
-    let loaded = match store::LoadedStore::open(&dataset.store) {
+    let loaded = match store::LoadedStore::of(Arc::clone(&dataset.mapped)) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("check: the dataset declares a store that atlas cannot read: {e}");
@@ -289,11 +289,9 @@ async fn main() {
     // knows, so a client draws first-party art where there is any and keeps metahub for the rest. Read once
     // here rather than through the query indexes, which are released when idle (see `CatalogState::posters`).
     if let Some(ds) = dataset.as_ref() {
-        // Mapped, read and dropped: the map is held for the life of the query indexes, not of the
-        // process, and these are an owned map either way. It used to read the metadata sidecar.
-        match store::MappedStore::open(&ds.store)
-            .and_then(|store| plotrows::posters_from_store(&store.view()))
-        {
+        // Read out of the mapping `Dataset::load` verified, into an owned map. It used to read the
+        // metadata sidecar.
+        match plotrows::posters_from_store(&ds.mapped.view()) {
             Ok(posters) => {
                 eprintln!("catalog posters: {} titles from the store", posters.len());
                 catalog = catalog.with_posters(Arc::new(posters));
@@ -343,7 +341,7 @@ async fn main() {
         .then(|| {
             dataset.as_ref().map(|ds| {
                 tmdb::Tmdb::new(
-                    ds.store.clone(),
+                    Arc::clone(&ds.mapped),
                     cache_dir.as_deref().map(std::path::PathBuf::from),
                     env_opt("TMDB_PROXY"),
                     env_opt("TMDB_DAILY_MAX").and_then(|v| v.parse().ok()).unwrap_or(tmdb::DEFAULT_DAILY_MAX),

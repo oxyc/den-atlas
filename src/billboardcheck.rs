@@ -164,7 +164,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
         eprintln!("billboard-check: CACHE_DIR names no directory of kept TMDB numbers (tmdb-votes.tsv)");
         return 1;
     };
-    let tmdb = match crate::tmdb::Tmdb::new(dataset.store.clone(), Some(cache_dir), None, 0) {
+    let tmdb = match crate::tmdb::Tmdb::new(dataset.mapped.clone(), Some(cache_dir), None, 0) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("billboard-check: {e}");

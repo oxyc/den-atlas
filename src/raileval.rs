@@ -501,7 +501,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     };
     let cache_dir = std::env::var("CACHE_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let characters = match cache_dir {
-        Some(cache_dir) => match crate::tmdb::Tmdb::new(dataset.store.clone(), Some(cache_dir), None, 0) {
+        Some(cache_dir) => match crate::tmdb::Tmdb::new(dataset.mapped.clone(), Some(cache_dir), None, 0) {
             Ok(tmdb) => {
                 eprintln!("{}", tmdb.load().await);
                 Some(tmdb.characters())

@@ -42,6 +42,7 @@
 
 use crate::characters::{self, Characters};
 use crate::ratings::{self, Key, Ratings};
+use crate::store::MappedStore;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -357,8 +358,8 @@ struct Proxy {
 pub struct Tmdb {
     /// `CACHE_DIR`; `None` keeps everything in memory, so a restart starts over.
     dir: Option<PathBuf>,
-    /// The store the numbers are joined onto, by path: opened per build, never held.
-    store: PathBuf,
+    /// The store the numbers are joined onto: the process's one verified mapping (`Dataset::mapped`).
+    store: Arc<MappedStore>,
     kept: Mutex<Kept>,
     state: Mutex<State>,
     proxy: Option<Proxy>,
@@ -369,7 +370,7 @@ pub struct Tmdb {
 impl Tmdb {
     /// `proxy` is den-edge's `/tmdb` base; `None` serves what is kept and asks for nothing.
     pub fn new(
-        store: PathBuf,
+        store: Arc<MappedStore>,
         dir: Option<PathBuf>,
         proxy: Option<String>,
         daily_max: u32,
@@ -447,17 +448,15 @@ impl Tmdb {
                 kept.votes.iter().map(|(&k, v)| (k, (v.average, v.count))).collect();
             (votes, kept.credits.clone())
         };
-        let store = self.store.clone();
+        let store = Arc::clone(&self.store);
         let built = tokio::task::spawn_blocking(move || {
-            let mapped = crate::store::MappedStore::open(&store)?;
-            let view = mapped.view();
+            let view = store.view();
             let ratings = ratings::build(&view, &votes);
             let characters = characters::build(&view, &credits);
-            Ok::<_, String>((ratings, characters, credits.len()))
+            (ratings, characters, credits.len())
         })
         .await
-        .map_err(|e| format!("tmdb build task: {e}"))
-        .and_then(|built| built);
+        .map_err(|e| format!("tmdb build task: {e}"));
         match built {
             Ok((rated, linked, credited)) => {
                 let votes = match rated {
@@ -505,11 +504,11 @@ impl Tmdb {
     /// One refresh. A line for the log.
     async fn tick(&self, now: u64) -> String {
         let Some(proxy) = self.proxy.as_ref() else { return "tmdb: no proxy, nothing asked".to_owned() };
-        let store = self.store.clone();
+        let store = Arc::clone(&self.store);
         let corpus = tokio::task::spawn_blocking(move || corpus_keys(&store)).await;
         let corpus = match corpus {
             Ok(Ok(corpus)) => corpus,
-            Ok(Err(e)) => return format!("tmdb: refresh skipped, the store did not open ({e})"),
+            Ok(Err(e)) => return format!("tmdb: refresh skipped, the store's keys did not read ({e})"),
             Err(e) => return format!("tmdb: refresh skipped ({e})"),
         };
         let (mut budget, previous) = {
@@ -834,9 +833,8 @@ impl Budget {
 }
 
 /// The store's titles, as the keys TMDB's answers are matched against.
-fn corpus_keys(store: &Path) -> Result<HashSet<Key>, String> {
-    let mapped = crate::store::MappedStore::open(store)?;
-    let view = mapped.view();
+fn corpus_keys(store: &MappedStore) -> Result<HashSet<Key>, String> {
+    let view = store.view();
     let keys = view.per_row::<u64>("keys").map_err(|e| e.to_string())?;
     Ok(keys.iter().map(|&packed| (u8::from(packed >> 32 == 1), packed as u32)).collect())
 }
@@ -1066,9 +1064,9 @@ mod tests {
     async fn a_refresh_sweeps_asks_credits_keeps_and_rebuilds() {
         let dir = temp("tick");
         let ds = crate::queries::write_fixture(&dir.join("ds"));
-        let corpus = corpus_keys(&ds.store).unwrap();
+        let corpus = corpus_keys(&ds.mapped).unwrap();
         let (base, asked) = fake_proxy().await;
-        let mut tmdb = Tmdb::new(ds.store.clone(), Some(dir.clone()), Some(base), 1000).unwrap();
+        let mut tmdb = Tmdb::new(ds.mapped.clone(), Some(dir.clone()), Some(base), 1000).unwrap();
         tmdb.proxy.as_mut().unwrap().pace = Duration::ZERO;
         let now = days_from_civil(2026, 9, 22) as u64 * DAY;
 
@@ -1107,7 +1105,7 @@ mod tests {
         let dir = temp("ceiling");
         let ds = crate::queries::write_fixture(&dir.join("ds"));
         let (base, asked) = fake_proxy().await;
-        let mut tmdb = Tmdb::new(ds.store.clone(), Some(dir.clone()), Some(base), 3).unwrap();
+        let mut tmdb = Tmdb::new(ds.mapped.clone(), Some(dir.clone()), Some(base), 3).unwrap();
         tmdb.proxy.as_mut().unwrap().pace = Duration::ZERO;
         let now = days_from_civil(2026, 9, 22) as u64 * DAY;
         let line = tmdb.tick(now).await;
@@ -1132,7 +1130,7 @@ mod tests {
             &HashMap::from([((0, 1), Votes { average: 8.4, count: 9000, fetched: now - DAY })]),
         )
         .unwrap();
-        let tmdb = Tmdb::new(ds.store.clone(), Some(dir.clone()), None, DEFAULT_DAILY_MAX).unwrap();
+        let tmdb = Tmdb::new(ds.mapped.clone(), Some(dir.clone()), None, DEFAULT_DAILY_MAX).unwrap();
         let line = tmdb.load().await;
         assert!(line.contains("vote counts for 1 of 12 store rows"), "{line}");
         assert_eq!(tmdb.ratings().index().and_then(|i| i.of(0)), Some((9000, 8.4)));
