@@ -743,9 +743,9 @@ pub(crate) fn title_json(indexes: &Indexes, key: Key, card: &Card) -> serde_json
     title
 }
 
-/// The most cast members `facts_json` names. Wikidata rarely says who is billed first, so this is a sample of the
-/// credits in the store's order, not a billing.
-const FACTS_CAST: usize = 20;
+/// The most cast members `facts_json` names. Wikidata rarely says who is billed first, so the store's order is no
+/// billing either, and a cut must be high enough to keep the leads: Heat credits 30, its leads past the twentieth.
+const FACTS_CAST: usize = 60;
 
 /// `/index/title/<type>/<id>.json`: one title as the corpus describes it — its card, the labels and plot facets
 /// at the display floor, and the Wikidata facts with its credited people named. `None` when the corpus has no

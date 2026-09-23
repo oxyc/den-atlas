@@ -554,7 +554,7 @@ fn routes() -> Value {
             "returns": "the card /index/row draws, with indexed, labels {primaryGenre, animated, subgenres, moods} \
                         at the display floor, plotFacets {axis: value} at the same floor, and from the facts \
                         countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
-                        (cast at most 20, castTotal all of them)",
+                        (cast at most 60, castTotal all of them)",
         },
         {
             "method": "GET",
