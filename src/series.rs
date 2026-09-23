@@ -238,8 +238,8 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("series.store");
         fixture::write(&path, "v1", 8, &rows, &[]);
-        let store = MappedStore::open(&path).expect("store");
-        let plot = Index::from_store_plot(&store.view()).expect("plot index");
+        let store = std::sync::Arc::new(MappedStore::open(&path).expect("store"));
+        let plot = Index::from_store_plot(&store.view(), store.clone()).expect("plot index");
         let facts = Facts::from_store(&store.view()).expect("facts");
         let strengths = SeriesStrength::from_facts(&plot, &facts);
         std::fs::remove_dir_all(&dir).ok();
@@ -281,9 +281,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("one.store");
         fixture::write(&path, "v1", 8, &[Row { tmdb_id: 99, plot: axis(0, 1), ..Row::default() }], &[]);
-        let store = MappedStore::open(&path).expect("store");
+        let store = std::sync::Arc::new(MappedStore::open(&path).expect("store"));
         std::fs::remove_dir_all(&dir).ok();
-        let plot = Index::from_store_plot(&store.view()).expect("plot index");
+        let plot = Index::from_store_plot(&store.view(), store.clone()).expect("plot index");
         let title = |id: u32, series: &'static [u32]| Title {
             key: (MediaType::Movie, id),
             row: None,
@@ -304,8 +304,8 @@ mod tests {
             eprintln!("SKIP: set DEN_STORE to measure the named series");
             return;
         };
-        let store = MappedStore::open(std::path::Path::new(&path)).expect("store");
-        let plot = Index::from_store_plot(&store.view()).expect("plot index");
+        let store = std::sync::Arc::new(MappedStore::open(std::path::Path::new(&path)).expect("store"));
+        let plot = Index::from_store_plot(&store.view(), store.clone()).expect("plot index");
         let facts = Facts::from_store(&store.view()).expect("facts");
         let started = std::time::Instant::now();
         let s = SeriesStrength::from_facts(&plot, &facts);

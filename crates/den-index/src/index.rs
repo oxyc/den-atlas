@@ -2,10 +2,12 @@
 //! (den-spec `wire/store-v1.md`). The dataset has two spaces — plot and premise — and each is an `Index`;
 //! nothing here mixes them.
 //!
-//! Vectors are held in the layout the old `vectors-*.bin` blob had — a little-endian `[i32 count][i32 dim]`
-//! header, then `count × dim` int8 rows in record order — because every scorer below addresses them that
-//! way. The blob itself is no longer read: [`Index::from_blobs`] is kept only for the tests that hold the
-//! store reader to what the blobs answered.
+//! An index built from the store reads its int8 vectors in place, in the store's `vec_*` section, through
+//! the bytes the caller keeps alive for it ([`StoreBytes`]). An index of its own vectors — the tests' blobs,
+//! and the plot-length-free copy — holds them in the layout the old `vectors-*.bin` blob had: a
+//! little-endian `[i32 count][i32 dim]` header, then `count × dim` rows in record order. The blob itself is
+//! no longer read: [`Index::from_blobs`] is kept only for the tests that hold the store reader to what the
+//! blobs answered.
 
 use crate::MediaType;
 /// Only the blob reader below parses JSON, and only tests call it — so serde is a dev-dependency here
@@ -14,7 +16,7 @@ use crate::MediaType;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// The confidence a label needs to be shown in a row — the tvOS app's `displayConfidenceFloor`. The producer
 /// keeps weaker labels as review material, but a row built from them puts the classifier's least confident
@@ -221,19 +223,60 @@ impl<'a> LabelColumns<'a> {
     }
 }
 
+/// The bytes a store was read out of, held for as long as an index built over them lives, so the index can
+/// read its vectors in place rather than copy them: on the server, the store's one mapping.
+///
+/// A trait, so this crate owns no mapping and knows no file: `memmap2` compiles for neither wasm32 nor tvOS.
+/// A caller that reads the store into memory instead hands over that `Vec`.
+pub trait StoreBytes: Send + Sync {
+    /// Every byte of the store the index's `den_store::Store` view was opened over.
+    fn store_bytes(&self) -> &[u8];
+}
+
+impl StoreBytes for Vec<u8> {
+    fn store_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// An index's int8 vectors, row by row.
+enum Vectors {
+    /// A blob of its own: an `[i32 count][i32 dim]` header, then one row per record in record order. The
+    /// test blobs, and the plot-length-free copy (`without_length`).
+    Owned(Vec<u8>),
+    /// In place, in the store's `vec_*` section: `offset` is where that section starts in `bytes`, and
+    /// `rows[r]` is record `r`'s store row. The section has a row for every title of the store, and the
+    /// index only the ones with a vector.
+    Stored { bytes: Arc<dyn StoreBytes>, offset: usize, rows: Box<[u32]> },
+}
+
+/// The vectors borrowed for a scan: resolved once, then read row by row.
+struct Matrix<'a> {
+    bytes: &'a [u8],
+    rows: Option<&'a [u32]>,
+    dim: usize,
+}
+
+impl<'a> Matrix<'a> {
+    fn row(&self, row: usize) -> &'a [u8] {
+        let at = self.rows.map_or(row, |rows| rows[row] as usize) * self.dim;
+        &self.bytes[at..at + self.dim]
+    }
+}
+
 pub struct Index {
     taxonomy_version: String,
     dim: usize,
-    records: Vec<Record>,
-    names: Vec<Box<str>>,
+    /// The metadata below is shared (`Arc`) with the plot-length-free copy, which differs only in its vectors.
+    records: Arc<[Record]>,
+    names: Arc<[Box<str>]>,
     /// (type, tmdb id) → row. Ids collide across the movie and tv namespaces (1399 is both a movie and Game
     /// of Thrones), so a title is always looked up with its type. The first row wins a duplicate.
-    rows: HashMap<(MediaType, u32), u32>,
-    /// The vectors blob as delivered, header included; row r starts at `HEADER_BYTES + r × dim`.
-    vectors: Vec<u8>,
+    rows: Arc<HashMap<(MediaType, u32), u32>>,
+    vectors: Vectors,
     /// Label → titles carrying it, most confident first (stable, so equal confidences keep record order).
-    subgenres: HashMap<u32, Vec<Entry>>,
-    moods: HashMap<u32, Vec<Entry>>,
+    subgenres: Arc<HashMap<u32, Vec<Entry>>>,
+    moods: Arc<HashMap<u32, Vec<Entry>>>,
     /// The length direction to remove for `without_length`: the plot index's, when its dimension fits;
     /// `None` for the premise index, which is another space.
     length_direction: Option<Box<[f32]>>,
@@ -275,7 +318,7 @@ impl Index {
                 moods,
             });
         }
-        Ok(assemble(artifact.taxonomy_version, dim, records, names, vectors))
+        Ok(assemble(artifact.taxonomy_version, dim, records, names, Vectors::Owned(vectors)))
     }
 
     /// The plot index, out of the store — den-spec `wire/store-v1.md` — instead of the two blobs. Same
@@ -284,8 +327,14 @@ impl Index {
     /// JSON parse for signals the process has already mapped.
     ///
     /// See [`from_store_space`](Index::from_store_space) for what the move has to reconcile.
-    pub fn from_store_plot(store: &den_store::Store<'_>) -> Result<Index, LoadError> {
-        Index::from_store_space(store, Space::Plot)
+    ///
+    /// `bytes` are the bytes `store` was opened over. The vectors are read from them in place for as long
+    /// as the index lives, not copied out of the store.
+    pub fn from_store_plot(
+        store: &den_store::Store<'_>,
+        bytes: Arc<dyn StoreBytes>,
+    ) -> Result<Index, LoadError> {
+        Index::from_store_space(store, bytes, Space::Plot)
     }
 
     /// The premise index, out of the store: `labels-premise.json` + `vectors-premise.bin`, which cover the
@@ -302,8 +351,11 @@ impl Index {
     /// generation this was written against), because the premise labels are the same labelling pass,
     /// restricted to the titles that have a premise vector. So the caller stamps both indexes from the
     /// same manifest field.
-    pub fn from_store_premise(store: &den_store::Store<'_>) -> Result<Index, LoadError> {
-        Index::from_store_space(store, Space::Premise)
+    pub fn from_store_premise(
+        store: &den_store::Store<'_>,
+        bytes: Arc<dyn StoreBytes>,
+    ) -> Result<Index, LoadError> {
+        Index::from_store_space(store, bytes, Space::Premise)
     }
 
     /// One body for both spaces, so the plot and premise paths cannot drift.
@@ -349,7 +401,11 @@ impl Index {
     /// passes); the parity test below bounds it so it cannot grow unnoticed.
     ///
     /// [`with_taxonomy_version`]: Index::with_taxonomy_version
-    fn from_store_space(store: &den_store::Store<'_>, space: Space) -> Result<Index, LoadError> {
+    fn from_store_space(
+        store: &den_store::Store<'_>,
+        bytes: Arc<dyn StoreBytes>,
+        space: Space,
+    ) -> Result<Index, LoadError> {
         let (vector_section, has_section) = space.sections();
         let labelled = |e: den_store::StoreError| LoadError::Labels(e.to_string());
         let vectored = |e: den_store::StoreError| LoadError::Vectors(e.to_string());
@@ -368,6 +424,17 @@ impl Index {
                 keys.len()
             )));
         }
+        // Where the section starts in `bytes`, found by address: `store` must be a view over exactly those
+        // bytes, or every row read later would come from somewhere else.
+        let within = bytes.store_bytes().as_ptr_range();
+        let section = space_vectors.as_ptr_range();
+        let (from, to) = (section.start as usize, section.end as usize);
+        if from < within.start as usize || to > within.end as usize {
+            return Err(LoadError::Vectors(format!(
+                "{vector_section} is not in the bytes the store was read from"
+            )));
+        }
+        let offset = from - within.start as usize;
 
         let mut names: Vec<Box<str>> = Vec::new();
         let mut name_ids: HashMap<String, u32> = HashMap::new();
@@ -379,11 +446,7 @@ impl Index {
         };
         let kept = has_vector.iter().filter(|&&has| has != 0).count();
         let mut records = Vec::with_capacity(kept);
-        let mut vectors = Vec::with_capacity(HEADER_BYTES + kept * dim);
-        // The header the blob carries and every reader of `self.vectors` assumes; the count is written once
-        // the rows are known, and `vector_dimension` below re-reads it rather than trusting this.
-        vectors.extend_from_slice(&0i32.to_le_bytes());
-        vectors.extend_from_slice(&0i32.to_le_bytes());
+        let mut store_rows: Vec<u32> = Vec::with_capacity(kept);
         for (i, &packed) in keys.iter().enumerate() {
             if has_vector[i] == 0 {
                 continue;
@@ -402,15 +465,12 @@ impl Index {
                 subgenres,
                 moods,
             });
-            vectors.extend(space_vectors[i * dim..(i + 1) * dim].iter().map(|&v| v as u8));
+            store_rows.push(
+                u32::try_from(i)
+                    .map_err(|_| LoadError::Vectors(format!("store row {i} does not fit a u32")))?,
+            );
         }
-        let count = i32::try_from(records.len())
-            .map_err(|_| LoadError::Vectors(format!("{} rows do not fit a blob header", records.len())))?;
-        let width = i32::try_from(dim)
-            .map_err(|_| LoadError::Vectors(format!("{dim} dimensions do not fit a blob header")))?;
-        vectors[..4].copy_from_slice(&count.to_le_bytes());
-        vectors[4..8].copy_from_slice(&width.to_le_bytes());
-        let dim = vector_dimension(&vectors, records.len())?;
+        let vectors = Vectors::Stored { bytes, offset, rows: store_rows.into() };
         let mut index = assemble(String::new(), dim, records, names, vectors);
         if matches!(space, Space::Plot) {
             index.length_direction = Some(plot_length_direction()).filter(|d| d.len() == dim);
@@ -445,12 +505,17 @@ impl Index {
         self
     }
 
+    /// The copy's vectors are its own — built here, in atlas's process — while its records, names and label
+    /// buckets are this index's, shared rather than cloned.
     fn with_direction_removed(&self, direction: &[f32]) -> Index {
-        let mut vectors = self.vectors[..HEADER_BYTES].to_vec();
-        vectors.reserve(self.records.len() * self.dim);
+        let mut vectors = Vec::with_capacity(HEADER_BYTES + self.records.len() * self.dim);
+        // `from_blobs`' layout; every length here fits, since the index's own rows and dimension do.
+        vectors.extend_from_slice(&(self.records.len() as i32).to_le_bytes());
+        vectors.extend_from_slice(&(self.dim as i32).to_le_bytes());
+        let matrix = self.matrix();
         let mut unit = vec![0.0f64; self.dim];
         for row in 0..self.records.len() {
-            for (x, &v) in unit.iter_mut().zip(self.row_vector(row)) {
+            for (x, &v) in unit.iter_mut().zip(matrix.row(row)) {
                 *x = f64::from(v as i8);
             }
             let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -467,12 +532,12 @@ impl Index {
         Index {
             taxonomy_version: self.taxonomy_version.clone(),
             dim: self.dim,
-            records: self.records.clone(),
-            names: self.names.clone(),
-            rows: self.rows.clone(),
-            vectors,
-            subgenres: self.subgenres.clone(),
-            moods: self.moods.clone(),
+            records: Arc::clone(&self.records),
+            names: Arc::clone(&self.names),
+            rows: Arc::clone(&self.rows),
+            vectors: Vectors::Owned(vectors),
+            subgenres: Arc::clone(&self.subgenres),
+            moods: Arc::clone(&self.moods),
             length_direction: None,
             without_length: OnceLock::new(),
         }
@@ -516,7 +581,7 @@ impl Index {
     /// an unknown media type do not count as covered: neither can answer a query.
     pub fn primary_genre_counts(&self) -> Vec<(&str, usize)> {
         let mut counts: HashMap<u32, usize> = HashMap::new();
-        for record in &self.records {
+        for record in self.records.iter() {
             if record.media_type.is_some() && !self.name(record.primary_genre).is_empty() {
                 *counts.entry(record.primary_genre).or_default() += 1;
             }
@@ -560,7 +625,7 @@ impl Index {
     pub fn media_type_counts(&self) -> [(MediaType, usize); 2] {
         let mut movie = 0;
         let mut tv = 0;
-        for record in &self.records {
+        for record in self.records.iter() {
             match record.media_type {
                 Some(MediaType::Movie) => movie += 1,
                 Some(MediaType::Tv) => tv += 1,
@@ -752,8 +817,9 @@ impl Index {
     /// sits to the index as a whole.
     pub fn mean_vector(&self) -> Vec<f64> {
         let mut mean = vec![0.0; self.dim];
+        let matrix = self.matrix();
         for row in 0..self.records.len() {
-            for (m, &v) in mean.iter_mut().zip(self.row_vector(row)) {
+            for (m, &v) in mean.iter_mut().zip(matrix.row(row)) {
                 *m += f64::from(v as i8);
             }
         }
@@ -773,8 +839,17 @@ impl Index {
     }
 
     fn row_vector(&self, row: usize) -> &[u8] {
-        let start = HEADER_BYTES + row * self.dim;
-        &self.vectors[start..start + self.dim]
+        self.matrix().row(row)
+    }
+
+    /// The vectors, resolved for reading row by row: a scan resolves them once rather than per row.
+    fn matrix(&self) -> Matrix<'_> {
+        match &self.vectors {
+            Vectors::Owned(blob) => Matrix { bytes: &blob[HEADER_BYTES..], rows: None, dim: self.dim },
+            Vectors::Stored { bytes, offset, rows } => {
+                Matrix { bytes: &bytes.store_bytes()[*offset..], rows: Some(rows), dim: self.dim }
+            }
+        }
     }
 
     fn labels_by_size(&self, buckets: &HashMap<u32, Vec<Entry>>) -> Vec<&str> {
@@ -903,9 +978,10 @@ impl Index {
     }
 
     fn scores(&self, include: impl Fn(usize) -> bool, query: &[u8]) -> Vec<(i32, u32)> {
+        let matrix = self.matrix();
         (0..self.records.len())
             .filter(|&row| include(row))
-            .map(|row| (dot(query, self.row_vector(row)), row as u32))
+            .map(|row| (dot(query, matrix.row(row)), row as u32))
             .collect()
     }
 
@@ -1006,7 +1082,7 @@ fn assemble(
     dim: usize,
     records: Vec<Record>,
     names: Vec<Box<str>>,
-    vectors: Vec<u8>,
+    vectors: Vectors,
 ) -> Index {
     let mut rows = HashMap::with_capacity(records.len());
     for (row, record) in records.iter().enumerate() {
@@ -1019,12 +1095,12 @@ fn assemble(
     Index {
         taxonomy_version,
         dim,
-        records,
-        names,
-        rows,
+        records: records.into(),
+        names: names.into(),
+        rows: Arc::new(rows),
         vectors,
-        subgenres,
-        moods,
+        subgenres: Arc::new(subgenres),
+        moods: Arc::new(moods),
         length_direction: None,
         without_length: OnceLock::new(),
     }
@@ -1049,6 +1125,7 @@ fn buckets(records: &[Record], family: impl Fn(&Record) -> &[(u32, f64)]) -> Has
 }
 
 /// The vectors blob's dimension, checked against its header and the label count — without copying the rows.
+#[cfg(test)]
 fn vector_dimension(blob: &[u8], rows: usize) -> Result<usize, LoadError> {
     let header =
         |at: usize| -> Option<i32> { Some(i32::from_le_bytes(blob.get(at..at + 4)?.try_into().ok()?)) };
@@ -1366,7 +1443,7 @@ pub(crate) mod tests {
             return;
         };
         // `read`, not mmap: `memmap2` compiles for neither wasm32 nor tvOS, and this crate has to.
-        let bytes = std::fs::read(&store_path).expect("read the store");
+        let bytes = Arc::new(std::fs::read(&store_path).expect("read the store"));
         let store = den_store::Store::open(&bytes).expect("open the store");
         let blobs = |labels: &str, vectors: &str| {
             Index::from_blobs(
@@ -1376,11 +1453,11 @@ pub(crate) mod tests {
             .expect("index from the blobs")
         };
         let plot = (
-            Index::from_store_plot(&store).expect("plot from the store"),
+            Index::from_store_plot(&store, bytes.clone()).expect("plot from the store"),
             blobs(&labels_path, &vectors_path),
         );
         let premise = (
-            Index::from_store_premise(&store).expect("premise from the store"),
+            Index::from_store_premise(&store, bytes.clone()).expect("premise from the store"),
             blobs(&premise_labels_path, &premise_vectors_path),
         );
 
