@@ -3235,6 +3235,24 @@ mod tests {
         }
     }
 
+    /// people.json's `order`: a known one answers and names itself, and anything else is a 400 like any other
+    /// parameter the route cannot read.
+    #[tokio::test]
+    async fn filter_people_order_is_checked() {
+        let state = index_state("den-atlas-filter-people-order");
+        let credits = get(&state, "/index/filter/movie/people.json?order=credits").await;
+        assert_eq!(credits.status(), 200);
+        let credits = serde_json::from_str::<serde_json::Value>(&body_of(credits).await).unwrap();
+        assert_eq!(credits["order"], "credits");
+        for path in [
+            "/index/filter/movie/people.json?order=nope",
+            "/index/filter/all/people.json?order=credits,name",
+            "/index/filter/movie/people.json?order=score",
+        ] {
+            assert_eq!(get(&state, path).await.status(), 400, "{path}");
+        }
+    }
+
     /// One kind's values under a selection: a prefix search over names and aliases for people, over label
     /// words for the rest — most titles first, labelled.
     #[tokio::test]

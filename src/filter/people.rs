@@ -1,5 +1,5 @@
 //! `/index/filter/<movie|series|all>/people.json` and `people/counts.json` (oxyc/den#136): the people credited
-//! on the titles a selection matches, filtered by what Wikidata states about them, most matching titles first.
+//! on the titles a selection matches, filtered by what Wikidata states about them, most prominent first.
 //!
 //! # Two lists, one grammar
 //!
@@ -21,6 +21,17 @@
 //! inferred, and unknown is never a match: a person with no gender on record matches no `gender:`, and no
 //! `-gender:` either, since they are not known to lack it. A birth dated only to its century has no decade.
 //! `traitCoverage` says how many of the credited people each applied trait is on record for.
+//!
+//! # Order
+//!
+//! `people.json` ranks by `order` (`ORDERS`), `prominence` by default: how popular a person's biggest matching
+//! titles are. A title weighs its standing in its own type's popularity order (`Context::within_type`, the
+//! share the `all` title order merges the types by), and a person scores their `TOP_TITLES` heaviest. A plain
+//! sum would rank on volume — fifteen titles from the middle of the table over five hits — and a sum of
+//! squares still does at a ratio of four to one; on the real store both kept prolific supporting players
+//! above the stars. The score is a sort key alone, never in the answer: it is read off TMDB's vote counts.
+//! Without a popularity order the weights would be TMDB-id order, so prominence falls back to `credits` and
+//! says so.
 
 use super::{normalise_id, ones, Context, Id, Item, Mode, Request, Scope, Status, ENTITY_KINDS, TOP_K};
 use den_store::{List, PersonDate, PersonTraits, Row};
@@ -97,6 +108,51 @@ const TRAITS: [TraitSpec; 5] = [
     },
 ];
 
+/// `people.json`'s order: `order=<name>`, `prominence` when left out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum Order {
+    #[default]
+    Prominence,
+    Credits,
+    Name,
+    BornAsc,
+    BornDesc,
+}
+
+const ORDERS: [(&str, Order, &str); 5] = [
+    (
+        "prominence",
+        Order::Prominence,
+        "the default: the people whose biggest matching titles are most popular first. Each matching title \
+         weighs one minus its rank in its own type's popularity order over that type's size, and a person \
+         scores the sum of their 5 heaviest, so a few hits outrank many titles from the middle of the table. \
+         Without a popularity order this falls back to credits and names prominence in orderUnavailable",
+    ),
+    ("credits", Order::Credits, "most matching titles first, then most titles in the corpus"),
+    ("name", Order::Name, "by name, folded as search folds names; people with no name last"),
+    (
+        "born_asc",
+        Order::BornAsc,
+        "earliest birth first, as Wikidata dates it; people with no birth on record last",
+    ),
+    ("born_desc", Order::BornDesc, "latest birth first; people with no birth on record last"),
+];
+
+impl Order {
+    pub(super) fn parse(text: &str) -> Result<Order, String> {
+        let text = text.trim().to_ascii_lowercase();
+        ORDERS
+            .iter()
+            .find(|o| o.0 == text)
+            .map(|o| o.1)
+            .ok_or_else(|| format!("order: {text:?} is not one of {}", ORDERS.map(|o| o.0).join(", ")))
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        ORDERS.iter().find(|o| o.1 == self).map_or("", |o| o.0)
+    }
+}
+
 /// The person kinds: the traits a `fails` mask has a bit for.
 const PERSON_KINDS: usize = 4;
 
@@ -162,6 +218,31 @@ struct Tally {
     held: Vec<u8>,
     /// The entities credited at least once, in the order first met.
     touched: Vec<u32>,
+    /// Per entity, its position in `touched`, kept with `top`.
+    at: Vec<u32>,
+    /// Per entity credited, in `touched` order: the `within_type` weights of its `TOP_TITLES` biggest matching
+    /// titles, largest first. Empty unless the order asks for it.
+    top: Vec<[f64; TOP_TITLES]>,
+}
+
+/// How many of a person's matching titles their prominence counts: their biggest, so a few hits outrank many
+/// titles from the middle of the table (`Order::Prominence`).
+const TOP_TITLES: usize = 5;
+
+impl Tally {
+    /// A person's prominence: the sum of their biggest matching titles' weights; 0 when not weighed.
+    fn prominence(&self, e: u32) -> f64 {
+        let at = self.at.get(e as usize).map_or(usize::MAX, |&at| at as usize);
+        self.top.get(at).map_or(0.0, |top| top.iter().sum())
+    }
+}
+
+/// `weight` into a person's biggest titles, if it is one of them.
+fn keep_top(top: &mut [f64; TOP_TITLES], weight: f64) {
+    if let Some(at) = top.iter().position(|&w| weight > w) {
+        top.copy_within(at..TOP_TITLES - 1, at + 1);
+        top[at] = weight;
+    }
 }
 
 /// The decade a birth falls in, when it is dated finely enough to have one.
@@ -288,10 +369,16 @@ impl<'a> Context<'a> {
     }
 
     /// Every person credited on the rows of `base`, counting a title for them when their credits on it hold
-    /// every role of `want` and none of `avoid`.
-    fn tally(&self, sources: &Sources<'a>, base: &[u64], want: u8, avoid: u8) -> Tally {
+    /// every role of `want` and none of `avoid` — and, with `weigh`, adding its weight to their prominence.
+    fn tally(&self, sources: &Sources<'a>, base: &[u64], want: u8, avoid: u8, weigh: bool) -> Tally {
         let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
-        let mut tally = Tally { credits: vec![0; size], held: vec![0; size], touched: Vec::new() };
+        let mut tally = Tally {
+            credits: vec![0; size],
+            held: vec![0; size],
+            touched: Vec::new(),
+            at: if weigh { vec![0; size] } else { Vec::new() },
+            top: Vec::new(),
+        };
         let mut on_row = vec![0u8; size];
         let mut credited: Vec<u32> = Vec::new();
         let lists = [
@@ -302,6 +389,7 @@ impl<'a> Context<'a> {
             (&sources.creators, CREATOR),
         ];
         for row in ones(base) {
+            let weight = if weigh { self.within_type(row) } else { 0.0 };
             credited.clear();
             for &(list, role) in &lists {
                 for &e in list.get(Row(row)) {
@@ -320,10 +408,17 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 if tally.credits[e] == 0 {
+                    if weigh {
+                        tally.at[e] = tally.touched.len() as u32;
+                        tally.top.push([0.0; TOP_TITLES]);
+                    }
                     tally.touched.push(e as u32);
                 }
                 tally.credits[e] += 1;
                 tally.held[e] |= roles;
+                if weigh {
+                    keep_top(&mut tally.top[tally.at[e] as usize], weight);
+                }
             }
         }
         tally
@@ -352,13 +447,13 @@ impl<'a> Context<'a> {
             .fold(0, |fails, a| fails | a.bit)
     }
 
-    /// The title selection, the traits, and who is credited under them.
-    fn people_of<'r>(&self, request: &'r Request) -> People<'a, 'r> {
+    /// The title selection, the traits, and who is credited under them; with `weigh`, how prominently.
+    fn people_of<'r>(&self, request: &'r Request, weigh: bool) -> People<'a, 'r> {
         let (applied, ignored) = self.split(&request.items);
         let base = self.matched(&applied, None);
         let sources = self.sources();
         let split = self.split_traits(&sources, &request.traits);
-        let tally = self.tally(&sources, &base, split.want, split.avoid);
+        let tally = self.tally(&sources, &base, split.want, split.avoid, weigh);
         let mut envelope = json!({ "coverage": self.coverage(&applied) });
         let mut degraded = self.envelope(&mut envelope, &applied, ignored);
         if !split.ignored.is_empty() {
@@ -379,7 +474,7 @@ impl<'a> Context<'a> {
     /// other traits holding it — a one-pick kind (gender, born) counted without its own pick, as
     /// `counts.json` counts a one-pick kind.
     pub fn people_counts(&self, request: &Request) -> (Value, bool) {
-        let people = self.people_of(request);
+        let people = self.people_of(request, false);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let mut values: [HashMap<i64, u32>; PERSON_KINDS] = Default::default();
         let mut roles = [0u32; 4];
@@ -512,49 +607,87 @@ impl<'a> Context<'a> {
         answer
     }
 
-    /// `people.json`: the people credited on the matching titles and holding every trait, most matching titles
-    /// first, then most titles in the whole corpus, then by Q-id; paged as `titles.json` is.
+    /// `people.json`: the people credited on the matching titles and holding every trait, in the request's
+    /// `order` (`ORDERS`); paged as `titles.json` is. Ties fall to the `credits` order — most matching titles,
+    /// then most titles in the whole corpus — then the Q-id; `name` ties go straight to the Q-id. `order` in
+    /// the answer names the order used: `prominence` needs a popularity order, and without one the answer is
+    /// in `credits` and names the order it could not use in `orderUnavailable`.
     pub fn people(&self, request: &Request) -> (Value, bool) {
-        let people = self.people_of(request);
+        let order = match request.order {
+            Order::Prominence if !self.popular() => Order::Credits,
+            order => order,
+        };
+        let people = self.people_of(request, order == Order::Prominence);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let corpus = ENTITY_KINDS
             .iter()
             .position(|k| k.name == "person")
             .and_then(|i| self.filter.entities[i].as_ref());
         let qids = self.view.column::<u32>("ent_qid").unwrap_or(&[]);
-        // (credits, titles in the corpus, Q-id, entity)
-        let mut ranked: Vec<(u32, usize, u32, u32)> = tally
+        let mut ranked: Vec<Ranked> = tally
             .touched
             .iter()
             .filter(|&&e| self.fails(sources, &split.applied, e) == 0)
-            .map(|&e| {
-                let titles = corpus.map_or(0, |k| k.titles(e));
-                (tally.credits[e as usize], titles, qids.get(e as usize).copied().unwrap_or(0), e)
+            .map(|&e| Ranked {
+                e,
+                credits: tally.credits[e as usize],
+                titles: corpus.map_or(0, |k| k.titles(e)),
+                qid: qids.get(e as usize).copied().unwrap_or(0),
+                prominence: tally.prominence(e),
+                born: match order {
+                    Order::BornAsc | Order::BornDesc => sources.traits.born(e).map(|d| d.days),
+                    _ => None,
+                },
+                name: match order {
+                    Order::Name => self.label(e).map(crate::facts::name_key),
+                    _ => None,
+                },
             })
             .collect();
         let total = ranked.len();
-        let order = |a: &(u32, usize, u32, u32), b: &(u32, usize, u32, u32)| {
-            b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2))
+        let compare = |a: &Ranked, b: &Ranked| {
+            let tie = || b.credits.cmp(&a.credits).then(b.titles.cmp(&a.titles)).then(a.qid.cmp(&b.qid));
+            // Nothing on record sorts last, whichever way the order runs.
+            let last = |a: bool, b: bool| a.cmp(&b);
+            match order {
+                Order::Prominence => b.prominence.total_cmp(&a.prominence).then_with(tie),
+                Order::Credits => tie(),
+                Order::Name => last(a.name.is_none(), b.name.is_none())
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then(a.qid.cmp(&b.qid)),
+                Order::BornAsc => {
+                    last(a.born.is_none(), b.born.is_none()).then(a.born.cmp(&b.born)).then_with(tie)
+                }
+                Order::BornDesc => {
+                    last(a.born.is_none(), b.born.is_none()).then(b.born.cmp(&a.born)).then_with(tie)
+                }
+            }
         };
         let end = request.skip.saturating_add(request.limit);
         if end < ranked.len() {
-            ranked.select_nth_unstable_by(end, order);
+            ranked.select_nth_unstable_by(end, compare);
             ranked.truncate(end);
         }
-        ranked.sort_unstable_by(order);
+        ranked.sort_unstable_by(compare);
         let mut labels = Map::new();
         let page: Vec<Value> = ranked
             .iter()
             .skip(request.skip)
-            .map(|&(credits, _, _, e)| {
-                self.person_json(sources, e, credits, tally.held[e as usize], &mut labels)
-            })
+            .map(|r| self.person_json(sources, r.e, r.credits, tally.held[r.e as usize], &mut labels))
             .collect();
         let mut answer = people.envelope;
+        let mut degraded = people.degraded;
+        answer["order"] = json!(order.name());
+        if order != request.order {
+            answer["orderUnavailable"] = json!(request.order.name());
+            // A ratings provider that has not filled in yet is a passing failure; a deployment without one
+            // answers this way for good.
+            degraded |= self.indexes.ratings.is_some();
+        }
         answer["people"] = json!(page);
         answer["total"] = json!(total);
         answer["labels"] = Value::Object(labels);
-        (answer, people.degraded)
+        (answer, degraded)
     }
 
     /// One person as `people.json` lists them; the trait ids they carry are labelled in `labels`.
@@ -604,6 +737,19 @@ impl<'a> Context<'a> {
     }
 }
 
+/// A person as `people.json` ranks them: what each order reads.
+struct Ranked {
+    e: u32,
+    credits: u32,
+    /// Titles crediting them in the whole corpus.
+    titles: usize,
+    qid: u32,
+    prominence: f64,
+    /// Read for the birth orders alone, as for the name order `name`.
+    born: Option<i32>,
+    name: Option<String>,
+}
+
 /// A people request worked out: who is credited, and the envelope every answer carries.
 struct People<'a, 'r> {
     sources: Sources<'a>,
@@ -630,8 +776,12 @@ pub(super) fn schema() -> Value {
             (t.name.to_owned(), about)
         })
         .collect();
+    let orders: Map<String, Value> = ORDERS.iter().map(|o| (o.0.to_owned(), json!(o.2))).collect();
     json!({
         "kinds": kinds,
+        "orders": orders,
+        "defaultOrder": Order::default().name(),
+        "orderTies": "most matching titles, then most titles in the corpus, then Q-id; under name, the Q-id",
         "about": "people.json and people/counts.json take the title selection as sel, and the person traits as \
                   traits in the same [-]<kind>:<id> grammar and canonical order. A person matches a trait only \
                   when it is on record for them: unknown matches neither a value nor its exclusion. Gender, \
@@ -740,10 +890,14 @@ mod tests {
             label(DIRECTOR_JOB, "film director"),
             label(SCREENWRITER, "screenwriter"),
         ];
+        load(name, &titles, &entities)
+    }
+
+    fn load(name: &str, titles: &[Title], entities: &[Entity]) -> Indexes {
         let dir = std::env::temp_dir().join(format!("den-atlas-people-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &entities);
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, titles, entities);
         let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
                            "quantization": "int8", "storeFile": "den-v1.store" });
         std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
@@ -877,11 +1031,11 @@ mod tests {
         assert_eq!((&grip["total"], &grip["unknownTraits"]), (&0.into(), &json!(["role:grip"])));
     }
 
-    /// Ranked by matching titles, then titles in the whole corpus, then Q-id; paged as titles.json is.
+    /// `credits`: ranked by matching titles, then titles in the whole corpus, then Q-id; paged as titles.json is.
     #[test]
     fn people_are_ranked_and_paged() {
         let indexes = people_store("paged");
-        let all = ask(&indexes, Scope::All, Route::People, "");
+        let all = ask(&indexes, Scope::All, Route::People, "order=credits");
         assert_eq!(
             names(&all),
             named(&[("Bob", 3), ("Cid", 3), ("Ann", 2), ("Dee", 1), ("Eve", 1)]),
@@ -889,13 +1043,130 @@ mod tests {
         );
         let mut paged = Vec::new();
         for skip in 0..5 {
-            let page = ask(&indexes, Scope::All, Route::People, &format!("skip={skip}&limit=1"));
+            let page =
+                ask(&indexes, Scope::All, Route::People, &format!("order=credits&skip={skip}&limit=1"));
             assert_eq!(page["total"], 5);
             paged.extend(names(&page));
         }
         assert_eq!(paged, names(&all));
         let both = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300,citizenship:Q301");
         assert_eq!(names(&both), named(&[("Bob", 3)]), "citizenship holds several at once");
+    }
+
+    /// Twenty films, film i (TMDB id i + 1) at rank i in the popularity order when `popular`, so it weighs
+    /// 1 − i/20; without, every vote count is 0 and the order is by TMDB id alone. Synthetic numbers.
+    ///
+    /// - Zed (501): cast in films 0–4, the five biggest (weights 1 … 0.8: top five 4.5, sum 4.5). Born 1 May
+    ///   1990.
+    /// - Amy (502): cast in films 5–19, fifteen from the middle down (0.75 … 0.05: top five 3.25, sum 6).
+    ///   Born 1950 (year precision).
+    /// - Mo (503): cast in films 0 and 10 (1 + 0.5). No birth on record.
+    /// - Ängel (504): cast in film 19 (0.05). Born in the 1970s (decade precision).
+    ///
+    /// A plain sum would put Amy first on volume; prominence puts Zed's hits first.
+    fn orders_store(name: &str, popular: bool) -> Indexes {
+        let cast = |i: u32| -> Vec<u32> {
+            [(501, i < 5), (502, i >= 5), (503, i == 0 || i == 10), (504, i == 19)]
+                .into_iter()
+                .filter(|&(_, on)| on)
+                .map(|(qid, _)| qid)
+                .collect()
+        };
+        let titles: Vec<Title> = (0..20)
+            .map(|i| Title {
+                tmdb_id: i + 1,
+                primary_genre: "Drama",
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A title", None, Some(2020))),
+                votes: if popular { 1000 - 10 * i } else { 0 },
+                cast: cast(i),
+                ..Title::default()
+            })
+            .collect();
+        let entities = [
+            Entity { qid: 501, name: "Zed", born: Some((days(1990, 5, 1), 0)), ..Entity::default() },
+            Entity { qid: 502, name: "Amy", born: Some((days(1950, 1, 1), 2)), ..Entity::default() },
+            Entity { qid: 503, name: "Mo", ..Entity::default() },
+            Entity { qid: 504, name: "Ängel", born: Some((days(1970, 1, 1), 3)), ..Entity::default() },
+        ];
+        load(name, &titles, &entities)
+    }
+
+    fn order_of(answer: &Value) -> Vec<String> {
+        names(answer).into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// Every order ranks as it says, pages stably, and names itself in `order`.
+    #[test]
+    fn each_order_ranks_as_it_says() {
+        let indexes = orders_store("orders", true);
+        for (query, expected) in [
+            ("", ["Zed", "Amy", "Mo", "Ängel"]),
+            ("order=prominence", ["Zed", "Amy", "Mo", "Ängel"]),
+            ("order=credits", ["Amy", "Zed", "Mo", "Ängel"]),
+            // Folded as search folds names: Ängel is read as angel, not after z.
+            ("order=name", ["Amy", "Ängel", "Mo", "Zed"]),
+            // Mo has no birth on record, and is last whichever way the order runs.
+            ("order=born_asc", ["Amy", "Ängel", "Zed", "Mo"]),
+            ("order=born_desc", ["Zed", "Ängel", "Amy", "Mo"]),
+        ] {
+            let answer = ask(&indexes, Movie, Route::People, query);
+            assert_eq!(order_of(&answer), expected, "{query}");
+            let name = query.strip_prefix("order=").unwrap_or("prominence");
+            assert_eq!(answer["order"], name, "{query}");
+            assert!(answer.get("orderUnavailable").is_none(), "{answer}");
+            assert!(answer["people"][0].get("prominence").is_none(), "no score is published");
+            let mut paged = Vec::new();
+            for skip in 0..4 {
+                let sep = if query.is_empty() { "" } else { "&" };
+                let page = ask(&indexes, Movie, Route::People, &format!("{query}{sep}skip={skip}&limit=1"));
+                paged.extend(order_of(&page));
+            }
+            assert_eq!(paged, expected, "{query}, a page at a time");
+        }
+    }
+
+    /// Prominence counts a person's biggest titles, not how many they have: five hits outrank fifteen titles
+    /// from the middle of the table, which a plain sum of the weights (6 against 4.5) would put first.
+    #[test]
+    fn prominence_is_top_heavy() {
+        let indexes = orders_store("top-heavy", true);
+        let context = Context::new(&indexes, Movie, None);
+        let request = Request::parse(Route::People, Movie.into(), "").unwrap();
+        let people = context.people_of(&request, true);
+        let tally = &people.tally;
+        let entity = |qid: &str| context.entity_of(qid).unwrap();
+        let (zed, amy) = (entity("Q501"), entity("Q502"));
+        assert!((tally.prominence(zed) - 4.5).abs() < 1e-9, "{}", tally.prominence(zed));
+        assert!((tally.prominence(amy) - 3.25).abs() < 1e-9, "{}", tally.prominence(amy));
+        let answer = ask(&indexes, Movie, Route::People, "");
+        assert_eq!(order_of(&answer)[..2], ["Zed", "Amy"]);
+    }
+
+    /// With no popularity order — no title has a vote count, and the type's order is by TMDB id alone —
+    /// prominence is not ranked on that order, which would weigh the lowest ids as hits: the answer is in
+    /// credits and says so, asked for or by default.
+    #[test]
+    fn prominence_without_popularity_falls_back_to_credits() {
+        let indexes = orders_store("unpopular", false);
+        for query in ["", "order=prominence"] {
+            let (answer, degraded) = Context::new(&indexes, Movie, None)
+                .people(&Request::parse(Route::People, Movie.into(), query).unwrap());
+            assert_eq!(order_of(&answer), ["Amy", "Zed", "Mo", "Ängel"], "{query}: {answer}");
+            assert_eq!(
+                (&answer["order"], &answer["orderUnavailable"]),
+                (&json!("credits"), &json!("prominence"))
+            );
+            assert!(
+                !degraded,
+                "no ratings provider here: a property of the deployment, not a passing failure"
+            );
+        }
+        let credits = ask(&indexes, Movie, Route::People, "order=credits");
+        assert!(credits.get("orderUnavailable").is_none(), "credits was what it asked for");
+        let named = ask(&indexes, Movie, Route::People, "order=name");
+        assert_eq!(order_of(&named), ["Amy", "Ängel", "Mo", "Zed"], "the other orders need no popularity");
     }
 
     /// A store with no trait sections answers the credits and roles, and names the person traits it cannot
@@ -913,6 +1184,55 @@ mod tests {
         let counts = ask(&indexes, Movie, Route::PeopleCounts, "");
         assert!(counts["traits"].get("gender").is_none(), "{counts}");
         assert_eq!(counts["traits"]["role"]["values"], json!({ "cast": 2 }), "makers are not split here");
+    }
+
+    /// The people orders over the REAL corpus: the first ten in `credits` and in `prominence`, and what
+    /// prominence costs. Opt-in: `DEN_STORE` names a store whose directory holds its `dataset.meta.json`, and
+    /// `CACHE_DIR` a directory of kept TMDB numbers (`tmdb-votes.tsv`) for the popularity order; without it
+    /// the answers fall back to `credits`.
+    #[test]
+    fn real_corpus_people_orders() {
+        let Ok(store) = std::env::var("DEN_STORE") else {
+            eprintln!("SKIP: set DEN_STORE to a real den-<ver>.store to measure this");
+            return;
+        };
+        let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
+        let ds = crate::dataset::Dataset::load(dir).expect("the dataset loads");
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let tmdb = std::env::var("CACHE_DIR").ok().map(|kept| {
+            let tmdb = crate::tmdb::Tmdb::new(ds.store.clone(), Some(kept.into()), None, 0).unwrap();
+            eprintln!("{}", runtime.block_on(tmdb.load()));
+            tmdb
+        });
+        let (indexes, _) = runtime
+            .block_on(
+                crate::queries::IndexQueries::new(&ds)
+                    .with_ratings(tmdb.as_ref().map(|t| t.ratings()))
+                    .get(|| ()),
+            )
+            .expect("the indexes load");
+        for (scope, query) in [
+            (Scope::from(Movie), "sel=decade:2020&traits=gender:Q6581097,role:cast"),
+            (Scope::All, "traits=citizenship:Q34,role:director"),
+            (Scope::All, "traits=role:director"),
+        ] {
+            let context = Context::new(&indexes, scope, None);
+            for order in ["credits", "prominence"] {
+                let request =
+                    Request::parse(Route::People, scope, &format!("{query}&order={order}")).unwrap();
+                let started = std::time::Instant::now();
+                let (answer, _) = context.people(&request);
+                let took = started.elapsed();
+                let first: Vec<String> = answer["people"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .take(10)
+                    .map(|p| format!("{} ({})", p["name"].as_str().unwrap_or("?"), p["credits"]))
+                    .collect();
+                eprintln!("{query} order={order} → {} in {took:?}: {}", answer["order"], first.join(" | "));
+            }
+        }
     }
 
     /// The people routes over the REAL corpus, and what they cost. Opt-in: `DEN_STORE` names a store whose

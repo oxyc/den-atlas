@@ -1,5 +1,5 @@
 {
-  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
+  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it; people.json's `order` follows `traits`, lowercased, and is left out when it is the default, `prominence`. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
   "cases": [
     { "url": "/index/filter/movie/counts.json", "canonical": "/index/filter/movie/counts.json" },
     { "url": "/index/filter/movie/counts.json?sel=", "canonical": "/index/filter/movie/counts.json" },
@@ -47,7 +47,14 @@
     { "url": "/index/filter/all/people.json?limit=40&skip=40&traits=Role:Director", "canonical": "/index/filter/all/people.json?traits=role:director&skip=40&limit=40" },
     { "url": "/index/filter/all/people.json?traits=born:1974,occupation:33999", "canonical": "/index/filter/all/people.json?traits=born:1970,occupation:Q33999" },
     { "url": "/index/filter/series/people/counts.json?sel=genre:18&limit=10&skip=0", "canonical": "/index/filter/series/people/counts.json?sel=genre:18" },
-    { "url": "/index/filter/all/people/counts.json?traits=role:cast", "canonical": "/index/filter/all/people/counts.json?traits=role:cast" }
+    { "url": "/index/filter/all/people/counts.json?traits=role:cast", "canonical": "/index/filter/all/people/counts.json?traits=role:cast" },
+    { "url": "/index/filter/movie/people.json?order=prominence", "canonical": "/index/filter/movie/people.json" },
+    { "url": "/index/filter/movie/people.json?order=", "canonical": "/index/filter/movie/people.json" },
+    { "url": "/index/filter/movie/people.json?order=name&sel=decade:2020", "canonical": "/index/filter/movie/people.json?sel=decade:2020&order=name" },
+    { "url": "/index/filter/all/people.json?limit=40&order=Born_Desc&skip=40&traits=role:director", "canonical": "/index/filter/all/people.json?traits=role:director&order=born_desc&skip=40&limit=40" },
+    { "url": "/index/filter/series/people.json?order=credits", "canonical": "/index/filter/series/people.json?order=credits" },
+    { "url": "/index/filter/all/people/counts.json?traits=role:cast&order=name", "canonical": "/index/filter/all/people/counts.json?traits=role:cast" },
+    { "url": "/index/filter/movie/titles.json?order=name", "canonical": "/index/filter/movie/titles.json" }
   ],
   "refused": [
     "/index/filter/movie/counts.json?sel=genre:action",
@@ -66,6 +73,8 @@
     "/index/filter/movie/people.json?traits=gender:male",
     "/index/filter/movie/people.json?traits=born:1970s",
     "/index/filter/movie/people.json?traits=role",
-    "/index/filter/movie/people.json?skip=10&limit=24"
+    "/index/filter/movie/people.json?skip=10&limit=24",
+    "/index/filter/movie/people.json?order=popularity",
+    "/index/filter/movie/people.json?order=credits,name"
   ]
 }
