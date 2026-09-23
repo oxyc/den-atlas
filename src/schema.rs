@@ -543,6 +543,21 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/index/title/{type}/{tmdbId}.json",
+            "example": "/index/title/movie/1.json",
+            "about": "One title as the corpus describes it. A title with no card is {type, id, indexed: false}: \
+                      Den has nothing on it, which does not mean it does not exist.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+            ],
+            "returns": "the card /index/row draws, with indexed, labels {primaryGenre, animated, subgenres, moods} \
+                        at the display floor, plotFacets {axis: value} at the same floor, and from the facts \
+                        countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
+                        (cast at most 20, castTotal all of them)",
+        },
+        {
+            "method": "GET",
             "path": "/index/search.json",
             "example": "/index/search.json?q=heist",
             "about": "Semantic search alone: the plot vectors nearest to the query. 503 without the embedder.",

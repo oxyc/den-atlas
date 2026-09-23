@@ -743,6 +743,80 @@ pub(crate) fn title_json(indexes: &Indexes, key: Key, card: &Card) -> serde_json
     title
 }
 
+/// The most cast members `facts_json` names. Wikidata rarely says who is billed first, so this is a sample of the
+/// credits in the store's order, not a billing.
+const FACTS_CAST: usize = 20;
+
+/// `/index/title/<type>/<id>.json`: one title as the corpus describes it — its card, the labels and plot facets
+/// at the display floor, and the Wikidata facts with its credited people named. `None` when the corpus has no
+/// card for it, which means Den does not index it, not that it does not exist.
+pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Value> {
+    let (media_type, id) = key;
+    let card = indexes.cards.as_ref()?.get(&key)?;
+    let mut title = title_json(indexes, key, card);
+    if let Some(labels) = indexes.plot.labels(id, media_type) {
+        let shown = |pairs: &[(&str, f64)]| -> Vec<String> {
+            pairs.iter().filter(|(_, c)| *c >= LABEL_FLOOR).map(|(name, _)| (*name).to_owned()).collect()
+        };
+        title["labels"] = serde_json::json!({
+            "primaryGenre": labels.primary_genre,
+            "animated": labels.animated,
+            "subgenres": shown(&labels.subgenres),
+            "moods": shown(&labels.moods),
+        });
+    }
+    let store = indexes.store.view();
+    let media = u8::from(media_type == MediaType::Tv);
+    if let (Ok(Some(row)), Ok(values), Ok(confs), Ok(strings)) = (
+        store.row_of(media, id),
+        store.column::<u32>("facet_v"),
+        store.column::<u8>("facet_c"),
+        store.strings(),
+    ) {
+        let floor = (FACET_FLOOR * 100.0).round() as u8;
+        let axes = den_store::FACET_AXES.len();
+        let facets: serde_json::Map<String, serde_json::Value> = den_store::FACET_AXES
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, name)| {
+                let at = row.0 * axes + axis;
+                let (value, conf) = (*values.get(at)?, *confs.get(at)?);
+                (value != den_store::NONE_U32 && conf >= floor)
+                    .then(|| strings.get(value))
+                    .flatten()
+                    .map(|v| ((*name).to_owned(), serde_json::json!(v)))
+            })
+            .collect();
+        title["plotFacets"] = serde_json::Value::Object(facets);
+    }
+    if let Some(facts) = indexes.facts.as_ref() {
+        if let Some(record) = facts.get(id, media_type) {
+            let people = |qids: &[u32], cap: usize| -> Vec<serde_json::Value> {
+                qids.iter()
+                    .take(cap)
+                    .filter_map(|&qid| {
+                        let person = facts.person(qid)?;
+                        let mut out = serde_json::json!({ "id": format!("Q{qid}"), "name": person.name });
+                        if let Some(tmdb) = person.tmdb_id {
+                            out["tmdbId"] = serde_json::json!(tmdb);
+                        }
+                        Some(out)
+                    })
+                    .collect()
+            };
+            let code = |c: &[u8; 2]| String::from_utf8_lossy(c).into_owned();
+            title["countries"] = serde_json::json!(record.countries.iter().map(code).collect::<Vec<_>>());
+            title["languages"] = serde_json::json!(record.languages.iter().map(code).collect::<Vec<_>>());
+            title["runtimeMinutes"] = serde_json::json!(record.runtime_minutes);
+            title["basedOn"] = serde_json::json!(crate::facts::SourceKinds::names(record.source_kinds.raw()));
+            title["makers"] = serde_json::json!(people(&record.makers, usize::MAX));
+            title["cast"] = serde_json::json!(people(&record.cast, FACTS_CAST));
+            title["castTotal"] = serde_json::json!(record.cast.len());
+        }
+    }
+    Some(title)
+}
+
 /// The confidence a label row needs (the label rows' own floor).
 const LABEL_FLOOR: f64 = den_index::DISPLAY_CONFIDENCE_FLOOR;
 
