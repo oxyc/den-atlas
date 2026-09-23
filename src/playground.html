@@ -10,16 +10,21 @@
     --bg: #f6f5f3; --panel: #ffffff; --text: #1c1917; --muted: #655f5a; --line: #e2dfdb;
     --accent: #2458d6; --accent-text: #ffffff; --accent-soft: #e3ebfc; --up: #137a39; --down: #b42318;
     --changed: #fff3d1; --changed-line: #d9a514; --shadow: 0 1px 2px rgb(0 0 0 / .06);
+    --card: #e7e4e0; --dock-shadow: 0 -6px 24px rgb(0 0 0 / .12);
+    /* The results dock's height; the script sets it from the drag handle and what was saved. */
+    --dock-h: 45vh;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #141312; --panel: #1f1d1b; --text: #f3f1ee; --muted: #aaa39d; --line: #3a3633;
       --accent: #86aefc; --accent-text: #0d1422; --accent-soft: #1d2a45; --up: #5bd98a; --down: #f58a80;
       --changed: #3a2f12; --changed-line: #c9961a; --shadow: none;
+      --card: #2b2826; --dock-shadow: 0 -6px 24px rgb(0 0 0 / .5);
     }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text);
+  /* The padding keeps the end of the page scrollable above the results dock. */
+  body { margin: 0; background: var(--bg); color: var(--text); padding-bottom: var(--dock-h);
          font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   h1 { font-size: 22px; margin: 0; }
   h2 { font-size: 18px; margin: 0; }
@@ -74,7 +79,8 @@
     /* Settings run beside both the results and the end section, so the sticky column never covers it. */
     #settings { grid-column: 2; grid-row: 2 / span 2; }
     #end { grid-column: 1; }
-    #settings { position: sticky; top: 72px; max-height: calc(100vh - 88px); overflow-y: auto; align-self: start; }
+    #settings { position: sticky; top: 72px; max-height: calc(100vh - 88px - var(--dock-h)); overflow-y: auto;
+                align-self: start; }
   }
 
   /* Chips: the titles ranked, watched titles, filters. */
@@ -103,29 +109,75 @@
   .combo .t { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .combo .m { color: var(--muted); font-size: 13px; white-space: nowrap; }
 
-  /* One card per title ranked. */
-  .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
-  .card { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--bg); min-width: 0; }
-  .card > * + * { margin-top: 8px; }
-  .card h3 { overflow-wrap: anywhere; }
-  .card .sub { color: var(--muted); font-size: 13px; }
-  .card.busy ol, .card.busy .sub { opacity: .55; }
-  .card .state { font-size: 14px; }
-  .card .state.error { background: color-mix(in srgb, var(--down) 12%, transparent); border-radius: 8px;
+  /* The results dock: fixed to the bottom of the viewport, as tall as its top edge is dragged, so the
+     settings above can be moved while the posters below re-rank. */
+  #dock { position: fixed; left: 0; right: 0; bottom: 0; z-index: 4; height: var(--dock-h); display: flex;
+          flex-direction: column; background: var(--panel); border-top: 1px solid var(--line);
+          box-shadow: var(--dock-shadow); }
+  #dock-grip { position: absolute; left: 0; right: 0; top: -12px; height: 24px; cursor: ns-resize;
+               touch-action: none; display: grid; place-items: center; }
+  #dock-grip::before { content: ""; width: 44px; height: 5px; border-radius: 3px; background: var(--muted);
+                       opacity: .6; }
+  #dock-grip:hover::before, #dock-grip:focus-visible::before, #dock-grip.dragging::before { opacity: 1;
+                       background: var(--accent); }
+  #dock-grip:focus-visible { outline-offset: -4px; }
+  .dock-head { max-width: 1440px; width: 100%; margin: 0 auto; padding: 10px 16px 6px; display: flex;
+               gap: 4px 12px; align-items: center; flex-wrap: wrap; }
+  .dock-head h2 { margin-right: auto; }
+  .dock-head select { min-height: 36px; padding: 4px 8px; }
+  #dock-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+  .dock-inner, #cards { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); }
+  .dock-inner { max-width: 1440px; margin: 0 auto; padding: 4px 16px 16px; }
+
+  /* A poster row, in Den Web's look (PosterRow/PosterCard) at a smaller size. */
+  .prow { min-width: 0; }
+  .prow > * + * { margin-top: 8px; }
+  .prow-head { display: flex; gap: 2px 10px; align-items: baseline; flex-wrap: wrap; }
+  .prow-head h3 { overflow-wrap: anywhere; }
+  .prow-head small, .detail h4 small { color: var(--muted); font-weight: 400; }
+  .prow .sub { color: var(--muted); font-size: 13px; }
+  .prow.busy .track, .prow.busy .sub { opacity: .55; }
+  .prow .state { font-size: 14px; }
+  .prow .state.error { background: color-mix(in srgb, var(--down) 12%, transparent); border-radius: 8px;
                        padding: 8px 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .card ol { list-style: none; margin: 0; padding: 0; }
-  .card li + li { border-top: 1px solid var(--line); }
-  .title-btn { width: 100%; display: flex; gap: 8px; align-items: baseline; text-align: left; border: 0;
-               background: none; border-radius: 6px; padding: 10px 4px; }
-  .title-btn:hover { background: var(--accent-soft); }
-  .title-btn .rank { min-width: 2ch; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .title-btn .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .title-btn .name small, h3 small { color: var(--muted); font-weight: 400; }
+  .track { --card-w: clamp(104px, 28vw, 136px); display: flex; gap: 12px; margin: 0 -16px;
+           padding: 4px 16px 6px; overflow: auto hidden; scroll-snap-type: x proximity;
+           scroll-padding-inline: 16px; scrollbar-width: thin; }
+  .track > * { flex: 0 0 auto; scroll-snap-align: start; }
+  .poster { width: var(--card-w); min-height: 0; padding: 0; border: 0; border-radius: 0; background: none;
+            text-align: left; color: inherit; }
+  .poster .art { position: relative; display: block; aspect-ratio: 2 / 3; overflow: hidden; border-radius: 10px;
+                 background: var(--card); }
+  .poster .art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .poster .placeholder { display: grid; height: 100%; place-items: center; padding: 10px; color: var(--muted);
+                         font-size: 13px; text-align: center; overflow-wrap: anywhere; }
+  .poster .rating { position: absolute; top: 6px; left: 6px; padding: 1px 7px; border-radius: 999px;
+                    background: rgb(0 0 0 / .72); color: #fff; font-size: 11px; font-weight: 600; }
+  .poster:hover .art { filter: brightness(1.08); }
+  .poster:focus-visible { outline: none; }
+  .poster:focus-visible .art { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .poster[aria-pressed=true] .art { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .poster[aria-pressed=true] .name { color: var(--accent); }
+  .poster .meta { display: grid; margin-top: 6px; grid-template-rows: 1.35em 1.35em; font-size: 13px;
+                  line-height: 1.35; }
+  .poster .name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+  .poster .caption { display: flex; gap: 6px; overflow: hidden; white-space: nowrap; color: var(--muted); }
+  .poster .caption .rk { color: var(--text); font-variant-numeric: tabular-nums; }
+  .poster .caption .move { margin-left: auto; }
   .move { font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .move.same { color: var(--muted); }
   .move.new { color: var(--accent); font-weight: 600; }
-  .why { padding: 4px 4px 12px 30px; font-size: 14px; }
-  .why > * + * { margin-top: 6px; }
+
+  /* Why the selected poster is in its row: one strip, under that row. */
+  .detail { border: 1px solid var(--line); border-radius: 12px; background: var(--bg); padding: 12px;
+            font-size: 14px; max-height: min(60vh, 420px); overflow-y: auto; }
+  .detail > * + * { margin-top: 8px; }
+  .detail-head { display: flex; gap: 12px; align-items: flex-start; }
+  .detail-head h4 { flex: 1; min-width: 0; font-size: 16px; margin: 0; padding-top: 6px; overflow-wrap: anywhere; }
+  .detail-head button { flex: none; min-height: 36px; min-width: 36px; padding: 0 8px; font-size: 18px; line-height: 1; }
+  .detail .detail-meta { margin-top: 0; display: flex; gap: 4px 16px; align-items: center; flex-wrap: wrap; }
+  .detail-meta .den { min-height: 36px; display: inline-flex; align-items: center; font-weight: 600; }
+  @media (min-width: 900px) { .detail .reasons { max-width: 640px; } }
   .reasons { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
   .reasons li { display: grid; grid-template-columns: minmax(0, 1fr) 64px 52px; gap: 8px; align-items: center;
                 border: 0 !important; }
@@ -138,10 +190,7 @@
   details > summary::-webkit-details-marker { display: none; }
   details:not(.group) > summary::before { content: "▸"; color: var(--muted); width: 1em; }
   details[open]:not(.group) > summary::before { content: "▾"; }
-  #ymal-list { margin: 0; padding: 0; list-style: none; }
-  #ymal-list li { display: flex; gap: 8px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--line); }
-  #ymal-list .rank { min-width: 2ch; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-  #ymal-list .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  #ymal > * + * { margin-top: 8px; }
   .dropped summary { font-size: 14px; color: var(--muted); }
   .dropped ul { margin: 0; padding-left: 20px; font-size: 14px; }
 
@@ -225,24 +274,6 @@
       <p class="error" id="titles-error" role="alert"></p>
     </section>
 
-    <section class="panel" aria-labelledby="results-h">
-      <div class="head">
-        <h2 id="results-h">Results</h2>
-        <label class="hint">Show <select id="limit" aria-label="Titles shown per row"></select> per title</label>
-      </div>
-      <p class="hint">Each title's More Like This row. <span class="up">▲</span>/<span class="down">▼</span> is
-         how many places a title moved against production; tap a title to see why it is there.</p>
-      <div class="cards" id="cards"></div>
-      <details class="panel" id="ymal">
-        <summary><h3>You might also like</h3><span class="hint" id="ymal-sub"></span></summary>
-        <p class="hint">The rows of these titles pooled together, as the home screen's You might also like
-           does.</p>
-        <ul class="chips" id="ymal-seeds" aria-label="You might also like is pooled from"></ul>
-        <button type="button" id="ymal-use">Use my titles</button>
-        <ol id="ymal-list"></ol>
-      </details>
-    </section>
-
     <section class="panel" aria-labelledby="score-h">
       <h2 id="score-h">How it scores</h2>
       <p class="headline" id="score-headline">Scoring…</p>
@@ -290,11 +321,39 @@
      <a href="https://www.themoviedb.org/" target="_blank" rel="noopener">TMDB</a> API but is not endorsed or
      certified by TMDB.</p>
 </div>
+
+<section id="dock" aria-labelledby="results-h">
+  <div id="dock-grip" role="separator" tabindex="0" aria-orientation="horizontal" aria-controls="dock"
+       aria-label="Results height: drag, or use the arrow keys"></div>
+  <div class="dock-head">
+    <h2 id="results-h">Results</h2>
+    <span class="hint"><span class="up">▲</span>/<span class="down">▼</span> places moved against production<span
+      class="wide"> · select a poster for why it is there</span></span>
+    <label class="hint">Show <select id="limit" aria-label="Titles shown per row"></select> per title</label>
+  </div>
+  <div id="dock-body">
+    <div class="dock-inner">
+      <div id="cards"></div>
+      <details id="ymal">
+        <summary><h3>You might also like</h3><span class="hint" id="ymal-sub"></span></summary>
+        <p class="hint">The rows of these titles pooled together, as the home screen's You might also like
+           does.</p>
+        <ul class="chips" id="ymal-seeds" aria-label="You might also like is pooled from"></ul>
+        <button type="button" id="ymal-use">Use my titles</button>
+        <div class="prow" id="ymal-row"></div>
+      </details>
+    </div>
+  </div>
+</section>
 <script>
 "use strict";
 // Relative to wherever atlas is mounted, with or without a trailing slash.
 const base = location.pathname.replace(/\/+$/, "");
 const root = base.replace(/\/playground$/, "");
+// Den Web's origin (and path prefix) when atlas is reached through den-edge at `<prefix>/atlas`: where a
+// title's Den page lives and where den-edge's TMDB proxy answers for poster art. Null when atlas is served
+// on its own, which has neither, so posters stay placeholders and there is no Den link.
+const edge = /\/atlas$/.test(root) ? root.slice(0, -"/atlas".length) : null;
 const $ = (id) => document.getElementById(id);
 // Every row is re-ranked in ONE request (`rows.json`, which also carries the judged scores), and only once
 // typing pauses or a slider is let go: the relay allows an address a few dozen playground requests a minute.
@@ -383,8 +442,9 @@ let seeds = [], suggestSeeds = [], watched = [], filters = [];
 const names = new Map();
 // The last answer drawn, so a failed re-rank can keep showing it.
 let last = null;
-// Titles whose "why" is open, as `<seed>|<id>`, kept across re-ranks.
-const openWhy = new Set();
+// The one poster whose "why" strip is open, as `<row>|<title key>` (row is a seed key or `ymal`), kept
+// across re-ranks while the title is still in its row.
+let selected = null;
 let timer = 0;
 // Answers can arrive out of order; only the newest request's is drawn.
 let asked = 0;
@@ -807,16 +867,18 @@ async function refresh() {
   drawLists();
   drawCards();
   drawSuggest(body.suggest);
+  // A selected title the re-rank pushed out of its row closes its strip.
+  if (selected && !document.querySelector(".detail")) selected = null;
   drawScore(body.judged);
 }
 
 function setBusy(on) {
   $("bar-busy").textContent = on ? "Re-ranking…" : "";
   $("bar-busy").classList.toggle("on", on);
-  for (const card of $("cards").querySelectorAll(".card")) card.classList.toggle("busy", on);
+  for (const row of document.querySelectorAll(".prow")) row.classList.toggle("busy", on);
 }
 
-// A request that failed: every card says so and offers a retry, over the last answer it had, if any.
+// A request that failed: every row says so and offers a retry, over the last answer it had, if any.
 function failed(message) {
   drawCards(message);
   $("score-headline").innerHTML = `<span class="error">Not updated: ${esc(message)}</span>`;
@@ -832,64 +894,140 @@ function moveBadge(rank, production) {
     `aria-label="${up ? "up" : "down"} ${n} from production #${production}">${up ? "▲" : "▼"}${n}</span>`;
 }
 
-// Every seed's card, in the order of the seed list: its row from the last answer, or why there is none.
+// One result as the page draws it, whichever shape atlas sent: a pooled title names its `key`; a row's title
+// names its `type` and `id`, or only its `id` from an atlas that ranks one kind per row, and then takes the
+// row's seed's kind. The one place a result's identity is read, so a row may mix films and series.
+function rowTitle(t, seedKey) {
+  const type = t.key ? kindOf(t.key) : t.type ? (t.type === "movie" ? "movie" : "series") : kindOf(seedKey);
+  const id = t.key ? Number(t.key.split(":")[1]) : t.id;
+  return { ...t, type, id, key: `${type}:${id}`, title: t.title || `TMDB id ${id}` };
+}
+
+// Den Web's slug (web/src/lib/route.ts): decoration after the id, so anything unusual is dropped.
+function slug(name) {
+  const words = name.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return words.length > 60 ? words.slice(0, 60).replace(/-+[^-]*$/, "") : words;
+}
+
+// A title's page in Den Web (`/movie/<id>-<slug>`, `/tv/<id>-<slug>`), or null when atlas is not behind
+// den-edge.
+function denHref(r) {
+  if (edge === null) return null;
+  const words = r.title.startsWith("TMDB id") ? "" : slug(r.title);
+  return `${edge}/${r.type === "movie" ? "movie" : "tv"}/${r.id}${words ? `-${words}` : ""}`;
+}
+
+// The error the rows were last drawn with, so opening a strip redraws them as they were.
+let drawnError;
+
+// Every seed's row, in the order of the seed list: its posters from the last answer, or why there are none.
 function drawCards(error) {
+  drawnError = error;
   const rows = new Map((last?.rows || []).map((a) => [a.key, a]));
-  $("cards").innerHTML = seeds.length
+  redraw($("cards"), seeds.length
     ? seeds.map((key) => card(key, rows.get(key), error)).join("")
-    : `<p class="hint">No titles yet: add one above.</p>`;
+    : `<p class="hint">No titles yet: add one above.</p>`);
+}
+
+// Replaces `el`'s rows, keeping each track's sideways scroll, so a re-rank does not jump back to the start.
+function redraw(el, html) {
+  const at = new Map([...el.querySelectorAll(".track")].map((t) => [t.dataset.row, t.scrollLeft]));
+  el.innerHTML = html;
+  for (const t of el.querySelectorAll(".track")) t.scrollLeft = at.get(t.dataset.row) || 0;
+  watchArt(el);
 }
 
 function card(key, a, error) {
-  let html = `<article class="card" data-card="${esc(key)}"><h3>${nameOf(key)}</h3>`;
+  const kind = kindName(key);
+  const sub = a?.total ? `${kind} · top ${a.titles.length} of ${a.total}` +
+    (a.total !== a.productionTotal ? ` (production ${a.productionTotal})` : "") +
+    (a.tilted ? " · leaning toward what you watched" : "") : "";
+  let html = `<section class="prow" aria-label="More like ${esc(plainName(key))}">` +
+    `<div class="prow-head"><h3>${nameOf(key)}</h3>${sub ? `<span class="sub">${sub}</span>` : ""}</div>`;
   if (error) {
     html += `<p class="state error" role="alert">Couldn't re-rank: ${esc(error)}.` +
       ` <button type="button" data-retry>Retry</button></p>` +
       (a ? `<p class="sub">Showing the last result.</p>` : "");
   }
-  if (!a) return html + (error ? "" : `<p class="state muted">Ranking…</p>`) + "</article>";
-  const kind = kindName(key);
+  if (!a) return html + (error ? "" : `<p class="state muted">Ranking…</p>`) + "</section>";
   if (a.seed.title == null) {
     return html + `<p class="state error">Atlas has no ${kind.toLowerCase()} with TMDB id ${esc(key.split(":")[1])},` +
-      ` so there is no row. Check it is a ${kind.toLowerCase()}, not a ${kind === "Film" ? "series" : "film"}.</p></article>`;
+      ` so there is no row. Check it is a ${kind.toLowerCase()}, not a ${kind === "Film" ? "series" : "film"}.</p></section>`;
   }
   if (!a.productionTotal && !a.total) {
     return html + `<p class="state error">Atlas knows this title but has no More Like This row for it:` +
-      ` it lacks the text or labels to compare.</p></article>`;
+      ` it lacks the text or labels to compare.</p></section>`;
   }
   if (!a.total) {
     return html + `<p class="state error">Your settings leave nothing in this row: production has` +
-      ` ${a.productionTotal} titles, and the filters or minimums drop them all.</p></article>`;
+      ` ${a.productionTotal} titles, and the filters or minimums drop them all.</p></section>`;
   }
-  html += `<p class="sub">${kind} · top ${a.titles.length} of ${a.total}` +
-    (a.total !== a.productionTotal ? ` (production ${a.productionTotal})` : "") +
-    (a.tilted ? " · leaning toward what you watched" : "") + "</p><ol>";
-  for (const t of a.titles) {
-    const open = openWhy.has(`${key}|${t.id}`);
-    html += `<li><button type="button" class="title-btn" data-why="${esc(key)}|${t.id}" aria-expanded="${open}">` +
-      `<span class="rank">${t.rank}</span><span class="name">${esc(t.title || `TMDB id ${t.id}`)}` +
-      `${t.year ? ` <small>(${t.year})</small>` : ""}</span>${moveBadge(t.rank, t.production)}</button>` +
-      `<div class="why"${open ? "" : " hidden"}>${whyHtml(key, t)}</div></li>`;
-  }
-  html += "</ol>";
+  const items = a.titles.map((t) => rowTitle(t, key));
+  html += track(key, items, kindOf(key)) + detailFor(key, items, whyHtml);
   if (a.left.length) {
     html += `<details class="dropped"><summary>${a.left.length} of production's top ${a.titles.length} dropped out</summary><ul>` +
-      a.left.map((t) => `<li>${esc(t.title || `TMDB id ${t.id}`)}${t.year ? ` (${t.year})` : ""} · was #${t.production}</li>`).join("") +
+      a.left.map((t) => rowTitle(t, key)).map((r) => `<li>${esc(r.title)}${r.year ? ` (${r.year})` : ""} · was #${r.production}</li>`).join("") +
       "</ul></details>";
   }
-  return html + "</article>";
+  return html + "</section>";
+}
+
+// A sideways row of posters. `row` names it for the selection and the kept scroll; a poster whose kind is
+// not `rowType` says which it is.
+function track(row, items, rowType) {
+  return `<div class="track" data-row="${esc(row)}">${items.map((r) => poster(row, r, rowType)).join("")}</div>`;
+}
+
+function poster(row, r, rowType) {
+  const pick = `${row}|${r.key}`;
+  if (!names.has(r.key) && !r.title.startsWith("TMDB id")) names.set(r.key, { title: r.title, year: r.year });
+  const caption = `<span class="rk">#${r.rank}</span>${r.year ? `<span>${r.year}</span>` : ""}` +
+    (r.type !== rowType ? `<span>${kindName(r.key)}</span>` : "") + moveBadge(r.rank, r.production);
+  return `<button type="button" class="poster" data-pick="${esc(pick)}" aria-pressed="${selected === pick}">` +
+    `<span class="art" data-art="${esc(r.key)}">${artInner(r.key)}</span>` +
+    `<span class="meta"><span class="name">${esc(r.title)}</span><span class="caption">${caption}</span></span></button>`;
+}
+
+// The strip under a row saying why its selected poster is there, if the selection is in this row.
+function detailFor(row, items, body) {
+  const r = selected?.startsWith(`${row}|`) && items.find((r) => `${row}|${r.key}` === selected);
+  if (!r) return "";
+  const href = denHref(r);
+  return `<div class="detail" role="region" aria-label="Why ${esc(r.title)} is here">` +
+    `<div class="detail-head"><h4>${esc(r.title)} <small>${r.year ? `(${r.year}) · ` : ""}${kindName(r.key)}</small></h4>` +
+    `<button type="button" data-close aria-label="Close">×</button></div>` +
+    `<div class="detail-meta"><span>#${r.rank} ${moveBadge(r.rank, r.production)}</span>` +
+    (href ? `<a class="den" href="${esc(href)}" target="_blank" rel="noopener">Open in Den ↗</a>` : "") +
+    `</div>${body(r)}</div>`;
+}
+
+// Opens `pick`'s strip, or closes it when it is the one open: one strip at a time across every row.
+function select(pick) {
+  selected = selected === pick ? null : pick;
+  drawCards(drawnError);
+  drawSuggest(last?.suggest);
+  const button = document.querySelector(`[data-pick="${CSS.escape(pick)}"]`);
+  button?.focus({ preventScroll: true });
+  // Bring the strip up into the dock, but never so far that the poster it explains scrolls out of view.
+  const strip = document.querySelector(".detail");
+  if (!strip || !button) return;
+  const dock = $("dock-body").getBoundingClientRect();
+  const below = strip.getBoundingClientRect().bottom - dock.bottom;
+  const room = button.getBoundingClientRect().top - dock.top - 8;
+  if (below > 0 && room > 0) $("dock-body").scrollTop += Math.min(below, room);
 }
 
 // Why a title is where it is: the text similarity it starts from, then every signal that added or took
 // points, largest first.
-function whyHtml(key, t) {
+function whyHtml(t) {
   const parts = Object.entries(t.signals).filter(([, s]) => Math.abs(s.points) >= 0.0005)
     .sort((a, b) => Math.abs(b[1].points) - Math.abs(a[1].points));
   const top = Math.max(...parts.map(([, s]) => Math.abs(s.points)), 1e-9);
   const line = (label, pts) =>
     `<li class="${pts < 0 ? "neg" : ""}"><span>${esc(label)}</span><span class="bar"><span style="width:${(Math.abs(pts) / top) * 100}%"></span></span>` +
     `<span class="pts ${pts < 0 ? "down" : ""}">${pts >= 0 ? "+" : ""}${fmt(pts)}</span></li>`;
-  const tmdb = kindOf(key) === "movie" ? "movie" : "tv";
+  const tmdb = t.type === "movie" ? "movie" : "tv";
   return `<p>Starts at <b>${fmt(t.base)}</b> for how alike the premise and plot texts are${parts.length ? ", then:" : "."}</p>` +
     (parts.length ? `<ul class="reasons">${parts.map(([name, s]) => line(SIGNALS[name] || name, s.points)).join("")}</ul>` : "") +
     `<p class="hint">Score ${fmt(t.score)} · ${t.production == null ? "not in production's row" : `production #${t.production}`}` +
@@ -898,10 +1036,134 @@ function whyHtml(key, t) {
 }
 
 function drawSuggest(s) {
-  $("ymal-list").innerHTML = s && s.titles.length
-    ? s.titles.map((t) => `<li><span class="rank">${t.rank}</span><span class="name">${esc(t.title || t.key)}${t.year ? ` <small class="muted">(${t.year})</small>` : ""}</span> ` +
-        `${moveBadge(t.rank, t.production)}</li>`).join("")
-    : `<li class="hint">${suggestSeeds.length ? "Nothing to suggest for these titles." : "Add titles to pool, or use your titles."}</li>`;
+  const items = (s?.titles || []).map((t) => rowTitle(t));
+  const pooled = (r) => `<p class="hint">Pooled #${r.rank} · ` +
+    `${r.production == null ? "not in production's pool" : `production #${r.production}`}</p>`;
+  redraw($("ymal-row"), items.length ? track("ymal", items, null) + detailFor("ymal", items, pooled)
+    : `<p class="hint">${suggestSeeds.length ? "Nothing to suggest for these titles." : "Add titles to pool, or use your titles."}</p>`);
+}
+
+// ---------- Poster art ----------
+
+// Atlas carries no artwork, so a poster is asked of den-edge's TMDB proxy, as Den Web's are: one title's
+// record per request. A hit in its disk cache is free, but a miss spends this address's budget there (120 a
+// minute), so only posters scrolled near view are asked for, a few at a time, each once per page load.
+const ART_PARALLEL = 4;
+// key -> { poster, rating } once TMDB has answered for it.
+const art = new Map();
+const artAsked = new Set();
+const artQueue = [];
+let artBusy = 0, artWaitUntil = 0;
+
+function artInner(key) {
+  const a = art.get(key);
+  return (a?.poster
+    ? `<img src="https://image.tmdb.org/t/p/w342${esc(a.poster)}" alt="" loading="lazy" decoding="async">`
+    : `<span class="placeholder">${esc(plainName(key))}</span>`) +
+    (a?.rating ? `<span class="rating" aria-label="Rated ${a.rating.toFixed(1)}">★ ${a.rating.toFixed(1)}</span>` : "");
+}
+
+const artSeen = "IntersectionObserver" in window ? new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) { artSeen.unobserve(e.target); wantArt(e.target.dataset.art); }
+}, { rootMargin: "300px" }) : null;
+
+function watchArt(el) {
+  if (edge === null) return;
+  for (const node of el.querySelectorAll("[data-art]")) {
+    if (art.has(node.dataset.art)) continue;
+    if (artSeen) artSeen.observe(node); else wantArt(node.dataset.art);
+  }
+}
+
+function wantArt(key) {
+  if (artAsked.has(key)) return;
+  artAsked.add(key);
+  artQueue.push(key);
+  pumpArt();
+}
+
+function pumpArt() {
+  const wait = artWaitUntil - Date.now();
+  if (wait > 0) { setTimeout(pumpArt, wait); return; }
+  while (artBusy < ART_PARALLEL && artQueue.length) {
+    const key = artQueue.shift();
+    artBusy++;
+    fetchArt(key).finally(() => { artBusy--; pumpArt(); });
+  }
+}
+
+async function fetchArt(key) {
+  const [kind, id] = key.split(":");
+  let resp, body;
+  try {
+    resp = await fetch(`${edge}/tmdb/3/${kind === "movie" ? "movie" : "tv"}/${id}`);
+    body = await resp.json().catch(() => ({}));
+  } catch (e) {
+    // Asked again the next time the row is drawn.
+    artAsked.delete(key);
+    console.warn(`Poster for ${key} could not be fetched: ${e.message}`);
+    return;
+  }
+  if (resp.status === 429) { artWaitUntil = Date.now() + 15000; artQueue.unshift(key); return; }
+  if (!resp.ok && resp.status !== 404) { console.warn(`Poster for ${key}: HTTP ${resp.status}, ${why(body)}`); return; }
+  // A 404 is TMDB having no such title: the placeholder with the name stays.
+  art.set(key, { poster: body.poster_path || null,
+                 rating: body.vote_count > 0 && body.vote_average > 0 ? body.vote_average : null });
+  for (const node of document.querySelectorAll(`[data-art="${CSS.escape(key)}"]`)) node.innerHTML = artInner(key);
+}
+
+// ---------- The results dock ----------
+
+const DOCK_KEY = "den-atlas.playground.dock-height";
+const DOCK_MIN = 96;
+let dockH = 0;
+const dockMax = () => Math.max(DOCK_MIN, innerHeight - 64);
+
+function setDock(h, save) {
+  dockH = Math.round(Math.min(dockMax(), Math.max(DOCK_MIN, h)));
+  document.documentElement.style.setProperty("--dock-h", `${dockH}px`);
+  const grip = $("dock-grip");
+  grip.setAttribute("aria-valuemin", DOCK_MIN);
+  grip.setAttribute("aria-valuemax", dockMax());
+  grip.setAttribute("aria-valuenow", dockH);
+  grip.setAttribute("aria-valuetext", `${Math.round((dockH / innerHeight) * 100)}% of the window`);
+  if (!save) return;
+  try { localStorage.setItem(DOCK_KEY, String(dockH)); } catch (e) { console.warn(`Results height not kept: ${e.message}`); }
+}
+
+// The dock's top edge resizes it: dragged (mouse, pen or touch), or with the arrow keys while focused.
+function wireDock() {
+  const grip = $("dock-grip");
+  let saved = null;
+  try { saved = Number(localStorage.getItem(DOCK_KEY)) || null; } catch (e) { console.warn(`Results height not read: ${e.message}`); }
+  // Half a phone's height leaves the settings a usable strip above; a little less on a wider window.
+  setDock(saved ?? innerHeight * (innerWidth < 600 ? 0.5 : 0.42));
+  let from = null;
+  grip.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add("dragging");
+    from = { y: e.clientY, h: dockH };
+  });
+  grip.addEventListener("pointermove", (e) => { if (from) setDock(from.h + from.y - e.clientY); });
+  const end = () => {
+    if (!from) return;
+    from = null;
+    grip.classList.remove("dragging");
+    setDock(dockH, true);
+  };
+  grip.addEventListener("pointerup", end);
+  grip.addEventListener("pointercancel", end);
+  grip.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? 120 : 32;
+    const to = { ArrowUp: dockH + step, ArrowDown: dockH - step, PageUp: dockH + innerHeight / 4,
+                 PageDown: dockH - innerHeight / 4, Home: DOCK_MIN, End: dockMax() }[e.key];
+    if (to === undefined) return;
+    e.preventDefault();
+    setDock(to, true);
+  });
+  addEventListener("resize", () => setDock(dockH));
 }
 
 // The judged scores: the tuning half's mean as the headline, every case and the held-out half folded away.
@@ -1017,22 +1279,16 @@ $("import").addEventListener("change", (e) => {
 });
 $("reset-everything").addEventListener("click", () => {
   if (!confirm("Reset titles and settings to the defaults?")) return;
-  openWhy.clear();
+  selected = null;
   applyQuery("");
   note("Everything is back to the defaults.");
   refresh();
 });
-// Delegated, because the cards and chips are redrawn.
+// Delegated, because the rows and chips are redrawn.
 document.addEventListener("click", (e) => {
   const at = (attr) => e.target.closest(`[data-${attr}]`);
-  const w = at("why");
-  if (w) {
-    const open = w.getAttribute("aria-expanded") !== "true";
-    w.setAttribute("aria-expanded", String(open));
-    w.nextElementSibling.hidden = !open;
-    if (open) openWhy.add(w.dataset.why); else openWhy.delete(w.dataset.why);
-    return;
-  }
+  if (at("pick")) { select(at("pick").dataset.pick); return; }
+  if (at("close") && selected) { select(selected); return; }
   if (at("retry")) { refresh(); return; }
   const drop = (list, key) => list.filter((k) => k !== key);
   if (at("unseed")) {
@@ -1046,6 +1302,11 @@ document.addEventListener("click", (e) => {
   if (at("unsuggest")) { suggestSeeds = drop(suggestSeeds, at("unsuggest").dataset.unsuggest); drawLists(); refresh(); }
   if (at("unfilter")) { filters.splice(Number(at("unfilter").dataset.unfilter), 1); drawLists(); countChanged(); refresh(); }
 });
+// Esc closes the open strip, except inside a search box, where it closes the suggestions.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && selected && !e.target.closest?.(".combo")) select(selected);
+});
+wireDock();
 start().catch((e) => {
   $("cards").innerHTML = `<p class="error" role="alert">Could not load the playground: ${esc(e.message || e)}</p>`;
   $("score-headline").textContent = "";
