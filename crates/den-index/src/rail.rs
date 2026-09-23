@@ -388,6 +388,8 @@ pub struct SeedAuthorship<'a> {
     mine_homes: Vec<u32>,
     /// The titles sharing a character with the seed (`with_characters`): not in the store, so the caller's.
     characters: Vec<(Key, f64)>,
+    /// The titles sharing a franchise series with the seed (`with_series`): the caller's, like `characters`.
+    series: Vec<(Key, f64)>,
 }
 
 impl<'a> SeedAuthorship<'a> {
@@ -402,6 +404,7 @@ impl<'a> SeedAuthorship<'a> {
             mine_makers: Vec::new(),
             mine_homes: Vec::new(),
             characters: Vec::new(),
+            series: Vec::new(),
         };
         if let Some(row) = row_in(out.keys, out.media, tmdb_id) {
             out.mine_makers = out.qids(out.makers.get(row)).collect();
@@ -414,6 +417,13 @@ impl<'a> SeedAuthorship<'a> {
     /// The links are built from credits the store does not carry.
     pub fn with_characters(mut self, characters: Vec<(Key, f64)>) -> Self {
         self.characters = characters;
+        self
+    }
+
+    /// The titles sharing a franchise series with the seed, each with its strength (`Authorship::series`).
+    /// A series' strength is measured over the whole corpus, which the caller holds.
+    pub fn with_series(mut self, series: Vec<(Key, f64)>) -> Self {
+        self.series = series;
         self
     }
 
@@ -470,5 +480,9 @@ impl crate::Authorship for SeedAuthorship<'_> {
 
     fn characters(&self) -> &[(Key, f64)] {
         &self.characters
+    }
+
+    fn series(&self) -> &[(Key, f64)] {
+        &self.series
     }
 }

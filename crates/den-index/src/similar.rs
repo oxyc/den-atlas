@@ -131,6 +131,9 @@ pub struct SimilarParams {
     /// A shared character (`Authorship::characters`). Above 0 the linked titles are also nominated into the
     /// pool, as a shared maker's are.
     pub w_character: f64,
+    /// A shared franchise series (`Authorship::series`). Above 0 the series' other members are also nominated
+    /// into the pool.
+    pub w_series: f64,
     /// A shared origin (country, region, continent) for a seed from outside the English-language
     /// mainstream (`origin_affinity`).
     pub w_region: f64,
@@ -259,6 +262,7 @@ impl Default for SimilarParams {
             max_row: MAX_ROW,
             w_maker: W_MAKER,
             w_character: W_CHARACTER,
+            w_series: W_SERIES,
             w_region: W_REGION,
             w_home: W_HOME,
             w_facet: W_FACET,
@@ -359,6 +363,14 @@ impl SimilarParams {
             W_MAX,
             false,
             "shared character (spin-offs, sequels); above 0 also nominates the linked titles",
+        ),
+        knob(
+            "w_series",
+            "signals",
+            0.0,
+            W_MAX,
+            false,
+            "shared franchise series, by its strength; above 0 also nominates the series' other members",
         ),
         knob(
             "w_region",
@@ -493,6 +505,7 @@ impl SimilarParams {
             "w_plot" => self.w_plot,
             "w_maker" => self.w_maker,
             "w_character" => self.w_character,
+            "w_series" => self.w_series,
             "w_region" => self.w_region,
             "w_home" => self.w_home,
             "w_facet" => self.w_facet,
@@ -547,6 +560,7 @@ impl SimilarParams {
             "w_plot" => self.w_plot = value,
             "w_maker" => self.w_maker = value,
             "w_character" => self.w_character = value,
+            "w_series" => self.w_series = value,
             "w_region" => self.w_region = value,
             "w_home" => self.w_home = value,
             "w_facet" => self.w_facet = value,
@@ -694,6 +708,41 @@ const W_MAKER: f64 = 1.20;
 /// is. With the exemption, the Ewok TV films and the Star Wars Holiday Special — every character of the
 /// seed, none of the film — entered Star Wars' first five (nDCG 0.703 → 0.671); without it they stay out.
 const W_CHARACTER: f64 = 1.0;
+/// How hard a shared franchise series pulls a candidate up, as a fraction of the pool's spread (the series'
+/// strength, 0..=1, is what it multiplies): the rest of Beck for a Beck film, oxyc/den-atlas#92. Wikidata's
+/// "part of the series" names 26 Beck films in the store, and before this the row showed six of them and
+/// drifted into unrelated crime; a shared character, worth one spread, could not hold the other twenty
+/// against vectors that put them 40th to 80th. A member of such a series is also exempt from the tonal
+/// floor and the subgenre cap: the cap is there to vary the unrelated titles, and a series' entries are not
+/// three more police procedurals.
+///
+/// A member of a studio catalogue or a critics' list is not lifted at all: the strength (`series.rs` in
+/// den-atlas) is 0 for a series whose members share neither plots nor people.
+///
+/// Chosen with `den-atlas rail-eval` (both judged files, character links loaded) and the franchise recall
+/// of 429 series of strength 0.5 or more with three or more members in the store (five seeds each: the
+/// share of the rest of the series, at most 20, in the seed's first 20):
+///
+/// ```text
+///                            dev nDCG'  test nDCG   test nDCG'   bad   recall@20   series share
+///   0 (before)                 0.778      0.505       0.740       27     0.626        0.109
+///   2, weight alone            0.782      0.511       0.740       27     0.784        0.141
+///   2, + floor exemption       0.782      0.511       0.740       27     0.807        0.147
+///   2, + floor and cap         0.787      0.529       0.749       22     0.945        0.200
+///   1, + floor and cap         0.786      0.524       0.749       23     0.897        0.185
+///   3, + floor and cap         0.787      0.529       0.749       22     0.963        0.206
+/// ```
+///
+/// The cap exemption is what the judged set rewards: Star Wars 0.640 → 0.873 with its three judged-bad
+/// titles gone, Rocky 0.488 → 0.739, Mad Max: Fury Road 0.562 → 0.764, Spirited Away 0.608 → 0.791. It costs
+/// Tokyo Story 0.819 → 0.703, where Ozu's own trilogy now leads and two other Ozu films judged good are held
+/// past the first ten. Giving same-actor character links the cap exemption as well scored worse (dev nDCG
+/// 0.627 → 0.622, one more bad), so it stays with the series. 2 is the start of the plateau.
+///
+/// The row stays ordered by score, not by release date. More Like This is what is like the seed; a series
+/// block in release order would open every entry's row with the same first film. Where TMDB has a collection,
+/// the TV shows it as its own row in order and removes its members from this one.
+const W_SERIES: f64 = 2.0;
 /// How hard a shared origin pulls a candidate up, as a fraction of the pool's spread, for a seed from outside
 /// the English-language mainstream (`regional`): a Swedish title favours Swedish ones, then Nordic, then
 /// European.
@@ -990,6 +1039,12 @@ pub trait Authorship {
     fn characters(&self) -> &[(Key, f64)] {
         &[]
     }
+    /// The titles of either type in one of the seed's franchise series, each with the strength of the
+    /// strongest series the two share, 0..=1: 0 for a studio catalogue or a critics' list, 1 for a story
+    /// franchise — the rest of Beck, of Bond, of the Carry On films.
+    fn series(&self) -> &[(Key, f64)] {
+        &[]
+    }
 }
 
 /// Neighbour ids for More Like This, best first — the pooled scorer.
@@ -1051,6 +1106,9 @@ pub struct Scored {
     pub maker: f64,
     /// The strongest character link to the seed (`Authorship::characters`), 0 without one.
     pub character: f64,
+    /// The strength of the strongest franchise series it shares with the seed (`Authorship::series`), 0
+    /// without one.
+    pub series: f64,
     /// How near its origin is to a regional seed's (`origin_affinity`); 0 for any other seed.
     pub region: f64,
     pub home: f64,
@@ -1229,6 +1287,14 @@ fn ranked(
             }
         }
     }
+    // And a shared series, on the same terms.
+    if p.w_series > 0.0 {
+        for &(key, _) in authorship.map(Authorship::series).unwrap_or_default() {
+            if wanted(key) && seen.insert(key) {
+                pool.push(key);
+            }
+        }
+    }
     if pool.is_empty() {
         return Vec::new();
     }
@@ -1316,6 +1382,8 @@ pub fn rank_pool<'l>(
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(seed_key)).unwrap_or_default();
     let characters: &[(Key, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
     let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
+    let members: &[(Key, f64)] = authorship.map(Authorship::series).unwrap_or_default();
+    let series = |key: Key| members.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
     // Read only while weighed, and only for a seed from outside the English-language mainstream.
     let seed_origin: Vec<[u8; 2]> = match facets {
         Some(f) if p.w_region > 0.0 => {
@@ -1404,7 +1472,11 @@ pub fn rank_pool<'l>(
         let unlabelled =
             theirs.subgenres.iter().chain(theirs.moods.iter()).all(|(_, c)| *c < p.min_confidence);
         let across = !own_type(id) && c.plot_rank.is_some_and(|rank| rank < CROSS_TOP);
-        if !unlabelled && maker <= 0.0 && !across && t < p.tone_floor {
+        //
+        // A shared series does exempt it, as a shared maker does: membership is a fact about the title, and
+        // the series' strength has already said whether that fact means "one story" (`W_SERIES`).
+        let in_series = p.w_series > 0.0 && series(id) > 0.0;
+        if !unlabelled && maker <= 0.0 && !across && !in_series && t < p.tone_floor {
             continue;
         }
         let base = p.w_premise * pc.unwrap_or(premise_floor) + p.w_plot * l.unwrap_or(plot_floor);
@@ -1462,6 +1534,7 @@ pub fn rank_pool<'l>(
             };
             let popularity = popularity_of(id);
             let ch = character(id);
+            let sr = series(id);
             let region = origin(id);
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
@@ -1484,7 +1557,8 @@ pub fn rank_pool<'l>(
                         + p.w_year * year
                         + p.w_popularity * popularity
                         + p.w_character * ch
-                        + p.w_region * region);
+                        + p.w_region * region
+                        + p.w_series * sr);
             Scored {
                 media_type: id.0,
                 tmdb_id: id.1,
@@ -1499,6 +1573,7 @@ pub fn rank_pool<'l>(
                 coverage: cov,
                 maker,
                 character: ch,
+                series: sr,
                 region,
                 home,
                 facet: fa,
@@ -1550,7 +1625,12 @@ fn capped(mut sorted: Vec<Scored>, p: &SimilarParams) -> Vec<Scored> {
         let count = taken.entry(s.subgenre.as_str()).or_insert(0);
         // Past the first screenful the cap stops applying: it exists to keep the visible row varied, and
         // beyond that it would start excluding good answers for being the same kind of thing.
-        if s.subgenre.is_empty() || out.len() >= p.cap_window || *count < p.subgenre_cap {
+        //
+        // Another entry of the seed's own series is not one more title of the same kind: the cap neither
+        // holds it back nor counts it (`W_SERIES`), while the series is weighed at all.
+        if p.w_series > 0.0 && s.series > 0.0 {
+            out.push(at);
+        } else if s.subgenre.is_empty() || out.len() >= p.cap_window || *count < p.subgenre_cap {
             *count += 1;
             out.push(at);
         } else {
@@ -1786,6 +1866,75 @@ mod tests {
         assert!(on.iter().all(|s| s.tmdb_id != 7), "the tonal floor still applies: {on:?}");
     }
 
+    /// The Beck case (oxyc/den-atlas#92). Four police procedurals the vectors put nearest, and four entries of
+    /// the seed's own series far down: two labelled like the seed, one labelled as something else, one as
+    /// close on the vectors as the unrelated titles. At `w_series = 0` the series changes nothing. Weighed,
+    /// every entry is nominated and leads the row, the subgenre cap (3) does not hold the third and fourth
+    /// back, and the one the tonal floor would drop is kept. A catalogue's member, strength 0, is not lifted.
+    #[test]
+    fn a_shared_series_nominates_lifts_and_is_exempt_from_the_floor_and_the_cap() {
+        let subs: &[(&str, f64)] = &[("Police Procedural", 0.9)];
+        let moods: &[(&str, f64)] = &[("Dark & Gritty", 0.9)];
+        let premise = fixture(&[
+            (1, "movie", "Crime", false, subs, moods, [100, 0, 0]),
+            (2, "movie", "Crime", false, subs, moods, [95, 10, 0]),
+            (3, "movie", "Crime", false, subs, moods, [92, 20, 0]),
+            (4, "movie", "Crime", false, subs, moods, [90, 30, 0]),
+            (5, "movie", "Crime", false, subs, moods, [88, 35, 0]),
+            // The series: 10 and 11 far on the vectors; 12 labelled as another kind of film; 13 near.
+            (10, "movie", "Crime", false, subs, moods, [20, 90, 0]),
+            (11, "movie", "Crime", false, subs, moods, [10, 95, 0]),
+            (12, "movie", "Drama", false, &[("Legal Drama", 0.9)], &[("Tense", 0.9)], [30, 80, 0]),
+            (13, "movie", "Crime", false, subs, moods, [87, 36, 0]),
+            // In a catalogue with the seed.
+            (20, "movie", "Crime", false, subs, moods, [0, 100, 0]),
+        ]);
+        struct Beck;
+        impl Authorship for Beck {
+            fn nominate(&self) -> Vec<Key> {
+                Vec::new()
+            }
+            fn makers(&self, _: Key) -> f64 {
+                0.0
+            }
+            fn series(&self) -> &[(Key, f64)] {
+                &[
+                    ((MediaType::Movie, 10), 1.0),
+                    ((MediaType::Movie, 11), 1.0),
+                    ((MediaType::Movie, 12), 1.0),
+                    ((MediaType::Movie, 13), 1.0),
+                    ((MediaType::Movie, 20), 0.0),
+                ]
+            }
+        }
+        let mut p = SimilarParams::default();
+        p.set("pool_k", 5.0).unwrap();
+        let row = |p: &SimilarParams| -> Vec<Scored> {
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, Some(&Beck), None, p)
+        };
+        p.set("w_series", 0.0).unwrap();
+        // Unweighed, the series changes no title, score or hold; the raw signal is still reported.
+        let ranked = |row: Vec<Scored>| -> Vec<(u32, f64, bool)> {
+            row.iter().map(|s| (s.tmdb_id, s.score, s.held)).collect()
+        };
+        let off = row(&p);
+        let none = more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, None, None, &p);
+        assert_eq!(ranked(off.clone()), ranked(none), "unweighed, the series changes nothing");
+        assert!(off.iter().all(|s| ![10, 11, 12, 20].contains(&s.tmdb_id)), "{off:?}");
+
+        p.set("w_series", W_SERIES).unwrap();
+        let on = row(&p);
+        let ids: Vec<u32> = on.iter().map(|s| s.tmdb_id).collect();
+        let mut lead = ids[..4].to_vec();
+        lead.sort_unstable();
+        assert_eq!(lead, [10, 11, 12, 13], "the series leads: {ids:?}");
+        assert!(on[..4].iter().all(|s| s.series == 1.0 && !s.held), "{on:?}");
+        assert!(on.iter().any(|s| s.tmdb_id == 2 && !s.held), "the cap still leaves room for others: {on:?}");
+        let catalogue = on.iter().find(|s| s.tmdb_id == 20).expect("a strength-0 member is still nominated");
+        assert_eq!(catalogue.series, 0.0);
+        assert!(ids.iter().position(|&id| id == 20) > ids.iter().position(|&id| id == 5), "{ids:?}");
+    }
+
     /// Breaking Bad and El Camino: a film the seed's premise and plot put first joins a series seed's row
     /// only while `mix_types` is on, and the series in it keep exactly the order a series-only row gives
     /// them — the other type is merged in between, never reorders the seed's own.
@@ -1958,7 +2107,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 49, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 50, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {
