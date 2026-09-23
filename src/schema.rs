@@ -122,8 +122,9 @@ fn named(values: Vec<(&str, usize)>) -> Vec<(String, usize)> {
 }
 
 /// `/index/schema.json`: what can be queried, its value vocabulary, and how much of the corpus can honestly
-/// answer each field. It deliberately says that result totals are retrieval counts, not corpus aggregates;
-/// group-by/count tools must not be built by relabelling search output.
+/// answer each field. It deliberately says that a search's totals are retrieval counts, not corpus aggregates;
+/// counting and group-by are the filter routes' (`/index/filter/{type}/counts.json`), which AND bitsets over
+/// the corpus, and must not be built by relabelling search output.
 pub fn document(indexes: &Indexes) -> Value {
     let population = indexes.population;
     let floor = DISPLAY_CONFIDENCE_FLOOR;
@@ -297,7 +298,10 @@ pub fn document(indexes: &Indexes) -> Value {
         "semantics": {
             "missing": "unknown",
             "resultTotal": "retrievedCandidatesNotCorpusCount",
-            "groupBy": false,
+            // One axis at a time, under any AND-ed selection: counts.json counts every other kind's values
+            // among the titles carrying the selection.
+            "groupBy": true,
+            "groupByRoute": "/index/filter/{type}/counts.json",
             "counts": {
                 "coverage": "count: titles with the field on record; denominator: the titles it is out of (the \
                              corpus, or the media type the field or route is scoped to); ratio: count / \
@@ -310,6 +314,16 @@ pub fn document(indexes: &Indexes) -> Value {
                              record, which is at most coverage.fields.<field>.count",
                 "resultTotal": "candidates the search retrieved and scored above zero: a pool the ranking \
                                 drew from, not a corpus count",
+                "filterTotal": "total on the filter routes: titles on record as carrying every selected value, \
+                                out of denominator, the titles of the route's type. A title with a selected kind \
+                                unknown is not counted, so it is a floor: coverage says how much of the type \
+                                each selected kind is known for",
+                "filterValueCount": "kinds.<kind>.values.<id> on counts.json, and values[].count on \
+                                     values/{kind}.json: titles carrying the selection and that value, out of \
+                                     that answer's denominator (the selection's titles, or for a single-mode kind \
+                                     with a value selected, the selection without it, so it may exceed total). \
+                                     A title with the kind unknown is in the denominator and in no value, so the \
+                                     values need not sum to it",
             },
             "applied": {
                 "filter": "drops a title on record as not matching; keeps one with no record, ranked lower",
@@ -321,6 +335,39 @@ pub fn document(indexes: &Indexes) -> Value {
         },
         "routes": routes(),
         "filter": crate::filter::schema(),
+        "tmdb": tmdb(),
+    })
+}
+
+/// What in atlas's answers is TMDB's own data, read at run time (`tmdb.rs`): usable here only to filter and sort,
+/// and never to reach a model, so a client that hands answers to one (an MCP tool) drops exactly these. TMDB ids
+/// and TMDB's genre id space are identifiers; the genre values are Wikidata's.
+fn tmdb() -> Value {
+    json!({
+        "about": "Values atlas takes from TMDB at run time. They filter and sort inside atlas and must not be \
+                  passed to a model, an MCP tool result included, nor stored.",
+        "filterKinds": crate::filter::tmdb_kinds(),
+        "fields": {
+            "/index/query.json": [
+                "hits[].f.pop: popularity from TMDB's vote count, else its export's popularity",
+                "hits[].title where hits[].titleFrom is \"tmdb\": named by TMDB's daily export, the corpus having \
+                 no card for it",
+            ],
+            "/index/filter/{type}/counts.json": [
+                "kinds.<kind> and coverage.<kind> for a kind in filterKinds",
+                "every count, when the selection names a kind in filterKinds",
+            ],
+            "/index/filter/{type}/titles.json": [
+                "total and coverage, when the selection names a kind in filterKinds",
+            ],
+            "/index/filter/{type}/values/{kind}.json": [
+                "the whole answer, for a kind in filterKinds or a selection naming one",
+            ],
+        },
+        "order": "most voted, as rows and filter titles are ordered, is by TMDB's vote counts (else its \
+                  popularity), used as a sort key",
+        "identifiers": "id, tmdbId and people[].id are TMDB ids and genre ids are in TMDB's genre id space: \
+                        identifiers, not TMDB data",
     })
 }
 
@@ -372,13 +419,17 @@ fn routes() -> Value {
             with(param("runtime_max", "integer", "longest runtime"), json!({ "field": "runtimeMinutes" })),
             with(param("broadcaster", "string", "Q-id, with or without the Q"), json!({ "field": "broadcaster" })),
         ],
-        "returns": "{parse, people, hits, total, semantics, coverage}",
+        "returns": "{parse, people, hits, total, semantics, coverage, ignored, unknownValues?}",
         "counts": {
             "total": "resultTotal",
             "coverage": "each constraint the query applied, how it was applied, and how many titles have its \
                          field on record out of the titles of the type asked for",
             "people[].credits": "that person's titles in the corpus",
         },
+        "ignored": "parameters the route does not read, or whose value it could not read: the answer is as \
+                    though they were not sent",
+        "unknownValues": "language:<code> for a language no title is in; it still filters, leaving the titles \
+                          with no language on record",
     });
     use crate::handler::{
         FACET_LIMIT, MAX_NEIGHBOUR_K, MAX_ROW_PAGE, MAX_SEEDS, MAX_TITLES, NEIGHBOUR_K, ROW_PAGE, SEMANTIC_K,
@@ -505,8 +556,9 @@ fn routes() -> Value {
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
             ],
-            "returns": "{total, kinds: {<kind>: {mode, complete, values: {<id>: n}, labels?, selected?, \
-                        excluded?}}, coverage, ignored, kindsUnavailable?}",
+            "returns": "{total, denominator, kinds: {<kind>: {mode, complete, values: {<id>: n}, denominator, \
+                        labels?, selected?, excluded?}}, coverage, ignored, unknownValues?, kindsUnavailable?}",
+            "counts": { "total": "filterTotal", "kinds.<kind>.values": "filterValueCount" },
         },
         {
             "method": "GET",
@@ -527,7 +579,8 @@ fn routes() -> Value {
                     json!({ "default": crate::filter::PAGE, "max": crate::filter::MAX_PAGE }),
                 ),
             ],
-            "returns": "{titles, total, order, coverage, ignored, kindsUnavailable?}",
+            "returns": "{titles, total, denominator, order, coverage, ignored, unknownValues?, kindsUnavailable?}",
+            "counts": { "total": "filterTotal" },
         },
         {
             "method": "GET",
@@ -552,7 +605,9 @@ fn routes() -> Value {
                             "maxCharacter": crate::filter::CHARACTER_LIMIT }),
                 ),
             ],
-            "returns": "{kind, mode, values: [{id, name, count, tmdbId?}], complete, ignored, kindsUnavailable?}",
+            "returns": "{kind, mode, values: [{id, name, count, tmdbId?}], complete, denominator, ignored, \
+                        unknownValues?, kindsUnavailable?}",
+            "counts": { "values[].count": "filterValueCount" },
         },
         {
             "method": "GET",
@@ -736,7 +791,26 @@ mod tests {
         assert_eq!(schema["fields"]["mood"]["coverage"]["count"], 1);
         assert_eq!(schema["fields"]["tone"]["coverage"]["count"], 3);
         assert_eq!(schema["fields"]["subgenre"]["values"][0]["count"]["population"], 12);
-        assert_eq!(schema["semantics"]["groupBy"], false);
+        assert_eq!(schema["semantics"]["groupBy"], true);
+        let route = schema["semantics"]["groupByRoute"].as_str().unwrap();
+        assert!(
+            schema["routes"].as_array().unwrap().iter().any(|r| r["path"] == route),
+            "{route} is a route"
+        );
+    }
+
+    /// The kinds the schema names as TMDB's are exactly the ones whose values come from `tmdb.rs`, and each says
+    /// so where it is described: a client handing answers to a model drops these and nothing else.
+    #[test]
+    fn the_schema_names_what_is_tmdbs() {
+        let tmdb = tmdb();
+        assert_eq!(tmdb["filterKinds"], json!(["rating", "character"]));
+        let kinds = &crate::filter::schema()["kinds"];
+        for (name, kind) in kinds.as_object().unwrap() {
+            let named = tmdb["filterKinds"].as_array().unwrap().iter().any(|k| k == name);
+            assert_eq!(kind.get("source") == Some(&json!("tmdb")), named, "{name}");
+        }
+        assert!(tmdb["fields"]["/index/query.json"][0].as_str().unwrap().starts_with("hits[].f.pop"));
     }
 
     /// The merged display rows are listed under their axis, apart from its values, each with the values it
