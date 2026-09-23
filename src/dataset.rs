@@ -14,6 +14,7 @@
 //! fetches them and are gone: no field describes them and no route streams them (#113).
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone)]
@@ -49,6 +50,24 @@ pub struct Meta {
     // any of its query routes, so it does not load.
     #[serde(rename = "storeFile")]
     pub store_file: String,
+    /// Every top-level string field of the meta whose key ends in `Sha256`, key → value verbatim.
+    ///
+    /// The `den.dataset.v2` signature covers these lines (sorted by key), so `/dataset.json` must carry
+    /// every one for the app to rebuild the signed payload. Collected by key suffix rather than named, so
+    /// an artifact the publisher adds is covered without a change here. Nested hashes (`storeInputs[]`)
+    /// are not signed and not collected.
+    #[serde(skip)]
+    pub sha256: BTreeMap<String, String>,
+}
+
+/// The top-level `…Sha256` string fields of a parsed `dataset.meta.json`, in key byte order.
+fn top_level_sha256(meta: &serde_json::Value) -> BTreeMap<String, String> {
+    let Some(object) = meta.as_object() else { return BTreeMap::new() };
+    object
+        .iter()
+        .filter(|(key, _)| key.ends_with("Sha256"))
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .collect()
 }
 
 pub struct Dataset {
@@ -81,7 +100,12 @@ impl Dataset {
             .map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw).map_err(|e| e.to_string())?;
-        let meta: Meta = serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
+        let sha256 = top_level_sha256(&value);
+        let mut meta: Meta =
+            serde_json::from_value(value).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
+        meta.sha256 = sha256;
 
         // Verified here and the mapping dropped, so the row count below is the store's OWN — the one
         // number about this dataset that has been checked against the bytes rather than claimed by the
