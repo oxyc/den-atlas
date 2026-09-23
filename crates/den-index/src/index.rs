@@ -429,8 +429,9 @@ impl Index {
     /// requantised to int8, so every scorer below reads it exactly as it reads the original. A seed is a row
     /// of the same index, so the seed and the corpus it is compared with lose the direction alike.
     ///
-    /// Built on first use and kept with the index: a second copy of the vectors (~49 MB on the plot index)
-    /// that nothing pays for until something asks. An index with no direction answers itself.
+    /// Built on first use and kept with the index: a second copy of the vectors (~49 MB on the plot index,
+    /// ~150 ms), paid on the first More Like This of a load, since production ranks on it
+    /// (`SimilarParams::plot_length_off`). An index with no direction answers itself.
     pub fn without_length(&self) -> &Index {
         let Some(direction) = &self.length_direction else { return self };
         self.without_length.get_or_init(|| Box::new(self.with_direction_removed(direction)))

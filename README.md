@@ -52,7 +52,10 @@ Three things about the data that keep being got wrong — see `den-dataset/READM
   Consumers must degrade for 35% of the catalogue, not treat it as an edge case.
 - **There are two vector spaces.** The plot index (`vectors-bge-m3.bin`) and the premise index
   (`vectors-premise.bin`, Sonnet-generated premise tags embedded with the same model) are complements, not
-  duplicates — measured mean |cos| 0.43. The app's "More Like This" leads with premise.
+  duplicates — measured mean |cos| 0.43. The app's "More Like This" leads with premise. It reads the plot
+  space with its plot-length direction projected out, so short plots stop pulling short plots
+  (`plot_length_off`, on by default; oxyc/den-dataset#109); `/index/neighbours` and search read the plot
+  vectors as published.
 - **A bare TMDB id is ambiguous**: movie and TV namespaces overlap (tv 95 is Buffy, movie 95 is
   Armageddon). Key every per-title map on `(mediaType, id)`.
 
