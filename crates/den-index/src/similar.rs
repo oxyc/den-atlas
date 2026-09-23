@@ -131,6 +131,9 @@ pub struct SimilarParams {
     /// A shared character (`Authorship::characters`). Above 0 the linked titles are also nominated into the
     /// pool, as a shared maker's are.
     pub w_character: f64,
+    /// A shared origin (country, region, continent) for a seed from outside the English-language
+    /// mainstream (`origin_affinity`).
+    pub w_region: f64,
     pub w_home: f64,
     pub w_facet: f64,
     pub w_world: f64,
@@ -235,6 +238,7 @@ impl Default for SimilarParams {
             max_row: MAX_ROW,
             w_maker: W_MAKER,
             w_character: W_CHARACTER,
+            w_region: W_REGION,
             w_home: W_HOME,
             w_facet: W_FACET,
             w_world: W_WORLD,
@@ -319,6 +323,14 @@ impl SimilarParams {
             10.0,
             false,
             "shared character (spin-offs, sequels); above 0 also nominates the linked titles",
+        ),
+        knob(
+            "w_region",
+            "signals",
+            0.0,
+            10.0,
+            false,
+            "same country, then region, then continent — for a seed not from the US or UK nor in English",
         ),
         knob("w_home", "signals", 0.0, 10.0, false, "shared broadcaster/production company"),
         knob("w_facet", "signals", 0.0, 10.0, false, "agreement on the twelve facet axes, rarity-weighted"),
@@ -415,6 +427,7 @@ impl SimilarParams {
             "w_plot" => self.w_plot,
             "w_maker" => self.w_maker,
             "w_character" => self.w_character,
+            "w_region" => self.w_region,
             "w_home" => self.w_home,
             "w_facet" => self.w_facet,
             "w_world" => self.w_world,
@@ -465,6 +478,7 @@ impl SimilarParams {
             "w_plot" => self.w_plot = value,
             "w_maker" => self.w_maker = value,
             "w_character" => self.w_character = value,
+            "w_region" => self.w_region = value,
             "w_home" => self.w_home = value,
             "w_facet" => self.w_facet = value,
             "w_world" => self.w_world = value,
@@ -608,6 +622,61 @@ const W_MAKER: f64 = 1.20;
 /// is. With the exemption, the Ewok TV films and the Star Wars Holiday Special — every character of the
 /// seed, none of the film — entered Star Wars' first five (nDCG 0.703 → 0.671); without it they stay out.
 const W_CHARACTER: f64 = 1.0;
+/// How hard a shared origin pulls a candidate up, as a fraction of the pool's spread, for a seed from outside
+/// the English-language mainstream (`regional`): a Swedish title favours Swedish ones, then Nordic, then
+/// European.
+///
+/// Off: the judged set cannot show a gain. `den-atlas rail-eval` over both judged files, dev half:
+///
+/// ```text
+/// w_region   nDCG    nDCG'   bad   judged@10
+///   0.00     0.792   0.794    26     293
+///   0.25     0.791   0.795    26     293
+///   0.50     0.789   0.796    24     290
+///   1.00     0.787   0.799    23     287
+///   2.00     0.763   0.800    24     276
+/// ```
+///
+/// Condensed nDCG and bad@10 improve while plain nDCG falls and fewer of the first ten are judged: the rows
+/// move onto titles nobody has graded, which is the judged set's gap, not evidence for the weight. Grading
+/// what `RAIL_EVAL_UNJUDGED` lists at 0.5–1 is what would settle it.
+const W_REGION: f64 = 0.0;
+/// What each tier of `origin_affinity` counts for: the same country in full, the same region
+/// (`regions::REGIONS`: Nordic, Slavic, East Asian …) this much, the same continent this much.
+const REGION_TIER: f64 = 0.5;
+const CONTINENT_TIER: f64 = 0.25;
+
+/// Whether a seed's origin is a signal worth reading: its first country is not the US or Britain and its
+/// original language is not English. For Hollywood the term would only reinforce Hollywood.
+fn regional(countries: &[[u8; 2]], language: Option<[u8; 2]>) -> bool {
+    countries.first().is_some_and(|home| home != b"US" && home != b"GB") && language != Some(*b"en")
+}
+
+/// How near a candidate's origin is to the seed's, 0..=1: the seed's first country against the candidate's
+/// first two, the nearest tier of any.
+fn origin_affinity(seed: &[[u8; 2]], theirs: &[[u8; 2]]) -> f64 {
+    let Some(home) = seed.first().and_then(|c| std::str::from_utf8(c).ok()) else { return 0.0 };
+    let shared = |groups: &[crate::Region], c: &str| {
+        groups.iter().any(|g| g.countries.contains(&home) && g.countries.contains(&c))
+    };
+    theirs
+        .iter()
+        .take(2)
+        .filter_map(|c| std::str::from_utf8(c).ok())
+        .map(|c| {
+            if c == home {
+                1.0
+            } else if shared(crate::REGIONS, c) {
+                REGION_TIER
+            } else if shared(crate::regions::CONTINENTS, c) {
+                CONTINENT_TIER
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0, f64::max)
+}
+
 /// A shared home — the same broadcaster or production company — as a small tiebreak, never a lane of its
 /// own. HBO is 131 titles in this corpus, so it discriminates; "made for television" would not.
 const W_HOME: f64 = 0.15;
@@ -742,6 +811,16 @@ pub trait Facets {
         let _ = key;
         None
     }
+    /// Its countries of origin, ISO 3166-1 alpha-2 upper-case, first the one Wikidata lists first.
+    fn countries(&self, key: Key) -> Vec<[u8; 2]> {
+        let _ = key;
+        Vec::new()
+    }
+    /// Its original language, ISO 639-1 lower-case, when known.
+    fn language(&self, key: Key) -> Option<[u8; 2]> {
+        let _ = key;
+        None
+    }
     /// Share of the SEED's type carrying this axis value, for rarity weighting — read from the seed's type
     /// for a candidate of either. A shared `chronology = linear` is worth almost nothing (76% of titles)
     /// where a shared `conflict = person-vs-system` is worth a lot.
@@ -865,6 +944,8 @@ pub struct Scored {
     pub maker: f64,
     /// The strongest character link to the seed (`Authorship::characters`), 0 without one.
     pub character: f64,
+    /// How near its origin is to a regional seed's (`origin_affinity`); 0 for any other seed.
+    pub region: f64,
     pub home: f64,
     pub facet: f64,
     pub world: f64,
@@ -1065,6 +1146,24 @@ pub fn rank_pool<'l>(
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(seed_key)).unwrap_or_default();
     let characters: &[(Key, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
     let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
+    // Read only while weighed, and only for a seed from outside the English-language mainstream.
+    let seed_origin: Vec<[u8; 2]> = match facets {
+        Some(f) if p.w_region > 0.0 => {
+            let countries = f.countries(seed_key);
+            if regional(&countries, f.language(seed_key)) {
+                countries
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let origin = |key: Key| -> f64 {
+        match facets {
+            Some(f) if !seed_origin.is_empty() => origin_affinity(&seed_origin, &f.countries(key)),
+            _ => 0.0,
+        }
+    };
 
     let audience = extras.audience;
     // The request's filters. Each is skipped outright at its production value, so production's pool is
@@ -1192,6 +1291,7 @@ pub fn rank_pool<'l>(
             };
             let popularity = popularity_of(id);
             let ch = character(id);
+            let region = origin(id);
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
             // against a pair, not merely absence of evidence for it.
@@ -1209,10 +1309,11 @@ pub fn rank_pool<'l>(
                         + p.w_facet * fa
                         - p.w_world * world
                         // Last, so at production's `w_year = 0` and `w_popularity = 0` each adds an exact 0.0
-                        // to the sum above; `w_character` likewise at 0.
+                        // to the sum above; `w_character` and `w_region` likewise at 0.
                         + p.w_year * year
                         + p.w_popularity * popularity
-                        + p.w_character * ch);
+                        + p.w_character * ch
+                        + p.w_region * region);
             Scored {
                 media_type: id.0,
                 tmdb_id: id.1,
@@ -1227,6 +1328,7 @@ pub fn rank_pool<'l>(
                 coverage: cov,
                 maker,
                 character: ch,
+                region,
                 home,
                 facet: fa,
                 world,
@@ -1556,6 +1658,33 @@ mod tests {
         assert_eq!(z_map(0.7, own, ScanStats::default()), 0.7);
     }
 
+    /// Beck's tiers: Swedish in full, Nordic (not Britain, which UN M49 would call Northern Europe) at the
+    /// region's share, Europe at the continent's, anything else nothing; a co-production's second country
+    /// counts, its third does not.
+    #[test]
+    fn origin_affinity_is_country_then_region_then_continent() {
+        let sweden: &[[u8; 2]] = &[*b"SE"];
+        assert_eq!(origin_affinity(sweden, &[*b"SE"]), 1.0);
+        assert_eq!(origin_affinity(sweden, &[*b"DK"]), REGION_TIER);
+        assert_eq!(origin_affinity(sweden, &[*b"IS"]), REGION_TIER, "Nordic, not only Scandinavian");
+        assert_eq!(origin_affinity(sweden, &[*b"GB"]), CONTINENT_TIER, "Britain is not Nordic");
+        assert_eq!(origin_affinity(sweden, &[*b"US"]), 0.0);
+        assert_eq!(origin_affinity(sweden, &[*b"US", *b"SE"]), 1.0, "a co-production's second country");
+        assert_eq!(origin_affinity(sweden, &[*b"US", *b"CA", *b"SE"]), 0.0, "but not its third");
+        assert_eq!(origin_affinity(&[], &[*b"SE"]), 0.0);
+    }
+
+    /// Only a seed from outside the English-language mainstream is regional.
+    #[test]
+    fn a_seed_is_regional_outside_the_us_and_britain_and_english() {
+        assert!(regional(&[*b"SE"], Some(*b"sv")));
+        assert!(regional(&[*b"KR"], None));
+        assert!(!regional(&[*b"US"], Some(*b"es")), "American");
+        assert!(!regional(&[*b"GB"], None), "British");
+        assert!(!regional(&[*b"IE"], Some(*b"en")), "in English");
+        assert!(!regional(&[], Some(*b"sv")), "no known country");
+    }
+
     /// A candidate with no confident labels is not filtered out: unknown is not none.
     #[test]
     fn an_unlabelled_candidate_is_not_gated_by_the_tonal_floor() {
@@ -1592,7 +1721,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 45, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 46, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
         }

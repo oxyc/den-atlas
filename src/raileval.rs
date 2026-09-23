@@ -343,6 +343,20 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             }
         }
     }
+    // A seed the judged set does not hold is shown too, ungraded.
+    if let Some((media, id)) = show.as_deref().and_then(parse_key) {
+        if !cases.iter().any(|c| (c.media, c.id) == (media, id)) {
+            println!("{} (not judged):", title(&indexes, media, id));
+            let row: Vec<Key> = if production {
+                indexes.more_like_this_mixed(id, media).to_vec()
+            } else {
+                indexes.more_like_this_scored(id, media, &params).iter().map(|s| s.key()).collect()
+            };
+            for (at, &(kind, other)) in row.iter().take(K).enumerate() {
+                println!("    {:>2}. {}", at + 1, title(&indexes, kind, other));
+            }
+        }
+    }
     println!("{}", "-".repeat(84));
     for half in ["dev", "test", "all"] {
         if let Some((rail, plot)) = by_split.get(half) {

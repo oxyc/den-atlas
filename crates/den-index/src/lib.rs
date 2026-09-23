@@ -10,6 +10,7 @@ pub mod eval;
 mod facets;
 mod index;
 mod rail;
+pub mod regions;
 mod similar;
 
 pub use facets::{split_negation, FacetIndex, FacetQuery, Negation, TitleFacets};
@@ -17,6 +18,7 @@ pub use index::{
     Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, TypeNeighbours, DISPLAY_CONFIDENCE_FLOOR,
 };
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
+pub use regions::{region, Region, REGIONS};
 pub use similar::{
     more_like_this, more_like_this_pooled, more_like_this_scored, more_like_this_with, rank_pool, Audience,
     Authorship, Axis, Candidate, Extras, Facets, Knob, Scored, SimilarParams, ValueId, Weighted, KNOB_GROUPS,
