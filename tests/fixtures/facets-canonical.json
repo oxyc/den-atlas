@@ -9,6 +9,9 @@
     { "url": "/index/filter/movie/counts.json?sel=genre:28&x=1", "canonical": "/index/filter/movie/counts.json?sel=genre:28" },
     { "url": "/index/filter/series/counts.json?sel=genre:18,genre:10759", "canonical": "/index/filter/series/counts.json?sel=genre:10759,genre:18" },
     { "url": "/index/filter/movie/counts.json?sel=decade:1995,language:SV,country:se", "canonical": "/index/filter/movie/counts.json?sel=country:SE,decade:1990,language:sv" },
+    { "url": "/index/filter/movie/counts.json?sel=region:Nordic,country:se", "canonical": "/index/filter/movie/counts.json?sel=country:SE,region:nordic" },
+    { "url": "/index/filter/movie/counts.json?sel=region:east-asian,genre:18", "canonical": "/index/filter/movie/counts.json?sel=genre:18,region:east-asian" },
+    { "url": "/index/filter/series/titles.json?sel=-region:NORTH-AMERICAN", "canonical": "/index/filter/series/titles.json?sel=-region:north-american" },
     { "url": "/index/filter/movie/counts.json?sel=genre:028,rating:08", "canonical": "/index/filter/movie/counts.json?sel=genre:28,rating:8" },
     { "url": "/index/filter/movie/counts.json?sel=subgenre:Psychological%20Thriller", "canonical": "/index/filter/movie/counts.json?sel=subgenre:Psychological%20Thriller" },
     { "url": "/index/filter/movie/counts.json?sel=subgenre:Psychological+Thriller", "canonical": "/index/filter/movie/counts.json?sel=subgenre:Psychological%20Thriller" },
@@ -29,6 +32,7 @@
     { "url": "/index/filter/movie/titles.json?limit=500", "canonical": "/index/filter/movie/titles.json?limit=100" },
     { "url": "/index/filter/movie/values/person.json?q=Bong%20Joon", "canonical": "/index/filter/movie/values/person.json?q=bong%20joon" },
     { "url": "/index/filter/movie/values/person.json?limit=10&q=Nolan&sel=genre:18", "canonical": "/index/filter/movie/values/person.json?sel=genre:18&q=nolan" },
+    { "url": "/index/filter/movie/values/region.json?q=Scandi", "canonical": "/index/filter/movie/values/region.json?q=scandi" },
     { "url": "/index/filter/movie/values/company.json?limit=3", "canonical": "/index/filter/movie/values/company.json?limit=3" },
     { "url": "/index/filter/movie/values/character.json?q=Walter+White&limit=9", "canonical": "/index/filter/movie/values/character.json?q=walter%20white" }
   ],

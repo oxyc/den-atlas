@@ -312,6 +312,13 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
         spec("genre", Mode::And, Id::Integer, B, "TMDB genre id; a series also under TMDB's composites"),
         spec("language", Mode::And, Id::Lower, B, "ISO 639-1, every original language"),
         spec("country", Mode::And, Id::Upper, B, "ISO 3166-1, every country of origin"),
+        spec(
+            "region",
+            Mode::Single,
+            Id::Lower,
+            B,
+            "a notable region by slug (`regions`): any of its countries of origin",
+        ),
         spec("decade", Mode::Single, Id::Decade, B, "the release, or a series' first air date"),
         spec("mood", Mode::And, Id::Label, B, "a mood label at 0.55 or more"),
         spec("subgenre", Mode::And, Id::Label, B, "a subgenre label at 0.55 or more"),
@@ -701,11 +708,11 @@ impl FilterIndex {
 
         let facts = indexes.facts.as_ref();
         if facts.is_some() {
-            for kind in ["genre", "language", "country", "source"] {
+            for kind in ["genre", "language", "country", "region", "source"] {
                 open(&mut bits, kind);
             }
         } else {
-            unavailable.extend(["genre", "language", "country", "source"]);
+            unavailable.extend(["genre", "language", "country", "region", "source"]);
         }
         if facts.is_some() || indexes.cards.is_some() {
             open(&mut bits, "decade");
@@ -777,6 +784,23 @@ impl FilterIndex {
                     add(&mut bits, "runtime", bucket.to_owned(), row);
                 }
             }
+        }
+
+        // Regions: each the union of its countries' titles, known wherever a country is. A region none of
+        // whose countries a title carries is not offered.
+        if let Some(country) = bits.get("country") {
+            let mut values = BTreeMap::new();
+            for region in den_index::REGIONS {
+                let mut union = zeros();
+                for member in region.countries.iter().filter_map(|c| country.values.get(*c)) {
+                    union.iter_mut().zip(member).for_each(|(u, m)| *u |= m);
+                }
+                if union.iter().any(|&w| w != 0) {
+                    values.insert(region.slug.to_owned(), union);
+                }
+            }
+            let known = country.known.clone();
+            bits.insert("region", Valued { values, known });
         }
 
         // The score tables. A title the labelling pass described is known for all of them — an unanswered
@@ -1364,6 +1388,13 @@ impl<'a> Context<'a> {
                 _ => {}
             }
         }
+        if spec.name == "region" {
+            for id in values.keys() {
+                if let Some(region) = den_index::region(id) {
+                    labels.insert(id.clone(), region.label.into());
+                }
+            }
+        }
         let mut answer = json!({ "mode": spec.mode.name(), "complete": complete, "values": values });
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
@@ -1413,6 +1444,8 @@ impl<'a> Context<'a> {
     /// apart from a real zero.
     fn known_value(&self, spec: &Spec, id: &str) -> bool {
         match spec.data {
+            // A region is known by the table even when no title here carries it.
+            Data::Bits if spec.name == "region" => den_index::region(id).is_some(),
             Data::Bits => self.filter.bits.get(spec.name).is_some_and(|v| v.values.contains_key(id)),
             Data::Rating => self.derived.rating.as_ref().is_some_and(|v| v.values.contains_key(id)),
             Data::Entity(_) => self.entity_of(id).is_some(),
@@ -1525,10 +1558,17 @@ impl<'a> Context<'a> {
                         self.filter.bits.get(spec.name)
                     };
                     for (value, bits) in valued.map(|v| &v.values).into_iter().flatten() {
+                        // A region is named by its label and found by its label, slug or aliases.
+                        let region = den_index::region(value).filter(|_| spec.name == "region");
+                        let name = region.map_or(value.as_str(), |r| r.label);
+                        let matches = match region {
+                            Some(r) => [r.label, r.slug].iter().chain(r.aliases).any(|n| words_match(n)),
+                            None => words_match(value),
+                        };
                         let n = and_count(&base, bits);
-                        if n > 0 && words_match(value) {
+                        if n > 0 && matches {
                             let all = and_count(&self.filter.types[self.t()], bits);
-                            found.push((value.clone(), value.clone(), n, all, None));
+                            found.push((value.clone(), name.to_owned(), n, all, None));
                         }
                     }
                 }
@@ -1649,6 +1689,10 @@ pub fn schema() -> Value {
             },
         },
         "merged": merged,
+        "regions": den_index::REGIONS
+            .iter()
+            .map(|r| json!({ "slug": r.slug, "label": r.label, "aliases": r.aliases, "countries": r.countries }))
+            .collect::<Vec<_>>(),
         "runtimeBuckets": RUNTIME_BUCKETS.iter().map(|b| b.0).collect::<Vec<_>>(),
         "ratingThresholds": RATING_THRESHOLDS,
         "ratingMinVotes": MIN_VOTES,
@@ -1941,6 +1985,81 @@ mod tests {
         let counted = context.counts(&request(Route::Counts, "sel=like:1")).0;
         assert_eq!(counted["total"], similar.len());
         assert_eq!(counted["kinds"]["like"]["mode"], "single");
+    }
+
+    /// A region is the union of its countries: a title with two members counts once. One pick at a time, its
+    /// values counted without it, and it narrows with a country like any other kind.
+    #[test]
+    fn a_region_is_the_union_of_its_countries() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-regions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let title = |tmdb_id, countries: Vec<&'static str>| crate::store::fixture::Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            countries,
+            ..crate::store::fixture::Title::default()
+        };
+        let titles = [
+            title(1, vec!["SE"]),
+            title(2, vec!["NO", "SE"]),
+            title(3, vec!["DK"]),
+            title(4, vec!["FI"]),
+            title(5, vec!["US"]),
+        ];
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 3, &titles, &[]);
+        let meta = json!({ "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+                           "quantization": "int8", "storeFile": "den-v1.store" });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("the region store loads");
+        let indexes = crate::queries::load_for_tools(&ds).expect("its indexes load");
+
+        let all = counts(&indexes, Movie, "");
+        let countries = &all["kinds"]["country"]["values"];
+        assert_eq!(countries, &json!({ "DK": 1, "FI": 1, "NO": 1, "SE": 2, "US": 1 }));
+        let sum: u64 = ["SE", "NO", "DK", "FI", "IS"].iter().filter_map(|c| countries[c].as_u64()).sum();
+        let region = &all["kinds"]["region"];
+        assert_eq!(region["mode"], "single");
+        assert_eq!(region["values"]["nordic"], sum - 1, "title 2 is Swedish and Norwegian, counted once");
+        assert_eq!(
+            region["values"],
+            json!({ "nordic": 4, "north-american": 1, "scandinavian": 3 }),
+            "a region no title carries is not offered"
+        );
+        assert_eq!(region["labels"]["north-american"], "North American");
+
+        let nordic = counts(&indexes, Movie, "sel=region:nordic");
+        assert_eq!(nordic["total"], 4);
+        let region = &nordic["kinds"]["region"];
+        assert_eq!(region["values"], json!({ "nordic": 4, "north-american": 1, "scandinavian": 3 }));
+        assert_eq!(region["selected"], json!(["nordic"]));
+        assert_eq!(nordic["coverage"]["region"], json!({ "count": 5, "denominator": 5 }));
+        let swedish = counts(&indexes, Movie, "sel=country:SE,region:scandinavian");
+        assert_eq!(swedish["total"], 2);
+        assert_eq!(swedish["kinds"]["region"]["values"], json!({ "nordic": 2, "scandinavian": 2 }));
+        let context = Context::new(&indexes, Movie, None);
+        let titles = context.titles(&request(Route::Titles, "sel=-region:scandinavian")).0;
+        let mut excluded = ids(&titles);
+        excluded.sort_unstable();
+        assert_eq!(excluded, vec![4, 5]);
+
+        let empty = counts(&indexes, Movie, "sel=region:african");
+        assert_eq!(empty["total"], 0);
+        assert!(empty.get("unknownValues").is_none(), "a real region, just none here: {empty}");
+        let typo = counts(&indexes, Movie, "sel=region:nordik");
+        assert_eq!(typo["unknownValues"], json!(["region:nordik"]));
+
+        let spec = spec("region").unwrap();
+        let scandi = context.values(spec, &request(Route::Values(spec), "q=scandi")).0;
+        assert_eq!(scandi["values"], json!([{ "id": "scandinavian", "name": "Scandinavian", "count": 3 }]));
+        let schema = schema();
+        let nordic = schema["regions"].as_array().unwrap().iter().find(|r| r["slug"] == "nordic").unwrap();
+        assert_eq!(nordic["countries"], json!(["SE", "NO", "DK", "FI", "IS"]));
+        assert_eq!(nordic["label"], "Nordic");
     }
 
     /// Den Web tests against the same file (tests/fixtures/facets-canonical.json): every url answers as its
