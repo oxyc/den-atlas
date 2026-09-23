@@ -287,6 +287,10 @@ pub struct Knob {
 /// The groups `Knob::group` names, in the order a form shows them.
 pub const KNOB_GROUPS: &[&str] = &["pool", "signals", "facet axes", "floors", "filters", "row"];
 
+/// The top of every weight's range. The largest production weight is `W_WORLD` (2.5); twice that leaves room to
+/// overshoot and see where a weight breaks, without a slider spending most of its travel on values nobody uses.
+const W_MAX: f64 = 5.0;
+
 const fn knob(
     name: &'static str,
     group: &'static str,
@@ -309,8 +313,8 @@ impl SimilarParams {
     /// and 0.72 MB. The other knobs change what a candidate scores, not how many are scored.
     pub const KNOBS: &'static [Knob] = &[
         knob("pool_k", "pool", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
-        knob("w_premise", "pool", 0.0, 10.0, false, "base: weight of the premise-space cosine"),
-        knob("w_plot", "pool", 0.0, 10.0, false, "base: weight of the plot-space cosine"),
+        knob("w_premise", "pool", 0.0, W_MAX, false, "base: weight of the premise-space cosine"),
+        knob("w_plot", "pool", 0.0, W_MAX, false, "base: weight of the plot-space cosine"),
         knob("pool_floor_pct", "pool", 0.0, 50.0, true, "percentile of the pool a missing cosine is read at"),
         knob(
             "spread_low_pct",
@@ -321,12 +325,12 @@ impl SimilarParams {
             "spread = base at spread_high_pct minus base at this",
         ),
         knob("spread_high_pct", "pool", 51.0, 100.0, true, "... the upper percentile of that spread"),
-        knob("w_maker", "signals", 0.0, 10.0, false, "shared director/writer/creator (share of the seed's)"),
+        knob("w_maker", "signals", 0.0, W_MAX, false, "shared director/writer/creator (share of the seed's)"),
         knob(
             "w_character",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "shared character (spin-offs, sequels); above 0 also nominates the linked titles",
         ),
@@ -334,36 +338,36 @@ impl SimilarParams {
             "w_region",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "same country, then region, then continent — for a seed not from the US or UK nor in English",
         ),
-        knob("w_home", "signals", 0.0, 10.0, false, "shared broadcaster/production company"),
-        knob("w_facet", "signals", 0.0, 10.0, false, "agreement on the twelve facet axes, rarity-weighted"),
+        knob("w_home", "signals", 0.0, W_MAX, false, "shared broadcaster/production company"),
+        knob("w_facet", "signals", 0.0, W_MAX, false, "agreement on the twelve facet axes, rarity-weighted"),
         knob(
             "w_world",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "penalty for a different world (realist vs fantastical)",
         ),
-        knob("w_noul", "signals", 0.0, 10.0, false, "cosine over the taxonomy nouls"),
-        knob("w_critique", "signals", 0.0, 10.0, false, "centered cosine over what the works argue about"),
+        knob("w_noul", "signals", 0.0, W_MAX, false, "cosine over the taxonomy nouls"),
+        knob("w_critique", "signals", 0.0, W_MAX, false, "centered cosine over what the works argue about"),
         knob(
             "w_coverage",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "coverage of the seed's defining arguments, idf-weighted",
         ),
-        knob("w_tone", "signals", 0.0, 10.0, false, "coverage of the seed's confident subgenres and moods"),
+        knob("w_tone", "signals", 0.0, W_MAX, false, "coverage of the seed's confident subgenres and moods"),
         knob(
             "w_year",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "release-year proximity: 2^(-|years apart| / year_halflife)",
         ),
@@ -371,22 +375,36 @@ impl SimilarParams {
             "w_popularity",
             "signals",
             0.0,
-            10.0,
+            W_MAX,
             false,
             "TMDB popularity, ln-scaled to the pool's most popular",
         ),
-        knob("w_facet_era", "facet axes", 0.0, 10.0, false, "x w_facet for the era axis alone"),
-        knob("w_facet_setting", "facet axes", 0.0, 10.0, false, "x w_facet for the setting axis alone"),
-        knob("w_facet_scope", "facet axes", 0.0, 10.0, false, "x w_facet for the scope axis alone"),
-        knob("w_facet_ending", "facet axes", 0.0, 10.0, false, "x w_facet for the ending axis alone"),
-        knob("w_facet_pacing", "facet axes", 0.0, 10.0, false, "x w_facet for the pacing axis alone"),
-        knob("w_facet_chronology", "facet axes", 0.0, 10.0, false, "x w_facet for the chronology axis alone"),
-        knob("w_facet_continuity", "facet axes", 0.0, 10.0, false, "x w_facet for the continuity axis alone"),
-        knob("w_facet_conflict", "facet axes", 0.0, 10.0, false, "x w_facet for the conflict axis alone"),
-        knob("w_facet_ensemble", "facet axes", 0.0, 10.0, false, "x w_facet for the ensemble axis alone"),
-        knob("w_facet_tone", "facet axes", 0.0, 10.0, false, "x w_facet for the tone axis alone"),
-        knob("w_facet_timespan", "facet axes", 0.0, 10.0, false, "x w_facet for the timespan axis alone"),
-        knob("w_facet_archetype", "facet axes", 0.0, 10.0, false, "x w_facet for the archetype axis alone"),
+        knob("w_facet_era", "facet axes", 0.0, W_MAX, false, "x w_facet for the era axis alone"),
+        knob("w_facet_setting", "facet axes", 0.0, W_MAX, false, "x w_facet for the setting axis alone"),
+        knob("w_facet_scope", "facet axes", 0.0, W_MAX, false, "x w_facet for the scope axis alone"),
+        knob("w_facet_ending", "facet axes", 0.0, W_MAX, false, "x w_facet for the ending axis alone"),
+        knob("w_facet_pacing", "facet axes", 0.0, W_MAX, false, "x w_facet for the pacing axis alone"),
+        knob(
+            "w_facet_chronology",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "x w_facet for the chronology axis alone",
+        ),
+        knob(
+            "w_facet_continuity",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "x w_facet for the continuity axis alone",
+        ),
+        knob("w_facet_conflict", "facet axes", 0.0, W_MAX, false, "x w_facet for the conflict axis alone"),
+        knob("w_facet_ensemble", "facet axes", 0.0, W_MAX, false, "x w_facet for the ensemble axis alone"),
+        knob("w_facet_tone", "facet axes", 0.0, W_MAX, false, "x w_facet for the tone axis alone"),
+        knob("w_facet_timespan", "facet axes", 0.0, W_MAX, false, "x w_facet for the timespan axis alone"),
+        knob("w_facet_archetype", "facet axes", 0.0, W_MAX, false, "x w_facet for the archetype axis alone"),
         knob(
             "min_confidence",
             "floors",
@@ -1798,6 +1816,9 @@ mod tests {
         assert_eq!(SimilarParams::KNOBS.len(), 48, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
+            if knob.name.starts_with("w_") {
+                assert_eq!((knob.min, knob.max), (0.0, W_MAX), "{} is a weight on another scale", knob.name);
+            }
         }
         // The per-axis knobs name the store's axes, in its order.
         for (knob, axis) in FACET_AXIS_KNOBS.iter().zip(den_store::FACET_AXES) {
@@ -1966,8 +1987,11 @@ mod tests {
             let axis = axis as Axis;
             assert!(!two_before_three(axis, &SimilarParams::default()), "{name}: production");
             let mut p = SimilarParams::default();
-            p.set(name, 10.0).unwrap();
-            assert!(two_before_three(axis, &p), "{name} = 10 lifts the title agreeing on that axis alone");
+            p.set(name, W_MAX).unwrap();
+            assert!(
+                two_before_three(axis, &p),
+                "{name} at its top lifts the title agreeing on that axis alone"
+            );
         }
     }
 
@@ -2031,7 +2055,7 @@ mod tests {
         assert!(with("min_rating", 6.0).contains(&3), "unrated: kept");
         assert!(!with("min_votes", 101.0).contains(&2), "100 votes: dropped");
         assert_eq!(with("min_popularity", 5.0), [3], "only the popular title clears the floor");
-        assert_eq!(with("w_popularity", 10.0)[0], 3, "popularity lifts 3 over 2");
+        assert_eq!(with("w_popularity", W_MAX)[0], 3, "popularity lifts 3 over 2");
         let not_two = |id: Key| id != film(2);
         assert!(!audience_row(&SimilarParams::default(), Some(&not_two)).contains(&2));
     }
