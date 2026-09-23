@@ -439,7 +439,7 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/similar/{type}/{tmdbId}.json",
             "example": "/index/similar/movie/1.json",
-            "about": "More Like This for one title, best first.",
+            "about": "More Like This for one title, best first: films and series alike, each named with its type.",
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
                 with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
@@ -447,7 +447,7 @@ fn routes() -> Value {
                 with(param("limit", "integer", "titles in the page"),
                      json!({ "default": SIMILAR_PAGE, "max": den_index::MAX_ROW })),
             ],
-            "returns": "{ids, total}",
+            "returns": "{titles:[{type,id}], total}",
             "counts": { "total": format!("the length of the ranked list, at most {}", den_index::MAX_ROW) },
         },
         {
@@ -562,7 +562,7 @@ fn routes() -> Value {
             "path": "/index/suggest.json",
             "about": format!("More Like This for up to {MAX_SEEDS} seeds, per seed and pooled in seed order."),
             "body": "{seeds, exclude?, limit?}",
-            "returns": "{perSeed:[{seed,ids}], pooled}",
+            "returns": "{perSeed:[{seed,titles:[{type,id}]}], pooled:[{type,id}]}",
         },
         {
             "method": "POST",

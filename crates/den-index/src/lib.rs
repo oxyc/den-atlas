@@ -13,13 +13,19 @@ mod rail;
 mod similar;
 
 pub use facets::{split_negation, FacetIndex, FacetQuery, Negation, TitleFacets};
-pub use index::{Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, DISPLAY_CONFIDENCE_FLOOR};
+pub use index::{
+    Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, TypeNeighbours, DISPLAY_CONFIDENCE_FLOOR,
+};
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use similar::{
     more_like_this, more_like_this_pooled, more_like_this_scored, more_like_this_with, rank_pool, Audience,
     Authorship, Axis, Candidate, Extras, Facets, Knob, Scored, SimilarParams, ValueId, Weighted, KNOB_GROUPS,
     MAX_ROW,
 };
+
+/// A title as the scorer names it: its type and its TMDB id. More Like This mixes films and series, so an id
+/// alone does not say which title it is.
+pub type Key = (MediaType, u32);
 
 /// The two kinds of title in the index. The store packs the distinction into a key's high word; this
 /// spelling is the labels blob's, which only the test-only reader still parses.

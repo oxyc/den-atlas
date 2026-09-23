@@ -691,6 +691,9 @@ mod tests {
             .expect("the fixture carries every column the rail reads")
     }
 
+    const MOVIE_1: den_index::Key = (den_index::MediaType::Movie, 1);
+    const MOVIE_2: den_index::Key = (den_index::MediaType::Movie, 2);
+
     fn axis(name: &str) -> den_index::Axis {
         den_store::FACET_AXES.iter().position(|a| *a == name).unwrap() as den_index::Axis
     }
@@ -702,7 +705,7 @@ mod tests {
     fn facets_carry_confidence_and_declines_are_absent() {
         use den_index::Facets as _;
         let Some(loaded) = rail_fixture() else { return };
-        let facets = seed(&loaded, den_index::MediaType::Movie).facets(1);
+        let facets = seed(&loaded, den_index::MediaType::Movie).facets(MOVIE_1);
         let (_, _, conf) = facets.iter().find(|(a, _, _)| *a == axis("era")).expect("era is answered");
         assert!((conf - 0.96).abs() < 1e-9, "confidence is hundredths, got {conf}");
         assert!(!facets.iter().any(|(a, _, _)| *a == axis("pacing")), "a declined axis must not appear");
@@ -716,7 +719,7 @@ mod tests {
         let Some(loaded) = rail_fixture() else { return };
         let movies = seed(&loaded, den_index::MediaType::Movie);
         let era = axis("era");
-        let (_, value, _) = movies.facets(1).into_iter().find(|(a, _, _)| *a == era).unwrap();
+        let (_, value, _) = movies.facets(MOVIE_1).into_iter().find(|(a, _, _)| *a == era).unwrap();
 
         assert!((movies.prevalence(era, value) - 0.5).abs() < 1e-9, "1 of 2 movie rows");
         // The same value id, asked of the other media type, must not read the movie statistic.
@@ -732,11 +735,14 @@ mod tests {
         let movies = seed(&loaded, den_index::MediaType::Movie);
 
         let floors = den_index::SimilarParams::default();
-        assert!(movies.nouls(1).iter().all(|(_, p)| *p >= floors.noul_floor), "every noul clears the floor");
-        let world = movies.world(1);
+        assert!(
+            movies.nouls(MOVIE_1).iter().all(|(_, p)| *p >= floors.noul_floor),
+            "every noul clears the floor"
+        );
+        let world = movies.world(MOVIE_1);
         assert!(world == 0.0 || world >= floors.world_floor, "world is floored, got {world}");
         // A row with nothing at all reads as zero distance, not as a missing value.
-        assert_eq!(movies.world(2), 0.0);
+        assert_eq!(movies.world(MOVIE_2), 0.0);
     }
 
     /// "Unknown is not none." A row with no critique must return NOTHING, so the cosine term is skipped
@@ -747,9 +753,12 @@ mod tests {
         let Some(loaded) = rail_fixture() else { return };
         let movies = seed(&loaded, den_index::MediaType::Movie);
 
-        assert!(!movies.critique(1).is_empty(), "movie:1 argues about something");
-        assert!(movies.critique_raw(2).is_empty(), "movie:2 has no critique at all");
-        assert!(movies.critique(2).is_empty(), "and centering must not manufacture seventeen values for it");
+        assert!(!movies.critique(MOVIE_1).is_empty(), "movie:1 argues about something");
+        assert!(movies.critique_raw(MOVIE_2).is_empty(), "movie:2 has no critique at all");
+        assert!(
+            movies.critique(MOVIE_2).is_empty(),
+            "and centering must not manufacture seventeen values for it"
+        );
     }
 
     /// Centering subtracts the per-media mean, so a title above the corpus on an axis reads positive.
@@ -758,8 +767,8 @@ mod tests {
         use den_index::Facets as _;
         let Some(loaded) = rail_fixture() else { return };
         let movies = seed(&loaded, den_index::MediaType::Movie);
-        let raw = movies.critique_raw(1);
-        let centered = movies.critique(1);
+        let raw = movies.critique_raw(MOVIE_1);
+        let centered = movies.critique(MOVIE_1);
 
         assert_eq!(raw.len(), centered.len());
         for ((name, r), (name2, c)) in raw.iter().zip(&centered) {

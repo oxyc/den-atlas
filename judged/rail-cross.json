@@ -40,7 +40,8 @@
       "judged": [
         {"id": "movie:54524", "type": "movie", "title": "The Robber (2010)", "grade": "ok", "basis": "known", "note": "A man living a double life as a bank robber; a cold character study, not the descent."},
         {"id": "movie:413601", "type": "movie", "title": "Wùlu (2016)", "grade": "good", "basis": "known", "note": "An ordinary worker rises through the cocaine trade: the descent, in Mali."},
-        {"id": "movie:1359", "type": "movie", "title": "American Psycho (2000)", "grade": "bad", "basis": "known", "note": "Shares a sociopath at the centre; a yuppie satire in another register."}
+        {"id": "movie:1359", "type": "movie", "title": "American Psycho (2000)", "grade": "bad", "basis": "known", "note": "Shares a sociopath at the centre; a yuppie satire in another register."},
+        {"id": "movie:559969", "type": "movie", "title": "El Camino: A Breaking Bad Movie (2019)", "grade": "good", "basis": "known, maker", "note": "Jesse's epilogue to the seed, by its creator; graded as for Better Call Saul."}
       ]
     },
     {
@@ -201,7 +202,9 @@
         {"id": "movie:157", "type": "movie", "title": "Star Trek III: The Search for Spock (1984)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
         {"id": "movie:172", "type": "movie", "title": "Star Trek V: The Final Frontier (1989)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
         {"id": "movie:152", "type": "movie", "title": "Star Trek: The Motion Picture (1979)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
-        {"id": "movie:174", "type": "movie", "title": "Star Trek VI: The Undiscovered Country (1991)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."}
+        {"id": "movie:174", "type": "movie", "title": "Star Trek VI: The Undiscovered Country (1991)", "grade": "ok", "basis": "known", "note": "A film of the original crew: a franchise entry, not this crew."},
+        {"id": "movie:199", "type": "movie", "title": "Star Trek: First Contact (1996)", "grade": "good", "basis": "known", "note": "This crew's own film, same actors, and its best-regarded."},
+        {"id": "movie:200", "type": "movie", "title": "Star Trek: Insurrection (1998)", "grade": "ok", "basis": "known", "note": "This crew's film, same actors, a slighter one."}
       ]
     },
     {

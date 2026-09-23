@@ -1,7 +1,9 @@
-//! Score More Like This against the hand-judged set in `judged/rail.json`.
+//! Score More Like This against the hand-judged set in `judged/rail.json`, with the other type's grades from
+//! `judged/rail-cross.json` added to each case.
 //!
 //!   den-atlas rail-eval <dataset dir>
 //!   RAIL_JUDGED=<file>        den-atlas rail-eval <dataset dir>   # another judged file
+//!   RAIL_JUDGED_CROSS=<file>  den-atlas rail-eval <dataset dir>   # another cross-type file; empty: none
 //!   RAIL_EVAL_UNJUDGED=10     den-atlas rail-eval <dataset dir>   # …and list what is not judged yet
 //!   RAIL_KNOBS='w_maker=1'    den-atlas rail-eval <dataset dir>   # knobs moved off production
 //!   RAIL_EVAL_SHOW=movie:11   den-atlas rail-eval <dataset dir>   # …and print that seed's first ten
@@ -18,7 +20,8 @@
 //! # The metrics, at k = 10
 //!
 //! - **nDCG@10** — graded, gain 2 / 1 / 0 for good / ok / bad, an unjudged title scoring 0. The ideal is
-//!   the case's own judgements sorted best first, so a case with three goods is out of three goods.
+//!   the case's own judgements sorted best first, so a case with three goods is out of three goods — both
+//!   types' goods, so a row of one type is read against the same ideal as a mixed one and the two compare.
 //! - **nDCG'@10** — the same over the row with unjudged titles removed first (Sakai's condensed list).
 //!   The judgements are a sample, not the corpus, so a change that surfaces a good title nobody judged yet
 //!   reads as a loss on plain nDCG and not on this one. Read the two together: plain nDCG falling while
@@ -49,8 +52,10 @@ use std::sync::OnceLock;
 
 pub(crate) const K: usize = 10;
 
-/// The judged set as committed, compiled in so the playground can score against it with no file on the box.
+/// The judged set as committed, compiled in so the playground can score against it with no file on the box:
+/// the seed type's grades, and the other type's (`judged/rail-cross.json`, oxyc/den-atlas#49).
 const EMBEDDED: &str = include_str!("../judged/rail.json");
+const EMBEDDED_CROSS: &str = include_str!("../judged/rail-cross.json");
 
 #[derive(Deserialize)]
 struct Judged {
@@ -101,31 +106,38 @@ fn dataset_key(media: MediaType, id: u32) -> String {
     }
 }
 
-/// A case, resolved: the seed and its grades by id.
+/// A case, resolved: the seed and its grades by title, of either type.
 pub(crate) struct Resolved<'a> {
     pub(crate) case: &'a Case,
     pub(crate) media: MediaType,
     pub(crate) id: u32,
-    pub(crate) grades: HashMap<u32, Grade>,
+    pub(crate) grades: HashMap<Key, Grade>,
 }
 
-/// The compiled-in judged set, resolved once. It cannot fail at runtime in a built binary: the test below
-/// resolves the same bytes, so a set that would not resolve fails the build's tests instead.
+type Key = (MediaType, u32);
+
+/// The compiled-in judged set — both files — resolved once. It cannot fail at runtime in a built binary: the
+/// test below resolves the same bytes, so a set that would not resolve fails the build's tests instead.
 pub(crate) fn embedded() -> &'static [Resolved<'static>] {
-    static JUDGED: OnceLock<Judged> = OnceLock::new();
+    static JUDGED: OnceLock<(Judged, Judged)> = OnceLock::new();
     static CASES: OnceLock<Vec<Resolved<'static>>> = OnceLock::new();
     CASES.get_or_init(|| {
-        let judged =
-            JUDGED.get_or_init(|| serde_json::from_str(EMBEDDED).expect("judged/rail.json parses (tested)"));
-        resolve(judged).expect("judged/rail.json resolves (tested)")
+        let (judged, cross) = JUDGED.get_or_init(|| {
+            (
+                serde_json::from_str(EMBEDDED).expect("judged/rail.json parses (tested)"),
+                serde_json::from_str(EMBEDDED_CROSS).expect("judged/rail-cross.json parses (tested)"),
+            )
+        });
+        resolve(judged, Some(cross)).expect("the judged files resolve (tested)")
     })
 }
 
-/// Every case's keys parsed and checked. A malformed file is refused whole: scoring the cases that happen
-/// to parse would report a number over a different set than the one on disk.
-fn resolve(judged: &Judged) -> Result<Vec<Resolved<'_>>, String> {
+/// Every case's keys parsed and checked, with the cross-type file's grades (films for a series seed, series
+/// for a film) added to its seed's case. A malformed file is refused whole: scoring the cases that happen to
+/// parse would report a number over a different set than the one on disk.
+fn resolve<'a>(judged: &'a Judged, cross: Option<&'a Judged>) -> Result<Vec<Resolved<'a>>, String> {
     let mut seeds = HashSet::new();
-    judged
+    let mut resolved: Vec<Resolved<'a>> = judged
         .cases
         .iter()
         .map(|case| {
@@ -137,24 +149,49 @@ fn resolve(judged: &Judged) -> Result<Vec<Resolved<'_>>, String> {
                 return Err(format!("{}: split must be dev or test, got {:?}", case.seed, case.split));
             }
             let mut grades = HashMap::new();
-            for j in &case.judged {
-                let (m, other) =
-                    parse_key(&j.id).ok_or_else(|| format!("{}: bad key {:?}", case.seed, j.id))?;
-                // More Like This never crosses media types, so a judgement that does can never be scored.
-                if m != media || other == id {
-                    return Err(format!("{}: {} can never appear in this row", case.seed, j.id));
-                }
-                // A grade nobody can trace back to a reason cannot be argued with, only deleted.
-                if j.basis.trim().is_empty() || j.title.trim().is_empty() {
-                    return Err(format!("{}: {} needs a title and a basis", case.seed, j.id));
-                }
-                if grades.insert(other, j.grade).is_some() {
-                    return Err(format!("{}: {} is judged twice", case.seed, j.id));
-                }
-            }
+            add_grades(&mut grades, (media, id), case, |_| true)?;
             Ok(Resolved { case, media, id, grades })
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    for case in cross.map_or(&[][..], |c| c.cases.as_slice()) {
+        let Some(at) = resolved.iter_mut().find(|r| r.case.seed == case.seed) else {
+            return Err(format!("{}: a cross-type case for a seed the judged set lacks", case.seed));
+        };
+        if at.case.split != case.split {
+            return Err(format!(
+                "{}: split {:?} here, {:?} in the judged set",
+                case.seed, case.split, at.case.split
+            ));
+        }
+        let seed = (at.media, at.id);
+        // The cross-type file holds only the other type, as its `about` says.
+        add_grades(&mut at.grades, seed, case, |(media, _)| media != seed.0)?;
+    }
+    Ok(resolved)
+}
+
+/// A case's judgements into `grades`: refused when a key will not parse, names the seed itself, is not what
+/// `allowed` admits, lacks a title or a basis, or is judged twice.
+fn add_grades(
+    grades: &mut HashMap<Key, Grade>,
+    seed: Key,
+    case: &Case,
+    allowed: impl Fn(Key) -> bool,
+) -> Result<(), String> {
+    for j in &case.judged {
+        let key = parse_key(&j.id).ok_or_else(|| format!("{}: bad key {:?}", case.seed, j.id))?;
+        if key == seed || !allowed(key) {
+            return Err(format!("{}: {} does not belong in this case", case.seed, j.id));
+        }
+        // A grade nobody can trace back to a reason cannot be argued with, only deleted.
+        if j.basis.trim().is_empty() || j.title.trim().is_empty() {
+            return Err(format!("{}: {} needs a title and a basis", case.seed, j.id));
+        }
+        if grades.insert(key, j.grade).is_some() {
+            return Err(format!("{}: {} is judged twice", case.seed, j.id));
+        }
+    }
+    Ok(())
 }
 
 fn title(indexes: &Indexes, media: MediaType, id: u32) -> String {
@@ -175,20 +212,28 @@ fn line(label: &str, s: &Scores, plot: &Scores) {
 /// Exit code, as the other subcommands return one.
 pub async fn run(dir: &std::path::Path) -> i32 {
     let path = std::env::var("RAIL_JUDGED").unwrap_or_else(|_| "judged/rail.json".to_owned());
-    let judged: Judged = match std::fs::read(&path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
-    {
-        Ok(j) => j,
+    let cross_path =
+        std::env::var("RAIL_JUDGED_CROSS").unwrap_or_else(|_| "judged/rail-cross.json".to_owned());
+    let read = |path: &str| -> Result<Judged, String> {
+        std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+            .map_err(|e| format!("{path}: {e}"))
+    };
+    // An empty RAIL_JUDGED_CROSS scores the seed type's grades alone.
+    let loaded =
+        read(&path).and_then(|j| Ok((j, (!cross_path.is_empty()).then(|| read(&cross_path)).transpose()?)));
+    let (judged, cross) = match loaded {
+        Ok(both) => both,
         Err(e) => {
-            eprintln!("rail-eval: {path}: {e}");
+            eprintln!("rail-eval: {e}");
             return 1;
         }
     };
-    let cases = match resolve(&judged) {
+    let cases = match resolve(&judged, cross.as_ref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("rail-eval: {path}: {e}");
+            eprintln!("rail-eval: {path} / {cross_path}: {e}");
             return 1;
         }
     };
@@ -247,25 +292,29 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     let mut by_split: HashMap<&str, (Vec<Scores>, Vec<Scores>)> = HashMap::new();
     let mut gaps: Vec<String> = Vec::new();
     for c in &cases {
-        let row: Vec<u32> = if production {
+        let row: Vec<Key> = if production {
             indexes.more_like_this(c.id, c.media).to_vec()
         } else {
-            indexes.more_like_this_scored(c.id, c.media, &params).iter().map(|s| s.tmdb_id).collect()
+            indexes.more_like_this_scored(c.id, c.media, &params).iter().map(|s| s.key()).collect()
         };
-        let plot: Vec<u32> =
-            indexes.plot.nearest(c.id, c.media, den_index::MAX_ROW).into_iter().map(|n| n.tmdb_id).collect();
+        let plot: Vec<Key> = indexes
+            .plot
+            .nearest(c.id, c.media, den_index::MAX_ROW)
+            .into_iter()
+            .map(|n| (n.media_type, n.tmdb_id))
+            .collect();
         let (s, p) = (score(&row, &c.grades, K), score(&plot, &c.grades, K));
         let name: String = c.case.title.chars().take(26).collect();
         line(&format!("{name} [{}]", c.case.split), &s, &p);
         if show.as_deref() == Some(c.case.seed.as_str()) {
-            for (at, id) in row.iter().take(K).enumerate() {
-                let grade = match c.grades.get(id) {
+            for (at, &(media, id)) in row.iter().take(K).enumerate() {
+                let grade = match c.grades.get(&(media, id)) {
                     Some(Grade::Good) => "good",
                     Some(Grade::Ok) => "ok",
                     Some(Grade::Bad) => "bad",
                     None => "-",
                 };
-                println!("    {:>2}. {grade:<4} {}", at + 1, title(&indexes, c.media, *id));
+                println!("    {:>2}. {grade:<4} {}", at + 1, title(&indexes, media, id));
             }
         }
         for half in [c.case.split.as_str(), "all"] {
@@ -276,9 +325,9 @@ pub async fn run(dir: &std::path::Path) -> i32 {
         if unjudged > 0 {
             let mut seen = HashSet::new();
             for (arm, list) in [("rail", &row), ("plot", &plot)] {
-                for (at, id) in list.iter().take(unjudged).enumerate() {
-                    if !c.grades.contains_key(id) && seen.insert(*id) {
-                        let key = match c.media {
+                for (at, &(media, id)) in list.iter().take(unjudged).enumerate() {
+                    if !c.grades.contains_key(&(media, id)) && seen.insert((media, id)) {
+                        let key = match media {
                             MediaType::Movie => format!("movie:{id}"),
                             MediaType::Tv => format!("series:{id}"),
                         };
@@ -286,7 +335,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
                             "{} <- {arm} #{}: {{\"id\": \"{key}\", \"title\": {:?}, \"grade\": \"\", \"basis\": \"\"}}",
                             c.case.seed,
                             at + 1,
-                            title(&indexes, c.media, *id)
+                            title(&indexes, media, id)
                         ));
                     }
                 }

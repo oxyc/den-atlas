@@ -136,22 +136,21 @@ pub struct Sources<'a> {
     pub export: Option<&'a den_titlesearch::TitleIndex>,
 }
 
-/// `den_index::Audience` over one media type: TMDB's kept rating and count (`Indexes::rating`, empty while
-/// nothing is kept) and its export popularity. Read by the filters and the popularity term only — plain
-/// filters and a sort term, as `tmdb.rs` allows; no answer here carries the numbers themselves.
+/// `den_index::Audience`: TMDB's kept rating and count (`Indexes::rating`, empty while nothing is kept) and
+/// its export popularity. Read by the filters and the popularity term only — plain filters and a sort term,
+/// as `tmdb.rs` allows; no answer here carries the numbers themselves.
 struct Viewers<'a> {
     sources: &'a Sources<'a>,
-    media: MediaType,
 }
 
 impl den_index::Audience for Viewers<'_> {
-    fn rating(&self, tmdb_id: u32) -> Option<(f64, f64)> {
-        let (votes, rating) = self.sources.indexes.rating(self.media, tmdb_id)?;
+    fn rating(&self, (media, tmdb_id): (MediaType, u32)) -> Option<(f64, f64)> {
+        let (votes, rating) = self.sources.indexes.rating(media, tmdb_id)?;
         Some((f64::from(rating), f64::from(votes)))
     }
 
-    fn popularity(&self, tmdb_id: u32) -> Option<f64> {
-        let kind = match self.media {
+    fn popularity(&self, (media, tmdb_id): (MediaType, u32)) -> Option<f64> {
+        let kind = match media {
             MediaType::Movie => den_titlesearch::MediaType::Movie,
             MediaType::Tv => den_titlesearch::MediaType::Tv,
         };
@@ -165,29 +164,31 @@ impl den_index::Audience for Viewers<'_> {
 /// At production's `Tuning` this is `Indexes::more_like_this_scored` exactly: no filter is consulted, no
 /// title is dropped and nothing is reordered.
 fn tuned_row(sources: &Sources<'_>, media: MediaType, tmdb_id: u32, tuning: &Tuning) -> (Vec<Scored>, bool) {
+    type Key = (MediaType, u32);
     let indexes = sources.indexes;
-    let viewers = Viewers { sources, media };
-    let allowed: Option<std::collections::HashSet<u32>> = (!tuning.filters.is_empty()).then(|| {
-        crate::plotrows::carrying(indexes, media, &tuning.filters)
+    let viewers = Viewers { sources };
+    // A facet filter over both types: a mixed row keeps the other type's titles that carry it too.
+    let allowed: Option<std::collections::HashSet<Key>> = (!tuning.filters.is_empty()).then(|| {
+        [MediaType::Movie, MediaType::Tv]
             .into_iter()
-            .map(|((_, id), _)| id)
+            .flat_map(|kind| crate::plotrows::carrying(indexes, kind, &tuning.filters))
+            .map(|(key, _)| key)
             .collect()
     });
-    let watched: std::collections::HashSet<u32> =
-        tuning.watched.iter().filter(|(m, _)| *m == media).map(|&(_, id)| id).collect();
-    let keep = |id: u32| !watched.contains(&id) && allowed.as_ref().is_none_or(|a| a.contains(&id));
+    let watched: std::collections::HashSet<Key> = tuning.watched.iter().copied().collect();
+    let keep = |key: Key| !watched.contains(&key) && allowed.as_ref().is_none_or(|a| a.contains(&key));
     let filtering = allowed.is_some() || !watched.is_empty();
     let extras = den_index::Extras {
         audience: Some(&viewers),
-        keep: filtering.then_some(&keep as &dyn Fn(u32) -> bool),
+        keep: filtering.then_some(&keep as &dyn Fn(Key) -> bool),
     };
     let row = indexes.more_like_this_with(tmdb_id, media, &tuning.params, extras);
     let Some(tilt) = watched_tilt(&tuning.watched) else { return (row, false) };
     let Some(cards) = indexes.cards.as_ref() else { return (row, false) };
-    let order: Vec<(MediaType, u32)> = row.iter().map(|s| (media, s.tmdb_id)).collect();
+    let order: Vec<Key> = row.iter().map(Scored::key).collect();
     let tilted = tilt.applied(indexes, &order, cards);
-    let mut by_id: std::collections::HashMap<u32, Scored> = row.into_iter().map(|s| (s.tmdb_id, s)).collect();
-    (tilted.iter().filter_map(|(_, id)| by_id.remove(id)).collect(), true)
+    let mut by_key: std::collections::HashMap<Key, Scored> = row.into_iter().map(|s| (s.key(), s)).collect();
+    (tilted.iter().filter_map(|key| by_key.remove(key)).collect(), true)
 }
 
 /// den-core's household tilt with the watched titles as what the household liked — the `tilt.liked` a
@@ -230,12 +231,12 @@ pub fn suggest(sources: &Sources<'_>, seeds: &[(MediaType, u32)], tuning: &Tunin
     let seeds: Vec<(u32, MediaType)> = seeds.iter().map(|&(m, id)| (id, m)).collect();
     let mut excluded: std::collections::HashSet<(u32, MediaType)> = seeds.iter().copied().collect();
     let production_pool = crate::handler::suggest_pool(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-        indexes.more_like_this(id, media).to_vec()
+        indexes.more_like_this(id, media).iter().map(|&(m, id)| (id, m)).collect()
     })
     .1;
     excluded.extend(tuning.watched.iter().map(|&(m, id)| (id, m)));
     let (per_seed, pooled) = crate::handler::suggest_pool(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-        tuned_row(sources, media, id, tuning).0.iter().map(|s| s.tmdb_id).collect()
+        tuned_row(sources, media, id, tuning).0.iter().map(|s| (s.tmdb_id, s.media_type)).collect()
     });
     let card = |media: MediaType, id: u32| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&(media, id)));
@@ -398,8 +399,8 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
     let (params, limit) = (&tuning.params, tuning.limit);
     let production = indexes.more_like_this(tmdb_id, media_type);
     let (row, tilted) = tuned_row(sources, media_type, tmdb_id, tuning);
-    let card = |id: u32| {
-        let card = indexes.cards.as_ref().and_then(|cards| cards.get(&(media_type, id)));
+    let card = |key: (MediaType, u32)| {
+        let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key));
         (card.map(|c| c.title.clone()), card.and_then(|c| c.year))
     };
     let shown: Vec<&Scored> = row.iter().take(limit).collect();
@@ -407,13 +408,14 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
         .iter()
         .enumerate()
         .map(|(at, s)| {
-            let (title, year) = card(s.tmdb_id);
+            let (title, year) = card(s.key());
             json!({
                 "rank": at + 1,
                 "id": s.tmdb_id,
+                "key": seed_key(s.media_type, s.tmdb_id),
                 "title": title,
                 "year": year,
-                "production": production.iter().position(|&id| id == s.tmdb_id).map(|p| p + 1),
+                "production": production.iter().position(|&key| key == s.key()).map(|p| p + 1),
                 "score": s.score,
                 "base": s.base,
                 // Not `premise`/`plot`: the serving guard (`tos.rs`) refuses those keys as prose fields.
@@ -429,13 +431,13 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
         .iter()
         .take(limit)
         .enumerate()
-        .filter(|(_, id)| !shown.iter().any(|s| s.tmdb_id == **id))
-        .map(|(at, &id)| {
-            let (title, year) = card(id);
-            json!({ "production": at + 1, "id": id, "title": title, "year": year })
+        .filter(|(_, key)| !shown.iter().any(|s| s.key() == **key))
+        .map(|(at, &(media, id))| {
+            let (title, year) = card((media, id));
+            json!({ "production": at + 1, "id": id, "key": seed_key(media, id), "title": title, "year": year })
         })
         .collect();
-    let (title, year) = card(tmdb_id);
+    let (title, year) = card((media_type, tmdb_id));
     json!({
         "seed": { "id": tmdb_id, "title": title, "year": year },
         "changed": changed(params),
@@ -698,8 +700,8 @@ pub fn judged(sources: &Sources<'_>, tuning: &Tuning) -> Value {
     for c in crate::raileval::embedded() {
         let production = score(&indexes.more_like_this(c.id, c.media), &c.grades, crate::raileval::K);
         let mine = if tuned {
-            let row: Vec<u32> =
-                tuned_row(sources, c.media, c.id, tuning).0.iter().map(|s| s.tmdb_id).collect();
+            let row: Vec<(MediaType, u32)> =
+                tuned_row(sources, c.media, c.id, tuning).0.iter().map(Scored::key).collect();
             score(&row, &c.grades, crate::raileval::K)
         } else {
             production
@@ -907,6 +909,10 @@ mod tests {
     /// from den-atlas 0.53.0 over HTTP). `scripts/similar-golden.py` recaptures it; it was recaptured when
     /// the scorer's `ln` moved to `libm`, which moved scores by ULPs and changed no id.
     ///
+    /// The golden rows are of one type. With `mix_types` off the row is the golden exactly; with it on (the
+    /// default), the seed type's titles in the row are the golden's first ones, in its order — the other
+    /// type is merged in between and never reorders them.
+    ///
     /// Opt-in, like every test that needs the real corpus: `DEN_STORE` names a store whose directory holds
     /// its `dataset.meta.json`. It skips unless that store is the generation the golden was captured on,
     /// because a different corpus ranks differently by design.
@@ -929,19 +935,28 @@ mod tests {
         let indexes = crate::queries::load_for_tools(&ds).expect("the indexes load");
         let anchors = golden["anchors"].as_array().unwrap();
         assert_eq!(anchors.len(), 5);
+        let one_type = SimilarParams { mix_types: false, ..SimilarParams::default() };
         for anchor in anchors {
             let media = if anchor["type"] == "movie" { MediaType::Movie } else { MediaType::Tv };
             let id = anchor["id"].as_u64().unwrap() as u32;
             let want: Vec<u32> =
                 anchor["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
             assert!(!want.is_empty(), "{}", anchor["name"]);
-            assert_eq!(&*indexes.more_like_this(id, media), want.as_slice(), "{} (serving)", anchor["name"]);
-            let tuned: Vec<u32> = indexes
+            let own = |row: &[(MediaType, u32)]| -> Vec<u32> {
+                row.iter().filter(|&&(kind, _)| kind == media).map(|&(_, id)| id).collect()
+            };
+            let served = own(&indexes.more_like_this(id, media));
+            assert!(served.len() <= want.len(), "{}", anchor["name"]);
+            assert_eq!(served, want[..served.len()], "{} (serving, its own type)", anchor["name"]);
+            let tuned: Vec<(MediaType, u32)> = indexes
                 .more_like_this_scored(id, media, &SimilarParams::default())
                 .iter()
-                .map(|s| s.tmdb_id)
+                .map(Scored::key)
                 .collect();
-            assert_eq!(tuned, want, "{} (playground, default parameters)", anchor["name"]);
+            assert_eq!(own(&tuned), served, "{} (playground, default parameters)", anchor["name"]);
+            let single: Vec<u32> =
+                indexes.more_like_this_scored(id, media, &one_type).iter().map(|s| s.tmdb_id).collect();
+            assert_eq!(single, want, "{} (mix_types = 0)", anchor["name"]);
         }
 
         // The character links, built from the credits `CACHE_DIR` keeps, change nothing while unweighed:
@@ -958,7 +973,7 @@ mod tests {
             .with_characters(Some(std::sync::Arc::new(crate::characters::Characters::with_index(list))));
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let (indexes, _) = runtime.block_on(linked.get(|| ())).expect("the indexes load");
-        let unweighed = SimilarParams { w_character: 0.0, ..SimilarParams::default() };
+        let unweighed = SimilarParams { w_character: 0.0, ..one_type };
         for anchor in anchors {
             let media = if anchor["type"] == "movie" { MediaType::Movie } else { MediaType::Tv };
             let id = anchor["id"].as_u64().unwrap() as u32;
@@ -990,7 +1005,7 @@ mod tests {
             let media = if anchor["type"] == "movie" { MediaType::Movie } else { MediaType::Tv };
             let id = anchor["id"].as_u64().unwrap() as u32;
             let (row, tilted) = tuned_row(&sources, media, id, &Tuning::default());
-            let row: Vec<u32> = row.iter().map(|s| s.tmdb_id).collect();
+            let row: Vec<(MediaType, u32)> = row.iter().map(Scored::key).collect();
             assert_eq!(row.as_slice(), &*indexes.more_like_this(id, media), "{}", anchor["name"]);
             assert!(!tilted);
         }
