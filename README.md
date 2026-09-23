@@ -186,7 +186,8 @@ about it (counts, titles, one kind's values). `/index/schema.json`'s `filter` ob
 pins url → canonical url pairs a client can test against.
 
 - **`sel`** is `[-]<kind>:<id>` items joined by `,`. Kinds: `genre` (TMDB id; a series also under 10759/10765/10768),
-  `language`, `country` (every one a title lists), `decade` (first year; a series' first air date), `mood`,
+  `language`, `country` (every one a title lists), `region` (one pick: any of its countries; the table is
+  `crates/den-index/src/regions.rs`, published as the schema's `regions`), `decade` (first year; a series' first air date), `mood`,
   `subgenre`, `primary` (the labels' primary genre), `animated` (`yes`/`no`), `runtime` (`under-90`, `90-120`,
   `120-150`, `over-150`; a series per episode), `source` (adapted from), `rating` (the rating provider's average ≥ 6,
   7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the twelve

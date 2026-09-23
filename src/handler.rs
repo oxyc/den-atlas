@@ -2899,6 +2899,21 @@ mod tests {
         assert_eq!(all["kinds"]["country"]["mode"], "and");
         assert_eq!(all["kinds"]["decade"]["mode"], "single");
         assert_eq!(all["ignored"], serde_json::json!([]));
+        // Regions: the union of their countries (movie 1 is Korean and Danish), one pick at a time.
+        let regions = serde_json::json!({ "east-asian": 2, "nordic": 1, "scandinavian": 1 });
+        assert_eq!(all["kinds"]["region"]["values"], regions);
+        assert_eq!(all["kinds"]["region"]["labels"]["east-asian"], "East Asian");
+        let nordic =
+            json(body_of(get(&state, "/index/filter/movie/counts.json?sel=region:nordic").await).await);
+        assert_eq!(nordic["total"], 1);
+        assert_eq!(nordic["kinds"]["region"]["values"], regions, "counted as the alternative pick");
+        assert_eq!(nordic["kinds"]["country"]["values"], serde_json::json!({ "DK": 1, "KR": 1 }));
+        let narrowed = get(&state, "/index/filter/movie/titles.json?sel=country:KR,region:east-asian").await;
+        let narrowed = json(body_of(narrowed).await);
+        assert_eq!(narrowed["total"], 2);
+        let schema = json(body_of(get(&state, "/index/schema.json").await).await);
+        let listed = schema["filter"]["regions"].as_array().map_or(0, Vec::len);
+        assert_eq!(listed, den_index::REGIONS.len(), "{}", schema["filter"]);
 
         // The web's own URL for Korea and Heist, as `facetCountsUrl` writes it.
         let canonical = "/index/filter/movie/counts.json?sel=country:KR,subgenre:Heist";
