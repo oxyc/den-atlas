@@ -20,9 +20,9 @@ pub use index::{
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use regions::{region, Region, REGIONS};
 pub use similar::{
-    more_like_this, more_like_this_pooled, more_like_this_scored, more_like_this_with, rank_pool, Audience,
-    Authorship, Axis, Candidate, Extras, Facets, Knob, Scored, SimilarParams, ValueId, Weighted, KNOB_GROUPS,
-    MAX_ROW,
+    more_like_this, more_like_this_both, more_like_this_pooled, more_like_this_scored, more_like_this_with,
+    rank_pool, Audience, Authorship, Axis, Candidate, Extras, Facets, Knob, Scored, SimilarParams, ValueId,
+    Weighted, KNOB_GROUPS, MAX_ROW,
 };
 
 /// A title as the scorer names it: its type and its TMDB id. More Like This mixes films and series, so an id
