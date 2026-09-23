@@ -322,7 +322,8 @@ async fn handle_playground_import(state: &Arc<AppState>, req: Request) -> Respon
 
 /// `/playground` (the page), `/playground/params.json` (the knobs and production's values),
 /// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This),
-/// `/playground/rows.json?seeds=…&<knob>=…&limit=` (the same for up to twelve seeds in one request) and
+/// `/playground/rows.json?seeds=…&<knob>=…&limit=&judged=` (the same for up to twelve seeds in one request,
+/// with `judged=1` also the judged-set scores) and
 /// `/playground/judged.json?<knob>=…` (those knobs scored against the judged set). All 404 unless
 /// `PLAYGROUND` and `INDEX_QUERIES` are both on (`playground.rs`). Answers are `no-store`: a tuned row is an
 /// experiment, and nothing should keep one where a production row is looked for.
@@ -345,7 +346,7 @@ async fn handle_playground(
     enum Ask {
         Judged,
         Similar(den_index::MediaType, u32),
-        Rows,
+        Rows { judged: bool },
         Export { full: bool, judged: bool },
     }
     let bad_request = |detail: String| {
@@ -354,11 +355,16 @@ async fn handle_playground(
             StatusCode::BAD_REQUEST,
         )
     };
-    // Only `rows.json` and `export.json` read `seeds` and `suggest`, and only `export.json` reads `full` and
-    // `judged`; everywhere else they are left in the query, where `parse` refuses them.
+    // Only `rows.json` and `export.json` read `seeds` and `suggest`, only `export.json` reads `full`, and only
+    // those two read `judged`; everywhere else they are left in the query, where `parse` refuses them.
     let (ask, query) = match route {
         "/playground/judged.json" => (Ask::Judged, query.to_owned()),
-        "/playground/rows.json" => (Ask::Rows, query.to_owned()),
+        "/playground/rows.json" => {
+            // `judged=1` adds the judged set's scores to the answer, so the page's one request per change
+            // also carries how the change scores.
+            let (judged, rest) = crate::playground::take_param(query, "judged");
+            (Ask::Rows { judged: judged.as_deref() == Some("1") }, rest)
+        }
         "/playground/export.json" => {
             let (full, rest) = crate::playground::take_param(query, "full");
             let (judged, rest) = crate::playground::take_param(&rest, "judged");
@@ -379,7 +385,7 @@ async fn handle_playground(
         }
     };
     let parsed = match ask {
-        Ask::Rows | Ask::Export { .. } => crate::playground::State::parse(&query),
+        Ask::Rows { .. } | Ask::Export { .. } => crate::playground::State::parse(&query),
         _ => crate::playground::parse(&query).map(|tuning| crate::playground::State {
             tuning,
             seeds: Vec::new(),
@@ -390,7 +396,9 @@ async fn handle_playground(
         Ok(parsed) => parsed,
         Err(detail) => return bad_request(detail),
     };
-    if let (Ask::Rows, Err(detail)) = (&ask, crate::playground::rows_limit(playground_state.tuning.limit)) {
+    if let (Ask::Rows { .. }, Err(detail)) =
+        (&ask, crate::playground::rows_limit(playground_state.tuning.limit))
+    {
         return bad_request(detail);
     }
     let meta = state.dataset.as_ref().map(|ds| ds.meta.clone());
@@ -411,7 +419,13 @@ async fn handle_playground(
             Ask::Similar(media_type, tmdb_id) => {
                 crate::playground::answer(&sources, media_type, tmdb_id, &s.tuning).to_string()
             }
-            Ask::Rows => crate::playground::rows(&sources, &s.seeds, &s.suggest, &s.tuning).to_string(),
+            Ask::Rows { judged } => {
+                let mut answer = crate::playground::rows(&sources, &s.seeds, &s.suggest, &s.tuning);
+                if judged {
+                    answer["judged"] = crate::playground::judged(&sources, &s.tuning);
+                }
+                answer.to_string()
+            }
             Ask::Judged => crate::playground::judged(&sources, &s.tuning).to_string(),
             Ask::Export { full, judged } => {
                 let now = std::time::SystemTime::now()
@@ -2011,6 +2025,10 @@ mod tests {
         assert_eq!(serde_json::json!(keys), serde_json::json!(["movie:1", "series:4"]));
         let alone = json(body_of(get(&on, "/playground/similar/movie/1.json?w_maker=0&limit=5").await).await);
         assert_eq!(rows["rows"][0]["titles"], alone["titles"]);
+        assert!(rows.get("judged").is_none(), "the judged scores only when asked for");
+        let with_judged =
+            json(body_of(get(&on, "/playground/rows.json?seeds=movie:1&w_maker=0&judged=1").await).await);
+        assert_eq!(with_judged["judged"], moved, "the same answer judged.json gives");
         let defaults = json(body_of(get(&on, "/playground/rows.json").await).await);
         assert_eq!(defaults["rows"].as_array().unwrap().len(), crate::playground::DEFAULT_SEEDS.len());
         assert_eq!(get(&on, "/playground/rows.json?seeds=movie:1&limit=50").await.status(), 200);
