@@ -156,9 +156,9 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    // TMDB's kept vote counts and its daily exports, read as serving reads them: the checks are about the scorer
-    // as it runs in production, which has both. The counts are whatever `CACHE_DIR` keeps — the box's, or a seed
-    // (`scripts/tmdb-seed.py`); this asks TMDB for nothing.
+    // TMDB's kept vote counts and credits and its daily exports, read as serving reads them: the checks are about
+    // the scorer as it runs in production, which has all three. The counts and credits are whatever `CACHE_DIR`
+    // keeps — the box's, or a seed (`scripts/tmdb-seed.py`); this asks TMDB for nothing.
     let cache_dir = std::env::var("CACHE_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
     let Some(cache_dir) = cache_dir else {
         eprintln!("billboard-check: CACHE_DIR names no directory of kept TMDB numbers (tmdb-votes.tsv)");
@@ -186,7 +186,9 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     }
-    let queries = crate::queries::IndexQueries::new(&dataset).with_ratings(Some(tmdb.ratings()));
+    let queries = crate::queries::IndexQueries::new(&dataset)
+        .with_ratings(Some(tmdb.ratings()))
+        .with_characters(Some(tmdb.characters()));
     let indexes = match queries.get(|| ()).await {
         Ok((indexes, _)) => indexes,
         Err(e) => {

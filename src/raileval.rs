@@ -3,6 +3,12 @@
 //!   den-atlas rail-eval <dataset dir>
 //!   RAIL_JUDGED=<file>        den-atlas rail-eval <dataset dir>   # another judged file
 //!   RAIL_EVAL_UNJUDGED=10     den-atlas rail-eval <dataset dir>   # …and list what is not judged yet
+//!   RAIL_KNOBS='w_maker=1'    den-atlas rail-eval <dataset dir>   # knobs moved off production
+//!   RAIL_EVAL_SHOW=movie:11   den-atlas rail-eval <dataset dir>   # …and print that seed's first ten
+//!   CACHE_DIR=<dir>           den-atlas rail-eval <dataset dir>   # with the character links kept there
+//!
+//! The character links come from TMDB's credits, which are kept on the box only (`tmdb.rs`): without
+//! `CACHE_DIR` naming a directory of them the row is ranked with no links, which is not production's row.
 //!
 //! Each case is a seed and a set of candidates judged `good` / `ok` / `bad` as recommendations for it. The
 //! row scored is `Indexes::more_like_this`, the function `/index/similar` serves, over the same store load.
@@ -167,7 +173,7 @@ fn line(label: &str, s: &Scores, plot: &Scores) {
 }
 
 /// Exit code, as the other subcommands return one.
-pub fn run(dir: &std::path::Path) -> i32 {
+pub async fn run(dir: &std::path::Path) -> i32 {
     let path = std::env::var("RAIL_JUDGED").unwrap_or_else(|_| "judged/rail.json".to_owned());
     let judged: Judged = match std::fs::read(&path)
         .map_err(|e| e.to_string())
@@ -193,16 +199,46 @@ pub fn run(dir: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    let indexes = match crate::queries::load_for_tools(&dataset) {
-        Ok(i) => i,
+    let params = match crate::playground::parse(&std::env::var("RAIL_KNOBS").unwrap_or_default()) {
+        Ok(tuning) => tuning.params,
+        Err(e) => {
+            eprintln!("rail-eval: RAIL_KNOBS: {e}");
+            return 1;
+        }
+    };
+    let cache_dir = std::env::var("CACHE_DIR").ok().filter(|d| !d.is_empty()).map(std::path::PathBuf::from);
+    let characters = match cache_dir {
+        Some(cache_dir) => match crate::tmdb::Tmdb::new(dataset.store.clone(), Some(cache_dir), None, 0) {
+            Ok(tmdb) => {
+                eprintln!("{}", tmdb.load().await);
+                Some(tmdb.characters())
+            }
+            Err(e) => {
+                eprintln!("rail-eval: {e}");
+                return 1;
+            }
+        },
+        None => {
+            eprintln!("rail-eval: no CACHE_DIR, so no character links");
+            None
+        }
+    };
+    let queries = crate::queries::IndexQueries::new(&dataset).with_characters(characters);
+    let indexes = match queries.get(|| ()).await {
+        Ok((i, _)) => i,
         Err(e) => {
             eprintln!("rail-eval: {e}");
             return 1;
         }
     };
     let unjudged: usize = std::env::var("RAIL_EVAL_UNJUDGED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let production = params == den_index::SimilarParams::default();
+    let show = std::env::var("RAIL_EVAL_SHOW").ok();
 
     println!("dataset {}  ·  {} cases from {path}  ·  k = {K}", indexes.dataset_version, cases.len());
+    if !production {
+        println!("knobs {}", std::env::var("RAIL_KNOBS").unwrap_or_default());
+    }
     println!(
         "{:<34} {:>6} {:>6} {:>5} {:>4} {:>4}   {:>6} {:>6}",
         "seed", "nDCG", "nDCG'", "P", "bad", "jdg", "plot", "plot'"
@@ -211,12 +247,27 @@ pub fn run(dir: &std::path::Path) -> i32 {
     let mut by_split: HashMap<&str, (Vec<Scores>, Vec<Scores>)> = HashMap::new();
     let mut gaps: Vec<String> = Vec::new();
     for c in &cases {
-        let row: Vec<u32> = indexes.more_like_this(c.id, c.media).to_vec();
+        let row: Vec<u32> = if production {
+            indexes.more_like_this(c.id, c.media).to_vec()
+        } else {
+            indexes.more_like_this_scored(c.id, c.media, &params).iter().map(|s| s.tmdb_id).collect()
+        };
         let plot: Vec<u32> =
             indexes.plot.nearest(c.id, c.media, den_index::MAX_ROW).into_iter().map(|n| n.tmdb_id).collect();
         let (s, p) = (score(&row, &c.grades, K), score(&plot, &c.grades, K));
         let name: String = c.case.title.chars().take(26).collect();
         line(&format!("{name} [{}]", c.case.split), &s, &p);
+        if show.as_deref() == Some(c.case.seed.as_str()) {
+            for (at, id) in row.iter().take(K).enumerate() {
+                let grade = match c.grades.get(id) {
+                    Some(Grade::Good) => "good",
+                    Some(Grade::Ok) => "ok",
+                    Some(Grade::Bad) => "bad",
+                    None => "-",
+                };
+                println!("    {:>2}. {grade:<4} {}", at + 1, title(&indexes, c.media, *id));
+            }
+        }
         for half in [c.case.split.as_str(), "all"] {
             let entry = by_split.entry(half).or_default();
             entry.0.push(s);

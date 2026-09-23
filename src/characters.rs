@@ -179,12 +179,23 @@ pub struct CharacterLink {
 }
 
 impl CharacterLink {
-    // Read by the billboard's fit and More Like This once #43 wires the list into scoring.
-    #[allow(dead_code)]
     pub fn same_actor(&self) -> bool {
         self.tier.same_actor()
     }
+
+    /// How strongly the link says the two titles are one franchise, in 0..=1: the rarity `weight` in full
+    /// when one actor plays the character in both or the two titles also share a series (`shares_series`),
+    /// `RECAST` of it otherwise. The audit's line: a same-actor link is a franchise followed, a recast or
+    /// re-adaptation (Les Misérables, A Christmas Carol) weaker evidence of one.
+    pub fn strength(&self, shares_series: bool) -> f64 {
+        let confirmed = self.same_actor() || shares_series;
+        f64::from(self.weight) * if confirmed { 1.0 } else { RECAST }
+    }
 }
+
+/// What a character link counts for, of a confirmed one's, when neither the actor nor a shared series
+/// confirms it.
+pub const RECAST: f64 = 0.5;
 
 /// Every title's character neighbours, indexed BY STORE ROW.
 pub struct CharacterIndex {
@@ -1070,6 +1081,19 @@ mod tests {
         assert!((link.weight - 0.75).abs() < 1e-6, "{}", link.weight);
         let rare = built(&[(1, 1, 100, "Walter White"), (2, 1, 100, "Walter White")]);
         assert_eq!(rare.of(1)[0].weight, 1.0);
+    }
+
+    /// A same-actor link counts in full; a recast one half, unless a shared series confirms it; and a common
+    /// name's weight scales either.
+    #[test]
+    fn a_links_strength_is_full_for_the_same_actor_or_a_shared_series_and_half_for_a_recast() {
+        let link = |tier, weight| CharacterLink { row: 0, tier, weight };
+        assert_eq!(link(Tier::SameActor, 1.0).strength(false), 1.0);
+        assert_eq!(link(Tier::SameActorSubset, 1.0).strength(false), 1.0);
+        assert_eq!(link(Tier::TwoNames, 1.0).strength(false), RECAST);
+        assert_eq!(link(Tier::TwoNames, 1.0).strength(true), 1.0, "a shared series confirms a recast");
+        assert_eq!(link(Tier::TwoNames, 0.75).strength(false), 0.75 * RECAST, "Holmes, recast");
+        assert_eq!(link(Tier::SameActor, 0.75).strength(false), 0.75);
     }
 
     #[test]

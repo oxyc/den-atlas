@@ -256,7 +256,7 @@ async fn main() {
             std::process::exit(railab::run(std::path::Path::new(path)));
         }
         if command == "rail-eval" {
-            std::process::exit(raileval::run(std::path::Path::new(path)));
+            std::process::exit(raileval::run(std::path::Path::new(path)).await);
         }
         if command == "billboard-check" {
             std::process::exit(billboardcheck::run(std::path::Path::new(path)).await);

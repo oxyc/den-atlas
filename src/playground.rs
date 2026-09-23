@@ -733,6 +733,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
     let term = |value: f64, weight: f64| json!({ "value": value, "points": s.spread * weight * value });
     json!({
         "maker": term(s.maker, p.w_maker),
+        "character": term(s.character, p.w_character),
         "home": term(s.home, p.w_home),
         "facet": term(s.facet, p.w_facet),
         "noul": term(s.noul, p.w_noul),
@@ -941,6 +942,31 @@ mod tests {
                 .map(|s| s.tmdb_id)
                 .collect();
             assert_eq!(tuned, want, "{} (playground, default parameters)", anchor["name"]);
+        }
+
+        // The character links, built from the credits `CACHE_DIR` keeps, change nothing while unweighed:
+        // not the pool, not a score. Without `CACHE_DIR` the indexes above have no links at all.
+        let Ok(cache) = std::env::var("CACHE_DIR") else {
+            eprintln!("SKIP: set CACHE_DIR to kept TMDB credits to check the links at w_character = 0");
+            return;
+        };
+        let mapped = crate::store::MappedStore::open(std::path::Path::new(&store)).expect("store");
+        let credits = crate::tmdb::read_credits(&std::path::Path::new(&cache).join("tmdb-credits.tsv"), 0);
+        let list = crate::characters::build(&mapped.view(), &credits).expect("the links build");
+        assert!(list.links() > 0, "CACHE_DIR holds no credits that link anything");
+        let linked = crate::queries::IndexQueries::new(&ds)
+            .with_characters(Some(std::sync::Arc::new(crate::characters::Characters::with_index(list))));
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (indexes, _) = runtime.block_on(linked.get(|| ())).expect("the indexes load");
+        let unweighed = SimilarParams { w_character: 0.0, ..SimilarParams::default() };
+        for anchor in anchors {
+            let media = if anchor["type"] == "movie" { MediaType::Movie } else { MediaType::Tv };
+            let id = anchor["id"].as_u64().unwrap() as u32;
+            let want: Vec<u32> =
+                anchor["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            let row: Vec<u32> =
+                indexes.more_like_this_scored(id, media, &unweighed).iter().map(|s| s.tmdb_id).collect();
+            assert_eq!(row, want, "{} (character links loaded, w_character = 0)", anchor["name"]);
         }
     }
 

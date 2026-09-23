@@ -349,6 +349,8 @@ pub struct SeedAuthorship<'a> {
     /// The seed's own makers and homes, as Q-ids.
     mine_makers: Vec<u32>,
     mine_homes: Vec<u32>,
+    /// The titles sharing a character with the seed (`with_characters`): not in the store, so the caller's.
+    characters: Vec<(u32, f64)>,
 }
 
 impl<'a> SeedAuthorship<'a> {
@@ -362,12 +364,20 @@ impl<'a> SeedAuthorship<'a> {
             broadcasters: store.list::<u32>("broadcasters_v", "broadcasters_o")?,
             mine_makers: Vec::new(),
             mine_homes: Vec::new(),
+            characters: Vec::new(),
         };
         if let Some(row) = row_in(out.keys, out.media, tmdb_id) {
             out.mine_makers = out.qids(out.makers.get(row)).collect();
             out.mine_homes = out.qids(out.broadcasters.get(row)).collect();
         }
         Ok(out)
+    }
+
+    /// The titles of the seed's type sharing a character with it, each with its strength
+    /// (`Authorship::characters`). The links are built from credits the store does not carry.
+    pub fn with_characters(mut self, characters: Vec<(u32, f64)>) -> Self {
+        self.characters = characters;
+        self
     }
 
     fn qids<'s>(&'s self, entities: &'s [u32]) -> impl Iterator<Item = u32> + 's {
@@ -419,5 +429,9 @@ impl crate::Authorship for SeedAuthorship<'_> {
 
     fn home(&self, tmdb_id: u32) -> f64 {
         self.share(&self.mine_homes, self.list_of(&self.broadcasters, tmdb_id))
+    }
+
+    fn characters(&self) -> &[(u32, f64)] {
+        &self.characters
     }
 }
