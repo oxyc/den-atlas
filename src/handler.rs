@@ -760,6 +760,11 @@ enum IndexQuestion {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     },
+    /// One title as the corpus describes it (`plotrows::facts_json`).
+    Title {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
     /// Answered in `handle_index`, because it waits on den-embed.
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
@@ -802,6 +807,9 @@ impl IndexQuestion {
             ["studios"] => Some(Self::Studios),
             ["studios", type_, id] => {
                 Some(Self::TitleStudios { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["title", type_, id] => {
+                Some(Self::Title { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
@@ -872,6 +880,19 @@ impl IndexQuestion {
                 })
             }
             Self::Similar { media_type, tmdb_id } => similar_json(indexes, *media_type, *tmdb_id, query),
+            // A title the corpus has no card for is answered, not refused: `indexed: false` says Den has nothing
+            // on it, which is not the same as it not existing.
+            Self::Title { media_type, tmdb_id } => {
+                match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
+                    Some(mut title) => {
+                        title["indexed"] = serde_json::json!(true);
+                        title
+                    }
+                    None => serde_json::json!({
+                        "type": stremio_type(*media_type), "id": tmdb_id, "indexed": false,
+                    }),
+                }
+            }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
                 let k = query_param(query, "k")
@@ -3163,6 +3184,31 @@ mod tests {
         ] {
             assert_eq!(get(&state, path).await.status(), 404, "{path}");
         }
+    }
+
+    /// One title: the card a row draws, with its labels, plot facets and credited people beside it. A title with
+    /// no card is `indexed: false`, never a 404 a client could read as "no such title".
+    #[tokio::test]
+    async fn a_title_is_its_card_labels_facets_and_people() {
+        let state = index_state("den-atlas-title");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let resp = get(&state, "/index/title/movie/1.json").await;
+        assert_eq!(resp.status(), 200);
+        let title = json(body_of(resp).await);
+        let row = json(body_of(get(&state, "/index/row/movie.json?subgenre=Heist").await).await);
+        let card = row["titles"].as_array().unwrap().iter().find(|t| t["id"] == 1).cloned().unwrap();
+        for (field, value) in card.as_object().unwrap() {
+            assert_eq!(&title[field], value, "{field}: the row's card, field for field");
+        }
+        assert_eq!(title["indexed"], true);
+        assert!(title["labels"]["subgenres"].as_array().unwrap().iter().any(|s| s == "Heist"), "{title}");
+        assert!(title["plotFacets"].is_object(), "{title}");
+        assert!(title["makers"].is_array() && title["cast"].is_array(), "{title}");
+
+        let unknown = json(body_of(get(&state, "/index/title/movie/999999.json").await).await);
+        assert_eq!(unknown, serde_json::json!({ "type": "movie", "id": 999999, "indexed": false }));
+        assert_eq!(get(&state, "/index/title/anime/1.json").await.status(), 404);
+        assert_eq!(get(&state, "/index/title/movie/x.json").await.status(), 404);
     }
 
     /// The titles carrying a selection: the very cards `/index/row` draws, paged, with the page in the
