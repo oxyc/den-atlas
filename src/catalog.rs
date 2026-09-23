@@ -902,14 +902,20 @@ fn poster_path(
 /// the detail page from it); `imdb_id` + `moviedb_id` are the extra keys the Den app maps rows through
 /// (it bridges everything via TMDB — an item without `moviedb_id` won't render there). Poster is
 /// metahub-by-IMDb (Cinemeta's own source), so no TMDB fetch is needed to draw the grid.
+///
+/// A title listed a second time under another IMDb id with the same TMDB id is dropped, the first (higher
+/// ranked) row kept. The sources dedupe by IMDb id, but JustWatch can carry one show under two IMDb ids
+/// (TMDB 332910 as tt44847531 and tt9280400), and the Den app, which keys rows by TMDB id, crashed on the pair.
 pub fn render_metas(items: &[TrendingItem], stremio_type: &str, posters: Option<&Posters>) -> String {
     let media_type = match stremio_type {
         "movie" => Some(MediaType::Movie),
         "series" => Some(MediaType::Tv),
         _ => None,
     };
+    let mut listed = std::collections::HashSet::new();
     let metas: Vec<serde_json::Value> = items
         .iter()
+        .filter(|it| it.moviedb.is_none_or(|tmdb| listed.insert(tmdb)))
         .map(|it| {
             let mut m = serde_json::json!({
                 "id": it.imdb,
@@ -970,7 +976,8 @@ mod tests {
     fn item(imdb: &str, title: &str, rank: usize) -> TrendingItem {
         TrendingItem {
             imdb: imdb.into(),
-            moviedb: Some(42),
+            // One TMDB id per IMDb id (tt1 → 42), so distinct test titles stay distinct to the TMDB dedupe.
+            moviedb: imdb.trim_start_matches("tt").parse::<i64>().ok().map(|n| 41 + n),
             title: title.into(),
             rank,
             rating: None,
@@ -1134,6 +1141,24 @@ mod tests {
         // Past the end is an empty page, which is what stops a client rather than repeating the row.
         assert!(page_of(&body, 2).contains(r#""metas":[]"#));
         assert!(page_of(&body, 99).contains(r#""metas":[]"#), "a skip beyond the row is empty, not a panic");
+    }
+
+    /// JustWatch carried TMDB 332910 under two IMDb ids in one row, and the Den app, keying rows by TMDB id,
+    /// crashed on launch. The higher-ranked row is kept; a row with no TMDB id is never merged with another.
+    #[test]
+    fn a_title_listed_under_two_imdb_ids_appears_once() {
+        let twin = TrendingItem { moviedb: Some(332_910), ..item("tt44847531", "A Killer Story", 0) };
+        let again = TrendingItem { moviedb: Some(332_910), ..item("tt9280400", "A Killer Story", 1) };
+        let unmapped = TrendingItem { moviedb: None, ..item("tt3", "C", 2) };
+        let unmapped_too = TrendingItem { moviedb: None, ..item("tt4", "D", 3) };
+        let body = render_metas(&[twin, again, item("tt2", "B", 4), unmapped, unmapped_too], "series", None);
+        let ids: Vec<String> = serde_json::from_str::<serde_json::Value>(&body).unwrap()["metas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, ["tt44847531", "tt2", "tt3", "tt4"]);
     }
 
     #[tokio::test]
