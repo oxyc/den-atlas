@@ -126,6 +126,13 @@ impl MappedStore {
     }
 }
 
+/// The mapping, for the indexes that read their vectors from it in place (`den_index::StoreBytes`).
+impl den_index::StoreBytes for MappedStore {
+    fn store_bytes(&self) -> &[u8] {
+        &self.map
+    }
+}
+
 /// A mapped store together with the corpus-wide statistics derived from it.
 ///
 /// The aggregates (prevalence, critique idf and means) are owned rather than borrowed, so this can hold

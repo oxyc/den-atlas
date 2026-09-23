@@ -15,7 +15,8 @@ mod similar;
 
 pub use facets::{split_negation, FacetIndex, FacetQuery, Negation, TitleFacets};
 pub use index::{
-    Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, TypeNeighbours, DISPLAY_CONFIDENCE_FLOOR,
+    Index, LabelColumns, Labels, LoadError, Neighbor, ScanStats, StoreBytes, TypeNeighbours,
+    DISPLAY_CONFIDENCE_FLOOR,
 };
 pub use rail::{RailAggregates, SeedAuthorship, SeedFacets};
 pub use regions::{region, Region, REGIONS};

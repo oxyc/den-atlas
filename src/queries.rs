@@ -714,11 +714,13 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
 
     let (plot, premise, cards) = std::thread::scope(|scope| {
         let view = || store.view();
-        let plot = scope.spawn(move || timed(|| Index::from_store_plot(&view())));
+        // Both indexes read their vectors in place, in the mapping, rather than copying ~95 MB of them.
+        let mapped = || Arc::clone(&store.store) as Arc<dyn den_index::StoreBytes>;
+        let plot = scope.spawn(move || timed(|| Index::from_store_plot(&view(), mapped())));
         // A premise index that will not read costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(move || {
             timed(|| {
-                Index::from_store_premise(&view())
+                Index::from_store_premise(&view(), mapped())
                     .map_err(|e| eprintln!("premise index unusable ({e}) — More Like This is plot-only"))
                     .ok()
             })
@@ -1384,6 +1386,27 @@ mod tests {
             }
             eprintln!("{seeds} seeds: both rows over one scan are the rows ranked apart");
         }
+    }
+
+    /// An index reads its vectors in place, in the bytes it was handed, and answers what an index over a copy
+    /// of those bytes answers. A store view over one copy handed another copy's bytes is refused: its rows
+    /// would be read from somewhere the view never checked.
+    #[test]
+    fn an_index_reads_its_vectors_from_the_bytes_its_store_was_opened_over() {
+        use den_index::MediaType::{Movie, Tv};
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-inplace-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let mapped = Index::from_store_plot(&ds.mapped.view(), ds.mapped.clone()).expect("plot, in place");
+        let copy = Arc::new(std::fs::read(&ds.store).expect("read the fixture store"));
+        let view = den_store::Store::open(&copy).expect("open the copy");
+        let copied = Index::from_store_plot(&view, copy.clone()).expect("plot, over the copy");
+        for (id, media) in [(1, Movie), (2, Movie), (4, Tv), (101, Tv)] {
+            assert_eq!(mapped.nearest(id, media, 12), copied.nearest(id, media, 12), "{media:?} {id}");
+            let by_type = |index: &Index| index.nearest_by_type(id, media, 12);
+            assert_eq!(by_type(&mapped), by_type(&copied), "{media:?} {id}");
+        }
+        assert!(Index::from_store_plot(&view, ds.mapped.clone()).is_err(), "another copy's bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TMDB numbers kept for the fixture's movie 1 alone, joined onto its store.
