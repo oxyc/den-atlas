@@ -685,7 +685,13 @@ fn routes() -> Value {
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
                 with(
-                    param("traits", "string", "[-]<trait>:<id>, comma-separated, in canonical order"),
+                    param(
+                        "traits",
+                        "string",
+                        "[-]<trait>:<id>, comma-separated, in canonical order; born takes a decade (born:1970) \
+                         or one range of birth years (born:1976-1996, born:1976-, born:-1996): \
+                         filter.traits.kinds.born",
+                    ),
                     json!({ "max": crate::filter::MAX_SELECTION }),
                 ),
                 with(
@@ -738,7 +744,10 @@ fn routes() -> Value {
             "counts": {
                 "total": "people credited on the matching titles and holding every trait",
                 "traitCoverage": "per applied trait, the credited people it is on record for (count) out of \
-                                  every person credited under the selection and role (denominator)",
+                                  every person credited under the selection and role (denominator); for a born \
+                                  range, the people whose birth is dated finely enough to be in or out of it",
+                "traits.born": "counted by decade even under a born range, as if the range were not picked; \
+                                the range is named in selected or excluded",
             },
         },
         {

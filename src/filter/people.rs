@@ -17,10 +17,12 @@
 //! `credits` is how many matching titles a person's counted credits are on.
 //!
 //! The person traits are stored as Wikidata states them, as the items it names — `gender` (P21) with whatever
-//! values it holds, `citizenship` (P27), `occupation` (P106) — and `born` (P569) by decade. Nothing is
-//! inferred, and unknown is never a match: a person with no gender on record matches no `gender:`, and no
-//! `-gender:` either, since they are not known to lack it. A birth dated only to its century has no decade.
-//! `traitCoverage` says how many of the credited people each applied trait is on record for.
+//! values it holds, `citizenship` (P27), `occupation` (P106) — and `born` (P569) by decade, or by a range of
+//! years (`born:1976-1996`, `born:1976-`, `born:-1996`). Nothing is inferred, and unknown is never a match: a
+//! person with no gender on record matches no `gender:`, and no `-gender:` either, since they are not known to
+//! lack it. A birth dated only to its century has no decade; a birth dated only to its decade or century is in
+//! a range when its whole span is, out of it when none of its span is, and unknown when the span straddles an
+//! end. `traitCoverage` says how many of the credited people each applied trait is on record for.
 //!
 //! # Order
 //!
@@ -82,7 +84,11 @@ const TRAITS: [TraitSpec; 5] = [
         mode: Mode::Single,
         id: Id::Decade,
         data: Trait::Born,
-        about: "the decade of birth (P569); a birth dated only to its century has none",
+        about: "the decade of birth (P569), born:1970 for 1970-1979; a birth dated only to its century has none. \
+                Or a range of birth years, both ends inclusive and either left open: born:1976-1996, \
+                born:1976-, born:-1996; one range, and no other born pick beside it, per request. A birth \
+                dated only to its decade or century matches a range when its whole span lies inside it, and \
+                is unknown when the span straddles an end",
     },
     TraitSpec {
         name: "citizenship",
@@ -177,8 +183,77 @@ pub(super) fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, S
         return Err(format!("{kind}: an empty id"));
     }
     let Some(spec) = trait_spec(&kind) else { return Ok((kind, id.to_owned())) };
+    if spec.data == Trait::Born && id.contains('-') {
+        return Ok((kind, Years::parse(id)?.spelled()));
+    }
     let id = normalise_id(&kind, id, spec.id, scope)?;
     Ok((kind, id))
+}
+
+/// A request's traits, refused when they cannot be answered as sent: a `born` range beside another positive
+/// `born` pick, which could only narrow it — one range says it.
+pub(super) fn check(traits: &[Item]) -> Result<(), String> {
+    let picks: Vec<&Item> = traits.iter().filter(|i| i.kind == "born" && !i.exclude).collect();
+    if picks.len() > 1 && picks.iter().any(|i| i.id.contains('-')) {
+        return Err("born: one range per request, and no other born pick beside it".to_owned());
+    }
+    Ok(())
+}
+
+/// The earliest birth year a `born` range may name; the latest is next year.
+const FIRST_BIRTH_YEAR: i64 = 1800;
+
+/// A `born` range: the birth years it holds, both ends inclusive, either open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Years {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+impl Years {
+    /// `<from>-<to>`, either end left out, each a year from `FIRST_BIRTH_YEAR` to next year.
+    fn parse(id: &str) -> Result<Years, String> {
+        let latest = crate::facts::civil_year(crate::recommend::today() as i64) + 1;
+        let (from, to) = id.split_once('-').ok_or_else(|| format!("born: {id:?} is not <year>-<year>"))?;
+        let year = |end: &str| -> Result<Option<i64>, String> {
+            let end = end.trim();
+            if end.is_empty() {
+                return Ok(None);
+            }
+            let year = end
+                .parse::<i64>()
+                .ok()
+                .filter(|_| end.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| format!("born: {id:?} is not <year>-<year>"))?;
+            if !(FIRST_BIRTH_YEAR..=latest).contains(&year) {
+                return Err(format!("born: {year} is not a birth year from {FIRST_BIRTH_YEAR} to {latest}"));
+            }
+            Ok(Some(year))
+        };
+        match (year(from)?, year(to)?) {
+            (None, None) => Err(format!("born: {id:?} names no year")),
+            (Some(from), Some(to)) if from > to => Err(format!("born: {id:?} ends before it starts")),
+            (from, to) => Ok(Years { from, to }),
+        }
+    }
+
+    /// As the canonical URL writes it: `1976-1996`, `1976-`, `-1996`.
+    fn spelled(self) -> String {
+        let end = |year: Option<i64>| year.map_or(String::new(), |y| y.to_string());
+        format!("{}-{}", end(self.from), end(self.to))
+    }
+
+    /// Whether a birth dated to the years `span` is in the range: `None` when the span straddles an end.
+    fn holds(self, (first, last): (i64, i64)) -> Option<bool> {
+        let (from, to) = (self.from.unwrap_or(i64::MIN), self.to.unwrap_or(i64::MAX));
+        if from <= first && last <= to {
+            Some(true)
+        } else if last < from || to < first {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 /// What the people routes read from the store: the traits and the credit lists.
@@ -197,12 +272,19 @@ struct Sources<'a> {
 }
 
 /// A person trait the request applies, with the value it names read into the store's terms: an entity index,
-/// or a decade. `None` names nothing the store holds, and matches no one.
+/// a decade, or a range of birth years. `None` names nothing the store holds, and matches no one.
 struct Applied<'r> {
     bit: u8,
     spec: &'static TraitSpec,
     item: &'r Item,
-    target: Option<i64>,
+    target: Option<Target>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    /// An entity index, or a decade.
+    Value(i64),
+    Years(Years),
 }
 
 /// The traits of a request, split.
@@ -262,6 +344,19 @@ fn keep_top(top: &mut Top, weight: f64, row: u32) {
 /// The decade a birth falls in, when it is dated finely enough to have one.
 fn birth_decade(born: Option<PersonDate>) -> Option<i64> {
     born.filter(|d| d.precision <= 3).map(|d| crate::facts::civil_year(i64::from(d.days)).div_euclid(10) * 10)
+}
+
+/// The years a birth may fall in, as far as it is dated: its year, its decade's ten, or its century's hundred.
+fn birth_span(born: Option<PersonDate>) -> Option<(i64, i64)> {
+    let born = born?;
+    let year = crate::facts::civil_year(i64::from(born.days));
+    match born.precision {
+        0..=2 => Some((year, year)),
+        3 => Some((year.div_euclid(10) * 10, year.div_euclid(10) * 10 + 9)),
+        // 1901–2000 is the 20th century.
+        4 => Some(((year - 1).div_euclid(100) * 100 + 1, (year - 1).div_euclid(100) * 100 + 100)),
+        _ => None,
+    }
 }
 
 /// The century of an astronomical year: 1901–2000 is the 20th, 0 (1 BCE) to -99 the -1st.
@@ -367,9 +462,10 @@ impl<'a> Context<'a> {
                     }
                     continue;
                 }
-                Trait::Born => item.id.parse::<i64>().ok(),
+                Trait::Born if item.id.contains('-') => Years::parse(&item.id).ok().map(Target::Years),
+                Trait::Born => item.id.parse::<i64>().ok().map(Target::Value),
                 Trait::Gender | Trait::Citizenship | Trait::Occupation => {
-                    self.entity_of(&item.id).map(i64::from)
+                    self.entity_of(&item.id).map(|e| Target::Value(i64::from(e)))
                 }
             };
             if target.is_none() {
@@ -439,15 +535,22 @@ impl<'a> Context<'a> {
     }
 
     /// Whether a person holds a trait's value: `None` when the trait is not on record for them.
-    fn holds(&self, sources: &Sources<'a>, data: Trait, target: Option<i64>, e: u32) -> Option<bool> {
+    fn holds(&self, sources: &Sources<'a>, data: Trait, target: Option<Target>, e: u32) -> Option<bool> {
+        let value = match target {
+            Some(Target::Value(value)) => Some(value),
+            _ => None,
+        };
         let among = |values: &[u32]| {
-            (!values.is_empty()).then(|| target.is_some_and(|t| values.iter().any(|&v| i64::from(v) == t)))
+            (!values.is_empty()).then(|| value.is_some_and(|t| values.iter().any(|&v| i64::from(v) == t)))
         };
         match data {
             Trait::Gender => among(sources.traits.genders(e)),
             Trait::Citizenship => among(sources.traits.citizenships(e)),
             Trait::Occupation => among(sources.traits.occupations(e)),
-            Trait::Born => birth_decade(sources.traits.born(e)).map(|decade| Some(decade) == target),
+            Trait::Born => match target {
+                Some(Target::Years(years)) => birth_span(sources.traits.born(e)).and_then(|s| years.holds(s)),
+                _ => birth_decade(sources.traits.born(e)).map(|decade| Some(decade) == value),
+            },
             Trait::Role => None,
         }
     }
@@ -459,6 +562,16 @@ impl<'a> Context<'a> {
             .iter()
             .filter(|a| self.holds(sources, a.spec.data, a.target, e) != Some(!a.item.exclude))
             .fold(0, |fails, a| fails | a.bit)
+    }
+
+    /// Whether every applied item of a person kind is on record for a person: known, whether it matches or
+    /// not. A kind with no item applied is on record when the person has any value of it.
+    fn on_record(&self, sources: &Sources<'a>, applied: &[Applied<'_>], data: Trait, e: u32) -> bool {
+        let mut items = applied.iter().filter(|a| a.spec.data == data).peekable();
+        if items.peek().is_none() {
+            return self.holds(sources, data, None, e).is_some();
+        }
+        items.all(|a| self.holds(sources, data, a.target, e).is_some())
     }
 
     /// The title selection, the traits, and who is credited under them; with `weigh`, how prominently.
@@ -519,7 +632,7 @@ impl<'a> Context<'a> {
                     Trait::Born => (&[], birth_decade(sources.traits.born(e))),
                     Trait::Role => (&[], None),
                 };
-                if !entities.is_empty() || decade.is_some() {
+                if self.on_record(sources, &split.applied, spec.data, e) {
                     known[i] += 1;
                 }
                 if alone == 0 {
@@ -590,7 +703,8 @@ impl<'a> Context<'a> {
             values.insert(id, n.into());
         }
         for item in &selected {
-            if values.contains_key(&item.id) {
+            // A born range is no decade value: it is named in `selected` or `excluded` alone.
+            if values.contains_key(&item.id) || (spec.data == Trait::Born && item.id.contains('-')) {
                 continue;
             }
             let value = match spec.data {
@@ -882,6 +996,15 @@ pub(super) fn schema() -> Value {
             }
             if t.data == Trait::Role {
                 about["values"] = json!(ROLES.iter().map(|r| r.0).collect::<Vec<_>>());
+            }
+            if t.data == Trait::Born {
+                about["range"] = json!({
+                    "id": "<from>-<to>: birth years, both inclusive, either end left out (1976-1996, 1976-, \
+                           -1996)",
+                    "years": format!("{FIRST_BIRTH_YEAR} to next year"),
+                    "counted": "people/counts.json counts born by decade whatever is picked; a range is \
+                                named in selected or excluded",
+                });
             }
             (t.name.to_owned(), about)
         })
@@ -1207,6 +1330,156 @@ mod tests {
         names(answer).into_iter().map(|(n, _)| n).collect()
     }
 
+    /// Ten 2020 films, film i (TMDB id i + 1) cast with:
+    ///
+    /// - Fay (601), born 15 March 1976, in film 0; Gus (602), born in the 1970s (decade precision), in film 1;
+    ///   Hal (603), no birth on record, in film 2; Ivy (604), born 31 December 1996, in film 3; Jon (605),
+    ///   born 1950 (year precision), in film 4; Kim (606), born in the 20th century, in film 5.
+    /// - Forty more, P0 … P39 (700 + i), born in 1960 + i (year precision), in film i mod 10.
+    fn range_store(name: &str) -> Indexes {
+        let titles: Vec<Title> = (0..10u32)
+            .map(|i| Title {
+                tmdb_id: i + 1,
+                primary_genre: "Drama",
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A title", None, Some(2020))),
+                votes: 1000 - 10 * i,
+                cast: [601 + i]
+                    .into_iter()
+                    .filter(|_| i < 6)
+                    .chain((0..40).filter(|p| p % 10 == i).map(|p| 700 + p))
+                    .collect(),
+                ..Title::default()
+            })
+            .collect();
+        let generated: Vec<String> = (0..40).map(|i| format!("P{i}")).collect();
+        let born = |qid, name, born| Entity { qid, name, born, ..Entity::default() };
+        let mut entities = vec![
+            born(601, "Fay", Some((days(1976, 3, 15), 0))),
+            born(602, "Gus", Some((days(1970, 1, 1), 3))),
+            born(603, "Hal", None),
+            born(604, "Ivy", Some((days(1996, 12, 31), 0))),
+            born(605, "Jon", Some((days(1950, 1, 1), 2))),
+            born(606, "Kim", Some((days(1950, 1, 1), 4))),
+        ];
+        for (i, name) in generated.iter().enumerate() {
+            entities.push(born(700 + i as u32, name, Some((days(1960 + i as i64, 6, 1), 2))));
+        }
+        load(name, &titles, &entities)
+    }
+
+    fn sorted(answer: &Value) -> Vec<String> {
+        let mut found = order_of(answer);
+        found.sort();
+        found
+    }
+
+    /// The generated people born in `years`, and the named ones given, sorted as `sorted` sorts.
+    fn born_in(years: std::ops::RangeInclusive<i64>, named: &[&str]) -> Vec<String> {
+        let mut expected: Vec<String> = (0..40)
+            .filter(|i| years.contains(&(1960 + i)))
+            .map(|i| format!("P{i}"))
+            .chain(named.iter().map(|n| n.to_string()))
+            .collect();
+        expected.sort();
+        expected
+    }
+
+    /// A range holds exact years, both ends inclusive: Fay, born 1976, is in 1976-1996 and not in 1977-1996.
+    #[test]
+    fn a_born_range_holds_exact_years() {
+        let indexes = range_store("born-range");
+        let people = |traits: &str| {
+            let answer = ask(&indexes, Movie, Route::People, &format!("traits={traits}&limit=100"));
+            assert!(answer.get("unknownTraits").is_none(), "{traits}: {answer}");
+            sorted(&answer)
+        };
+        assert_eq!(people("born:1976-1996"), born_in(1976..=1996, &["Fay", "Ivy"]));
+        assert_eq!(people("born:1977-1996"), born_in(1977..=1996, &["Ivy"]), "Fay is born the year before");
+        assert_eq!(people("born:1976-1995"), born_in(1976..=1995, &["Fay"]), "Ivy is born the year after");
+        assert_eq!(people("born:1996-"), born_in(1996..=2100, &["Ivy"]), "an open end");
+        assert_eq!(people("born:-1950"), born_in(0..=1950, &["Jon"]), "an open start");
+        // A bare decade keeps its meaning: Gus's decade is 1970.
+        assert_eq!(people("born:1975"), born_in(1970..=1979, &["Fay", "Gus"]));
+    }
+
+    /// A birth dated to its decade or century is in a range its whole span lies inside, out of one it does not
+    /// reach, and unknown — neither the range nor its exclusion — when it straddles an end.
+    #[test]
+    fn a_coarse_birth_is_in_a_range_only_when_its_whole_span_is() {
+        let indexes = range_store("born-coarse");
+        let people = |traits: &str| {
+            sorted(&ask(&indexes, Movie, Route::People, &format!("traits={traits}&limit=100")))
+        };
+        let has = |traits: &str, name: &str| people(traits).contains(&name.to_owned());
+        assert!(!has("born:1976-1996", "Gus"), "the 1970s straddle 1976");
+        assert!(!has("-born:1976-1996", "Gus"), "unknown is not out of the range either");
+        assert!(has("born:1970-1979", "Gus"), "the whole decade");
+        assert!(has("-born:1980-1996", "Gus"), "none of the decade");
+        assert!(!has("born:1976-1996", "Kim") && !has("-born:1976-1996", "Kim"), "a century straddles it");
+        assert!(has("born:1901-2000", "Kim"), "the whole 20th century");
+        assert!(has("born:1800-", "Kim"));
+        for traits in ["born:1800-", "-born:1800-", "born:1976-1996", "-born:1976-1996"] {
+            assert!(!has(traits, "Hal"), "{traits}: no birth on record matches nothing");
+        }
+        let mut outside = born_in(1960..=1976, &["Fay", "Jon"]);
+        outside.extend(born_in(1997..=1999, &[]));
+        outside.sort();
+        assert_eq!(
+            people("-born:1977-1996"),
+            outside,
+            "Ivy is in, Gus and Kim straddle 1977, Hal is unknown"
+        );
+    }
+
+    /// Paged a few at a time, a range lists every match once, whatever the order.
+    #[test]
+    fn a_born_range_pages_through_every_match_once() {
+        let indexes = range_store("born-paged");
+        let expected = born_in(1976..=1996, &["Fay", "Ivy"]);
+        for order in ["prominence", "credits", "name", "born_asc"] {
+            let mut paged = Vec::new();
+            for skip in (0..30).step_by(4) {
+                let query = format!("traits=born:1976-1996&order={order}&skip={skip}&limit=4");
+                let page = ask(&indexes, Movie, Route::People, &query);
+                assert_eq!(page["total"], expected.len(), "{query}");
+                paged.extend(order_of(&page));
+            }
+            let mut once = paged.clone();
+            once.sort();
+            assert_eq!(once, expected, "{order}: every match, each once");
+        }
+    }
+
+    /// `people/counts.json` under a range: the total and the other kinds over the people in it, `born` by
+    /// decade as if the range were not picked, and the range's coverage the people it is known for.
+    #[test]
+    fn a_born_range_is_counted_as_a_pick() {
+        let indexes = range_store("born-counts");
+        let all = ask(&indexes, Movie, Route::PeopleCounts, "");
+        let counts = ask(&indexes, Movie, Route::PeopleCounts, "traits=born:1976-1996");
+        assert_eq!(counts["total"], 23);
+        assert_eq!(counts["traits"]["role"]["values"], json!({ "cast": 23 }));
+        assert_eq!(counts["traits"]["born"]["values"], all["traits"]["born"]["values"]);
+        assert_eq!(counts["traits"]["born"]["selected"], json!(["1976-1996"]));
+        assert!(counts["traits"]["born"]["values"].get("1976-1996").is_none(), "a range is no decade");
+        assert_eq!(
+            counts["traitCoverage"]["born"],
+            json!({ "count": 43, "denominator": 46 }),
+            "Gus and Kim straddle the range, Hal has no birth"
+        );
+        let decade = ask(&indexes, Movie, Route::PeopleCounts, "traits=born:1970");
+        assert_eq!(
+            decade["traitCoverage"]["born"],
+            json!({ "count": 44, "denominator": 46 }),
+            "a decade pick: Kim's century and Hal have none"
+        );
+        let excluded = ask(&indexes, Movie, Route::PeopleCounts, "traits=-born:1976-1996");
+        assert_eq!(excluded["total"], 43 - 23);
+        assert_eq!(excluded["traits"]["born"]["excluded"], json!(["1976-1996"]));
+    }
+
     /// Every order ranks as it says, pages stably, and names itself in `order`.
     #[test]
     fn each_order_ranks_as_it_says() {
@@ -1441,6 +1714,62 @@ mod tests {
                 answer["complete"]
             );
         }
+    }
+
+    /// A born range over the REAL corpus against the per-decade requests it replaces: the male cast of 2020s
+    /// films born 1976–1996, paged through whole, beside one 100-person page per decade filtered to the years.
+    /// Opt-in: `DEN_STORE` names a store whose directory holds its `dataset.meta.json`.
+    #[test]
+    fn real_corpus_born_range() {
+        let Ok(store) = std::env::var("DEN_STORE") else {
+            eprintln!("SKIP: set DEN_STORE to a real den-<ver>.store to measure this");
+            return;
+        };
+        let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
+        let ds = crate::dataset::Dataset::load(dir).expect("the dataset loads");
+        let indexes = crate::queries::load_for_tools(&ds).expect("the indexes load");
+        let base = "sel=decade:2020&traits=born:1976-1996,gender:Q6581097,role:cast";
+        let context = Context::new(&indexes, Movie, None);
+        let run =
+            |query: &str| context.people(&Request::parse(Route::People, Movie.into(), query).unwrap()).0;
+        run(base);
+        let started = std::time::Instant::now();
+        let first = run(&format!("{base}&limit=100"));
+        let one = started.elapsed();
+        let total = first["total"].as_u64().unwrap() as usize;
+        let started = std::time::Instant::now();
+        let mut ids = std::collections::HashSet::new();
+        for skip in (0..total).step_by(100) {
+            let page = run(&format!("{base}&skip={skip}&limit=100"));
+            assert_eq!(page["total"], total);
+            for p in page["people"].as_array().unwrap() {
+                assert!(ids.insert(p["id"].as_str().unwrap().to_owned()), "{} twice", p["id"]);
+            }
+        }
+        let whole = started.elapsed();
+        assert_eq!(ids.len(), total, "every match once");
+        eprintln!(
+            "range: total {total}; first page of 100 in {one:?}; all {} pages in {whole:?}",
+            total.div_ceil(100)
+        );
+
+        let started = std::time::Instant::now();
+        let (mut kept, mut decade_totals) = (0, Vec::new());
+        for decade in [1970, 1980, 1990] {
+            let query = format!("sel=decade:2020&traits=born:{decade},gender:Q6581097,role:cast&limit=100");
+            let page = run(&query);
+            decade_totals.push(page["total"].as_u64().unwrap());
+            kept += page["people"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["born"]["year"].as_i64().is_some_and(|y| (1976..=1996).contains(&y)))
+                .count();
+        }
+        eprintln!(
+            "per decade: totals {decade_totals:?}; three 100-person pages in {:?} keep {kept} of the {total}",
+            started.elapsed()
+        );
     }
 
     /// The people routes over the REAL corpus, and what they cost. Opt-in: `DEN_STORE` names a store whose

@@ -626,6 +626,7 @@ impl Request {
         };
         let items = read_items("sel", &|kind, id| normalise(kind, id, scope))?;
         let traits = read_items("traits", &|kind, id| people::normalise(kind, id, scope))?;
+        people::check(&traits)?;
         let order = match params.get("order").map(|v| decode(v)) {
             Some(order) if !order.trim().is_empty() => people::Order::parse(&order)?,
             _ => people::Order::default(),

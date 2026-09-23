@@ -244,11 +244,17 @@ pins url → canonical url pairs a client can test against.
   `sel` matches. `traits` is a second list in `sel`'s grammar and canonical order, placed after it, because a
   trait is about a person and means nothing to the title routes. Kinds: `gender`, `citizenship`, `occupation`
   (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `born` (decade of
-  P569; a century-precision birth has none) and `role` (`cast`, `director`, `writer`, `creator`: the credit on
-  a matching title; two roles mean both on one title, `-role:cast` credited without it). `gender` and `born` are
-  one pick and count without their own pick. Unknown is never a match: a person with no gender on record matches
-  neither `gender:` nor `-gender:`, and `traitCoverage` says how many credited people each applied trait is on
-  record for. A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`.
+  P569, `born:1970` for 1970–1979; a century-precision birth has none) and `role` (`cast`, `director`, `writer`,
+  `creator`: the credit on a matching title; two roles mean both on one title, `-role:cast` credited without
+  it). `born` also takes a range of birth years, both ends inclusive and either left open — `born:1976-1996`,
+  `born:1976-`, `born:-1996`, each year 1800 to next year — one per request and with no other positive `born`
+  beside it; a reversed range, a year that is not digits or out of that span is a 400. A birth dated only to its
+  decade or century is in a range when its whole span is, out of it when none of it is, and unknown when it
+  straddles an end. `gender` and `born` are one pick and count without their own pick: under a range,
+  `people/counts.json` still counts `born` by decade, as if the range were not picked, and names the range in
+  `selected`/`excluded`. Unknown is never a match: a person with no gender on record matches neither `gender:`
+  nor `-gender:`, and `traitCoverage` says how many credited people each applied trait is on record for (for a
+  range, those it is decidable for). A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`.
   `order` (after `traits` in the canonical URL, left out when `prominence`) ranks the people: `prominence` sums
   a person's 5 biggest matching titles, each weighing 1 − its rank in its own type's popularity order over that
   type's size (the share the `all` title order interleaves by), so a few hits outrank a long run of mid-table
