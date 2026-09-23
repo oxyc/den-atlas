@@ -68,7 +68,8 @@ pub struct Indexes {
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
     pub display: Option<TitleIndex>,
     /// More Like This answers already worked out, by title (`Indexes::more_like_this`).
-    similar: Mutex<HashMap<Key, Arc<[Key]>>>,
+    /// Keyed by title and whether the row mixes types.
+    similar: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -81,6 +82,8 @@ pub struct Indexes {
 }
 
 type Key = (den_index::MediaType, u32);
+/// A More Like This row in the memo: the title, and whether the row mixes films and series.
+type SimilarKey = (Key, bool);
 
 /// More Like This answers and row orders kept at most: bounded, and simply started over when full. Both are small
 /// (a row order is at most a few thousand titles, an answer at most `den_index::MAX_ROW` ids).
@@ -108,9 +111,22 @@ impl Indexes {
     /// plot neighbour can never enter the row — measured on The Wire, its plot top-20 and premise top-40 do
     /// not intersect at all, and Homicide: Life on the Street sits at plot rank 10 and is discarded.
     ///
-    /// Typed: a row may mix films and series (`SimilarParams::mix_types`).
-    pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
-        memoised(&self.similar, (media_type, tmdb_id), SIMILAR_MEMO, || {
+    /// The seed's own type alone, as ids — the row `/index/similar`'s `ids` and `/index/suggest`'s have always
+    /// carried, which every client reads. `more_like_this_mixed` is the row with the other type in it.
+    pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
+        let row = memoised(&self.similar, ((media_type, tmdb_id), false), SIMILAR_MEMO, || {
+            let one_type =
+                den_index::SimilarParams { mix_types: false, ..den_index::SimilarParams::default() };
+            self.more_like_this_scored(tmdb_id, media_type, &one_type).iter().map(|s| s.key()).collect()
+        });
+        row.iter().map(|&(_, id)| id).collect()
+    }
+
+    /// More Like This mixing films and series (`SimilarParams::mix_types`), typed: the `mixed` lists of
+    /// `/index/similar` and `/index/suggest`. Its titles of the seed's type are `more_like_this`'s first ones,
+    /// in its order.
+    pub fn more_like_this_mixed(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
+        memoised(&self.similar, ((media_type, tmdb_id), true), SIMILAR_MEMO, || {
             let production = den_index::SimilarParams::default();
             self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
         })

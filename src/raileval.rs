@@ -13,7 +13,8 @@
 //! `CACHE_DIR` naming a directory of them the row is ranked with no links, which is not production's row.
 //!
 //! Each case is a seed and a set of candidates judged `good` / `ok` / `bad` as recommendations for it. The
-//! row scored is `Indexes::more_like_this`, the function `/index/similar` serves, over the same store load.
+//! row scored is `Indexes::more_like_this_mixed`, what `/index/similar` serves as `mixed`, over the same
+//! store load (with `RAIL_KNOBS=mix_types=0`, the one-type row its `ids` carry).
 //! Beside it runs a control arm: the plot index's nearest neighbours, which is what `/index/neighbours`
 //! answers — a weight change that does not beat the control has not earned its complexity.
 //!
@@ -293,7 +294,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     let mut gaps: Vec<String> = Vec::new();
     for c in &cases {
         let row: Vec<Key> = if production {
-            indexes.more_like_this(c.id, c.media).to_vec()
+            indexes.more_like_this_mixed(c.id, c.media).to_vec()
         } else {
             indexes.more_like_this_scored(c.id, c.media, &params).iter().map(|s| s.key()).collect()
         };

@@ -230,14 +230,16 @@ pub fn suggest(sources: &Sources<'_>, seeds: &[(MediaType, u32)], tuning: &Tunin
     let indexes = sources.indexes;
     let seeds: Vec<(u32, MediaType)> = seeds.iter().map(|&(m, id)| (id, m)).collect();
     let mut excluded: std::collections::HashSet<(u32, MediaType)> = seeds.iter().copied().collect();
-    let production_pool = crate::handler::suggest_pool(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-        indexes.more_like_this(id, media).iter().map(|&(m, id)| (id, m)).collect()
-    })
-    .1;
+    let production_pool =
+        crate::handler::suggest_pool_mixed(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
+            indexes.more_like_this_mixed(id, media).iter().map(|&(m, id)| (id, m)).collect()
+        })
+        .1;
     excluded.extend(tuning.watched.iter().map(|&(m, id)| (id, m)));
-    let (per_seed, pooled) = crate::handler::suggest_pool(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-        tuned_row(sources, media, id, tuning).0.iter().map(|s| (s.tmdb_id, s.media_type)).collect()
-    });
+    let (per_seed, pooled) =
+        crate::handler::suggest_pool_mixed(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
+            tuned_row(sources, media, id, tuning).0.iter().map(|s| (s.tmdb_id, s.media_type)).collect()
+        });
     let card = |media: MediaType, id: u32| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&(media, id)));
         (card.map(|c| c.title.clone()), card.and_then(|c| c.year))
@@ -397,7 +399,7 @@ pub fn parse(query: &str) -> Result<Tuning, String> {
 pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning: &Tuning) -> Value {
     let indexes = sources.indexes;
     let (params, limit) = (&tuning.params, tuning.limit);
-    let production = indexes.more_like_this(tmdb_id, media_type);
+    let production = indexes.more_like_this_mixed(tmdb_id, media_type);
     let (row, tilted) = tuned_row(sources, media_type, tmdb_id, tuning);
     let card = |key: (MediaType, u32)| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key));
@@ -698,7 +700,7 @@ pub fn judged(sources: &Sources<'_>, tuning: &Tuning) -> Value {
         vec![("dev", vec![], vec![]), ("test", vec![], vec![])];
     let mut cases = Vec::new();
     for c in crate::raileval::embedded() {
-        let production = score(&indexes.more_like_this(c.id, c.media), &c.grades, crate::raileval::K);
+        let production = score(&indexes.more_like_this_mixed(c.id, c.media), &c.grades, crate::raileval::K);
         let mine = if tuned {
             let row: Vec<(MediaType, u32)> =
                 tuned_row(sources, c.media, c.id, tuning).0.iter().map(Scored::key).collect();
@@ -909,9 +911,10 @@ mod tests {
     /// from den-atlas 0.53.0 over HTTP). `scripts/similar-golden.py` recaptures it; it was recaptured when
     /// the scorer's `ln` moved to `libm`, which moved scores by ULPs and changed no id.
     ///
-    /// The golden rows are of one type. With `mix_types` off the row is the golden exactly; with it on (the
-    /// default), the seed type's titles in the row are the golden's first ones, in its order — the other
-    /// type is merged in between and never reorders them.
+    /// The golden rows are of one type, and `/index/similar`'s `ids` and `total` — what every client reads —
+    /// are the golden exactly, as on main. The mixed row (`mixed`, `mix_types` on) holds the seed type's
+    /// titles in the golden's order, its first ones; the other type is merged in between and never reorders
+    /// them.
     ///
     /// Opt-in, like every test that needs the real corpus: `DEN_STORE` names a store whose directory holds
     /// its `dataset.meta.json`. It skips unless that store is the generation the golden was captured on,
@@ -942,12 +945,18 @@ mod tests {
             let want: Vec<u32> =
                 anchor["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
             assert!(!want.is_empty(), "{}", anchor["name"]);
+            // The fields every client reads, as `/index/similar` serves them: byte for byte main's row.
+            assert_eq!(&*indexes.more_like_this(id, media), want.as_slice(), "{} (serving)", anchor["name"]);
+            let answer = crate::handler::similar_json(&indexes, media, id, "limit=200");
+            assert_eq!(answer["ids"], serde_json::json!(want), "{} (/index/similar ids)", anchor["name"]);
+            assert_eq!(answer["total"], want.len(), "{} (/index/similar total)", anchor["name"]);
             let own = |row: &[(MediaType, u32)]| -> Vec<u32> {
                 row.iter().filter(|&&(kind, _)| kind == media).map(|&(_, id)| id).collect()
             };
-            let served = own(&indexes.more_like_this(id, media));
+            // The mixed row, beside them: its titles of the seed's type are the golden's first ones.
+            let served = own(&indexes.more_like_this_mixed(id, media));
             assert!(served.len() <= want.len(), "{}", anchor["name"]);
-            assert_eq!(served, want[..served.len()], "{} (serving, its own type)", anchor["name"]);
+            assert_eq!(served, want[..served.len()], "{} (mixed, its own type)", anchor["name"]);
             let tuned: Vec<(MediaType, u32)> = indexes
                 .more_like_this_scored(id, media, &SimilarParams::default())
                 .iter()
@@ -1006,7 +1015,7 @@ mod tests {
             let id = anchor["id"].as_u64().unwrap() as u32;
             let (row, tilted) = tuned_row(&sources, media, id, &Tuning::default());
             let row: Vec<(MediaType, u32)> = row.iter().map(Scored::key).collect();
-            assert_eq!(row.as_slice(), &*indexes.more_like_this(id, media), "{}", anchor["name"]);
+            assert_eq!(row.as_slice(), &*indexes.more_like_this_mixed(id, media), "{}", anchor["name"]);
             assert!(!tilted);
         }
         let wire = |query: &str| -> Vec<u32> {
