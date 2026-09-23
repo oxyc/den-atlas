@@ -149,13 +149,13 @@
       "q": "books",
       "split": "dev",
       "lane": "word-sense",
-      "observed": "FAIL",
+      "observed": "pass",
       "assert": {
         "not_in_top": {
           "movie:444539": 3
         }
       },
-      "note": "Reads as a title substring: The Bookshop, Booksmart, Black Books, Nightbooks. A person typing `books` means adaptations. This is the `based on a book` case the source comments already name."
+      "note": "Read as a title substring (The Bookshop, Booksmart, Black Books, Nightbooks) until `books` became a source phrase; it now answers with book adaptations. A person typing `books` means adaptations. This is the `based on a book` case the source comments already name."
     },
     {
       "q": "love stories",
