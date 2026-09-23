@@ -67,6 +67,8 @@ pub struct Strength {
 #[derive(Default)]
 pub struct SeriesStrength {
     by_series: HashMap<u32, Strength>,
+    /// Every series' members.
+    members: HashMap<u32, Vec<(MediaType, u32)>>,
 }
 
 impl SeriesStrength {
@@ -112,6 +114,10 @@ impl SeriesStrength {
             })
             .collect();
 
+        let keys = members
+            .iter()
+            .map(|(&series, list)| (series, list.iter().map(|&at| titles[at].key).collect()))
+            .collect();
         let by_series = members
             .into_iter()
             .map(|(series, mut list)| {
@@ -138,13 +144,38 @@ impl SeriesStrength {
                 (series, Strength { plot: plot_cohesion, people: people_share, strength })
             })
             .collect();
-        SeriesStrength { by_series }
+        SeriesStrength { by_series, members: keys }
     }
 
     /// A series' strength in [0, 1]: 0 for a catalogue or list, 1 for a story franchise or an auteur cycle.
     /// 0 for a series with no measurable pair, which is no evidence either way.
     pub fn series_strength(&self, series: u32) -> f64 {
         self.by_series.get(&series).map_or(0.0, |s| s.strength)
+    }
+
+    /// The titles sharing a series with a title in `series`, other than `seed`, each with the strength of the
+    /// strongest series the two share, in key order. A series of strength 0 — a catalogue, a list — links
+    /// nothing.
+    pub fn members_of(&self, seed: (MediaType, u32), series: &[u32]) -> Vec<((MediaType, u32), f64)> {
+        let mut out: Vec<((MediaType, u32), f64)> = Vec::new();
+        for &s in series {
+            let strength = self.series_strength(s);
+            if strength <= 0.0 {
+                continue;
+            }
+            for &key in self.members.get(&s).map_or(&[][..], Vec::as_slice) {
+                if key == seed {
+                    continue;
+                }
+                match out.iter_mut().find(|(k, _)| *k == key) {
+                    Some(held) => held.1 = held.1.max(strength),
+                    None => out.push((key, strength)),
+                }
+            }
+        }
+        // By key, so the pool the rail draws is the same on every load whatever order the facts came in.
+        out.sort_unstable_by_key(|&(key, _)| key);
+        out
     }
 
     /// A series' measurements, for tools and tests.
@@ -272,6 +303,21 @@ mod tests {
         assert!(trilogy.plot.expect("three plots") < PLOT_LO, "the plots are unlike: {trilogy:?}");
         assert_eq!(trilogy.people, Some(1.0));
         assert_eq!(s.series_strength(TRILOGY), 1.0);
+    }
+
+    /// More Like This's series signal: the other members of the seed's series, each once, at the strongest
+    /// series the two share; a catalogue's members are not there, and neither is the seed.
+    #[test]
+    fn a_titles_series_members_are_the_others_in_its_story_series() {
+        let s = strengths();
+        let film = |id| (MediaType::Movie, id);
+        assert_eq!(s.members_of(film(5), &[SEQUELS]), [(film(6), 1.0)]);
+        assert_eq!(s.members_of(film(7), &[TRILOGY, CATALOGUE]), [(film(8), 1.0), (film(9), 1.0)]);
+        assert!(s.members_of(film(1), &[CATALOGUE]).is_empty(), "a catalogue links nothing");
+        assert!(s.members_of(film(50), &[]).is_empty());
+        // A title in two series with the same member is given it once.
+        let twice = s.members_of(film(7), &[TRILOGY, TRILOGY]);
+        assert_eq!(twice.len(), 2, "{twice:?}");
     }
 
     #[test]

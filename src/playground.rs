@@ -738,6 +738,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
     json!({
         "maker": term(s.maker, p.w_maker),
         "character": term(s.character, p.w_character),
+        "series": term(s.series, p.w_series),
         "region": term(s.region, p.w_region),
         "home": term(s.home, p.w_home),
         "facet": term(s.facet, p.w_facet),

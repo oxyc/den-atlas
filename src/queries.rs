@@ -234,9 +234,10 @@ impl Indexes {
         // Without the credit lists the rail ranks without authorship. The facts read the same lists, so a
         // store missing them also reaches `/health` as `facts_unusable`.
         let characters = self.character_links(media_type, tmdb_id);
+        let series = self.series_members(media_type, tmdb_id);
         let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
             .ok()
-            .map(|authorship| authorship.with_characters(characters));
+            .map(|authorship| authorship.with_characters(characters).with_series(series));
         work(authorship.as_ref().map(|a| a as &dyn den_index::Authorship), &facets)
     }
 
@@ -327,6 +328,15 @@ impl Indexes {
                 Some((key, link.strength(shares_series)))
             })
             .collect()
+    }
+
+    /// The titles in one of this title's franchise series (the facts' `franchise` list), of either type, each
+    /// with the strength of the strongest series the two share (`SeriesStrength`). Empty without facts.
+    pub fn series_members(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Vec<(Key, f64)> {
+        let Some(record) = self.facts.as_ref().and_then(|f| f.get(tmdb_id, media_type)) else {
+            return Vec::new();
+        };
+        self.series.members_of((media_type, tmdb_id), &record.franchise)
     }
 
     /// Whether the store's own `votes` column holds a count for any row — the fallback source for row
