@@ -64,6 +64,8 @@ pub struct Indexes {
     /// Titles that share a character, from TMDB's credits (`characters`). The live holder, like `ratings`.
     pub characters: Option<Arc<Characters>>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
+    /// The iconic studios (`studios.rs`); empty for a store without their sections.
+    pub studios: crate::studios::Studios,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
     pub display: Option<TitleIndex>,
@@ -697,6 +699,13 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             .ok()
     });
 
+    // Optional sections: a store without them has no iconic studios, and says nothing. Present but malformed
+    // costs the studio links and rows, not the load.
+    let studios = crate::studios::Studios::from_store(&store.view()).unwrap_or_else(|e| {
+        eprintln!("iconic studios unusable ({e}) — no studio links, rows or list");
+        crate::studios::Studios::default()
+    });
+
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
         let other_names = facts.as_mut().map(Facts::take_titles).unwrap_or_default();
@@ -752,6 +761,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         ratings: sources.ratings.clone(),
         characters: sources.characters.clone(),
         cards,
+        studios,
         display,
         similar: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),

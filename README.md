@@ -113,6 +113,8 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /index/rows/<movie\|series>/<subgenre\|mood>/<label>.json?skip=&limit=` | with `INDEX_QUERIES` on: `{ids,total,coverage}` carrying the label, most confident first (≥ 0.55), 24 a page, at most 100; `coverage` names the full corpus, selected-type denominator and known-field population |
 | `GET /index/similar/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: `{ids,total}` for More Like This — premise neighbours gated by animation, genre and plot agreement, else plot neighbours — and beside them `{mixed:[{type,id}],mixedTotal}`, the same row with films and series together (`skip`/`limit` page both) |
 | `GET /index/neighbours/<movie\|series>/<tmdbId>.json?k=` | with `INDEX_QUERIES` on: `{ids}`, the plain plot neighbours (12 by default, at most 50) |
+| `GET /index/studios.json` | with `INDEX_QUERIES` on: the iconic studios (see **Studios** below) — `{studios:[{id,name,movies,series}]}`, each studio's own Q-id and how many films and series with a card credit it, most titles first; the shelf a client draws tappable studios from. Empty for a store without the studio sections |
+| `GET /index/studios/<movie\|series>/<tmdbId>.json` | with `INDEX_QUERIES` on: one title's iconic studios — `{studios:[{id,name}]}`, in the order it credits them, each once; what a detail header links. Empty for a title with none or not in the corpus |
 | `GET /index/search.json?q=&type=` | with `INDEX_QUERIES` on: semantic search in one request — the query embedded by den-embed, then `{titles:[{type,id}]}`, the 24 nearest; `503` without den-embed |
 | `GET /index/facets.json?q=` | with `INDEX_QUERIES` on: the facet lane — `{facet,titles}`, titles matching the query's country/decade/type most-voted first, a leftover theme ranked to the front (best 50) |
 | `GET /index/query.json?q=&type=&skip=&limit=` | with `INDEX_QUERIES` on: search in one request — `{parse,people:[{qid,id,name,credits}],hits:[{type,id,score,title,posterPath,year,genreIds,originalLanguage?,f}],total,semantics,coverage}`. `total` is the retrieved pool, not a corpus count, and `semantics` says so; `coverage` names every constraint the query applied, its value, how it was applied and how many titles have that field on record out of the titles of the type asked for (the corpus when none was). The query is read for a country, decade, type, genre, label, plot facet or person (the facts' credited people, by name or alias; `id` is the TMDB person id), and every candidate (fuzzy title under any of its names, facet, label, plot facet, a named person's titles, plot and premise vectors on the leftover) is scored `Φ·[2.0·title + w·max(plotSemantic,premiseSemantic) + 0.25·label + 0.10·plotFacet + 0.8·person + 0.15·popularity]`, so an exact title always outranks a theme match. Only candidates with a positive internal score are returned; wire scores are rounded to four decimals. 40 a page, at most 100 |
@@ -196,7 +198,8 @@ pins url → canonical url pairs a client can test against.
   plot axes (`structure` resolves by value; the merged rows count their members' union), the entity kinds
   `person` (anyone credited), `made`, `cast`, `company`, `network` (series), `subject`, `place` and `format`
   (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles, formats from a curated
-  list), `character` (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set
+  list), `studio` (an iconic studio by its own Q-id: every item it is credited as; see **Studios**), `character`
+  (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set
   `/index/similar` answers).
 - **`all`** asks every question of films and series together: counts and values over both; titles are the two
   types' own orders merged by rank within type (position in its type's order ÷ that type's size, ascending,
@@ -244,6 +247,26 @@ pins url → canonical url pairs a client can test against.
   Nothing is built at load: each answer walks the matching titles' credit lists in place. On b2c60751c955 (130,116
   people credited), male cast of 2020 films answers in ~0.8 ms warm (~39 ms the first time, mapping the pages
   in), every person unfiltered in ~4.4 ms, and the unfiltered trait counts in ~11 ms.
+
+### Studios
+
+The iconic studios are the production companies a viewer browses by — a house style (Ghibli, Aardman, Hammer)
+or a curation (A24, Searchlight). They are a hand-kept list in den-dataset (`data/iconic-studios.json`), because
+no measure over plots or credits finds the curatorial labels, and reach atlas as the store's optional `studio_*`
+sections (den-spec `wire/store-v2.md`, oxyc/den#132). One studio is often several Wikidata items (Toho and Toho
+Animation, HBO and HBO Films); a title crediting any of them is the studio's, and the studio is named by its own
+item.
+
+- **The list**: `/index/studios.json`, for a browse shelf.
+- **A title's studios**: `/index/studios/<type>/<tmdbId>.json`, for the detail header's link.
+- **The studio row**: `/index/filter/<movie|series|all>/titles.json?sel=studio:<id>` — paged and ordered as every
+  filter row, most voted first. `company:<id>` still selects the single item it names and would miss a studio's
+  other arms. The kind combines with every other (`sel=decade:1990,studio:Q182950`) and is listed whole in
+  `counts.json`, named in `labels`.
+
+A store without the sections loads and serves as before: both studio routes answer empty and `studio` is not
+offered (a selection naming it is `ignored`). On b2c60751c955 all 48 are credited, from Amblin's 119 titles to
+Neon's 5.
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows and search include

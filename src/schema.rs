@@ -521,6 +521,28 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/index/studios.json",
+            "example": "/index/studios.json",
+            "about": "The iconic studios: production companies a viewer browses by, from a hand-kept list, each \
+                      with its titles here, most titles first. A studio's row is \
+                      /index/filter/{type}/titles.json?sel=studio:<id>. Empty for a dataset without them.",
+            "returns": "{studios:[{id, name, movies, series}]}: id the studio's own Wikidata Q-id",
+            "counts": { "movies": "films with a card crediting the studio", "series": "series likewise" },
+        },
+        {
+            "method": "GET",
+            "path": "/index/studios/{type}/{tmdbId}.json",
+            "example": "/index/studios/movie/1.json",
+            "about": "One title's iconic studios, in the order it credits them: what a detail header links to the \
+                      studio's row. A title crediting a studio's TV or animation arm names the studio.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+            ],
+            "returns": "{studios:[{id, name}]}: empty for a title with none or not in the corpus",
+        },
+        {
+            "method": "GET",
             "path": "/index/search.json",
             "example": "/index/search.json?q=heist",
             "about": "Semantic search alone: the plot vectors nearest to the query. 503 without the embedder.",

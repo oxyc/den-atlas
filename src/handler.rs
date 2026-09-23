@@ -753,6 +753,13 @@ enum IndexQuestion {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     },
+    /// The iconic studios (`studios.rs`).
+    Studios,
+    /// One title's iconic studios.
+    TitleStudios {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
     /// Answered in `handle_index`, because it waits on den-embed.
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
@@ -791,6 +798,10 @@ impl IndexQuestion {
             }
             ["neighbours", type_, id] => {
                 Some(Self::Neighbours { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["studios"] => Some(Self::Studios),
+            ["studios", type_, id] => {
+                Some(Self::TitleStudios { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
@@ -867,6 +878,10 @@ impl IndexQuestion {
                 let ids: Vec<u32> =
                     plot.nearest(*tmdb_id, *media_type, k).iter().map(|n| n.tmdb_id).collect();
                 serde_json::json!({ "ids": ids })
+            }
+            Self::Studios => crate::studios::list_json(indexes),
+            Self::TitleStudios { media_type, tmdb_id } => {
+                crate::studios::title_json(indexes, *media_type, *tmdb_id)
             }
             Self::Plot { media_type } => {
                 let number = |key: &str, default: usize| {
