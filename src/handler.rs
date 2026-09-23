@@ -798,6 +798,8 @@ impl IndexQuestion {
                 let route = match route {
                     ["counts"] => crate::filter::Route::Counts,
                     ["titles"] => crate::filter::Route::Titles,
+                    ["people"] => crate::filter::Route::People,
+                    ["people", "counts"] => crate::filter::Route::PeopleCounts,
                     ["values", kind] => {
                         crate::filter::Route::Values(crate::filter::spec(kind).filter(|s| s.searchable())?)
                     }
@@ -1553,6 +1555,8 @@ async fn filter_answer(
             crate::filter::Route::Counts => context.counts(&request),
             crate::filter::Route::Titles => context.titles(&request),
             crate::filter::Route::Values(spec) => context.values(spec, &request),
+            crate::filter::Route::People => context.people(&request),
+            crate::filter::Route::PeopleCounts => context.people_counts(&request),
         };
         (body.to_string(), degraded)
     })

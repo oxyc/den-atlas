@@ -121,6 +121,8 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /index/filter/<movie\|series\|all>/counts.json?sel=…` | with `INDEX_QUERIES` on: stackable filters' counts (see **Filters** below) — `{total, kinds: {<kind>: {mode, complete, values: {<id>: n}, labels?, selected?, excluded?}}, coverage, ignored, kindsUnavailable?}`: for every value of every listed kind, the titles of the type (of both, under `all`) carrying the whole selection AND that value; zero counts left out, except a selected or excluded id, which always appears. Den Web hides an option at 0 in a `complete` kind |
 | `GET /index/filter/<movie\|series\|all>/titles.json?sel=…&skip=&limit=` | with `INDEX_QUERIES` on: the titles carrying the selection, most voted first (under `all`, films and series merged by rank within type, each card naming its `type`; in similarity order when a `like` is selected), as the cards `/index/row` returns — `{titles, total, order, coverage, ignored, kindsUnavailable?}`; 24 a page, at most 100, `skip` a multiple of `limit`. `order` fingerprints the order the page is a slice of (it moves with the rating provider's votes, or is `like:<id>`) |
 | `GET /index/filter/<movie\|series\|all>/values/<kind>.json?sel=…&q=&limit=` | with `INDEX_QUERIES` on: one kind's values under the selection, labelled, most titles first — `{kind, mode, values: [{id, name, count, tmdbId?}], complete, ignored, kindsUnavailable?}`, 10 at most; with `q` (2 characters or more), only those with a word starting it: the typeahead for people, studios, subjects and places, over names and aliases. `character` is search-only: `q` of 3 or more, a name starting it, 5 at most |
+| `GET /index/filter/<movie\|series\|all>/people.json?sel=…&traits=…&skip=&limit=` | with `INDEX_QUERIES` on: the people credited on the titles carrying `sel`, holding every person trait in `traits` (see **People** below), most matching titles first, then most titles in the corpus, then Q-id — `{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, occupation?}], total, labels, coverage, ignored, ignoredTraits?, unknownTraits?, …}`; paged as `titles.json`. `labels` names every trait id on the page |
+| `GET /index/filter/<movie\|series\|all>/people/counts.json?sel=…&traits=…` | with `INDEX_QUERIES` on: for every value of every person trait, the people credited under `sel` and the other traits holding it — `{total, traits: {<trait>: {mode, complete, values, labels?, selected?, excluded?}}, traitCoverage, …}`, shaped as `counts.json`'s kinds |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids,mixed}],pooled,pooledMixed}`, More Like This per seed and pooled in seed order; `mixed` and `pooledMixed` are the same with films and series together, `{type,id}` |
@@ -230,6 +232,18 @@ pins url → canonical url pairs a client can test against.
   are kept (0.1 ms); a three-kind selection answers in under 1 ms, the broadest single genre in ~6 ms, a titles
   page in ~0.1 ms, a name search in ~7 ms, and a page of people or cast without a prefix in 2–7 ms (only the
   values that can reach the page are named).
+- **People** (`people.json`, `people/counts.json`; `src/filter/people.rs`) answer who is credited on the titles
+  `sel` matches. `traits` is a second list in `sel`'s grammar and canonical order, placed after it, because a
+  trait is about a person and means nothing to the title routes. Kinds: `gender`, `citizenship`, `occupation`
+  (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `born` (decade of
+  P569; a century-precision birth has none) and `role` (`cast`, `director`, `writer`, `creator`: the credit on
+  a matching title; two roles mean both on one title, `-role:cast` credited without it). `gender` and `born` are
+  one pick and count without their own pick. Unknown is never a match: a person with no gender on record matches
+  neither `gender:` nor `-gender:`, and `traitCoverage` says how many credited people each applied trait is on
+  record for. A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`.
+  Nothing is built at load: each answer walks the matching titles' credit lists in place. On b2c60751c955 (130,116
+  people credited), male cast of 2020 films answers in ~0.8 ms warm (~39 ms the first time, mapping the pages
+  in), every person unfiltered in ~4.4 ms, and the unfiltered trait counts in ~11 ms.
 
 `total` on search is the number of retrieved candidates, not a corpus aggregate. Clients that present corpus
 counts must use the field coverage and denominators from `/index/schema.json`; browse rows and search include

@@ -912,14 +912,19 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
         }
     }
     let entities = [
-        Entity { qid: 1, name: "A Director", tmdb: Some(11), aliases: Vec::new() },
+        Entity { qid: 1, name: "A Director", tmdb: Some(11), ..Entity::default() },
         // People search indexes the aliases as well as the name.
-        Entity { qid: 2, name: "Lead Actor", tmdb: None, aliases: vec!["Bong Joon-ho", "기생충 배우"] },
-        Entity { qid: 50, name: "A Franchise", tmdb: None, aliases: Vec::new() },
-        Entity { qid: 60, name: "A Studio", tmdb: None, aliases: Vec::new() },
-        Entity { qid: 70, name: "Revenge", tmdb: None, aliases: Vec::new() },
-        Entity { qid: 80, name: "Seoul", tmdb: None, aliases: Vec::new() },
-        Entity { qid: 90, name: "feature film", tmdb: None, aliases: Vec::new() },
+        Entity {
+            qid: 2,
+            name: "Lead Actor",
+            aliases: vec!["Bong Joon-ho", "기생충 배우"],
+            ..Entity::default()
+        },
+        Entity { qid: 50, name: "A Franchise", ..Entity::default() },
+        Entity { qid: 60, name: "A Studio", ..Entity::default() },
+        Entity { qid: 70, name: "Revenge", ..Entity::default() },
+        Entity { qid: 80, name: "Seoul", ..Entity::default() },
+        Entity { qid: 90, name: "feature film", ..Entity::default() },
     ];
 
     std::fs::create_dir_all(dir).unwrap();

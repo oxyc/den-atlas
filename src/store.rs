@@ -219,6 +219,10 @@ pub(crate) mod fixture {
         /// Q-ids. The store interns these into the entity table; this resolves them on the way in.
         pub makers: Vec<u32>,
         pub cast: Vec<u32>,
+        /// The three credits `makers` is the union of; their sections are written when any title has one.
+        pub directors: Vec<u32>,
+        pub writers: Vec<u32>,
+        pub creators: Vec<u32>,
         pub broadcasters: Vec<u32>,
         pub based_kind: Vec<&'a str>,
         pub alias_titles: Vec<&'a str>,
@@ -238,12 +242,30 @@ pub(crate) mod fixture {
     }
 
     /// One row of the entity table: a person, a franchise, a place.
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub(crate) struct Entity<'a> {
         pub qid: u32,
         pub name: &'a str,
         pub tmdb: Option<u32>,
         pub aliases: Vec<&'a str>,
+        /// A person's traits, as Q-ids of the items Wikidata names. The ten trait sections are written when any
+        /// entity has one, as the real writer writes all of them or none.
+        pub genders: Vec<u32>,
+        pub citizenships: Vec<u32>,
+        pub occupations: Vec<u32>,
+        /// (days since 1970-01-01, precision: 0 day · 1 month · 2 year · 3 decade · 4 century).
+        pub born: Option<(i32, u8)>,
+        pub died: Option<(i32, u8)>,
+    }
+
+    impl Entity<'_> {
+        fn has_traits(&self) -> bool {
+            !self.genders.is_empty()
+                || !self.citizenships.is_empty()
+                || !self.occupations.is_empty()
+                || self.born.is_some()
+                || self.died.is_some()
+        }
     }
 
     /// The string dictionary and the section table, built up section by section.
@@ -348,6 +370,9 @@ pub(crate) mod fixture {
                 .makers
                 .iter()
                 .chain(&title.cast)
+                .chain(&title.directors)
+                .chain(&title.writers)
+                .chain(&title.creators)
                 .chain(&title.broadcasters)
                 .chain(&title.companies)
                 .chain(&title.locations)
@@ -360,8 +385,16 @@ pub(crate) mod fixture {
                 }
             }
         }
+        for entity in entities {
+            for &qid in entity.genders.iter().chain(&entity.citizenships).chain(&entity.occupations) {
+                if !named.contains(&qid) {
+                    named.push(qid);
+                    extra.push(format!("Q{qid}"));
+                }
+            }
+        }
         for (qid, name) in named[table.len()..].iter().zip(&extra) {
-            table.push(Entity { qid: *qid, name, tmdb: None, aliases: Vec::new() });
+            table.push(Entity { qid: *qid, name, ..Entity::default() });
         }
         // `ent_qid` is sorted in the real store (den-spec: "sorted, binary search"), and readers rely on it.
         table.sort_by_key(|e| e.qid);
@@ -519,6 +552,26 @@ pub(crate) mod fixture {
                 .collect();
             b.list(values, offsets, &rows_of);
         }
+        if titles.iter().any(|t| !t.directors.is_empty() || !t.writers.is_empty() || !t.creators.is_empty()) {
+            for (values, offsets, pick) in [
+                ("directors_v", "directors_o", 0),
+                ("writers_v", "writers_o", 1),
+                ("creators_v", "creators_o", 2),
+            ] {
+                let rows_of: Vec<Vec<u32>> = titles
+                    .iter()
+                    .map(|t| {
+                        let qids = match pick {
+                            0 => &t.directors,
+                            1 => &t.writers,
+                            _ => &t.creators,
+                        };
+                        qids.iter().map(|&qid| at(qid)).collect()
+                    })
+                    .collect();
+                b.list(values, offsets, &rows_of);
+            }
+        }
 
         // The dense tables the filters read: each axis a column, every row carrying every axis.
         for (table, names_section, pick) in [
@@ -563,6 +616,38 @@ pub(crate) mod fixture {
         let aliases: Vec<Vec<u32>> =
             table.iter().map(|e| e.aliases.iter().map(|a| b.intern(a)).collect()).collect();
         b.list("ent_alias_v", "ent_alias_o", &aliases);
+        if table.iter().any(Entity::has_traits) {
+            for (values, offsets, pick) in [
+                ("ent_gender_v", "ent_gender_o", 0),
+                ("ent_citizen_v", "ent_citizen_o", 1),
+                ("ent_occupation_v", "ent_occupation_o", 2),
+            ] {
+                let rows_of: Vec<Vec<u32>> = table
+                    .iter()
+                    .map(|e| {
+                        let qids = match pick {
+                            0 => &e.genders,
+                            1 => &e.citizenships,
+                            _ => &e.occupations,
+                        };
+                        qids.iter().map(|&qid| at(qid)).collect()
+                    })
+                    .collect();
+                b.list(values, offsets, &rows_of);
+            }
+            for (days, precision, pick) in
+                [("ent_born", "ent_born_prec", true), ("ent_died", "ent_died_prec", false)]
+            {
+                let dates: Vec<Option<(i32, u8)>> =
+                    table.iter().map(|e| if pick { e.born } else { e.died }).collect();
+                b.section(
+                    days,
+                    4,
+                    dates.iter().flat_map(|d| d.map_or(i32::MIN, |(d, _)| d).to_le_bytes()).collect(),
+                );
+                b.u8s(precision, &dates.iter().map(|d| d.map_or(0xFF, |(_, p)| p)).collect::<Vec<u8>>());
+            }
+        }
 
         // The rail's own columns. The fixture declares no critique axis and no noul, so the pooled scorer
         // reads the facets and the authorship alone — the terms these route tests are about.
