@@ -758,6 +758,16 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         );
     }
     let premise = premise.map(|index| index.with_taxonomy_version(&sources.taxonomy_version));
+    // More Like This ranks on the plot vectors with the length direction removed, a second 49 MB copy that
+    // took ~1 s of the first request after every load. Built here instead, on a core the phases below leave
+    // idle, and joined before the indexes are assembled.
+    let plot = Arc::new(plot);
+    let warming = {
+        let plot = Arc::clone(&plot);
+        std::thread::spawn(move || {
+            plot.without_length();
+        })
+    };
     // `factsFile` was a 43 MB JSON blob that atlas alone read — nothing served it and no client fetched
     // it — and parsing it was 1.04 s of a 1.6 s load, against 0.38 s off the store.
     //
@@ -844,6 +854,8 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         seconds(facets_took),
         seconds(display_took)
     );
+    warming.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let plot = Arc::into_inner(plot).expect("the warming thread held the only other reference");
     let indexes = Indexes {
         population,
         dataset_version: sources.dataset_version.clone(),
