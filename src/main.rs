@@ -2,6 +2,7 @@
 //! layer (ETag / Range / gzip / conditional). Data is mounted at `DATA_DIR` (default `data/`).
 
 mod billboardcheck;
+mod billing;
 mod cache;
 mod catalog;
 mod characters;

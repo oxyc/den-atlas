@@ -16,6 +16,7 @@
 //! shared name is — never cluster ids: crossovers chain over a thousand titles into one connected
 //! component, so "in the same cluster" would say nothing.
 
+use crate::billing::Billing;
 use crate::ratings::Key;
 use crate::tmdb::{Credits, Role};
 use std::collections::{HashMap, HashSet};
@@ -206,6 +207,8 @@ pub struct CharacterIndex {
     per_tier: [usize; 5],
     /// The names titles can be filtered by, and who plays each.
     named: NamedCharacters,
+    /// Where each title bills its cast, read from the same credits (`billing.rs`).
+    billing: Billing,
 }
 
 impl std::fmt::Debug for CharacterIndex {
@@ -253,11 +256,17 @@ impl CharacterIndex {
         &self.named
     }
 
-    /// Resident size, for the log: the links, and the names titles are filtered by.
+    /// Where each title bills its cast (`billing.rs`).
+    pub fn billing(&self) -> &Billing {
+        &self.billing
+    }
+
+    /// Resident size, for the log: the links, the names titles are filtered by, and the billing.
     pub(crate) fn bytes(&self) -> usize {
         self.starts.len() * std::mem::size_of::<u32>()
             + self.links.len() * std::mem::size_of::<CharacterLink>()
             + self.named.bytes()
+            + self.billing.bytes()
     }
 }
 
@@ -315,12 +324,13 @@ impl Characters {
 pub fn describe(index: &CharacterIndex) -> String {
     let tiers: Vec<String> = index.per_tier().map(|(tier, n)| format!("{} {n}", tier.name())).collect();
     format!(
-        "{} links over {} of {} store rows ({}), {} filterable names, {:.1} MB resident",
+        "{} links over {} of {} store rows ({}), {} filterable names, {} billed titles, {:.1} MB resident",
         index.links(),
         index.linked(),
         index.rows(),
         tiers.join(", "),
         index.named().len(),
+        index.billing().titles(),
         index.bytes() as f64 / 1_000_000.0
     )
 }
@@ -355,7 +365,13 @@ fn build_billed(
         let kept = credits.get(&(u8::from(packed >> 32 == 1), packed as u32))?;
         Some((u32::try_from(row).ok()?, kept.roles.as_slice()))
     });
-    Ok(from_roles(keys.len(), rows, billed))
+    let index = from_roles(keys.len(), rows, billed);
+    // The billing only reweighs people's prominence: without it the links still serve.
+    let billing = crate::billing::build(view, credits).unwrap_or_else(|e| {
+        eprintln!("characters: no billing ({e})");
+        Billing::default()
+    });
+    Ok(CharacterIndex { billing, ..index })
 }
 
 /// The neighbour list from each row's roles, reading the first `billed` of each.
@@ -786,6 +802,7 @@ fn index(row_count: usize, edges: &HashMap<Pair, (Tier, f32)>) -> CharacterIndex
         links: directed.into_iter().map(|(_, link)| link).collect(),
         per_tier,
         named: NamedCharacters::default(),
+        billing: Billing::default(),
     }
 }
 

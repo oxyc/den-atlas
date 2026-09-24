@@ -174,9 +174,10 @@ read a `facets.bin` sidecar, which covered 9,086 fewer titles. Taste weights sta
 
 Vote counts — what every browse row is ORDERED by — are TMDB's `vote_count`, with its `vote_average` the score
 `/recommend` rates a title with where no upstream list scored it, and TMDB's credits give the list of titles
-that share a character. None of it is in the published dataset: atlas asks den-edge's TMDB proxy for it
-(`TMDB_PROXY`) and keeps it in `CACHE_DIR` on the box — vote counts in bulk from `/discover`, sliced by date,
-about once a month; credits a share of the corpus a day, and at once for a title TMDB's changes feed names.
+that share a character and the billing people's prominence weighs a cast credit by. None of it is in the
+published dataset: atlas asks den-edge's TMDB proxy for it (`TMDB_PROXY`) and keeps it in `CACHE_DIR` on the
+box — vote counts in bulk from `/discover`, sliced by date, about once a month; credits a share of the corpus a
+day, and at once for a title TMDB's changes feed names.
 Every kept value is dropped six months after TMDB gave it. `src/tmdb.rs` opens with the rules on what these
 numbers may be used for: sort keys, filters, floors, merit and popularity terms and character-link evidence at
 runtime — never an embedding, a model or a file that leaves the box. A first boot reads a seed made from
@@ -273,9 +274,12 @@ pins url → canonical url pairs a client can test against.
   `order` (after `traits` in the canonical URL, left out when `prominence`) ranks the people: `prominence` sums
   a person's 5 biggest matching titles, each weighing 1 − its rank in its own type's popularity order over that
   type's size (the share the `all` title order interleaves by), so a few hits outrank a long run of mid-table
-  titles; `credits` is most matching titles, then most titles in the corpus; `name` is folded as search folds
-  names; `born_asc`/`born_desc` put people with no birth on record last. Ties go to `credits`, then the Q-id.
-  The score is never published (it comes from TMDB's vote counts). Without a popularity order (no vote counts
+  titles. A cast credit weighs its title by its TMDB billing: in full for the first three billed, 3/position
+  after (¾ fourth, 0.3 tenth), a fifth below the tenth; a credit with no billing kept (no credits for the
+  title, no TMDB id for the person) or on a title the person also directs, writes or created weighs in full.
+  Only prominence reads the billing; `credits` is most matching titles, then most titles in the corpus; `name`
+  is folded as search folds names; `born_asc`/`born_desc` put people with no birth on record last. Ties go to
+  `credits`, then the Q-id. The score is never published (it comes from TMDB's vote counts and billing). Without a popularity order (no vote counts
   kept) prominence answers in `credits`, with `order: "credits"` and `orderUnavailable: "prominence"`.
   With a popularity order each person carries `knownFor`: their three heaviest matching titles by the same
   weight (so a director's are the titles they direct when `role:director` is asked), named by the corpus cards;
