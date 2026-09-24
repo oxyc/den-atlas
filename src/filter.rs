@@ -1897,15 +1897,15 @@ impl<'a> Context<'a> {
     /// less those over `sure` where the two differ.
     fn entity_tallies(&self, i: usize, base: &Matched) -> Vec<(u32, Counted)> {
         let counted = self.entity_counts(i, &base.any);
-        let sure: HashMap<u32, u32> = if base.sure == base.any {
-            HashMap::new()
-        } else {
-            self.entity_counts(i, &base.sure).into_iter().collect()
-        };
+        // Compared once: the two are whole-corpus bitsets (~6 KB), and asked per entity this was most of
+        // `counts.json` on the musl build, whose memcmp is a byte loop — ~400 ms a request against ~40 ms.
+        let split = base.sure != base.any;
+        let sure: HashMap<u32, u32> =
+            if split { self.entity_counts(i, &base.sure).into_iter().collect() } else { HashMap::new() };
         counted
             .into_iter()
             .map(|(e, n)| {
-                let likely = if base.sure == base.any { 0 } else { n - sure.get(&e).copied().unwrap_or(0) };
+                let likely = if split { n - sure.get(&e).copied().unwrap_or(0) } else { 0 };
                 (e, Counted { total: n as usize, likely: likely as usize })
             })
             .collect()
