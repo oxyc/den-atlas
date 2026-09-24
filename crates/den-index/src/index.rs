@@ -490,8 +490,10 @@ impl Index {
     /// of the same index, so the seed and the corpus it is compared with lose the direction alike.
     ///
     /// Built on first use and kept with the index: a second copy of the vectors (~49 MB on the plot index,
-    /// ~150 ms), paid on the first More Like This of a load, since production ranks on it
-    /// (`SimilarParams::plot_length_off`). An index with no direction answers itself.
+    /// ~150 ms on glibc, ~1 s on the static musl build), which production ranks on
+    /// (`SimilarParams::plot_length_off`). A caller that does not want the first More Like This of a load to
+    /// pay for it calls this ahead, as den-atlas does beside its load. An index with no direction answers
+    /// itself.
     pub fn without_length(&self) -> &Index {
         let Some(direction) = &self.length_direction else { return self };
         self.without_length.get_or_init(|| Box::new(self.with_direction_removed(direction)))
