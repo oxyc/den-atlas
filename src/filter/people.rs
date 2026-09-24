@@ -38,11 +38,20 @@
 //! above the stars. The score is a sort key alone, never in the answer: it is read off TMDB's vote counts.
 //! Without a popularity order the weights would be TMDB-id order, so prominence falls back to `credits` and
 //! says so.
+//!
+//! A cast credit weighs its title's share by where the title bills the person (oxyc/den-atlas#82): in full
+//! among the first `LEADS`, falling off after, and `BIT_PART` below TMDB's first ten — so a few lines in
+//! three hits no longer outrank the lead of five. The billing is TMDB's (`billing.rs`), a sort key alone like
+//! the vote counts. A credit whose billing is not known — a title with no kept credits, a person with no TMDB
+//! id — weighs as it did before, and so does a credit on a title the person also directs, writes or created.
+//! The other orders, the counts and `knownFor` read the titles' own weights.
 
 use super::{
     counted_apart, normalise_id, ones, selected_ids, Context, Id, Item, Mode, Request, Scope, Status,
     ENTITY_KINDS, TOP_K,
 };
+use crate::billing::{Billed, Billing};
+use crate::characters::CharacterIndex;
 use den_store::{List, PersonDate, PersonTraits, Row};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -51,6 +60,9 @@ const CAST: u8 = 1;
 const DIRECTOR: u8 = 2;
 const WRITER: u8 = 4;
 const CREATOR: u8 = 8;
+/// Marks a person as credited on the row being walked by `makers`, which a store without the role lists
+/// names its directors, writers and creators in alone: a credit that is not only a cast one.
+const MAKER: u8 = 0x20;
 /// Marks a person as credited on the row being walked, whatever their roles on it.
 const CREDITED: u8 = 0x40;
 /// A role no credit carries: asking for one the store cannot answer matches nothing.
@@ -140,6 +152,8 @@ const ORDERS: [(&str, Order, &str); 5] = [
         "the default: the people whose biggest matching titles are most popular first. Each matching title \
          weighs one minus its rank in its own type's popularity order over that type's size, and a person \
          scores the sum of their 5 heaviest, so a few hits outrank many titles from the middle of the table. \
+         A cast credit weighs its title by the person's billing on it: in full among the first 3, less after, a \
+         fifth below the tenth, and in full where the billing is not known. \
          Without a popularity order this falls back to credits and names prominence in orderUnavailable",
     ),
     ("credits", Order::Credits, "most matching titles first, then most titles in the corpus"),
@@ -350,6 +364,9 @@ struct Tally {
     /// Per entity credited, in `touched` order: its `TOP_TITLES` biggest matching titles as (`within_type`
     /// weight, row), largest first; a weight of 0 is an empty place. Empty unless the titles are weighed.
     top: Vec<Top>,
+    /// The same, each cast credit weighed by its billing (`billed`): what prominence sums. Empty unless the
+    /// titles are weighed by a billing.
+    billed: Vec<Top>,
 }
 
 /// How many of a person's matching titles their prominence counts: their biggest, so a few hits outrank many
@@ -357,6 +374,23 @@ struct Tally {
 const TOP_TITLES: usize = 5;
 /// How many of those `people.json` names as what a person is known for.
 const KNOWN_FOR: usize = 3;
+/// The billing positions a cast credit weighs its title's full share at: the leads.
+const LEADS: u32 = 3;
+/// What a cast credit weighs, of its title's share, when the title bills the person below its first ten: a
+/// bit part, where a lead in a title a fifth as popular weighs the same.
+const BIT_PART: f64 = 0.2;
+
+/// The share of its title's weight a cast credit carries at its billing: 1 for the first `LEADS` and for a
+/// billing not known, then `LEADS` over the position counted from 1 — ¾ for the fourth, ½ for the sixth,
+/// 0.3 for the tenth — and `BIT_PART` below the tenth.
+fn billed(billing: Option<Billed>) -> f64 {
+    match billing {
+        None => 1.0,
+        Some(Billed::At(at)) if at < LEADS => 1.0,
+        Some(Billed::At(at)) => f64::from(LEADS) / f64::from(at + 1),
+        Some(Billed::Below) => BIT_PART,
+    }
+}
 
 type Top = [(f64, u32); TOP_TITLES];
 
@@ -366,9 +400,12 @@ impl Tally {
         self.top.get(self.at.get(e as usize).map_or(usize::MAX, |&at| at as usize))
     }
 
-    /// A person's prominence: the sum of their biggest matching titles' weights; 0 when not weighed.
+    /// A person's prominence: the sum of their biggest matching titles' weights, weighed by their billing
+    /// when the titles were; 0 when not weighed.
     fn prominence(&self, e: u32) -> f64 {
-        self.top(e).map_or(0.0, |top| top.iter().map(|t| t.0).sum())
+        let at = self.at.get(e as usize).map_or(usize::MAX, |&at| at as usize);
+        let top = if self.billed.is_empty() { self.top.get(at) } else { self.billed.get(at) };
+        top.map_or(0.0, |top| top.iter().map(|t| t.0).sum())
     }
 }
 
@@ -523,8 +560,17 @@ impl<'a> Context<'a> {
 
     /// Every person credited on the rows of `base`, counting a title for them when their credits on it hold
     /// a role of each mask of `want` and none of `avoid` — and, with `weigh`, keeping their biggest titles
-    /// (`top`).
-    fn tally(&self, sources: &Sources<'a>, base: &[u64], want: &[u8], avoid: u8, weigh: bool) -> Tally {
+    /// (`top`), and with a `billing` as well their biggest by billing (`billed`).
+    fn tally(
+        &self,
+        sources: &Sources<'a>,
+        base: &[u64],
+        want: &[u8],
+        avoid: u8,
+        weigh: bool,
+        billing: Option<&Billing>,
+    ) -> Tally {
+        let billing = billing.filter(|_| weigh);
         let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
         let mut tally = Tally {
             credits: vec![0; size],
@@ -532,12 +578,13 @@ impl<'a> Context<'a> {
             touched: Vec::new(),
             at: if weigh { vec![0; size] } else { Vec::new() },
             top: Vec::new(),
+            billed: Vec::new(),
         };
         let mut on_row = vec![0u8; size];
         let mut credited: Vec<u32> = Vec::new();
         let lists = [
             (&sources.cast, CAST),
-            (&sources.makers, 0),
+            (&sources.makers, MAKER),
             (&sources.directors, DIRECTOR),
             (&sources.writers, WRITER),
             (&sources.creators, CREATOR),
@@ -556,7 +603,8 @@ impl<'a> Context<'a> {
             }
             for &e in &credited {
                 let e = e as usize;
-                let roles = on_row[e] & !CREDITED;
+                let cast_only = on_row[e] & !CREDITED == CAST;
+                let roles = on_row[e] & !(CREDITED | MAKER);
                 on_row[e] = 0;
                 if want.iter().any(|&mask| roles & mask == 0) || roles & avoid != 0 {
                     continue;
@@ -566,12 +614,20 @@ impl<'a> Context<'a> {
                         tally.at[e] = tally.touched.len() as u32;
                         tally.top.push([(0.0, 0); TOP_TITLES]);
                     }
+                    if billing.is_some() {
+                        tally.billed.push([(0.0, 0); TOP_TITLES]);
+                    }
                     tally.touched.push(e as u32);
                 }
                 tally.credits[e] += 1;
                 tally.held[e] |= roles;
                 if weigh {
-                    keep_top(&mut tally.top[tally.at[e] as usize], weight, row as u32);
+                    let at = tally.at[e] as usize;
+                    keep_top(&mut tally.top[at], weight, row as u32);
+                    if let Some(billing) = billing {
+                        let share = if cast_only { billed(billing.of(row, e as u32)) } else { 1.0 };
+                        keep_top(&mut tally.billed[at], weight * share, row as u32);
+                    }
                 }
             }
         }
@@ -617,14 +673,14 @@ impl<'a> Context<'a> {
     }
 
     /// The title selection, the traits, and who is credited under them; with `weigh`, how prominently.
-    fn people_of<'r>(&self, request: &'r Request, weigh: bool) -> People<'a, 'r> {
+    fn people_of<'r>(&self, request: &'r Request, weigh: bool, billing: Option<&Billing>) -> People<'a, 'r> {
         let (applied, ignored) = self.split(&request.items);
         // The titles `total` counts: likely matches included, as `titles.json` lists them.
         let base = self.matched(&applied, None).any;
         let sources = self.sources();
         let split = self.split_traits(&sources, &request.traits);
         let want: Vec<u8> = split.want.iter().map(|w| w.roles).collect();
-        let tally = self.tally(&sources, &base, &want, split.avoid, weigh);
+        let tally = self.tally(&sources, &base, &want, split.avoid, weigh, billing);
         let mut envelope = json!({ "coverage": self.coverage(&applied) });
         let mut degraded = self.envelope(&mut envelope, &applied, ignored);
         if !split.ignored.is_empty() {
@@ -646,7 +702,7 @@ impl<'a> Context<'a> {
     /// an OR group (`citizenship:Q30|Q145`, `role:cast|director`) without its groups, as `counts.json` counts
     /// them.
     pub fn people_counts(&self, request: &Request) -> (Value, bool) {
-        let people = self.people_of(request, false);
+        let people = self.people_of(request, false, None);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let mut values: [HashMap<i64, u32>; PERSON_KINDS] = Default::default();
         let mut roles = [0u32; 4];
@@ -658,7 +714,7 @@ impl<'a> Context<'a> {
             .want
             .iter()
             .any(|w| w.group)
-            .then(|| self.tally(sources, &people.base, &split.want_apart(), split.avoid, false));
+            .then(|| self.tally(sources, &people.base, &split.want_apart(), split.avoid, false, None));
         if let Some(role_tally) = &role_tally {
             for &e in &role_tally.touched {
                 if self.fails(sources, &split.applied, e) == 0 {
@@ -801,7 +857,7 @@ impl<'a> Context<'a> {
     /// first, then those holding it as whole words, then the rest (`match_tier`). So a value past the top
     /// (citizenship:Iceland among the films of the 2020s) can be found by name.
     pub fn people_values(&self, kind: &str, request: &Request) -> (Value, bool) {
-        let people = self.people_of(request, false);
+        let people = self.people_of(request, false, None);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let i = TRAITS.iter().position(|t| t.name == kind).unwrap_or(0);
         let (spec, apart) = (&TRAITS[i], split.apart(i));
@@ -870,8 +926,11 @@ impl<'a> Context<'a> {
             Order::Prominence if !self.popular() => Order::Credits,
             order => order,
         };
-        // Weighed whenever there is a popularity order, for `knownFor` whatever the order.
-        let people = self.people_of(request, self.popular());
+        // Weighed whenever there is a popularity order, for `knownFor` whatever the order; by billing for
+        // prominence alone.
+        let billing =
+            self.characters.as_deref().map(CharacterIndex::billing).filter(|_| order == Order::Prominence);
+        let people = self.people_of(request, self.popular(), billing);
         let (sources, split, tally) = (&people.sources, &people.split, &people.tally);
         let corpus = ENTITY_KINDS
             .iter()
@@ -1669,7 +1728,7 @@ mod tests {
         let indexes = orders_store("top-heavy", true);
         let context = Context::new(&indexes, Movie, None);
         let request = Request::parse(Route::People, Movie.into(), "").unwrap();
-        let people = context.people_of(&request, true);
+        let people = context.people_of(&request, true, None);
         let tally = &people.tally;
         let entity = |qid: &str| context.entity_of(qid).unwrap();
         let (zed, amy) = (entity("Q501"), entity("Q502"));
@@ -1702,6 +1761,159 @@ mod tests {
         assert!(credits.get("orderUnavailable").is_none(), "credits was what it asked for");
         let named = ask(&indexes, Movie, Route::People, "order=name");
         assert_eq!(order_of(&named), ["Amy", "Ängel", "Mo", "Zed"], "the other orders need no popularity");
+    }
+
+    /// Ten 2020 films, film i (TMDB id i + 1) at rank i, so it weighs 1 − i/10, and TMDB's credits for the
+    /// first five when `billed` (synthetic):
+    ///
+    /// - Cam (701): cast in films 0–4, billed below their first ten each time — a bit part.
+    /// - Lee (702): cast in films 0–4, billed first each time.
+    /// - Una (703): cast in films 0–4, with no TMDB id to look for in the billing.
+    /// - Dee (704): directs films 0–4 and is billed ninth in them.
+    /// - Ned (705): cast in films 5–9, which have no credits kept.
+    ///
+    /// Without a billing Cam, Lee, Una and Dee tie at 1 + 0.9 + 0.8 + 0.7 + 0.6, Cam first on the Q-id.
+    fn billing_store(name: &str, billed: bool) -> Indexes {
+        let titles: Vec<Title> = (0..10u32)
+            .map(|i| Title {
+                tmdb_id: i + 1,
+                primary_genre: "Drama",
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A title", None, Some(2020))),
+                votes: 1000 - 10 * i,
+                cast: if i < 5 { vec![701, 702, 703, 704] } else { vec![705] },
+                directors: if i < 5 { vec![704] } else { Vec::new() },
+                makers: if i < 5 { vec![704] } else { Vec::new() },
+                ..Title::default()
+            })
+            .collect();
+        let person = |qid: u32, name: &'static str, tmdb: Option<u32>| Entity {
+            qid,
+            name,
+            tmdb,
+            genders: vec![MALE],
+            ..Entity::default()
+        };
+        let entities = [
+            person(701, "Cam", Some(9701)),
+            person(702, "Lee", Some(9702)),
+            person(703, "Una", None),
+            person(704, "Dee", Some(9704)),
+            person(705, "Ned", Some(9705)),
+            label(MALE, "male"),
+        ];
+        let mut indexes = load(name, &titles, &entities);
+        if billed {
+            let role = |order: u32, person: u32, character: &str| crate::tmdb::Role {
+                order,
+                person,
+                character: character.into(),
+            };
+            let credits: HashMap<crate::ratings::Key, crate::tmdb::Credits> = (1..=5)
+                .map(|id| {
+                    let roles = vec![role(0, 9702, "The Lead"), role(8, 9704, "A Passer-by")];
+                    ((0, id), crate::tmdb::Credits { fetched: 1, roles })
+                })
+                .collect();
+            let index = crate::characters::build(&indexes.store.view(), &credits).unwrap();
+            assert_eq!(index.billing().titles(), 5);
+            indexes.characters = Some(std::sync::Arc::new(crate::characters::Characters::with_index(index)));
+        }
+        indexes
+    }
+
+    fn label(qid: u32, name: &'static str) -> Entity<'static> {
+        Entity { qid, name, ..Entity::default() }
+    }
+
+    /// The issue's case: a bit part in the same hits no longer ranks with their lead. Without the billing
+    /// the two tie, and the tie goes to the bit part on the Q-id.
+    #[test]
+    fn a_lead_outranks_a_bit_part_on_the_same_titles() {
+        let plain = ask(&billing_store("unbilled", false), Movie, Route::People, "sel=decade:2020");
+        assert_eq!(order_of(&plain), ["Cam", "Lee", "Una", "Dee", "Ned"], "{plain}");
+        let billed = billing_store("billed", true);
+        for query in ["sel=decade:2020", "sel=decade:2020&order=prominence&traits=role:cast"] {
+            let answer = ask(&billed, Movie, Route::People, query);
+            assert_eq!(order_of(&answer), ["Lee", "Una", "Dee", "Ned", "Cam"], "{query}: {answer}");
+            assert!(answer["people"][0].get("prominence").is_none(), "no score is published");
+        }
+    }
+
+    /// A credit whose billing is not known weighs as it did: Una has no TMDB id, Ned's films have no credits
+    /// kept, and Dee directs the films he is billed ninth in. Cam's bit parts weigh a fifth.
+    #[test]
+    fn unknown_billing_weighs_as_before() {
+        let indexes = billing_store("unknown-billing", true);
+        let context = Context::new(&indexes, Movie, None);
+        let billing = context.characters.as_deref().map(CharacterIndex::billing);
+        assert!(billing.is_some());
+        let request = Request::parse(Route::People, Movie.into(), "").unwrap();
+        let (plain, billed) =
+            (context.people_of(&request, true, None), context.people_of(&request, true, billing));
+        let entity = |qid: &str| context.entity_of(qid).unwrap();
+        for (qid, before, after) in [
+            ("Q701", 4.0, 0.8),
+            ("Q702", 4.0, 4.0),
+            ("Q703", 4.0, 4.0),
+            ("Q704", 4.0, 4.0),
+            ("Q705", 1.5, 1.5),
+        ] {
+            let e = entity(qid);
+            assert!((plain.tally.prominence(e) - before).abs() < 1e-9, "{qid} {}", plain.tally.prominence(e));
+            assert!(
+                (billed.tally.prominence(e) - after).abs() < 1e-9,
+                "{qid} {}",
+                billed.tally.prominence(e)
+            );
+        }
+    }
+
+    /// The billing is read for prominence alone: the other orders, the counts and `knownFor` are what they
+    /// were without it, and paging through the billed order gives every person once, in order.
+    #[test]
+    fn billing_changes_prominence_alone() {
+        let (plain, billed) = (billing_store("alone-plain", false), billing_store("alone-billed", true));
+        for query in ["order=credits", "order=name", "order=born_asc"] {
+            assert_eq!(
+                ask(&plain, Movie, Route::People, query)["people"],
+                ask(&billed, Movie, Route::People, query)["people"],
+                "{query}"
+            );
+        }
+        let known = |indexes: &Indexes| {
+            let answer = ask(indexes, Movie, Route::People, "");
+            let mut known: Vec<(String, Value)> = answer["people"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (p["name"].as_str().unwrap().to_owned(), p["knownFor"].clone()))
+                .collect();
+            known.sort_by(|a, b| a.0.cmp(&b.0));
+            known
+        };
+        assert_eq!(known(&plain), known(&billed));
+        assert_eq!(
+            ask(&plain, Movie, Route::PeopleCounts, "sel=decade:2020"),
+            ask(&billed, Movie, Route::PeopleCounts, "sel=decade:2020")
+        );
+        let whole = order_of(&ask(&billed, Movie, Route::People, ""));
+        let paged: Vec<String> = (0..whole.len())
+            .step_by(2)
+            .flat_map(|skip| order_of(&ask(&billed, Movie, Route::People, &format!("skip={skip}&limit=2"))))
+            .collect();
+        assert_eq!(paged, whole);
+    }
+
+    #[test]
+    fn a_credit_weighs_its_title_by_its_billing() {
+        let shares: Vec<f64> = [None, Some(0), Some(2), Some(3), Some(5), Some(9)]
+            .into_iter()
+            .map(|at| billed(at.map(Billed::At)))
+            .collect();
+        assert_eq!(shares, [1.0, 1.0, 1.0, 0.75, 0.5, 0.3]);
+        assert_eq!(billed(Some(Billed::Below)), BIT_PART);
     }
 
     /// `people/values/<trait>.json`: every value of an entity trait counted under the selection and the other
@@ -1922,6 +2134,74 @@ mod tests {
             "per decade: totals {decade_totals:?}; three 100-person pages in {:?} keep {kept} of the {total}",
             started.elapsed()
         );
+    }
+
+    /// Prominence before and after the billing (oxyc/den-atlas#82) over the REAL corpus: the first ten of each
+    /// list as a Markdown table, names only, and the first hundred paged through against the whole. Opt-in:
+    /// `DEN_STORE` names a store whose directory holds its `dataset.meta.json`, and `CACHE_DIR` the kept TMDB
+    /// numbers — `tmdb-votes.tsv` for the popularity order and `tmdb-credits.tsv` for the billing.
+    #[test]
+    fn real_corpus_billing_before_after() {
+        let (Ok(store), Ok(kept)) = (std::env::var("DEN_STORE"), std::env::var("CACHE_DIR")) else {
+            eprintln!("SKIP: set DEN_STORE to a real den-<ver>.store and CACHE_DIR to its kept TMDB numbers");
+            return;
+        };
+        let dir = std::path::Path::new(&store).parent().expect("the store sits in a dataset directory");
+        let ds = crate::dataset::Dataset::load(dir).expect("the dataset loads");
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let tmdb = crate::tmdb::Tmdb::new(ds.mapped.clone(), Some(kept.into()), None, 0).unwrap();
+        eprintln!("{}", runtime.block_on(tmdb.load()));
+        let (indexes, _) = runtime
+            .block_on(
+                crate::queries::IndexQueries::new(&ds)
+                    .with_ratings(Some(tmdb.ratings()))
+                    .with_characters(Some(tmdb.characters()))
+                    .get(|| ()),
+            )
+            .expect("the indexes load");
+        for (title, scope, query) in [
+            (
+                "Male cast, 2020s films",
+                Scope::from(Movie),
+                "sel=decade:2020&traits=gender:Q6581097,role:cast",
+            ),
+            (
+                "Swedish directors born in the 1970s",
+                Scope::All,
+                "traits=citizenship:Q34,role:director,born:1970",
+            ),
+            (
+                "Actresses in horror films",
+                Scope::from(Movie),
+                "sel=genre:27&traits=gender:Q6581072,role:cast",
+            ),
+            (
+                "Actresses, 1990s films",
+                Scope::from(Movie),
+                "sel=decade:1990&traits=gender:Q6581072,role:cast",
+            ),
+            ("Series cast", Scope::from(den_index::MediaType::Tv), "traits=role:cast"),
+            ("Swedish cast", Scope::All, "traits=citizenship:Q34,role:cast"),
+        ] {
+            let mut context = Context::new(&indexes, scope, None);
+            let run = |context: &Context, query: &str| {
+                let answer = context.people(&Request::parse(Route::People, scope, query).unwrap()).0;
+                assert_eq!(answer["order"], "prominence", "{query}: a popularity order is needed");
+                order_of(&answer)
+            };
+            let after = run(&context, &format!("{query}&limit=100"));
+            let paged: Vec<String> = (0..100)
+                .step_by(20)
+                .flat_map(|skip| run(&context, &format!("{query}&skip={skip}&limit=20")))
+                .collect();
+            assert_eq!(paged, after, "{query}: paged");
+            context.characters = None;
+            let before = run(&context, &format!("{query}&limit=10"));
+            eprintln!("\n{title} (`{query}`)\n\n| # | before | after |\n|---|---|---|");
+            for (at, (was, now)) in before.iter().zip(&after).enumerate() {
+                eprintln!("| {} | {was} | {now} |", at + 1);
+            }
+        }
     }
 
     /// The people routes over the REAL corpus, and what they cost. Opt-in: `DEN_STORE` names a store whose
