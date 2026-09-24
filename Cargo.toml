@@ -56,7 +56,7 @@ members = ["crates/den-index", "crates/den-titlesearch"]
 # a case cannot be moved between halves by hand (`raileval.rs`).
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-blake2 = "0.10"
+blake2 = "0.11"
 sha2 = "0.10"
 
 # Speed over size, everywhere: every More Like This, search and row walks tens of thousands of records, the
