@@ -132,6 +132,8 @@ enum Id {
     Label,
     /// A Wikidata item: `Q` and digits.
     Qid,
+    /// A country: its ISO 3166-1 alpha-2 code, uppercase, or its Wikidata item, as `Qid` writes it.
+    Country,
     /// A character name, normalised (`characters::normalise`), its spaces written `-`.
     Character,
     /// A title: its TMDB id, and under `all`, which type it is as well — `movie-550`, `series-1396`, the
@@ -148,6 +150,7 @@ impl Id {
             Id::Upper => "uppercase",
             Id::Label => "the label exactly as atlas names it",
             Id::Qid => "Wikidata Q-id",
+            Id::Country => "ISO 3166-1 alpha-2 code (SE), uppercase, or Wikidata Q-id (Q34)",
             Id::Character => "the normalised name, lowercase, words joined by -",
             Id::Title => "a TMDB id of the route's type; under all, movie-<TMDB id> or series-<TMDB id>",
         }
@@ -278,6 +281,15 @@ const ENTITY_KINDS: &[EntitySpec] = &[
         series_only: false,
         only: &[],
         about: "a cast member",
+    },
+    EntitySpec {
+        name: "author",
+        sections: &[("src_authors_v", "src_authors_o")],
+        min_titles: 1,
+        series_only: false,
+        only: &[],
+        about: "the author (P50) of a work the title is adapted from (P144): author:Q39829 is adapted from \
+                Stephen King. Not a credit: a screenwriter is not a source author",
     },
     EntitySpec {
         name: "company",
@@ -527,6 +539,15 @@ fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, String), Str
     Ok((kind, id))
 }
 
+/// A Wikidata item id in its canonical form, `Q` and digits, or `None` for anything else.
+fn qid_of(id: &str) -> Option<String> {
+    let digits = id.strip_prefix(['Q', 'q']).unwrap_or(id);
+    match digits.parse::<u32>() {
+        Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => Some(format!("Q{n}")),
+        _ => None,
+    }
+}
+
 /// An id in its canonical form, as its kind's format says.
 fn normalise_id(kind: &str, id: &str, format: Id, scope: Scope) -> Result<String, String> {
     let number = || id.parse::<u32>().map_err(|_| format!("{kind}: {id:?} is not an integer"));
@@ -536,13 +557,17 @@ fn normalise_id(kind: &str, id: &str, format: Id, scope: Scope) -> Result<String
         Id::Lower => id.to_ascii_lowercase(),
         Id::Upper => id.to_ascii_uppercase(),
         Id::Label => id.to_owned(),
-        Id::Qid => {
-            let digits = id.strip_prefix(['Q', 'q']).unwrap_or(id);
-            match digits.parse::<u32>() {
-                Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => format!("Q{n}"),
-                _ => return Err(format!("{kind}: {id:?} is not a Wikidata Q-id")),
+        Id::Qid => qid_of(id).ok_or_else(|| format!("{kind}: {id:?} is not a Wikidata Q-id"))?,
+        // A Q-id first: `Q1` is an item, and no code is a Q and a digit. `QA` is Qatar.
+        Id::Country => match qid_of(id) {
+            Some(qid) => qid,
+            None if id.len() == 2 && id.bytes().all(|b| b.is_ascii_alphabetic()) => id.to_ascii_uppercase(),
+            None => {
+                return Err(format!(
+                    "{kind}: {id:?} is neither an ISO 3166-1 alpha-2 code nor a Wikidata Q-id"
+                ))
             }
-        }
+        },
         Id::Character => {
             let name = crate::characters::normalise(id);
             if name.is_empty() {
@@ -3091,6 +3116,76 @@ mod tests {
         let limited = spec("place").unwrap();
         let first = context.values(limited, &request(Route::Values(limited), "q=paris&limit=1")).0;
         assert_eq!(first["values"][0]["id"], "Q1", "the page is cut after ordering: {first}");
+    }
+
+    /// `author:` (oxyc/den-dataset#114): films 1 and 2 are adapted from Stephen King, 3 from King and Peter
+    /// Straub together, 4 from Shakespeare, 5 from nothing a store names an author of.
+    fn authors_store(name: &str, with_authors: bool) -> Indexes {
+        use crate::store::fixture::{Entity, Title};
+        const KING: u32 = 39_829;
+        const STRAUB: u32 = 1_174_521;
+        const SHAKESPEARE: u32 = 692;
+        let adapted = [vec![KING], vec![KING], vec![KING, STRAUB], vec![SHAKESPEARE], vec![]];
+        let titles: Vec<Title> = adapted
+            .iter()
+            .enumerate()
+            .map(|(i, authors)| Title {
+                media: 0,
+                tmdb_id: i as u32 + 1,
+                primary_genre: "Drama",
+                plot: vec![100, 0, 0],
+                premise: vec![100, 0, 0],
+                card: Some(("A title", None, Some(2000))),
+                votes: 100,
+                source_authors: if with_authors { authors.clone() } else { vec![] },
+                ..Title::default()
+            })
+            .collect();
+        let entities = [
+            Entity { qid: KING, name: "Stephen King", aliases: vec!["Richard Bachman"], ..Entity::default() },
+            Entity { qid: STRAUB, name: "Peter Straub", ..Entity::default() },
+            Entity { qid: SHAKESPEARE, name: "William Shakespeare", ..Entity::default() },
+        ];
+        store_of(name, &titles, &entities)
+    }
+
+    #[test]
+    fn author_selects_the_titles_adapted_from_a_writers_work() {
+        let indexes = authors_store("authors", true);
+        assert_eq!(sorted_ids(&indexes, "sel=author:Q39829"), [1, 2, 3]);
+        assert_eq!(sorted_ids(&indexes, "sel=author:Q39829,author:Q1174521"), [3], "both wrote it");
+        assert_eq!(sorted_ids(&indexes, "sel=author:Q692|Q1174521"), [3, 4], "either wrote it");
+        assert_eq!(
+            sorted_ids(&indexes, "sel=-author:Q39829"),
+            [4],
+            "a title with no source author on record is not known to be adapted from someone else"
+        );
+        let all = counts(&indexes, Movie, "");
+        let author = &all["kinds"]["author"];
+        assert_eq!(author["values"], json!({ "Q39829": 3, "Q1174521": 1, "Q692": 1 }));
+        assert_eq!(author["labels"]["Q39829"], "Stephen King");
+        let king = counts(&indexes, Movie, "sel=author:Q39829");
+        assert_eq!(king["coverage"]["author"], json!({ "count": 4, "denominator": 5 }));
+
+        let context = Context::new(&indexes, Movie, None);
+        let spec = spec("author").unwrap();
+        let found = |q: &str| context.values(spec, &request(Route::Values(spec), &format!("q={q}"))).0;
+        let king = found("king");
+        assert_eq!(king["values"][0]["id"], "Q39829", "{king}");
+        assert_eq!(king["values"][0]["count"], 3);
+        assert_eq!(found("bachman")["values"][0]["id"], "Q39829", "an alias finds the author");
+    }
+
+    /// A store written before the source authors does not offer the kind, and a selection naming it is
+    /// answered around it.
+    #[test]
+    fn a_store_without_source_authors_ignores_author() {
+        let indexes = authors_store("no-authors", false);
+        let answer =
+            Context::new(&indexes, Movie, None).titles(&request(Route::Titles, "sel=author:Q39829")).0;
+        assert_eq!(answer["ignored"], json!(["author"]), "{answer}");
+        assert_eq!(answer["total"], 5);
+        assert!(counts(&indexes, Movie, "")["kinds"].get("author").is_none());
     }
 
     /// Films 1 (action) and 4, series 2 (Action & Adventure, and kids) and 3 (kids), both on network Q70.

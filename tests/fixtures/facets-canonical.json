@@ -1,5 +1,5 @@
 {
-  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it; `born` is a decade (born:1970) or one range of birth years, ends inclusive and either left out (born:1976-1996, born:1976-, born:-1996), with no other positive born pick beside it. people.json's `order` follows `traits`, lowercased, and is left out when it is the default, `prominence`. people/values/<trait>.json (gender, citizenship, occupation) takes sel, traits, q and limit, in that order, as values/<kind>.json does. An item may OR values of its kind with a literal `|` (country:FR|IT; %7C is a second spelling): its ids sorted as strings and each kept once, the item sorted among the others by its ids joined with `|`, a one-value group written without `|`; a group counts toward the 16-value cap by its values; like and a born range never go in a group. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
+  "about": "Den Web's contract with den-atlas's /index/filter routes: each url, and the canonical url atlas answers it as (the Content-Location it names when they differ). A client that always builds the canonical form shares one cache entry per question. The type is movie, series or all (both); under all a like names its title's type, like:movie-550 or like:series-1396, and a bare id is refused. people.json and people/counts.json take the person traits as `traits`, written as `sel` is and placed after it; `birthcountry` is an ISO 3166-1 alpha-2 code, uppercased, or a Q-id, each canonical as itself; `born` is a decade (born:1970) or one range of birth years, ends inclusive and either left out (born:1976-1996, born:1976-, born:-1996), with no other positive born pick beside it. people.json's `order` follows `traits`, lowercased, and is left out when it is the default, `prominence`. people/values/<trait>.json (gender, citizenship, occupation, birthplace, birthcountry) takes sel, traits, q and limit, in that order, as values/<kind>.json does. An item may OR values of its kind with a literal `|` (country:FR|IT; %7C is a second spelling): its ids sorted as strings and each kept once, the item sorted among the others by its ids joined with `|`, a one-value group written without `|`; a group counts toward the 16-value cap by its values; like and a born range never go in a group. `refused` are answered 400. Checked by den-atlas's filter::tests::the_canonical_fixture_holds.",
   "cases": [
     { "url": "/index/filter/movie/counts.json", "canonical": "/index/filter/movie/counts.json" },
     { "url": "/index/filter/movie/counts.json?sel=", "canonical": "/index/filter/movie/counts.json" },
@@ -86,7 +86,17 @@
     { "url": "/index/filter/movie/people.json?traits=role:Director|cast,citizenship:Q30|Q145&sel=country:IT|FR", "canonical": "/index/filter/movie/people.json?sel=country:FR|IT&traits=citizenship:Q145|Q30,role:cast|director" },
     { "url": "/index/filter/movie/people/counts.json?traits=-citizenship:Q145|Q30", "canonical": "/index/filter/movie/people/counts.json?traits=-citizenship:Q145|Q30" },
     { "url": "/index/filter/movie/people.json?traits=born:1975|1980", "canonical": "/index/filter/movie/people.json?traits=born:1970|1980" },
-    { "url": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097|Q6581072", "canonical": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097" }
+    { "url": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097|Q6581072", "canonical": "/index/filter/movie/people.json?traits=gender:Q6581072|Q6581097" },
+    { "url": "/index/filter/movie/people.json?traits=birthcountry:se", "canonical": "/index/filter/movie/people.json?traits=birthcountry:SE" },
+    { "url": "/index/filter/movie/people.json?traits=birthcountry:q34", "canonical": "/index/filter/movie/people.json?traits=birthcountry:Q34" },
+    { "url": "/index/filter/movie/people.json?traits=BirthCountry:se|Q15180|SE", "canonical": "/index/filter/movie/people.json?traits=birthcountry:Q15180|SE" },
+    { "url": "/index/filter/movie/people.json?traits=birthplace:q1754,role:director,birthcountry:QA", "canonical": "/index/filter/movie/people.json?traits=birthcountry:QA,birthplace:Q1754,role:director" },
+    { "url": "/index/filter/all/people.json?traits=-birthcountry:US", "canonical": "/index/filter/all/people.json?traits=-birthcountry:US" },
+    { "url": "/index/filter/movie/people/values/birthplace.json?q=Gothen&traits=role:director", "canonical": "/index/filter/movie/people/values/birthplace.json?traits=role:director&q=gothen" },
+    { "url": "/index/filter/movie/people/values/birthcountry.json?q=Nigeria", "canonical": "/index/filter/movie/people/values/birthcountry.json?q=nigeria" },
+    { "url": "/index/filter/movie/counts.json?sel=author:q39829", "canonical": "/index/filter/movie/counts.json?sel=author:Q39829" },
+    { "url": "/index/filter/all/titles.json?sel=author:Q692|q39829,genre:18", "canonical": "/index/filter/all/titles.json?sel=author:Q39829|Q692,genre:18" },
+    { "url": "/index/filter/movie/values/author.json?q=Stephen+King", "canonical": "/index/filter/movie/values/author.json?q=stephen%20king" }
   ],
   "refused": [
     "/index/filter/movie/counts.json?sel=genre:action",
@@ -129,6 +139,11 @@
     "/index/filter/movie/people.json?traits=born:1976-1996|1970",
     "/index/filter/movie/people.json?traits=born:1976-1986|1990-1996",
     "/index/filter/movie/people.json?traits=born:1970|1980,born:1976-1996",
-    "/index/filter/movie/people.json?traits=citizenship:Q30|usa"
+    "/index/filter/movie/people.json?traits=citizenship:Q30|usa",
+    "/index/filter/movie/people.json?traits=birthcountry:SWE",
+    "/index/filter/movie/people.json?traits=birthcountry:S1",
+    "/index/filter/movie/people.json?traits=birthcountry:SE|Sweden",
+    "/index/filter/movie/people.json?traits=birthplace:Stockholm",
+    "/index/filter/movie/counts.json?sel=author:King"
   ]
 }

@@ -127,9 +127,9 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | `GET /index/filter/<movie\|series\|all>/counts.json?sel=…` | with `INDEX_QUERIES` on: stackable filters' counts (see **Filters** below) — `{total, kinds: {<kind>: {mode, complete, values: {<id>: n}, labels?, selected?, excluded?}}, coverage, ignored, kindsUnavailable?}`: for every value of every listed kind, the titles of the type (of both, under `all`) carrying the whole selection AND that value; zero counts left out, except a selected or excluded id, which always appears. Den Web hides an option at 0 in a `complete` kind |
 | `GET /index/filter/<movie\|series\|all>/titles.json?sel=…&skip=&limit=` | with `INDEX_QUERIES` on: the titles carrying the selection, most voted first (under `all`, films and series merged by rank within type, each card naming its `type`; in similarity order when a `like` is selected), as the cards `/index/row` returns — `{titles, total, order, coverage, ignored, kindsUnavailable?}`; 24 a page, at most 100, `skip` a multiple of `limit`. `order` fingerprints the order the page is a slice of (it moves with the rating provider's votes, or is `like:<id>`) |
 | `GET /index/filter/<movie\|series\|all>/values/<kind>.json?sel=…&q=&limit=` | with `INDEX_QUERIES` on: one kind's values under the selection, labelled, most titles first — `{kind, mode, values: [{id, name, count, tmdbId?}], complete, ignored, kindsUnavailable?}`, 10 at most; with `q` (2 characters or more), only those with a word starting it: the typeahead for people, studios, subjects and places, over names and aliases, the value `q` names exactly first, then those holding it as whole words, then the rest, most titles first within each. `character` is search-only: `q` of 3 or more, a name starting it, 5 at most |
-| `GET /index/filter/<movie\|series\|all>/people.json?sel=…&traits=…&order=&skip=&limit=` | with `INDEX_QUERIES` on: the people credited on the titles carrying `sel`, holding every person trait in `traits` (see **People** below), in `order`: `prominence` (the default), `credits`, `name`, `born_asc` or `born_desc` — `{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, occupation?, knownFor?}], total, order, orderUnavailable?, labels, coverage, ignored, ignoredTraits?, unknownTraits?, …}`; paged as `titles.json`. `labels` names every trait id on the page; `knownFor` is up to 3 of the person's matching titles, `[{type, id, title, year}]`, highest in their type's popularity order first |
+| `GET /index/filter/<movie\|series\|all>/people.json?sel=…&traits=…&order=&skip=&limit=` | with `INDEX_QUERIES` on: the people credited on the titles carrying `sel`, holding every person trait in `traits` (see **People** below), in `order`: `prominence` (the default), `credits`, `name`, `born_asc` or `born_desc` — `{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, occupation?, birthplace?, birthcountry?, knownFor?}], total, order, orderUnavailable?, labels, coverage, ignored, ignoredTraits?, unknownTraits?, …}`; paged as `titles.json`. `labels` names every trait id on the page; `knownFor` is up to 3 of the person's matching titles, `[{type, id, title, year}]`, highest in their type's popularity order first |
 | `GET /index/filter/<movie\|series\|all>/people/counts.json?sel=…&traits=…` | with `INDEX_QUERIES` on: for every value of every person trait, the people credited under `sel` and the other traits holding it — `{total, traits: {<trait>: {mode, complete, values, labels?, selected?, excluded?}}, traitCoverage, …}`, shaped as `counts.json`'s kinds |
-| `GET /index/filter/<movie\|series\|all>/people/values/<gender\|citizenship\|occupation>.json?sel=…&traits=…&q=&limit=` | with `INDEX_QUERIES` on: one person trait's values counted as `people/counts.json` counts them, but every value rather than the top 30, labelled, most people first — with `q`, those whose name or an alias has a word starting `q` — `{kind, mode, values: [{id, name, count}], complete, denominator, …}`, shaped as `values/<kind>.json` |
+| `GET /index/filter/<movie\|series\|all>/people/values/<gender\|citizenship\|occupation\|birthplace\|birthcountry>.json?sel=…&traits=…&q=&limit=` | with `INDEX_QUERIES` on: one person trait's values counted as `people/counts.json` counts them, but every value rather than the top 30, labelled, most people first — with `q`, those whose name or an alias has a word starting `q` — `{kind, mode, values: [{id, name, count, iso?}], complete, denominator, …}`, shaped as `values/<kind>.json`; a birth country carries its ISO code as `iso` |
 | `POST /index/labels.json` | with `INDEX_QUERIES` on: `{titles:[{type,id}]}` → `{labels}`, each title's labels or null |
 | `POST /index/score.json` | with `INDEX_QUERIES` on: `{space?,liked,disliked,candidates}` → `{space,scores:[{taste,dislike}]}`, cosine to each centroid, clamped at 0 |
 | `POST /index/suggest.json` | with `INDEX_QUERIES` on: `{seeds (≤8),exclude?,limit?}` → `{perSeed:[{seed,ids,mixed}],pooled,pooledMixed}`, More Like This per seed and pooled in seed order; `mixed` and `pooledMixed` are the same with films and series together, `{type,id}` |
@@ -203,9 +203,10 @@ pins url → canonical url pairs a client can test against.
   `120-150`, `over-150`; a series per episode), `source` (adapted from), `rating` (the rating provider's average ≥ 6,
   7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the twelve
   plot axes (`structure` resolves by value; the merged rows count their members' union), the entity kinds
-  `person` (anyone credited), `made`, `cast`, `company`, `network` (series), `subject`, `place` and `format`
-  (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles, formats from a curated
-  list), `studio` (an iconic studio by its own Q-id: every item it is credited as; see **Studios**), `character`
+  `person` (anyone credited), `made`, `cast`, `author` (the author, P50, of a work the title is adapted from,
+  P144: `author:Q39829` is adapted from Stephen King; not a credit), `company`, `network` (series), `subject`,
+  `place` and `format` (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles,
+  formats from a curated list; a store without the source authors does not offer `author`), `studio` (an iconic studio by its own Q-id: every item it is credited as; see **Studios**), `character`
   (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set
   `/index/similar` answers).
 - **`all`** asks every question of films and series together: counts and values over both; titles are the two
@@ -256,7 +257,12 @@ pins url → canonical url pairs a client can test against.
 - **People** (`people.json`, `people/counts.json`; `src/filter/people.rs`) answer who is credited on the titles
   `sel` matches. `traits` is a second list in `sel`'s grammar and canonical order, placed after it, because a
   trait is about a person and means nothing to the title routes. Kinds: `gender`, `citizenship`, `occupation`
-  (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `born` (decade of
+  (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `birthplace` (the
+  place of birth, P19, by Q-id: `birthplace:Q1754` is Stockholm), `birthcountry` (the country, P17, of that
+  place — never read from citizenship — by ISO 3166-1 alpha-2 code or Q-id: `birthcountry:SE` and
+  `birthcountry:Q34` are the same question; canonical as written, the code uppercased; a code matches every
+  country carrying it, and one with none, the Soviet Union or the Netherlands' Q55, is asked by Q-id;
+  `people/counts.json` names the codes of the countries it lists in `codes`), `born` (decade of
   P569, `born:1970` for 1970–1979; a century-precision birth has none) and `role` (`cast`, `director`, `writer`,
   `creator`: the credit on a matching title; two roles mean both on one title, `role:cast|director` either,
   `-role:cast` credited without it). Every trait takes an OR group as `sel` does (`citizenship:Q30|Q145` is
@@ -266,11 +272,12 @@ pins url → canonical url pairs a client can test against.
   `born:1976-`, `born:-1996`, each year 1800 to next year — one per request, never in a group, and with no other
   positive `born` beside it; a reversed range, a year that is not digits or out of that span is a 400. A birth dated only to its
   decade or century is in a range when its whole span is, out of it when none of it is, and unknown when it
-  straddles an end. `gender` and `born` are one pick and count without their own pick: under a range,
+  straddles an end. `gender`, `birthplace`, `birthcountry` and `born` are one pick and count without their own pick: under a range,
   `people/counts.json` still counts `born` by decade, as if the range were not picked, and names the range in
   `selected`/`excluded`. Unknown is never a match: a person with no gender on record matches neither `gender:`
-  nor `-gender:`, and `traitCoverage` says how many credited people each applied trait is on record for (for a
-  range, those it is decidable for). A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`.
+  nor `-gender:` — nor a person born in a place in no country any `birthcountry:` — and `traitCoverage` says how many credited people each applied trait is on record for (for a
+  range, those it is decidable for). A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`; one
+  with the traits and not the birthplaces (published before them) names `birthplace` and `birthcountry` there.
   `order` (after `traits` in the canonical URL, left out when `prominence`) ranks the people: `prominence` sums
   a person's 5 biggest matching titles, each weighing 1 − its rank in its own type's popularity order over that
   type's size (the share the `all` title order interleaves by), so a few hits outrank a long run of mid-table
