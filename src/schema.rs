@@ -712,7 +712,7 @@ fn routes() -> Value {
                 ),
             ],
             "returns": "{people: [{id, name, tmdbId?, credits, roles, gender?, born?, died?, citizenship?, \
-                        occupation?, knownFor?}], total, order, orderUnavailable?, labels, coverage, ignored, \
+                        occupation?, birthplace?, birthcountry?, knownFor?}], total, order, orderUnavailable?, labels, coverage, ignored, \
                         ignoredTraits?, unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
             "counts": {
                 "people[].knownFor": "[{type, id, title, year}]: up to 3 of the person's matching titles (the \
@@ -725,7 +725,8 @@ fn routes() -> Value {
                 "people[].credits": "matching titles the person's counted credits are on",
                 "people[].born": "{precision: day|month|year|decade|century, date?, year?, century?}: as far as \
                                   Wikidata dates it",
-                "labels": "the name of every gender, citizenship and occupation id on the page",
+                "labels": "the name of every gender, citizenship, occupation, birthplace and birthcountry id \
+                           on the page",
             },
         },
         {
@@ -746,8 +747,8 @@ fn routes() -> Value {
                 ),
                 with(param("traits", "string", "as people.json"), json!({ "max": crate::filter::MAX_SELECTION })),
             ],
-            "returns": "{total, traits: {<trait>: {mode, complete, values: {<id>: n}, labels?, selected?, \
-                        excluded?}}, traitCoverage, coverage, ignored, ignoredTraits?, unknownValues?, \
+            "returns": "{total, traits: {<trait>: {mode, complete, values: {<id>: n}, labels?, codes?, \
+                        selected?, excluded?}}, traitCoverage, coverage, ignored, ignoredTraits?, unknownValues?, \
                         unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
             "counts": {
                 "total": "people credited on the matching titles and holding every trait",
@@ -756,6 +757,8 @@ fn routes() -> Value {
                                   range, the people whose birth is dated finely enough to be in or out of it",
                 "traits.born": "counted by decade even under a born range, as if the range were not picked; \
                                 the range is named in selected or excluded",
+                "traits.birthcountry.codes": "the ISO 3166-1 alpha-2 code of each listed country that has \
+                                              one; a code picked is counted as every country carrying it",
             },
         },
         {
@@ -765,13 +768,13 @@ fn routes() -> Value {
             "about": "One person trait's values, counted as people/counts.json counts them but every value rather \
                       than the top, labelled, most people first, then by name; with q, those whose name or an \
                       alias has a word starting q. For the traits whose values are Wikidata items: gender, \
-                      citizenship, occupation.",
+                      citizenship, occupation, birthplace, birthcountry.",
             "parameters": [
                 with(
                     param("type", "enum", "movie, series or all (films and series together)"),
                     json!({ "in": "path", "field": "mediaType" }),
                 ),
-                with(param("trait", "enum", "gender, citizenship or occupation"), json!({ "in": "path" })),
+                with(param("trait", "enum", "gender, citizenship, occupation, birthplace or birthcountry"), json!({ "in": "path" })),
                 with(
                     param("sel", "string", "the titles, as counts.json"),
                     json!({ "max": crate::filter::MAX_SELECTION }),
@@ -786,7 +789,7 @@ fn routes() -> Value {
                     json!({ "default": crate::filter::VALUES_LIMIT, "max": crate::filter::VALUES_LIMIT }),
                 ),
             ],
-            "returns": "{kind, mode, values: [{id, name, count}], complete, denominator, coverage, ignored, \
+            "returns": "{kind, mode, values: [{id, name, count, iso?}], complete, denominator, coverage, ignored, \
                         ignoredTraits?, unknownValues?, unknownTraits?, kindsUnavailable?, traitsUnavailable?}",
             "counts": {
                 "values[].count": "people credited under the selection and the other traits holding the value",

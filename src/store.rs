@@ -279,6 +279,9 @@ pub(crate) mod fixture {
         pub locations: Vec<u32>,
         pub subjects: Vec<u32>,
         pub instance_of: Vec<u32>,
+        /// Q-ids of the authors of the works it is adapted from, interned like `makers`; `src_authors` is
+        /// written when any title has one.
+        pub source_authors: Vec<u32>,
         /// (axis, hundredths) in the dense `technique`, `audience` and `depicts` tables; an axis left out
         /// is 0, as the real writer stores an unanswered one.
         pub technique: Vec<(&'a str, u8)>,
@@ -301,6 +304,11 @@ pub(crate) mod fixture {
         /// (days since 1970-01-01, precision: 0 day · 1 month · 2 year · 3 decade · 4 century).
         pub born: Option<(i32, u8)>,
         pub died: Option<(i32, u8)>,
+        /// Where they were born, as Q-ids of the places and of their countries, and a country's ISO code.
+        /// The five birthplace sections are written when any entity has one of the three.
+        pub birthplaces: Vec<u32>,
+        pub birthcountries: Vec<u32>,
+        pub iso: Option<&'a str>,
     }
 
     /// One iconic studio: its own item, what a viewer calls it, and every item credited as it — Q-ids, interned
@@ -319,6 +327,10 @@ pub(crate) mod fixture {
                 || !self.occupations.is_empty()
                 || self.born.is_some()
                 || self.died.is_some()
+        }
+
+        fn has_birthplace(&self) -> bool {
+            !self.birthplaces.is_empty() || !self.birthcountries.is_empty() || self.iso.is_some()
         }
     }
 
@@ -456,6 +468,7 @@ pub(crate) mod fixture {
                 .chain(&title.locations)
                 .chain(&title.subjects)
                 .chain(&title.instance_of)
+                .chain(&title.source_authors)
             {
                 if !named.contains(&qid) {
                     named.push(qid);
@@ -464,7 +477,14 @@ pub(crate) mod fixture {
             }
         }
         for entity in entities {
-            for &qid in entity.genders.iter().chain(&entity.citizenships).chain(&entity.occupations) {
+            for &qid in entity
+                .genders
+                .iter()
+                .chain(&entity.citizenships)
+                .chain(&entity.occupations)
+                .chain(&entity.birthplaces)
+                .chain(&entity.birthcountries)
+            {
                 if !named.contains(&qid) {
                     named.push(qid);
                     extra.push(format!("Q{qid}"));
@@ -677,6 +697,12 @@ pub(crate) mod fixture {
             }
         }
 
+        if titles.iter().any(|t| !t.source_authors.is_empty()) {
+            let rows_of: Vec<Vec<u32>> =
+                titles.iter().map(|t| t.source_authors.iter().map(|&qid| at(qid)).collect()).collect();
+            b.list("src_authors_v", "src_authors_o", &rows_of);
+        }
+
         // The dense tables the filters read: each axis a column, every row carrying every axis.
         for (table, names_section, pick) in [
             ("technique", "technique_names", 0),
@@ -751,6 +777,23 @@ pub(crate) mod fixture {
                 );
                 b.u8s(precision, &dates.iter().map(|d| d.map_or(0xFF, |(_, p)| p)).collect::<Vec<u8>>());
             }
+        }
+
+        if table.iter().any(Entity::has_birthplace) {
+            for (values, offsets, pick) in
+                [("ent_bplace_v", "ent_bplace_o", true), ("ent_bcountry_v", "ent_bcountry_o", false)]
+            {
+                let rows_of: Vec<Vec<u32>> = table
+                    .iter()
+                    .map(|e| {
+                        let qids = if pick { &e.birthplaces } else { &e.birthcountries };
+                        qids.iter().map(|&qid| at(qid)).collect()
+                    })
+                    .collect();
+                b.list(values, offsets, &rows_of);
+            }
+            let iso: Vec<u32> = table.iter().map(|e| b.optional(e.iso)).collect();
+            b.u32s("ent_iso", &iso);
         }
 
         // The iconic studios, sorted by their own item as den-spec has them; keyed by studio, not by title row.

@@ -21,7 +21,8 @@
 //! `citizenship:Q30,citizenship:Q145` is both. A `born` range stands alone, never in a group.
 //!
 //! The person traits are stored as Wikidata states them, as the items it names — `gender` (P21) with whatever
-//! values it holds, `citizenship` (P27), `occupation` (P106) — and `born` (P569) by decade, or by a range of
+//! values it holds, `citizenship` (P27), `occupation` (P106), `birthplace` (P19) and `birthcountry` (P17 of that
+//! place, by ISO code or Q-id) — and `born` (P569) by decade, or by a range of
 //! years (`born:1976-1996`, `born:1976-`, `born:-1996`). Nothing is inferred, and unknown is never a match: a
 //! person with no gender on record matches no `gender:`, and no `-gender:` either, since they are not known to
 //! lack it — nor any group of values, nor its exclusion. A birth dated only to its century has no decade; a
@@ -52,7 +53,7 @@ use super::{
 };
 use crate::billing::{Billed, Billing};
 use crate::characters::CharacterIndex;
-use den_store::{List, PersonDate, PersonTraits, Row};
+use den_store::{Birthplaces, List, PersonDate, PersonTraits, Row};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -76,6 +77,8 @@ enum Trait {
     Born,
     Citizenship,
     Occupation,
+    Birthplace,
+    BirthCountry,
     Role,
 }
 
@@ -89,7 +92,7 @@ struct TraitSpec {
 }
 
 /// The person kinds first, in the order their bits in `fails` run, then `role`.
-const TRAITS: [TraitSpec; 5] = [
+const TRAITS: [TraitSpec; 7] = [
     TraitSpec {
         name: "gender",
         mode: Mode::Single,
@@ -122,6 +125,24 @@ const TRAITS: [TraitSpec; 5] = [
         id: Id::Qid,
         data: Trait::Occupation,
         about: "an occupation (P106): actor, film actor, film director, screenwriter, …; a person may hold several",
+    },
+    TraitSpec {
+        name: "birthplace",
+        mode: Mode::Single,
+        id: Id::Qid,
+        data: Trait::Birthplace,
+        about: "the place of birth (P19), as the item Wikidata names: a city, a village, now and then a \
+                country; birthplace:Q1754 is born in Stockholm. Not its country: that is birthcountry",
+    },
+    TraitSpec {
+        name: "birthcountry",
+        mode: Mode::Single,
+        id: Id::Country,
+        data: Trait::BirthCountry,
+        about: "the country of the place of birth (P17 of P19), by ISO 3166-1 alpha-2 code or Q-id: \
+                birthcountry:SE and birthcountry:Q34 are both born in Sweden. A code matches every country \
+                carrying it; a country with none (the Soviet Union, the Netherlands' Q55) is asked by Q-id. \
+                Wikidata's statement on the place, never read from citizenship",
     },
     TraitSpec {
         name: "role",
@@ -182,7 +203,7 @@ impl Order {
 }
 
 /// The person kinds: the traits a `fails` mask has a bit for.
-const PERSON_KINDS: usize = 4;
+const PERSON_KINDS: usize = 6;
 
 fn trait_spec(name: &str) -> Option<&'static TraitSpec> {
     TRAITS.iter().find(|t| t.name == name)
@@ -191,7 +212,14 @@ fn trait_spec(name: &str) -> Option<&'static TraitSpec> {
 /// The traits `people/values/<trait>.json` answers for: those whose values are Wikidata items, too many to
 /// list whole. A decade or a role is listed whole by `people/counts.json` already.
 pub(super) fn values_kind(name: &str) -> Option<&'static str> {
-    trait_spec(name).filter(|t| t.id == Id::Qid).map(|t| t.name)
+    trait_spec(name).filter(|t| t.entities()).map(|t| t.name)
+}
+
+impl TraitSpec {
+    /// Whether its values are entities: listed top-`TOP_K` and labelled, and searched by name.
+    fn entities(&self) -> bool {
+        matches!(self.id, Id::Qid | Id::Country)
+    }
 }
 
 /// A trait kind and an id as their canonical pair; an unknown kind is kept, as `sel` keeps one.
@@ -284,12 +312,17 @@ impl Years {
     }
 }
 
-/// What the people routes read from the store: the traits and the credit lists.
+/// What the people routes read from the store: the traits, the birthplaces and the credit lists.
 struct Sources<'a> {
     traits: PersonTraits<'a>,
-    /// Whether the person kinds answer: the trait sections read (`Ready`), the store has none (`NotOffered`,
-    /// a property of the dataset version), or they are there and do not read (`Unavailable`).
+    /// Whether gender, born, citizenship and occupation answer: the trait sections read (`Ready`), the store
+    /// has none (`NotOffered`, a property of the dataset version), or they are there and do not read
+    /// (`Unavailable`).
     status: Status,
+    /// The same for birthplace and birthcountry, which a store may carry apart from the other traits: one
+    /// written before them has the traits and not these.
+    births: Birthplaces<'a>,
+    birth_status: Status,
     cast: List<'a, u32>,
     makers: List<'a, u32>,
     directors: List<'a, u32>,
@@ -297,6 +330,29 @@ struct Sources<'a> {
     creators: List<'a, u32>,
     /// The roles the credit lists can tell apart.
     roles: u8,
+}
+
+impl<'a> Sources<'a> {
+    /// Whether a trait kind answers; `role` reads the credit lists, and always does.
+    fn status_of(&self, data: Trait) -> Status {
+        match data {
+            Trait::Role => Status::Ready,
+            Trait::Birthplace | Trait::BirthCountry => self.birth_status,
+            _ => self.status,
+        }
+    }
+
+    /// The entities a person holds of an entity-valued trait kind; empty for born and role.
+    fn values(&self, data: Trait, e: u32) -> &'a [u32] {
+        match data {
+            Trait::Gender => self.traits.genders(e),
+            Trait::Citizenship => self.traits.citizenships(e),
+            Trait::Occupation => self.traits.occupations(e),
+            Trait::Birthplace => self.births.places(e),
+            Trait::BirthCountry => self.births.countries(e),
+            Trait::Born | Trait::Role => &[],
+        }
+    }
 }
 
 /// A person trait the request applies, with the values it names read into the store's terms: entity indexes,
@@ -474,6 +530,14 @@ impl<'a> Context<'a> {
                 (PersonTraits::default(), Status::Unavailable)
             }
         };
+        let (births, birth_status) = match view.birthplaces() {
+            Ok(births) if !births.is_empty() => (births, Status::Ready),
+            Ok(births) => (births, Status::NotOffered),
+            Err(e) => {
+                eprintln!("people: the birthplace sections do not read: {e}");
+                (Birthplaces::default(), Status::Unavailable)
+            }
+        };
         let (cast, makers) = (view.list::<u32>("cast_v", "cast_o"), view.list::<u32>("makers_v", "makers_o"));
         let mut roles = if cast.is_ok() { CAST } else { 0 };
         // The three role lists come with the store that splits `makers`, and are empty lists without it.
@@ -496,6 +560,8 @@ impl<'a> Context<'a> {
         Sources {
             traits,
             status,
+            births,
+            birth_status,
             cast: cast.unwrap_or_default(),
             makers: makers.unwrap_or_default(),
             directors,
@@ -515,7 +581,7 @@ impl<'a> Context<'a> {
         };
         for item in items {
             let spec = trait_spec(&item.kind);
-            let ready = spec.is_some_and(|s| s.data == Trait::Role || sources.status == Status::Ready);
+            let ready = spec.is_some_and(|s| sources.status_of(s.data) == Status::Ready);
             let Some(spec) = spec.filter(|_| ready) else {
                 if !split.ignored.contains(&item.kind) {
                     split.ignored.push(item.kind.clone());
@@ -542,20 +608,43 @@ impl<'a> Context<'a> {
             }
             let mut targets = Vec::with_capacity(item.ids.len());
             for id in &item.ids {
-                let target = match spec.data {
-                    Trait::Born if id.contains('-') => Years::parse(id).ok().map(Target::Years),
-                    Trait::Born => id.parse::<i64>().ok().map(Target::Value),
-                    _ => self.entity_of(id).map(|e| Target::Value(i64::from(e))),
+                let found: Vec<Target> = match spec.data {
+                    Trait::Born if id.contains('-') => {
+                        Years::parse(id).ok().map(Target::Years).into_iter().collect()
+                    }
+                    Trait::Born => id.parse::<i64>().ok().map(Target::Value).into_iter().collect(),
+                    _ => self
+                        .entities_of(sources, spec, id)
+                        .into_iter()
+                        .map(|e| Target::Value(i64::from(e)))
+                        .collect(),
                 };
-                match target {
-                    Some(target) => targets.push(target),
-                    None => split.unknown.push(item.spelled_value(id)),
+                if found.is_empty() {
+                    split.unknown.push(item.spelled_value(id));
                 }
+                targets.extend(found);
             }
             let kind = TRAITS.iter().position(|t| t.data == spec.data).unwrap_or(0);
             split.applied.push(Applied { kind, spec, item, targets });
         }
         split
+    }
+
+    /// The entities a trait id names: its item, or for a country code every country carrying it.
+    fn entities_of(&self, sources: &Sources<'a>, spec: &TraitSpec, id: &str) -> Vec<u32> {
+        if spec.id == Id::Country && !id.starts_with('Q') {
+            let Ok(strings) = self.view.strings() else { return Vec::new() };
+            let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len) as u32;
+            return (0..size)
+                .filter(|&e| sources.births.iso(e).and_then(|s| strings.get(s)) == Some(id))
+                .collect();
+        }
+        self.entity_of(id).into_iter().collect()
+    }
+
+    /// A country's ISO code, when the store gives it one.
+    fn iso(&self, sources: &Sources<'a>, e: u32) -> Option<&'a str> {
+        sources.births.iso(e).and_then(|s| self.view.strings().ok()?.get(s))
     }
 
     /// Every person credited on the rows of `base`, counting a title for them when their credits on it hold
@@ -640,9 +729,11 @@ impl<'a> Context<'a> {
         let among =
             |values: &[u32]| (!values.is_empty()).then(|| values.iter().any(|&v| named(i64::from(v))));
         match data {
-            Trait::Gender => among(sources.traits.genders(e)),
-            Trait::Citizenship => among(sources.traits.citizenships(e)),
-            Trait::Occupation => among(sources.traits.occupations(e)),
+            Trait::Gender
+            | Trait::Citizenship
+            | Trait::Occupation
+            | Trait::Birthplace
+            | Trait::BirthCountry => among(sources.values(data, e)),
             // A range stands alone in its item (`one_value`).
             Trait::Born => match targets {
                 [Target::Years(years)] => birth_span(sources.traits.born(e)).and_then(|s| years.holds(s)),
@@ -689,9 +780,13 @@ impl<'a> Context<'a> {
         if !split.unknown.is_empty() {
             envelope["unknownTraits"] = json!(split.unknown);
         }
-        if sources.status == Status::Unavailable {
-            envelope["traitsUnavailable"] =
-                json!(TRAITS[..PERSON_KINDS].iter().map(|t| t.name).collect::<Vec<_>>());
+        let unavailable: Vec<&str> = TRAITS[..PERSON_KINDS]
+            .iter()
+            .filter(|t| sources.status_of(t.data) == Status::Unavailable)
+            .map(|t| t.name)
+            .collect();
+        if !unavailable.is_empty() {
+            envelope["traitsUnavailable"] = json!(unavailable);
             degraded = true;
         }
         People { sources, split, tally, base, envelope, degraded }
@@ -738,18 +833,16 @@ impl<'a> Context<'a> {
                     }
                 }
             }
-            if sources.status != Status::Ready {
-                continue;
-            }
             for (i, spec) in TRAITS[..PERSON_KINDS].iter().enumerate() {
+                if sources.status_of(spec.data) != Status::Ready {
+                    continue;
+                }
                 let alone = fails & !apart[i];
-                let (entities, decade): (&[u32], Option<i64>) = match spec.data {
-                    Trait::Gender => (sources.traits.genders(e), None),
-                    Trait::Citizenship => (sources.traits.citizenships(e), None),
-                    Trait::Occupation => (sources.traits.occupations(e), None),
-                    Trait::Born => (&[], birth_decade(sources.traits.born(e))),
-                    Trait::Role => (&[], None),
+                let decade = match spec.data {
+                    Trait::Born => birth_decade(sources.traits.born(e)),
+                    _ => None,
                 };
+                let entities = sources.values(spec.data, e);
                 if self.on_record(sources, &split.applied, spec.data, e) {
                     known[i] += 1;
                 }
@@ -762,9 +855,12 @@ impl<'a> Context<'a> {
         }
 
         let mut kinds = Map::new();
-        if sources.status == Status::Ready {
-            for (i, spec) in TRAITS[..PERSON_KINDS].iter().enumerate() {
-                kinds.insert(spec.name.to_owned(), self.trait_answer(spec, &values[i], &request.traits));
+        for (i, spec) in TRAITS[..PERSON_KINDS].iter().enumerate() {
+            if sources.status_of(spec.data) == Status::Ready {
+                kinds.insert(
+                    spec.name.to_owned(),
+                    self.trait_answer(sources, spec, &values[i], &request.traits),
+                );
             }
         }
         let role_values: HashMap<i64, u32> = ROLES
@@ -775,7 +871,7 @@ impl<'a> Context<'a> {
             .collect();
         kinds.insert(
             "role".to_owned(),
-            self.trait_answer(&TRAITS[PERSON_KINDS], &role_values, &request.traits),
+            self.trait_answer(sources, &TRAITS[PERSON_KINDS], &role_values, &request.traits),
         );
 
         let credited = tally.touched.len();
@@ -793,7 +889,13 @@ impl<'a> Context<'a> {
 
     /// One trait kind's object in `people/counts.json`, shaped as `counts.json`'s kinds are: an entity kind its
     /// top `TOP_K` values, labelled; a decade or a role every value; every selected id, even at 0.
-    fn trait_answer(&self, spec: &TraitSpec, counted: &HashMap<i64, u32>, items: &[Item]) -> Value {
+    fn trait_answer(
+        &self,
+        sources: &Sources<'a>,
+        spec: &TraitSpec,
+        counted: &HashMap<i64, u32>,
+        items: &[Item],
+    ) -> Value {
         let selected: Vec<&Item> = items.iter().filter(|i| i.kind == spec.name).collect();
         let id_of = |value: i64| -> String {
             match spec.data {
@@ -805,14 +907,20 @@ impl<'a> Context<'a> {
         let mut ranked: Vec<(i64, u32)> =
             counted.iter().map(|(&v, &n)| (v, n)).filter(|&(_, n)| n > 0).collect();
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let listed = spec.id != Id::Qid || ranked.len() <= TOP_K;
+        let listed = !spec.entities() || ranked.len() <= TOP_K;
         let mut values = Map::new();
         let mut labels = Map::new();
-        for &(value, n) in ranked.iter().take(if spec.id == Id::Qid { TOP_K } else { usize::MAX }) {
+        let mut codes = Map::new();
+        for &(value, n) in ranked.iter().take(if spec.entities() { TOP_K } else { usize::MAX }) {
             let id = id_of(value);
-            if spec.id == Id::Qid {
+            if spec.entities() {
                 if let Some(label) = self.label(value as u32) {
                     labels.insert(id.clone(), label.into());
+                }
+            }
+            if spec.id == Id::Country {
+                if let Some(code) = self.iso(sources, value as u32) {
+                    codes.insert(id.clone(), code.into());
                 }
             }
             values.insert(id, n.into());
@@ -822,14 +930,15 @@ impl<'a> Context<'a> {
             if values.contains_key(id) || (spec.data == Trait::Born && id.contains('-')) {
                 continue;
             }
-            let value = match spec.data {
-                Trait::Born => id.parse().ok(),
-                Trait::Role => ROLES.iter().find(|r| r.0 == id).map(|r| i64::from(r.1)),
-                _ => self.entity_of(id).map(i64::from),
+            // A country code counts the people of every country carrying it.
+            let found: Vec<i64> = match spec.data {
+                Trait::Born => id.parse().ok().into_iter().collect(),
+                Trait::Role => ROLES.iter().filter(|r| r.0 == id).map(|r| i64::from(r.1)).collect(),
+                _ => self.entities_of(sources, spec, id).into_iter().map(i64::from).collect(),
             };
-            let n = value.and_then(|v| counted.get(&v)).copied().unwrap_or(0);
-            if spec.id == Id::Qid {
-                if let Some(label) = self.entity_of(id).and_then(|e| self.label(e)) {
+            let n: u32 = found.iter().filter_map(|v| counted.get(v)).sum();
+            if spec.entities() {
+                if let Some(label) = found.first().and_then(|&e| self.label(e as u32)) {
                     labels.insert(id.clone(), label.into());
                 }
             }
@@ -838,6 +947,9 @@ impl<'a> Context<'a> {
         let mut answer = json!({ "mode": spec.mode.name(), "complete": listed, "values": values });
         if !labels.is_empty() {
             answer["labels"] = Value::Object(labels);
+        }
+        if !codes.is_empty() {
+            answer["codes"] = Value::Object(codes);
         }
         let (positive, excluded) = selected_ids(&selected);
         if !positive.is_empty() {
@@ -870,30 +982,25 @@ impl<'a> Context<'a> {
         };
         let mut counted: HashMap<u32, u32> = HashMap::new();
         let mut denominator = 0usize;
-        if sources.status == Status::Ready {
+        if sources.status_of(spec.data) == Status::Ready {
             for &e in &tally.touched {
                 if self.fails(sources, &split.applied, e) & !apart != 0 {
                     continue;
                 }
                 denominator += 1;
-                let values = match spec.data {
-                    Trait::Gender => sources.traits.genders(e),
-                    Trait::Citizenship => sources.traits.citizenships(e),
-                    Trait::Occupation => sources.traits.occupations(e),
-                    Trait::Born | Trait::Role => &[],
-                };
-                for &v in values {
+                for &v in sources.values(spec.data, e) {
                     if tier(v).is_some() {
                         *counted.entry(v).or_default() += 1;
                     }
                 }
             }
         }
-        // (match tier, id, name, people): the value `q` names first, as `values/<kind>.json` orders them.
-        let mut found: Vec<(u8, String, String, u32)> = counted
+        // (match tier, id, name, people, entity): the value `q` names first, as `values/<kind>.json` orders
+        // them.
+        let mut found: Vec<(u8, String, String, u32, u32)> = counted
             .into_iter()
             .map(|(v, n)| {
-                (tier(v).unwrap_or(0), self.qid(v), self.label(v).unwrap_or_default().to_owned(), n)
+                (tier(v).unwrap_or(0), self.qid(v), self.label(v).unwrap_or_default().to_owned(), n, v)
             })
             .collect();
         found.sort_by(|a, b| {
@@ -903,7 +1010,15 @@ impl<'a> Context<'a> {
         let values: Vec<Value> = found
             .into_iter()
             .take(request.limit)
-            .map(|(_, id, name, count)| json!({ "id": id, "name": name, "count": count }))
+            .map(|(_, id, name, count, e)| {
+                let mut value = json!({ "id": id, "name": name, "count": count });
+                if spec.id == Id::Country {
+                    if let Some(code) = self.iso(sources, e) {
+                        value["iso"] = json!(code);
+                    }
+                }
+                value
+            })
             .collect();
         let mut answer = people.envelope;
         answer["kind"] = json!(spec.name);
@@ -1043,15 +1158,9 @@ impl<'a> Context<'a> {
         if let Some(tmdb) = self.tmdb(e) {
             person["tmdbId"] = json!(tmdb);
         }
-        if sources.status != Status::Ready {
-            return person;
-        }
-        for (field, values) in [
-            ("gender", sources.traits.genders(e)),
-            ("citizenship", sources.traits.citizenships(e)),
-            ("occupation", sources.traits.occupations(e)),
-        ] {
-            if values.is_empty() {
+        for spec in &TRAITS[..PERSON_KINDS] {
+            let values = sources.values(spec.data, e);
+            if values.is_empty() || sources.status_of(spec.data) != Status::Ready {
                 continue;
             }
             let ids: Vec<String> = values
@@ -1064,7 +1173,10 @@ impl<'a> Context<'a> {
                     id
                 })
                 .collect();
-            person[field] = json!(ids);
+            person[spec.name] = json!(ids);
+        }
+        if sources.status != Status::Ready {
+            return person;
         }
         for (field, date) in [("born", sources.traits.born(e)), ("died", sources.traits.died(e))] {
             if let Some(date) = date.and_then(date_json) {
@@ -1104,10 +1216,10 @@ pub(super) fn schema() -> Value {
     let kinds: Map<String, Value> = TRAITS
         .iter()
         .map(|t| {
-            let listing = if t.id == Id::Qid { "top" } else { "full" };
+            let listing = if t.entities() { "top" } else { "full" };
             let mut about =
                 json!({ "mode": t.mode.name(), "id": t.id.format(), "listing": listing, "about": t.about });
-            if t.id == Id::Qid {
+            if t.entities() {
                 about["top"] = json!(TOP_K);
             }
             if t.data == Trait::Role {
@@ -1175,6 +1287,21 @@ mod tests {
     /// - Dee (104): nothing on record. Cast in film 1.
     /// - Eve (105): male, an actor, born in the 1970s (decade precision). Cast in film 2.
     fn people_store(name: &str) -> Indexes {
+        people_store_with(name, false)
+    }
+
+    const STOCKHOLM: u32 = 500;
+    const GOTHENBURG: u32 = 501;
+    const CHICAGO: u32 = 502;
+    const COLONUS: u32 = 503;
+    const LENINGRAD: u32 = 504;
+    const SOVIET_UNION: u32 = 15_180;
+
+    /// `people_store`, and with `births` where each was born (oxyc/den-dataset#114): Ann in Stockholm,
+    /// Sweden; Bob in Gothenburg and in Chicago, so in Sweden and the United States; Cid in Colonus, which
+    /// Wikidata puts in no country; Eve in Leningrad, in the Soviet Union, which has no ISO code. Dee's
+    /// birthplace is not on record.
+    fn people_store_with(name: &str, births: bool) -> Indexes {
         let title = |media, tmdb_id, year, votes| Title {
             media,
             tmdb_id,
@@ -1198,7 +1325,18 @@ mod tests {
             Title { cast: vec![102], creators: vec![103], makers: vec![103], ..title(1, 4, 2020, 50) },
         ];
         let label = |qid, name| Entity { qid, name, ..Entity::default() };
-        let entities = [
+        let born_in = |places: Vec<u32>, countries: Vec<u32>| -> (Vec<u32>, Vec<u32>) {
+            if births {
+                (places, countries)
+            } else {
+                (vec![], vec![])
+            }
+        };
+        let (ann, bob) =
+            (born_in(vec![STOCKHOLM], vec![SWEDEN]), born_in(vec![GOTHENBURG, CHICAGO], vec![SWEDEN, US]));
+        let (cid, eve) = (born_in(vec![COLONUS], vec![]), born_in(vec![LENINGRAD], vec![SOVIET_UNION]));
+        let iso = |code| births.then_some(code);
+        let mut entities = vec![
             Entity {
                 qid: 101,
                 name: "Ann",
@@ -1207,6 +1345,8 @@ mod tests {
                 citizenships: vec![SWEDEN],
                 occupations: vec![ACTOR],
                 born: Some((days(1974, 7, 29), 0)),
+                birthplaces: ann.0,
+                birthcountries: ann.1,
                 ..Entity::default()
             },
             Entity {
@@ -1216,6 +1356,8 @@ mod tests {
                 citizenships: vec![US, SWEDEN],
                 occupations: vec![ACTOR, DIRECTOR_JOB],
                 born: Some((days(1980, 1, 1), 2)),
+                birthplaces: bob.0,
+                birthcountries: bob.1,
                 ..Entity::default()
             },
             Entity {
@@ -1225,6 +1367,8 @@ mod tests {
                 occupations: vec![DIRECTOR_JOB, SCREENWRITER],
                 born: Some((days(1950, 1, 1), 4)),
                 died: Some((days(2019, 3, 2), 0)),
+                birthplaces: cid.0,
+                birthcountries: cid.1,
                 ..Entity::default()
             },
             label(104, "Dee"),
@@ -1234,17 +1378,35 @@ mod tests {
                 genders: vec![MALE],
                 occupations: vec![ACTOR],
                 born: Some((days(1970, 1, 1), 3)),
+                birthplaces: eve.0,
+                birthcountries: eve.1,
                 ..Entity::default()
             },
             label(FEMALE, "female"),
             label(MALE, "male"),
             label(NON_BINARY, "non-binary"),
-            Entity { qid: SWEDEN, name: "Sweden", aliases: vec!["Kingdom of Sweden"], ..Entity::default() },
-            label(US, "United States"),
+            Entity {
+                qid: SWEDEN,
+                name: "Sweden",
+                aliases: vec!["Kingdom of Sweden"],
+                iso: iso("SE"),
+                ..Entity::default()
+            },
+            Entity { qid: US, name: "United States", iso: iso("US"), ..Entity::default() },
             label(ACTOR, "actor"),
             label(DIRECTOR_JOB, "film director"),
             label(SCREENWRITER, "screenwriter"),
         ];
+        if births {
+            entities.extend([
+                label(STOCKHOLM, "Stockholm"),
+                label(GOTHENBURG, "Gothenburg"),
+                label(CHICAGO, "Chicago"),
+                label(COLONUS, "Colonus"),
+                label(LENINGRAD, "Saint Petersburg"),
+                label(SOVIET_UNION, "Soviet Union"),
+            ]);
+        }
         load(name, &titles, &entities)
     }
 
@@ -1995,6 +2157,100 @@ mod tests {
         let popular = orders_store("known-for-popular", true);
         let answer = ask(&popular, Movie, Route::People, "order=credits");
         assert_eq!(known(&answer, "Amy"), [pair("movie", 6), pair("movie", 7), pair("movie", 8)]);
+    }
+
+    fn sorted_people(answer: &Value) -> Vec<String> {
+        let mut found: Vec<String> = answer["people"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_owned())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// A birthplace is the place, a birth country its country, by code or item; unknown matches neither a
+    /// value nor its exclusion, for a place in no country as for no place on record.
+    #[test]
+    fn a_birthplace_and_a_birth_country_match_as_wikidata_states_them() {
+        let indexes = people_store_with("births", true);
+        let who = |traits: &str| {
+            sorted_people(&ask(&indexes, Scope::All, Route::People, &format!("traits={traits}")))
+        };
+        assert_eq!(who("birthplace:Q500"), ["Ann"]);
+        assert_eq!(who("birthcountry:SE"), ["Ann", "Bob"], "Bob was born in Gothenburg, among other places");
+        assert_eq!(who("birthcountry:se"), who("birthcountry:Q300"), "a code and the item are one country");
+        assert_eq!(who("birthcountry:US|Q15180"), ["Bob", "Eve"], "a country with no code, by its item");
+        assert_eq!(
+            who("-birthcountry:SE"),
+            ["Eve"],
+            "Cid's place is in no country and Dee's is not on record: neither is known to be elsewhere"
+        );
+        assert_eq!(who("-birthplace:Q500"), ["Bob", "Cid", "Eve"]);
+        assert_eq!(
+            who("birthcountry:SE,citizenship:Q301"),
+            ["Bob"],
+            "a trait of its own, beside citizenship"
+        );
+
+        let unknown = ask(&indexes, Scope::All, Route::People, "traits=birthcountry:ZZ|SE");
+        assert_eq!(unknown["unknownTraits"], json!(["birthcountry:ZZ"]), "{unknown}");
+        assert_eq!(sorted_people(&unknown), ["Ann", "Bob"], "the rest of the group applies");
+
+        let ann = ask(&indexes, Scope::All, Route::People, "traits=birthplace:Q500");
+        assert_eq!(
+            (&ann["people"][0]["birthplace"], &ann["people"][0]["birthcountry"]),
+            (&json!(["Q500"]), &json!(["Q300"]))
+        );
+        assert_eq!((&ann["labels"]["Q500"], &ann["labels"]["Q300"]), (&json!("Stockholm"), &json!("Sweden")));
+    }
+
+    /// people/counts.json counts a birth country as the other one-pick traits, without its own pick, and
+    /// names each country's code; a code picked is counted as every country carrying it.
+    #[test]
+    fn birth_countries_are_counted_with_their_codes() {
+        let indexes = people_store_with("birth-counts", true);
+        let counts = ask(&indexes, Scope::All, Route::PeopleCounts, "traits=birthcountry:SE");
+        let country = &counts["traits"]["birthcountry"];
+        assert_eq!(country["mode"], "single");
+        assert_eq!(country["values"], json!({ "Q300": 2, "Q301": 1, "Q15180": 1, "SE": 2 }), "{counts}");
+        assert_eq!(country["codes"], json!({ "Q300": "SE", "Q301": "US" }));
+        assert_eq!(country["labels"]["SE"], "Sweden");
+        assert_eq!(country["selected"], json!(["SE"]));
+        assert_eq!(counts["total"], 2);
+        assert_eq!(counts["traitCoverage"]["birthcountry"], json!({ "count": 3, "denominator": 5 }));
+        let places = &counts["traits"]["birthplace"]["values"];
+        assert_eq!(places, &json!({ "Q500": 1, "Q501": 1, "Q502": 1 }), "under the country: Ann and Bob");
+
+        let values = |kind: &'static str, query: &str| -> Value {
+            let scope: Scope = Scope::All;
+            let request = Request::parse(Route::PeopleValues(kind), scope, query).unwrap();
+            Context::new(&indexes, scope, None).people_values(kind, &request).0
+        };
+        let stock = values("birthplace", "q=stock");
+        assert_eq!(stock["values"], json!([{ "id": "Q500", "name": "Stockholm", "count": 1 }]));
+        let found = values("birthcountry", "q=swe");
+        assert_eq!(found["values"], json!([{ "id": "Q300", "name": "Sweden", "count": 2, "iso": "SE" }]));
+        let soviet = values("birthcountry", "q=soviet");
+        assert_eq!(soviet["values"], json!([{ "id": "Q15180", "name": "Soviet Union", "count": 1 }]));
+    }
+
+    /// A store with the traits and not the birthplaces — every store published before them — answers the
+    /// traits and names the birthplace kinds it cannot apply, not degraded.
+    #[test]
+    fn a_store_without_birthplaces_ignores_them() {
+        let indexes = people_store("no-births");
+        let request =
+            Request::parse(Route::People, Scope::All, "traits=birthcountry:SE,gender:Q201").unwrap();
+        let (answer, degraded) = Context::new(&indexes, Scope::All, None).people(&request);
+        assert!(!degraded);
+        assert_eq!(answer["ignoredTraits"], json!(["birthcountry"]));
+        assert_eq!(sorted_people(&answer), ["Bob", "Eve"]);
+        assert!(answer["people"][0].get("birthplace").is_none());
+        let counts = ask(&indexes, Scope::All, Route::PeopleCounts, "");
+        assert!(counts["traits"].get("birthplace").is_none(), "{counts}");
+        assert!(counts["traits"].get("gender").is_some());
     }
 
     /// A store with no trait sections answers the credits and roles, and names the person traits it cannot
