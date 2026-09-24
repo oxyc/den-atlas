@@ -1,6 +1,7 @@
 //! den-atlas — the Rust serving layer (RUST-1). Streams the derived dataset from disk with the full caching
 //! layer (ETag / Range / gzip / conditional). Data is mounted at `DATA_DIR` (default `data/`).
 
+mod awards;
 mod billboardcheck;
 mod billing;
 mod cache;

@@ -412,6 +412,22 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
         "an iconic studio by its own item (/index/studios.json): a title crediting any item the studio is, \
          its TV or animation arm included",
     ));
+    specs.push(spec(
+        "award",
+        Mode::And,
+        Id::Qid,
+        B,
+        "a ceremony or awarding body by its Wikidata item (/index/awards.json): won or nominated there (P166, \
+         P1411), award:Q19020 the Academy Awards. Categories are not held; a title with no award on record is \
+         not known to lack one",
+    ));
+    specs.push(spec(
+        "won",
+        Mode::And,
+        Id::Qid,
+        B,
+        "a ceremony a title won at least one award at (P166), by its item: won:Q19020 won an Oscar",
+    ));
     specs.push(spec("character", Mode::And, Id::Character, Character, "a character; search-only"));
     specs.push(spec(
         "like",
@@ -1230,6 +1246,32 @@ impl FilterIndex {
             }
         }
 
+        // Awards (`awards.rs`): a title is known for both kinds when it has any award on record, since Wikidata
+        // states none for most titles and a title with none is not known to have lost. A store without the
+        // award sections does not offer them.
+        if let (false, Ok(awards)) = (indexes.ceremonies.is_empty(), view.awards()) {
+            open(&mut bits, "award");
+            open(&mut bits, "won");
+            for row in 0..rows {
+                let mut any = false;
+                for award in awards.get(den_store::Row(row)) {
+                    let Some(ceremony) = indexes.ceremonies.at(award.ceremony) else { continue };
+                    any = true;
+                    add(&mut bits, "award", ceremony.id(), row);
+                    if award.won {
+                        add(&mut bits, "won", ceremony.id(), row);
+                    }
+                }
+                if any {
+                    for kind in ["award", "won"] {
+                        if let Some(valued) = bits.get_mut(kind) {
+                            set(&mut valued.known, row);
+                        }
+                    }
+                }
+            }
+        }
+
         // Entity kinds: each section inverted once, shared by the kinds that read it.
         let entity_count = view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
         let mut inverted: HashMap<&'static str, Option<(Arc<Postings>, Bits)>> = HashMap::new();
@@ -2012,6 +2054,13 @@ impl<'a> Context<'a> {
                 }
             }
         }
+        if spec.name == "award" || spec.name == "won" {
+            for id in values.keys() {
+                if let Some(ceremony) = self.indexes.ceremonies.get(id) {
+                    labels.insert(id.clone(), ceremony.name.clone().into());
+                }
+            }
+        }
         // What the values are counted out of: the selection, or for a one-pick kind with its pick made or an and
         // kind with an OR group, the selection without them — so `tone.values.comic` may exceed `total`.
         let mut answer = json!({
@@ -2231,8 +2280,13 @@ impl<'a> Context<'a> {
                         // by its name.
                         let region = den_index::region(value).filter(|_| spec.name == "region");
                         let studio = self.indexes.studios.get(value).filter(|_| spec.name == "studio");
-                        let name = region
-                            .map_or_else(|| studio.map_or(value.as_str(), |s| s.name.as_str()), |r| r.label);
+                        let ceremony = self
+                            .indexes
+                            .ceremonies
+                            .get(value)
+                            .filter(|_| spec.name == "award" || spec.name == "won");
+                        let named = studio.map(|s| s.name.as_str()).or(ceremony.map(|c| c.name.as_str()));
+                        let name = region.map_or_else(|| named.unwrap_or(value.as_str()), |r| r.label);
                         let matched = match region {
                             Some(r) => {
                                 [r.label, r.slug].iter().chain(r.aliases).filter_map(|n| tier(n)).min()

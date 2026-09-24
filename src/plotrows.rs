@@ -952,6 +952,11 @@ pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Valu
             title["castTotal"] = serde_json::json!(record.cast.len());
         }
     }
+    // The ceremonies it won or was nominated at, left out for a title with none or a store without them.
+    let awards = crate::awards::of_title(indexes, media_type, id);
+    if !awards.is_empty() {
+        title["awards"] = serde_json::json!(awards);
+    }
     Some(title)
 }
 
