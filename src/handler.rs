@@ -755,6 +755,8 @@ enum IndexQuestion {
     },
     /// The iconic studios (`studios.rs`).
     Studios,
+    /// The award ceremonies (`awards.rs`).
+    Awards,
     /// One title's iconic studios.
     TitleStudios {
         media_type: den_index::MediaType,
@@ -805,6 +807,7 @@ impl IndexQuestion {
                 Some(Self::Neighbours { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["studios"] => Some(Self::Studios),
+            ["awards"] => Some(Self::Awards),
             ["studios", type_, id] => {
                 Some(Self::TitleStudios { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
@@ -904,6 +907,7 @@ impl IndexQuestion {
                 serde_json::json!({ "ids": ids })
             }
             Self::Studios => crate::studios::list_json(indexes),
+            Self::Awards => crate::awards::list_json(indexes),
             Self::TitleStudios { media_type, tmdb_id } => {
                 crate::studios::title_json(indexes, *media_type, *tmdb_id)
             }

@@ -66,6 +66,8 @@ pub struct Indexes {
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
     /// The iconic studios (`studios.rs`); empty for a store without their sections.
     pub studios: crate::studios::Studios,
+    /// The award ceremonies (`awards.rs`); empty for a store without their sections.
+    pub ceremonies: crate::awards::Ceremonies,
     /// The cards' display titles as a fuzzy title index, for search: TMDB's export names a title by its original
     /// title, so "parasite" finds only what is displayed as "Parasite" here.
     pub display: Option<TitleIndex>,
@@ -813,6 +815,10 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         eprintln!("iconic studios unusable ({e}) — no studio links, rows or list");
         crate::studios::Studios::default()
     });
+    let ceremonies = crate::awards::Ceremonies::from_store(&store.view()).unwrap_or_else(|e| {
+        eprintln!("awards unusable ({e}) — no award kinds, list or title awards");
+        crate::awards::Ceremonies::default()
+    });
 
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
@@ -876,6 +882,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         characters: sources.characters.clone(),
         cards,
         studios,
+        ceremonies,
         display,
         similar: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),

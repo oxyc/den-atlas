@@ -558,6 +558,18 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/index/awards.json",
+            "example": "/index/awards.json",
+            "about": "Every award ceremony or awarding body a title here won or was nominated at (Wikidata P166, \
+                      P1411, filed under the ceremony), most titles first. A ceremony's row is \
+                      /index/filter/{type}/titles.json?sel=award:<id>, its winners' sel=won:<id>. Empty for a \
+                      dataset without awards.",
+            "returns": "{ceremonies:[{id, name, movies, series, won: {movies, series}}]}: id the ceremony's \
+                        Wikidata Q-id",
+            "counts": { "movies": "films with a card recognised there", "won": "of those, the ones that won" },
+        },
+        {
+            "method": "GET",
             "path": "/index/title/{type}/{tmdbId}.json",
             "example": "/index/title/movie/1.json",
             "about": "One title as the corpus describes it. A title with no card is {type, id, indexed: false}: \
@@ -569,7 +581,8 @@ fn routes() -> Value {
             "returns": "the card /index/row draws, with indexed, labels {primaryGenre, animated, subgenres, moods} \
                         at the display floor, plotFacets {axis: value} at the same floor, and from the facts \
                         countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
-                        (cast at most 60, castTotal all of them)",
+                        (cast at most 60, castTotal all of them), and awards [{id: ceremony Q-id, name, won}] \
+                        when it has any",
         },
         {
             "method": "GET",

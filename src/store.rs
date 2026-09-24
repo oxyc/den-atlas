@@ -282,6 +282,9 @@ pub(crate) mod fixture {
         /// Q-ids of the authors of the works it is adapted from, interned like `makers`; `src_authors` is
         /// written when any title has one.
         pub source_authors: Vec<u32>,
+        /// (ceremony Q-id, won): the ceremonies it was recognised at. The award and ceremony sections are
+        /// written when any title has one; a ceremony is named by the entity of its Q-id, else the Q-id.
+        pub awards: Vec<(u32, bool)>,
         /// (axis, hundredths) in the dense `technique`, `audience` and `depicts` tables; an axis left out
         /// is 0, as the real writer stores an unanswered one.
         pub technique: Vec<(&'a str, u8)>,
@@ -701,6 +704,39 @@ pub(crate) mod fixture {
             let rows_of: Vec<Vec<u32>> =
                 titles.iter().map(|t| t.source_authors.iter().map(|&qid| at(qid)).collect()).collect();
             b.list("src_authors_v", "src_authors_o", &rows_of);
+        }
+
+        if titles.iter().any(|t| !t.awards.is_empty()) {
+            let mut ceremonies: Vec<u32> = titles.iter().flat_map(|t| t.awards.iter().map(|a| a.0)).collect();
+            ceremonies.sort_unstable();
+            ceremonies.dedup();
+            b.u32s("ceremony_qid", &ceremonies);
+            let names: Vec<u32> = ceremonies
+                .iter()
+                .map(|&qid| {
+                    let name = entities.iter().find(|e| e.qid == qid).map(|e| e.name.to_owned());
+                    b.intern(&name.unwrap_or_else(|| format!("Q{qid}")))
+                })
+                .collect();
+            b.u32s("ceremony_name", &names);
+            // One entry per ceremony per title, in ceremony-table order, as the writer holds them.
+            let rows_of: Vec<Vec<(u32, u8)>> = titles
+                .iter()
+                .map(|t| {
+                    let mut row: Vec<(u32, u8)> = t
+                        .awards
+                        .iter()
+                        .map(|&(qid, won)| {
+                            (ceremonies.binary_search(&qid).expect("ceremony") as u32, u8::from(won))
+                        })
+                        .collect();
+                    row.sort_unstable();
+                    row
+                })
+                .collect();
+            let ids: Vec<Vec<u32>> = rows_of.iter().map(|r| r.iter().map(|a| a.0).collect()).collect();
+            b.list("award_v", "award_o", &ids);
+            b.u8s("award_w", &rows_of.iter().flat_map(|r| r.iter().map(|a| a.1)).collect::<Vec<u8>>());
         }
 
         // The dense tables the filters read: each axis a column, every row carrying every axis.

@@ -96,7 +96,10 @@
     { "url": "/index/filter/movie/people/values/birthcountry.json?q=Nigeria", "canonical": "/index/filter/movie/people/values/birthcountry.json?q=nigeria" },
     { "url": "/index/filter/movie/counts.json?sel=author:q39829", "canonical": "/index/filter/movie/counts.json?sel=author:Q39829" },
     { "url": "/index/filter/all/titles.json?sel=author:Q692|q39829,genre:18", "canonical": "/index/filter/all/titles.json?sel=author:Q39829|Q692,genre:18" },
-    { "url": "/index/filter/movie/values/author.json?q=Stephen+King", "canonical": "/index/filter/movie/values/author.json?q=stephen%20king" }
+    { "url": "/index/filter/movie/values/author.json?q=Stephen+King", "canonical": "/index/filter/movie/values/author.json?q=stephen%20king" },
+    { "url": "/index/filter/movie/titles.json?sel=won:q19020,award:Q42369", "canonical": "/index/filter/movie/titles.json?sel=award:Q42369,won:Q19020" },
+    { "url": "/index/filter/all/counts.json?sel=-won:Q19020|q130871", "canonical": "/index/filter/all/counts.json?sel=-won:Q130871|Q19020" },
+    { "url": "/index/filter/movie/values/award.json?q=Cannes", "canonical": "/index/filter/movie/values/award.json?q=cannes" }
   ],
   "refused": [
     "/index/filter/movie/counts.json?sel=genre:action",
@@ -144,6 +147,7 @@
     "/index/filter/movie/people.json?traits=birthcountry:S1",
     "/index/filter/movie/people.json?traits=birthcountry:SE|Sweden",
     "/index/filter/movie/people.json?traits=birthplace:Stockholm",
-    "/index/filter/movie/counts.json?sel=author:King"
+    "/index/filter/movie/counts.json?sel=author:King",
+    "/index/filter/movie/counts.json?sel=won:Oscar"
   ]
 }
