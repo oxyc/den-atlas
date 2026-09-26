@@ -57,7 +57,7 @@ members = ["crates/den-index", "crates/den-titlesearch"]
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 blake2 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Speed over size, everywhere: every More Like This, search and row walks tens of thousands of records, the
 # index load parses tens of megabytes of JSON, and a size-optimised build ("z", with a per-crate override that
