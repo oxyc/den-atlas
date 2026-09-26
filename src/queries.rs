@@ -765,7 +765,9 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     let warming = {
         let plot = Arc::clone(&plot);
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
             plot.without_length();
+            started.elapsed()
         })
     };
     // `factsFile` was a 43 MB JSON blob that atlas alone read — nothing served it and no client fetched
@@ -840,9 +842,13 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             )
         })
     });
+    let (warm_took, warm_wait) =
+        timed(|| warming.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+    let plot = Arc::into_inner(plot).expect("the warming thread held the only other reference");
+    debug_assert!(plot.without_length_ready());
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), facet rows {}, facets {}, display {}",
+        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), facet rows {}, facets {}, display {}, length-free plot {} (wait {})",
         seconds(store_took),
         seconds(plot_took),
         seconds(premise_took),
@@ -852,10 +858,10 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         series.len(),
         seconds(plot_facets_took),
         seconds(facets_took),
-        seconds(display_took)
+        seconds(display_took),
+        seconds(warm_took),
+        seconds(warm_wait)
     );
-    warming.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let plot = Arc::into_inner(plot).expect("the warming thread held the only other reference");
     let indexes = Indexes {
         population,
         dataset_version: sources.dataset_version.clone(),
@@ -1129,6 +1135,27 @@ mod tests {
         let (indexes, _) = queries.get(|| ()).await.expect("the verified mapping still loads");
         assert_eq!(indexes.plot.len(), 12);
         assert!(!queries.store_unusable());
+    }
+
+    /// A completed load has already paid for the length-free plot copy. This is the contract that keeps
+    /// the first More Like This request after an idle release from rebuilding the corpus-wide matrix.
+    #[test]
+    fn a_load_warms_the_length_free_plot_copy() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-warmed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let title =
+            crate::store::fixture::Title { media: 0, tmdb_id: 1, plot: vec![1; 1024], ..Default::default() };
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 1024, &[title], &[]);
+        let meta = serde_json::json!({
+            "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 1024,
+            "quantization": "int8", "storeFile": "den-v1.store",
+        });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let indexes =
+            load_for_tools(&Dataset::load(&dir).expect("the dataset loads")).expect("the indexes load");
+        assert!(indexes.plot.has_length_direction(), "the fixture must exercise the copied path");
+        assert!(indexes.plot.without_length_ready(), "load returned before the warmer finished");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// TMDB's kept counts, joined onto a real store. Only movie 1 has one kept, and every other row must

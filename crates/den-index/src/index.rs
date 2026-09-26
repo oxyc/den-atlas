@@ -499,6 +499,12 @@ impl Index {
         self.without_length.get_or_init(|| Box::new(self.with_direction_removed(direction)))
     }
 
+    /// Whether the length-free copy is ready without doing any work. An index with no compatible length
+    /// direction needs no copy and is therefore ready from construction.
+    pub fn without_length_ready(&self) -> bool {
+        self.length_direction.is_none() || self.without_length.get().is_some()
+    }
+
     /// A fixture index given a length direction, as the store path gives the plot index one.
     #[cfg(test)]
     pub(crate) fn with_length_direction(mut self, direction: &[f32]) -> Index {
