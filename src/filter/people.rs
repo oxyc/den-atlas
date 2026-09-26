@@ -806,10 +806,8 @@ impl<'a> Context<'a> {
         let apart: [u32; PERSON_KINDS] = std::array::from_fn(|i| split.apart(i));
         // A code may name several country entities. Count its selected value as the union of their people,
         // not the sum of the per-country counts: one person can carry two such entities.
-        let country_spec = TRAITS
-            .iter()
-            .find(|t| t.data == Trait::BirthCountry)
-            .expect("birth country trait");
+        let country_spec =
+            TRAITS.iter().find(|t| t.data == Trait::BirthCountry).expect("birth country trait");
         let country_codes: HashMap<String, Vec<u32>> = request
             .traits
             .iter()
@@ -881,13 +879,7 @@ impl<'a> Context<'a> {
             if sources.status_of(spec.data) == Status::Ready {
                 kinds.insert(
                     spec.name.to_owned(),
-                    self.trait_answer(
-                        sources,
-                        spec,
-                        &values[i],
-                        &country_code_counts,
-                        &request.traits,
-                    ),
+                    self.trait_answer(sources, spec, &values[i], &country_code_counts, &request.traits),
                 );
             }
         }
@@ -965,10 +957,8 @@ impl<'a> Context<'a> {
                 Trait::Role => ROLES.iter().filter(|r| r.0 == id).map(|r| i64::from(r.1)).collect(),
                 _ => self.entities_of(sources, spec, id).into_iter().map(i64::from).collect(),
             };
-            let n: u32 = grouped
-                .get(id)
-                .copied()
-                .unwrap_or_else(|| found.iter().filter_map(|v| counted.get(v)).sum());
+            let n: u32 =
+                grouped.get(id).copied().unwrap_or_else(|| found.iter().filter_map(|v| counted.get(v)).sum());
             if spec.entities() {
                 if let Some(label) = found.first().and_then(|&e| self.label(e as u32)) {
                     labels.insert(id.clone(), label.into());
