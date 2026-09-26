@@ -399,7 +399,7 @@ impl crate::Facets for SeedFacets<'_> {
 
         // Half broad agreement (best held-out AUC), half seed-focused agreement (the relevant axes may
         // differ between “similar” and “you might also like”). Fill duplicates from the remaining tails.
-        let halves = [(broad.as_slice(), (k + 1) / 2), (focused.as_slice(), k / 2)];
+        let halves = [(broad.as_slice(), k.div_ceil(2)), (focused.as_slice(), k / 2)];
         let mut out = Vec::with_capacity(k);
         let mut seen = HashSet::new();
         for (lane, take) in halves {

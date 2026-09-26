@@ -15,7 +15,7 @@ path = "src/main.rs"
 # lives in den-core so it also compiles for wasm32 (the tuning playground) and tvOS; the mmap is the one
 # impure step and belongs here, to whoever owns the bytes. Pinned to a tag: this is a binary format
 # contract, and Cargo.lock should say which version of it this build reads.
-den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v3" }
+den-store = { git = "https://github.com/oxyc/den-core.git", tag = "den-store-v3.1" }
 # The taste tilt's COMPOSITION — the weights, the squared dislike, the era curve — from the same repository.
 # A row ordered here and a page ordered on the tvOS app or in Den Web run the SAME arithmetic, which is the
 # only reason the three cannot drift. By TAG, like the store above: a policy contract wants one version per
