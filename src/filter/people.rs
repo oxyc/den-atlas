@@ -804,6 +804,21 @@ impl<'a> Context<'a> {
         let mut known = [0usize; PERSON_KINDS];
         let mut total = 0usize;
         let apart: [u32; PERSON_KINDS] = std::array::from_fn(|i| split.apart(i));
+        // A code may name several country entities. Count its selected value as the union of their people,
+        // not the sum of the per-country counts: one person can carry two such entities.
+        let country_spec = TRAITS
+            .iter()
+            .find(|t| t.data == Trait::BirthCountry)
+            .expect("birth country trait");
+        let country_codes: HashMap<String, Vec<u32>> = request
+            .traits
+            .iter()
+            .filter(|item| item.kind == country_spec.name)
+            .flat_map(|item| &item.ids)
+            .filter(|id| !id.starts_with('Q'))
+            .map(|id| (id.clone(), self.entities_of(sources, country_spec, id)))
+            .collect();
+        let mut country_code_counts: HashMap<String, u32> = HashMap::new();
         // A role group's roles are counted over the credits walked without it: a second walk, only then.
         let role_tally = split
             .want
@@ -850,6 +865,13 @@ impl<'a> Context<'a> {
                     for value in entities.iter().map(|&v| i64::from(v)).chain(decade) {
                         *values[i].entry(value).or_default() += 1;
                     }
+                    if spec.data == Trait::BirthCountry {
+                        for (code, countries) in &country_codes {
+                            if entities.iter().any(|country| countries.contains(country)) {
+                                *country_code_counts.entry(code.clone()).or_default() += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -859,7 +881,13 @@ impl<'a> Context<'a> {
             if sources.status_of(spec.data) == Status::Ready {
                 kinds.insert(
                     spec.name.to_owned(),
-                    self.trait_answer(sources, spec, &values[i], &request.traits),
+                    self.trait_answer(
+                        sources,
+                        spec,
+                        &values[i],
+                        &country_code_counts,
+                        &request.traits,
+                    ),
                 );
             }
         }
@@ -871,7 +899,7 @@ impl<'a> Context<'a> {
             .collect();
         kinds.insert(
             "role".to_owned(),
-            self.trait_answer(sources, &TRAITS[PERSON_KINDS], &role_values, &request.traits),
+            self.trait_answer(sources, &TRAITS[PERSON_KINDS], &role_values, &HashMap::new(), &request.traits),
         );
 
         let credited = tally.touched.len();
@@ -894,6 +922,7 @@ impl<'a> Context<'a> {
         sources: &Sources<'a>,
         spec: &TraitSpec,
         counted: &HashMap<i64, u32>,
+        grouped: &HashMap<String, u32>,
         items: &[Item],
     ) -> Value {
         let selected: Vec<&Item> = items.iter().filter(|i| i.kind == spec.name).collect();
@@ -936,7 +965,10 @@ impl<'a> Context<'a> {
                 Trait::Role => ROLES.iter().filter(|r| r.0 == id).map(|r| i64::from(r.1)).collect(),
                 _ => self.entities_of(sources, spec, id).into_iter().map(i64::from).collect(),
             };
-            let n: u32 = found.iter().filter_map(|v| counted.get(v)).sum();
+            let n: u32 = grouped
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| found.iter().filter_map(|v| counted.get(v)).sum());
             if spec.entities() {
                 if let Some(label) = found.first().and_then(|&e| self.label(e as u32)) {
                     labels.insert(id.clone(), label.into());
@@ -1269,6 +1301,7 @@ mod tests {
     const NON_BINARY: u32 = 202;
     const SWEDEN: u32 = 300;
     const US: u32 = 301;
+    const SECOND_SE: u32 = 302;
     const ACTOR: u32 = 400;
     const DIRECTOR_JOB: u32 = 401;
     const SCREENWRITER: u32 = 402;
@@ -1332,8 +1365,10 @@ mod tests {
                 (vec![], vec![])
             }
         };
-        let (ann, bob) =
-            (born_in(vec![STOCKHOLM], vec![SWEDEN]), born_in(vec![GOTHENBURG, CHICAGO], vec![SWEDEN, US]));
+        let (ann, bob) = (born_in(vec![STOCKHOLM], vec![SWEDEN]), {
+            let countries = vec![SWEDEN, US, SECOND_SE];
+            born_in(vec![GOTHENBURG, CHICAGO], countries)
+        });
         let (cid, eve) = (born_in(vec![COLONUS], vec![]), born_in(vec![LENINGRAD], vec![SOVIET_UNION]));
         let iso = |code| births.then_some(code);
         let mut entities = vec![
@@ -1393,6 +1428,7 @@ mod tests {
                 ..Entity::default()
             },
             Entity { qid: US, name: "United States", iso: iso("US"), ..Entity::default() },
+            Entity { qid: SECOND_SE, name: "Second country", iso: iso("SE"), ..Entity::default() },
             label(ACTOR, "actor"),
             label(DIRECTOR_JOB, "film director"),
             label(SCREENWRITER, "screenwriter"),
@@ -2214,8 +2250,12 @@ mod tests {
         let counts = ask(&indexes, Scope::All, Route::PeopleCounts, "traits=birthcountry:SE");
         let country = &counts["traits"]["birthcountry"];
         assert_eq!(country["mode"], "single");
-        assert_eq!(country["values"], json!({ "Q300": 2, "Q301": 1, "Q15180": 1, "SE": 2 }), "{counts}");
-        assert_eq!(country["codes"], json!({ "Q300": "SE", "Q301": "US" }));
+        assert_eq!(
+            country["values"],
+            json!({ "Q300": 2, "Q301": 1, "Q302": 1, "Q15180": 1, "SE": 2 }),
+            "a person born in both SE-coded countries counts once for the selected code: {counts}"
+        );
+        assert_eq!(country["codes"], json!({ "Q300": "SE", "Q301": "US", "Q302": "SE" }));
         assert_eq!(country["labels"]["SE"], "Sweden");
         assert_eq!(country["selected"], json!(["SE"]));
         assert_eq!(counts["total"], 2);
