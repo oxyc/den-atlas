@@ -272,6 +272,13 @@
         <input id="seed-q" type="search" placeholder="Add a title: type a name, e.g. breaking bad" autocomplete="off">
       </div>
       <p class="error" id="titles-error" role="alert"></p>
+      <div class="combo" id="inspect-combo">
+        <label for="inspect-q">Inspect why a title is missing</label>
+        <input id="inspect-q" type="search" placeholder="Choose one title to inspect in every row" autocomplete="off">
+      </div>
+      <ul class="chips" id="inspect-title" aria-label="Title being inspected"></ul>
+      <p class="hint">Shows whether it entered the candidate pool, its position, every scoring signal, and
+         the filter or gate that kept it out.</p>
     </section>
 
     <section class="panel" aria-labelledby="score-h">
@@ -336,8 +343,8 @@
       <div id="cards"></div>
       <details id="ymal">
         <summary><h3>You might also like</h3><span class="hint" id="ymal-sub"></span></summary>
-        <p class="hint">The rows of these titles pooled together, as the home screen's You might also like
-           does.</p>
+        <p class="hint">The structural-affinity rows of these titles pooled together, as the home screen's
+           You might also like does. The controls above tune Similar, not this separate promise.</p>
         <ul class="chips" id="ymal-seeds" aria-label="You might also like is pooled from"></ul>
         <button type="button" id="ymal-use">Use my titles</button>
         <div class="prow" id="ymal-row"></div>
@@ -401,6 +408,8 @@ const KNOBS = {
   w_tone: ["tone", "Same subgenres and mood", "Bonus for sharing the seed's confident subgenres and moods."],
   w_facet_tone: facetAxis("tone", "Tone"),
   tone_floor: ["tone", "Minimum tone match", "Drops a candidate sharing less than this of the seed's subgenres and moods."],
+  structural_k: ["structural", "Structural candidates", "Adds the nearest social-unit and story-engine profiles to the candidate pool."],
+  w_structural: ["structural", "Structural agreement", "Reranks by probability agreement; production keeps this at zero."],
   min_confidence: ["tone", "Label confidence needed", "A subgenre or mood label below this confidence is ignored."],
   w_facet_era: facetAxis("era", "Era"),
   w_year: ["era", "Released around the same time", "Bonus for close release years. Off in production."],
@@ -445,7 +454,7 @@ const FILTER_AXES = [
 let p = {};
 let knobs = [];
 // The page's state apart from the knob inputs. Seeds are `movie:<id>` / `series:<id>`, in order.
-let seeds = [], suggestSeeds = [], watched = [], filters = [];
+let seeds = [], suggestSeeds = [], watched = [], filters = [], inspect = null;
 // Names seen for a key, from search hits and answers, so chips can say more than an id.
 const names = new Map();
 // The last answer drawn, so a failed re-rank can keep showing it.
@@ -682,6 +691,7 @@ function drawLists() {
   $("seed-q").disabled = seeds.length >= p.maxSeeds;
   $("seed-q").placeholder = seeds.length >= p.maxSeeds
     ? `At most ${p.maxSeeds} titles: remove one to add another` : "Add a title: type a name, e.g. breaking bad";
+  $("inspect-title").innerHTML = inspect ? chip(nameOf(inspect), "uninspect", inspect, plainName(inspect)) : "";
   $("ymal-seeds").innerHTML = suggestSeeds.map((key) => chip(nameOf(key), "unsuggest", key, plainName(key))).join("");
   $("ymal-sub").textContent = suggestSeeds.length
     ? `pooled from ${suggestSeeds.map(plainName).join(", ")}` : "no titles to pool";
@@ -806,6 +816,7 @@ function query() {
   const q = new URLSearchParams(changedKnobs());
   q.set("limit", $("limit").value || p.defaultLimit);
   let out = `${q}&seeds=${seeds.join(",")}&suggest=${suggestSeeds.join(",")}`;
+  if (inspect) out += `&inspect=${inspect}`;
   if (watched.length) out += `&watched=${watched.join(",")}`;
   for (const f of filters) out += `&${FILTER}${encodeURIComponent(f.axis)}=${encodeURIComponent(f.value)}`;
   return out;
@@ -817,6 +828,7 @@ function applyQuery(search) {
     url.has(name) ? url.get(name).split(",").filter(Boolean).slice(0, max) : [...fallback];
   seeds = list("seeds", p.defaultSeeds, p.maxSeeds);
   suggestSeeds = list("suggest", p.defaultSuggestSeeds, p.maxSuggestSeeds);
+  inspect = url.get("inspect") || null;
   watched = list("watched", [], p.maxWatched);
   filters = [...url.entries()].filter(([key]) => key.startsWith(FILTER))
     .map(([key, value]) => ({ axis: key.slice(FILTER.length), value }));
@@ -973,6 +985,7 @@ function card(key, a, error) {
   }
   const items = a.titles.map((t) => rowTitle(t, key));
   html += track(key, items, kindOf(key)) + detailFor(key, items, whyHtml);
+  if (a.inspection) html += inspectionHtml(a.inspection);
   if (a.left.length) {
     html += `<details class="dropped"><summary>${a.left.length} of production's top ${a.titles.length} dropped out</summary><ul>` +
       a.left.map((t) => rowTitle(t, key)).map((r) => `<li>${esc(r.title)}${r.year ? ` (${r.year})` : ""} · was #${r.production}</li>`).join("") +
@@ -1041,6 +1054,34 @@ function whyHtml(t) {
     `<p class="hint">Score ${fmt(t.score)} · ${t.production == null ? "not in production's row" : `production #${t.production}`}` +
     `${t.subgenre ? ` · ${esc(t.subgenre)}` : ""}${t.held ? " · moved down by the per-subgenre limit" : ""}` +
     ` · <a href="https://www.themoviedb.org/${tmdb}/${t.id}" target="_blank" rel="noopener">TMDB</a></p>`;
+}
+
+function inspectionHtml(raw) {
+  const r = rowTitle(raw);
+  if (!names.has(r.key) && !r.title.startsWith("TMDB id")) names.set(r.key, { title: r.title, year: r.year });
+  const reason = (x) => ({
+    seed: "A More Like This row never includes its own seed.",
+    not_retrieved: "It was not among either vector index’s nearest candidates and no maker, character, or franchise link nominated it.",
+    other_media_type: "Mixing films and series is off, and this title is the other type.",
+    request_filter: "A selected facet filter or the watched-title exclusion removes it before scoring.",
+    missing_labels: "The indexes have no labels for it, so the scorer cannot compare it.",
+    animation_mismatch: "The animation/live-action filter removes it.",
+    subgenre_cap: "The per-subgenre diversity cap moves it behind the leading window.",
+    rating: `Its TMDB rating ${fmt(x.value)} is below the minimum ${fmt(x.minimum)}.`,
+    votes: `Its TMDB vote count ${fmt(x.value, 0)} is below the minimum ${fmt(x.minimum, 0)}.`,
+    popularity: `Its TMDB popularity ${fmt(x.value)} is below the minimum ${fmt(x.minimum)}.`,
+    tone: `Its tone coverage ${fmt(x.value)} is below the minimum ${fmt(x.minimum)}.`,
+    row_limit: `Its final position #${x.position} is beyond the row length ${x.maximum}.`,
+  }[x.code] || x.code);
+  const hypothetical = raw.reasons.length && raw.position != null;
+  const headline = raw.reasons.length
+    ? raw.reasons.map((x) => `<li>${esc(reason(x))}</li>`).join("")
+    : `<li>It reaches the row at #${raw.position}.</li>`;
+  const scored = raw.signals ? whyHtml(r) : "";
+  return `<details class="dropped inspection" open><summary>Why ${esc(r.title)} ${raw.reasons.length ? "isn’t here" : "is here"}</summary>` +
+    `<p class="hint">${raw.retrieved ? "Normal retrieval considered it." : "Normal retrieval did not consider it."}` +
+    `${hypothetical ? ` With those exclusions bypassed, it would be #${raw.position}.` : ""}</p>` +
+    `<ul>${headline}</ul>${scored}</details>`;
 }
 
 function drawSuggest(s) {
@@ -1267,6 +1308,12 @@ combo($("seed-q"), (hit) => {
   refresh();
 }, (key) => seeds.includes(key));
 
+combo($("inspect-q"), (hit) => {
+  inspect = hit.key;
+  drawLists();
+  refresh();
+}, (key) => key === inspect);
+
 $("limit").addEventListener("change", refresh);
 $("bar-reset").addEventListener("click", resetSettings);
 $("settings-reset").addEventListener("click", resetSettings);
@@ -1307,6 +1354,7 @@ document.addEventListener("click", (e) => {
     return;
   }
   if (at("unwatch")) { watched = drop(watched, at("unwatch").dataset.unwatch); drawLists(); countChanged(); refresh(); }
+  if (at("uninspect")) { inspect = null; drawLists(); refresh(); }
   if (at("unsuggest")) { suggestSeeds = drop(suggestSeeds, at("unsuggest").dataset.unsuggest); drawLists(); refresh(); }
   if (at("unfilter")) { filters.splice(Number(at("unfilter").dataset.unfilter), 1); drawLists(); countChanged(); refresh(); }
 });

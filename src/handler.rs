@@ -322,8 +322,8 @@ async fn handle_playground_import(state: &Arc<AppState>, req: Request) -> Respon
 
 /// `/playground` (the page), `/playground/params.json` (the knobs and production's values),
 /// `/playground/similar/{movie|series}/{id}.json?<knob>=…&limit=` (a tuned More Like This),
-/// `/playground/rows.json?seeds=…&<knob>=…&limit=&judged=` (the same for up to twelve seeds in one request,
-/// with `judged=1` also the judged-set scores) and
+/// `/playground/rows.json?seeds=…&inspect=…&<knob>=…&limit=&judged=` (the same for up to twelve seeds in one
+/// request, with `inspect` naming an arbitrary candidate to explain and `judged=1` adding judged scores) and
 /// `/playground/judged.json?<knob>=…` (those knobs scored against the judged set). All 404 unless
 /// `PLAYGROUND` and `INDEX_QUERIES` are both on (`playground.rs`). Answers are `no-store`: a tuned row is an
 /// experiment, and nothing should keep one where a production row is looked for.
@@ -406,6 +406,7 @@ async fn handle_playground(
             tuning,
             seeds: Vec::new(),
             suggest: Vec::new(),
+            inspect: None,
         }),
     };
     let playground_state = match parsed {
@@ -436,7 +437,8 @@ async fn handle_playground(
                 crate::playground::answer(&sources, media_type, tmdb_id, &s.tuning).to_string()
             }
             Ask::Rows { judged } => {
-                let mut answer = crate::playground::rows(&sources, &s.seeds, &s.suggest, &s.tuning);
+                let mut answer =
+                    crate::playground::rows(&sources, &s.seeds, &s.suggest, s.inspect, &s.tuning);
                 if judged {
                     answer["judged"] = crate::playground::judged(&sources, &s.tuning);
                 }
@@ -1381,9 +1383,9 @@ fn answer_score(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_
     Ok(serde_json::json!({ "space": space, "scores": scores }))
 }
 
-/// `{"seeds","exclude"?,"limit"?}` → More Like This for each seed (ids of the seed's type), minus the seeds and
-/// the excluded titles, and those lists pooled in seed order — the atlas half of Because you watched and You
-/// Might Also Like; the client blends in TMDB's.
+/// `{"seeds","exclude"?,"limit"?}` → structural affinity for each seed (ids of the seed's type), minus the
+/// seeds and excluded titles, and those lists pooled in seed order — You Might Also Like. More Like This is
+/// appended as coverage/fallback, rather than being mistaken for the affinity order; the client blends in TMDB's.
 fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serde_json::Value, String> {
     #[derive(serde::Deserialize)]
     struct Body {
@@ -1401,12 +1403,16 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     excluded.extend(seeds.iter().copied());
     let limit = body.limit.unwrap_or(SUGGEST_LIMIT).min(MAX_TITLES);
     let (per_seed, pooled) = suggest_pool(&seeds, &excluded, limit, |id, media_type| {
-        indexes.more_like_this(id, media_type).to_vec()
+        indexes.you_might_also_like(id, media_type, false).iter().map(|&(_, id)| id).collect()
     });
     // Beside the fields every client reads, never instead of them: the same pooling over the rows that mix
     // films and series.
     let (mixed, pooled_mixed) = suggest_pool_mixed(&seeds, &excluded, limit, |id, media_type| {
-        indexes.more_like_this_mixed(id, media_type).iter().map(|&(media, id)| (id, media)).collect()
+        indexes
+            .you_might_also_like(id, media_type, true)
+            .iter()
+            .map(|&(media, id)| (id, media))
+            .collect()
     });
     let per_seed: Vec<serde_json::Value> = per_seed
         .iter()
@@ -1451,7 +1457,7 @@ pub(crate) fn suggest_pool_mixed(
     (per_seed, pooled)
 }
 
-/// Each seed's More Like This (`row`) minus the excluded titles, and those rows pooled in seed order up to
+/// Each seed's affinity row (`row`) minus the excluded titles, and those rows pooled in seed order up to
 /// `limit` — You Might Also Like. The playground pools its tuned rows through this too.
 pub(crate) type SuggestPool =
     (Vec<((u32, den_index::MediaType), Vec<u32>)>, Vec<(u32, den_index::MediaType)>);
@@ -2290,7 +2296,9 @@ mod tests {
 
         let page = get(&on, "/playground").await;
         assert_eq!(page.status(), 200);
-        assert!(body_of(page).await.contains("Tuning playground"));
+        let page = body_of(page).await;
+        assert!(page.contains("Tuning playground"));
+        assert!(page.contains("Inspect why a title is missing"));
         let knobs = json(body_of(get(&on, "/playground/params.json").await).await);
         let maker = knobs["knobs"].as_array().unwrap().iter().find(|k| k["name"] == "w_maker").unwrap();
         assert_eq!(maker["default"], 1.2, "the form is pre-filled with production's value");
@@ -2358,6 +2366,15 @@ mod tests {
         assert_eq!(with_judged["judged"], moved, "the same answer judged.json gives");
         let defaults = json(body_of(get(&on, "/playground/rows.json").await).await);
         assert_eq!(defaults["rows"].as_array().unwrap().len(), crate::playground::DEFAULT_SEEDS.len());
+        let inspected = json(
+            body_of(get(&on, "/playground/rows.json?seeds=movie:1&inspect=movie:999&limit=5").await).await,
+        );
+        let why = &inspected["rows"][0]["inspection"];
+        assert_eq!(why["key"], "movie:999");
+        assert_eq!(why["retrieved"], false);
+        let reason_codes: Vec<&str> =
+            why["reasons"].as_array().unwrap().iter().filter_map(|r| r["code"].as_str()).collect();
+        assert!(reason_codes.contains(&"not_retrieved") && reason_codes.contains(&"missing_labels"), "{why}");
         assert_eq!(get(&on, "/playground/rows.json?seeds=movie:1&limit=50").await.status(), 200);
         let none = json(body_of(get(&on, "/playground/rows.json?seeds=").await).await);
         assert_eq!(none["rows"], serde_json::json!([]));
@@ -2396,7 +2413,7 @@ mod tests {
         assert_eq!(suggested["suggest"]["titles"][0]["production"], 1, "untuned, production's pool");
 
         // Export, then import: the same state, and a snapshot the import ignores.
-        let query = "seeds=movie:1&suggest=&w_maker=0.5&watched=movie:3&filter.ending=bittersweet&limit=5";
+        let query = "seeds=movie:1&suggest=&inspect=movie:2&w_maker=0.5&watched=movie:3&filter.ending=bittersweet&limit=5";
         let exported =
             json(body_of(get(&on, &format!("/playground/export.json?{query}&judged=1")).await).await);
         assert_eq!(exported["format"], "den-atlas-playground");

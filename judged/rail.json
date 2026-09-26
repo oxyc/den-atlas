@@ -9,7 +9,7 @@
     "basis": {
       "known": "Judged from what both titles are: premise, form, tone, audience. The judge's knowledge of the works, not the dataset's labels, so the set does not grade the ranker by its own features.",
       "maker": "Shares a director, creator or writer with the seed. A fact, but the grade is still on the work: a maker's weaker or unrelated film is not automatically good.",
-      "issue": "Named as wanted or unwanted in den-atlas #23/#24 or in rail-ab's WANTED/UNWANTED lists, and the grade agrees unless a note says otherwise.",
+      "issue": "Named as wanted or unwanted in a den-atlas issue or in rail-ab's WANTED/UNWANTED lists, and the grade agrees unless a note says otherwise.",
       "triplet+": "The twin positive for this anchor in den-dataset data/eval/triplets-final.json (two blind judges agreed on a shared premise). A premise twin is not always a good next watch, so the grade is judged again.",
       "triplet-": "The hard negative for this anchor in the same file: an unrelated premise that looks confusable. Graded again for the same reason."
     },
@@ -716,6 +716,13 @@
         {"id": "series:108978", "title": "Reacher (2022)", "grade": "bad", "basis": "known"},
         {"id": "series:129680", "title": "I Know What You Did Last Summer (2021)", "grade": "bad", "basis": "known"},
         {"id": "series:3940", "title": "Judge Judy (1996)", "grade": "bad", "basis": "known"}
+      ]
+    },
+    {
+      "seed": "series:1422", "title": "The Middle", "split": "dev",
+      "covers": ["series", "comedy", "family-sitcom", "2000s", "english", "famous"],
+      "judged": [
+        {"id": "series:2004", "title": "Malcolm in the Middle (2000)", "grade": "good", "basis": "issue", "note": "The closest structural analogue: a single-camera, no-laugh-track family sitcom about cash-strapped parents raising a household of sharply differentiated children. The sharper tone is variety within the same viewing appetite, not a different premise (den-atlas #103)."}
       ]
     },
     {

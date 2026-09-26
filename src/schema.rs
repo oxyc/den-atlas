@@ -831,7 +831,7 @@ fn routes() -> Value {
         {
             "method": "POST",
             "path": "/index/suggest.json",
-            "about": format!("More Like This for up to {MAX_SEEDS} seeds, per seed and pooled in seed order."),
+            "about": format!("You Might Also Like affinity for up to {MAX_SEEDS} seeds, per seed and pooled in seed order."),
             "body": "{seeds, exclude?, limit?}",
             "returns": "{perSeed:[{seed,ids,mixed:[{type,id}]}], pooled, pooledMixed:[{type,id}]}",
         },

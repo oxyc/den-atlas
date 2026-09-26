@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet};
 const PLOT_K: usize = 20;
 const PREMISE_K: usize = 40;
 const KEEP: usize = 20;
+/// Structural retrieval is available to an affinity rail but off for production More Like This. The
+/// rebuilt-store evaluation did not earn a global change, and the two product promises are distinct.
+const STRUCTURAL_K: usize = 0;
 
 /// How long a pooled row may be.
 ///
@@ -118,6 +121,9 @@ pub const DEFINING: f64 = 0.8;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SimilarParams {
     pub pool_k: usize,
+    /// Nearest structural-affinity profiles added to the candidate pool. They still pass every ordinary
+    /// gate and scorer term; this is a nomination lane, not an unconditional ranking boost.
+    pub structural_k: usize,
     pub w_premise: f64,
     pub w_plot: f64,
     pub w_tone: f64,
@@ -143,6 +149,9 @@ pub struct SimilarParams {
     pub w_noul: f64,
     pub w_critique: f64,
     pub w_coverage: f64,
+    /// Probability agreement over the 18 structural social-unit/story-engine axes. Off in production:
+    /// the measured gain is candidate recall, not evidence for a global More Like This rerank.
+    pub w_structural: f64,
     /// Never mix animated with live action.
     pub same_animation: bool,
     /// Mix films and series in one row: both types pooled, the other type's cosines read on the seed
@@ -252,6 +261,7 @@ impl Default for SimilarParams {
     fn default() -> Self {
         SimilarParams {
             pool_k: POOL_K,
+            structural_k: STRUCTURAL_K,
             w_premise: W_PREMISE,
             w_plot: W_PLOT,
             w_tone: W_TONE,
@@ -270,6 +280,7 @@ impl Default for SimilarParams {
             w_noul: W_NOUL,
             w_critique: W_CRITIQUE,
             w_coverage: W_COVERAGE,
+            w_structural: 0.0,
             same_animation: true,
             mix_types: MIX_TYPES,
             noul_floor: NOUL_FLOOR,
@@ -335,6 +346,14 @@ impl SimilarParams {
     /// and 0.72 MB. The other knobs change what a candidate scores, not how many are scored.
     pub const KNOBS: &'static [Knob] = &[
         knob("pool_k", "pool", 1.0, 1000.0, true, "candidates drawn from EACH vector index"),
+        knob(
+            "structural_k",
+            "pool",
+            0.0,
+            200.0,
+            true,
+            "nearest structural-affinity profiles added as candidates (0 disables)",
+        ),
         knob("w_premise", "pool", 0.0, W_MAX, false, "base: weight of the premise-space cosine"),
         knob("w_plot", "pool", 0.0, W_MAX, false, "base: weight of the plot-space cosine"),
         knob("pool_floor_pct", "pool", 0.0, 50.0, true, "percentile of the pool a missing cosine is read at"),
@@ -400,6 +419,14 @@ impl SimilarParams {
             false,
             "coverage of the seed's defining arguments, idf-weighted",
         ),
+        knob(
+            "w_structural",
+            "signals",
+            0.0,
+            W_MAX,
+            false,
+            "agreement on recurring social units and story engines; production rerank is 0",
+        ),
         knob("w_tone", "signals", 0.0, W_MAX, false, "coverage of the seed's confident subgenres and moods"),
         knob(
             "w_year",
@@ -417,18 +444,25 @@ impl SimilarParams {
             false,
             "TMDB popularity, ln-scaled to the pool's most popular",
         ),
-        knob("w_facet_era", "facet axes", 0.0, W_MAX, false, "x w_facet for the era axis alone"),
-        knob("w_facet_setting", "facet axes", 0.0, W_MAX, false, "x w_facet for the setting axis alone"),
-        knob("w_facet_scope", "facet axes", 0.0, W_MAX, false, "x w_facet for the scope axis alone"),
-        knob("w_facet_ending", "facet axes", 0.0, W_MAX, false, "x w_facet for the ending axis alone"),
-        knob("w_facet_pacing", "facet axes", 0.0, W_MAX, false, "x w_facet for the pacing axis alone"),
+        knob("w_facet_era", "facet axes", 0.0, W_MAX, false, "era's relative importance; 0 ignores it"),
+        knob(
+            "w_facet_setting",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "setting's relative importance; 0 ignores it",
+        ),
+        knob("w_facet_scope", "facet axes", 0.0, W_MAX, false, "scope's relative importance; 0 ignores it"),
+        knob("w_facet_ending", "facet axes", 0.0, W_MAX, false, "ending's relative importance; 0 ignores it"),
+        knob("w_facet_pacing", "facet axes", 0.0, W_MAX, false, "pacing's relative importance; 0 ignores it"),
         knob(
             "w_facet_chronology",
             "facet axes",
             0.0,
             W_MAX,
             false,
-            "x w_facet for the chronology axis alone",
+            "chronology's relative importance; 0 ignores it",
         ),
         knob(
             "w_facet_continuity",
@@ -436,13 +470,41 @@ impl SimilarParams {
             0.0,
             W_MAX,
             false,
-            "x w_facet for the continuity axis alone",
+            "continuity's relative importance; 0 ignores it",
         ),
-        knob("w_facet_conflict", "facet axes", 0.0, W_MAX, false, "x w_facet for the conflict axis alone"),
-        knob("w_facet_ensemble", "facet axes", 0.0, W_MAX, false, "x w_facet for the ensemble axis alone"),
-        knob("w_facet_tone", "facet axes", 0.0, W_MAX, false, "x w_facet for the tone axis alone"),
-        knob("w_facet_timespan", "facet axes", 0.0, W_MAX, false, "x w_facet for the timespan axis alone"),
-        knob("w_facet_archetype", "facet axes", 0.0, W_MAX, false, "x w_facet for the archetype axis alone"),
+        knob(
+            "w_facet_conflict",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "conflict's relative importance; 0 ignores it",
+        ),
+        knob(
+            "w_facet_ensemble",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "ensemble's relative importance; 0 ignores it",
+        ),
+        knob("w_facet_tone", "facet axes", 0.0, W_MAX, false, "tone's relative importance; 0 ignores it"),
+        knob(
+            "w_facet_timespan",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "timespan's relative importance; 0 ignores it",
+        ),
+        knob(
+            "w_facet_archetype",
+            "facet axes",
+            0.0,
+            W_MAX,
+            false,
+            "archetype's relative importance; 0 ignores it",
+        ),
         knob(
             "min_confidence",
             "floors",
@@ -513,6 +575,7 @@ impl SimilarParams {
             "w_noul" => self.w_noul,
             "w_critique" => self.w_critique,
             "w_coverage" => self.w_coverage,
+            "w_structural" => self.w_structural,
             "w_tone" => self.w_tone,
             "tone_floor" => self.tone_floor,
             "min_confidence" => self.min_confidence,
@@ -524,6 +587,7 @@ impl SimilarParams {
             "subgenre_cap" => self.subgenre_cap as f64,
             "cap_window" => self.cap_window as f64,
             "pool_k" => self.pool_k as f64,
+            "structural_k" => self.structural_k as f64,
             "max_row" => self.max_row as f64,
             "same_animation" => f64::from(u8::from(self.same_animation)),
             "mix_types" => f64::from(u8::from(self.mix_types)),
@@ -568,6 +632,7 @@ impl SimilarParams {
             "w_noul" => self.w_noul = value,
             "w_critique" => self.w_critique = value,
             "w_coverage" => self.w_coverage = value,
+            "w_structural" => self.w_structural = value,
             "w_tone" => self.w_tone = value,
             "tone_floor" => self.tone_floor = value,
             "min_confidence" => self.min_confidence = value,
@@ -579,6 +644,7 @@ impl SimilarParams {
             "subgenre_cap" => self.subgenre_cap = whole,
             "cap_window" => self.cap_window = whole,
             "pool_k" => self.pool_k = whole,
+            "structural_k" => self.structural_k = whole,
             "max_row" => self.max_row = whole,
             "same_animation" => self.same_animation = whole == 1,
             "mix_types" => self.mix_types = whole == 1,
@@ -956,6 +1022,25 @@ pub trait Facets {
         let _ = key;
         Vec::new()
     }
+    /// The answered 18-axis structural-affinity profile. `None` means the pass did not cover this title,
+    /// not an all-zero answer.
+    fn structural(&self, key: Key) -> Option<Vec<f64>> {
+        let _ = key;
+        None
+    }
+    /// Titles nearest to `seed` by structural probability agreement, best first. This is a candidate
+    /// source: the ordinary scorer still decides whether and where each title belongs.
+    fn structural_nominate(&self, seed: Key, k: usize) -> Vec<Key> {
+        let _ = (seed, k);
+        Vec::new()
+    }
+    /// Titles whose structural profile best fulfils the seed's active social units and story engines.
+    /// Unlike `structural_nominate`, this is the order of an affinity rail itself: the seed's strong axes
+    /// carry more weight, and no broad-agreement lane is interleaved.
+    fn structural_affinity(&self, seed: Key, k: usize, mix_types: bool) -> Vec<Key> {
+        let _ = (seed, k, mix_types);
+        Vec::new()
+    }
     /// How far this title is from a realist world: vampires, superheroes, time travel, the apocalypse.
     /// 0 for The Wire, 0.97 for Angel.
     fn world(&self, key: Key) -> f64 {
@@ -983,12 +1068,39 @@ pub trait Facets {
     fn prevalence(&self, axis: Axis, value: ValueId) -> f64;
 }
 
+/// Agreement on the structural axes that define the seed: `1 - Σ p·|p-q| / Σ p`, where `p` is the
+/// seed's probability. Every axis stays in the profile, but an axis the seed says is absent cannot drown
+/// its family/story engines in dozens of shared negatives. Directionality is intentional: “you may also
+/// like this after X” asks what X promises, not whether the two profiles are interchangeable.
+fn probability_agreement(a: &[f64], b: &[f64]) -> Option<f64> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let weight: f64 = a.iter().sum();
+    (weight > 0.0).then(|| 1.0 - a.iter().zip(b).map(|(p, q)| p * (p - q).abs()).sum::<f64>() / weight)
+}
+
+/// You Might Also Like is an affinity promise, not another spelling of More Like This. Its structural
+/// profiles describe family/household shapes and recurring story engines that plot vectors and tone gates
+/// deliberately do not. An old store has no such profiles and returns an empty row, letting the serving
+/// layer append its backwards-compatible More Like This fallback.
+pub fn you_might_also_like(
+    facets: Option<&dyn Facets>,
+    seed: Key,
+    mix_types: bool,
+    max_row: usize,
+) -> Vec<Key> {
+    facets
+        .map(|f| f.structural_affinity(seed, max_row.min(MAX_ROW), mix_types))
+        .unwrap_or_default()
+}
+
 /// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1 at production's
 /// per-axis weights.
 ///
-/// `axis_weight` multiplies what an agreeing axis adds and leaves the denominator alone, so it acts as a
-/// per-axis `w_facet`: at 1.0 an axis counts as it always has (and `1.0 * weight` is `weight` exactly), at 0
-/// agreeing on it adds nothing, at 2 it counts double.
+/// `axis_weight` selects how much an axis participates in both sides of the agreement ratio. At 1.0 an axis
+/// counts as it always has, at 0 it is ignored for this rail, and at 2 it counts twice as much as an axis at
+/// 1.0. Facets remain in the index; a rail merely chooses the profile relevant to its promise.
 fn facet_agreement(
     f: &dyn Facets,
     seed: &[(Axis, ValueId, f64)],
@@ -1003,12 +1115,16 @@ fn facet_agreement(
     let mut den = 0.0;
     for (axis, value, conf) in seed {
         let Some((_, their_value, their_conf)) = theirs.iter().find(|(a, _, _)| a == axis) else { continue };
+        let axis_weight = axis_weight.get(usize::from(*axis)).copied().unwrap_or(1.0);
+        if axis_weight <= 0.0 {
+            continue;
+        }
         // ln(1/prevalence): a value the whole corpus shares carries almost no evidence. `libm::log`, not
         // `f64::ln`, so every target rounds it the same way (see den-index's Cargo.toml).
-        let weight = conf * libm::log(1.0 / f.prevalence(*axis, *value).max(1e-6)).max(0.0);
+        let weight = axis_weight * conf * libm::log(1.0 / f.prevalence(*axis, *value).max(1e-6)).max(0.0);
         den += weight;
         if their_value == value {
-            num += axis_weight.get(usize::from(*axis)).copied().unwrap_or(1.0) * weight * their_conf;
+            num += weight * their_conf;
         }
     }
     if den <= 0.0 {
@@ -1103,6 +1219,8 @@ pub struct Scored {
     pub noul: f64,
     pub critique: f64,
     pub coverage: f64,
+    /// Agreement over structural social units and story engines, whether or not it is weighed.
+    pub structural: f64,
     pub maker: f64,
     /// The strongest character link to the seed (`Authorship::characters`), 0 without one.
     pub character: f64,
@@ -1128,6 +1246,62 @@ impl Scored {
     pub fn key(&self) -> Key {
         (self.media_type, self.tmdb_id)
     }
+}
+
+/// Why a title an inspector named did not reach the served More Like This row.
+///
+/// Retrieval is deliberately separate from scoring: a title can be a perfectly good match once scored but
+/// never enter the finite vector/authorship pool.  Keeping these as structured reasons lets a caller explain
+/// that distinction instead of reducing every absence to "ranked below 200".
+#[derive(Clone, Debug, PartialEq)]
+pub enum InspectReason {
+    /// A More Like This row never recommends its own seed.
+    Seed,
+    /// Neither vector space's nearest `pool_k`, nor an authorship/character/series link, nominated it.
+    NotRetrieved,
+    /// The row was configured to keep only the seed's media type.
+    OtherMediaType,
+    /// A request-level filter or watched-title exclusion rejected it.
+    RequestFilter,
+    Rating {
+        value: f64,
+        minimum: f64,
+    },
+    Votes {
+        value: f64,
+        minimum: f64,
+    },
+    Popularity {
+        value: f64,
+        minimum: f64,
+    },
+    /// The candidate has no labels in either index, so the scorer cannot compare it.
+    MissingLabels,
+    AnimationMismatch,
+    Tone {
+        value: f64,
+        minimum: f64,
+    },
+    /// It scored, but the subgenre diversity cap moved it behind the visible cap window.
+    SubgenreCap,
+    /// Its final position was beyond the configured row length.
+    RowLimit {
+        position: usize,
+        maximum: usize,
+    },
+}
+
+/// The scorer's account of one explicitly named candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Inspection {
+    /// Whether normal retrieval nominated it before inspection forced it into the diagnostic pool.
+    pub retrieved: bool,
+    /// Position in the complete scored row, after the subgenre cap. When a gate rejected it this is the
+    /// counterfactual position with request filters and hard gates opened, while `reasons` names each one.
+    pub position: Option<usize>,
+    /// Its score and signals, even when normal retrieval or the configured row length kept it out.
+    pub scored: Option<Scored>,
+    pub reasons: Vec<InspectReason>,
 }
 
 /// What viewers make of a title — its rating and vote count, TMDB's popularity — for the filters and the
@@ -1179,6 +1353,61 @@ pub fn more_like_this_with(
     let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
     let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
     ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p)
+}
+
+/// Rank as `more_like_this_with` does and explain one explicitly named candidate, including a candidate
+/// normal retrieval did not nominate. The ordinary row is unchanged; forcing the candidate is diagnostic
+/// only, and `Inspection::retrieved` says whether production would have considered it.
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_more_like_this(
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    candidate: Key,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+) -> Inspection {
+    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
+    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
+    let mut inspected = ranked_inspecting(
+        &scans, plot, premise, tmdb_id, media_type, candidate, authorship, facets, extras, p,
+    );
+    // A rejected candidate still needs a position and its scoring factors: that is the useful half of
+    // "why not". Open only the hard gates and request filter, leave every scoring weight untouched, and
+    // force it through the same diagnostic retrieval path. A title with no labels cannot be scored at all.
+    if inspected.scored.is_none()
+        && !inspected.reasons.iter().any(|r| matches!(r, InspectReason::Seed | InspectReason::MissingLabels))
+    {
+        let open = SimilarParams {
+            mix_types: true,
+            same_animation: false,
+            tone_floor: 0.0,
+            min_rating: 0.0,
+            min_votes: 0.0,
+            min_popularity: 0.0,
+            ..*p
+        };
+        let scans =
+            [premise, plot].map(|index| scan(index, tmdb_id, media_type, open.pool_k, open.mix_types));
+        let counterfactual = ranked_inspecting(
+            &scans,
+            plot,
+            premise,
+            tmdb_id,
+            media_type,
+            candidate,
+            authorship,
+            facets,
+            Extras { audience: extras.audience, keep: None },
+            &open,
+        );
+        inspected.position = counterfactual.position;
+        inspected.scored = counterfactual.scored;
+    }
+    inspected
 }
 
 /// More Like This of the seed's own type (`mix_types` off) and mixing both types (on), over ONE vector
@@ -1241,6 +1470,40 @@ fn ranked(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
+    ranked_inner(scans, plot, premise, tmdb_id, media_type, None, authorship, facets, extras, p).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked_inspecting(
+    scans: &[Option<Vec<TypeNeighbours>>; 2],
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    candidate: Key,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+) -> Inspection {
+    ranked_inner(scans, plot, premise, tmdb_id, media_type, Some(candidate), authorship, facets, extras, p)
+        .1
+        .expect("an inspection key always produces an inspection")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked_inner(
+    scans: &[Option<Vec<TypeNeighbours>>; 2],
+    plot: Option<&Index>,
+    premise: Option<&Index>,
+    tmdb_id: u32,
+    media_type: MediaType,
+    inspect: Option<Key>,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+) -> (Vec<Scored>, Option<Inspection>) {
     let seed: Key = (media_type, tmdb_id);
     let wanted = |key: Key| key != seed && (p.mix_types || key.0 == media_type);
     let mut pool: Vec<Key> = Vec::new();
@@ -1295,8 +1558,35 @@ fn ranked(
             }
         }
     }
+    // Structural affinity is a measured candidate source. It does not globally rerank More Like This at
+    // production's `w_structural = 0`, but candidates it recovers are judged by every existing term.
+    if p.structural_k > 0 {
+        for key in facets.map(|f| f.structural_nominate(seed, p.structural_k)).unwrap_or_default() {
+            if wanted(key) && seen.insert(key) {
+                pool.push(key);
+            }
+        }
+    }
+    let retrieved = inspect.is_some_and(|key| seen.contains(&key));
+    if let Some(key) = inspect {
+        if wanted(key) && seen.insert(key) {
+            pool.push(key);
+        }
+    }
     if pool.is_empty() {
-        return Vec::new();
+        let inspection = inspect.map(|key| Inspection {
+            retrieved,
+            position: None,
+            scored: None,
+            reasons: vec![if key == seed {
+                InspectReason::Seed
+            } else if key.0 != media_type && !p.mix_types {
+                InspectReason::OtherMediaType
+            } else {
+                InspectReason::NotRetrieved
+            }],
+        });
+        return (Vec::new(), inspection);
     }
 
     // One index's cosine between the seed and a candidate, when that index holds both — on the seed type's
@@ -1324,7 +1614,18 @@ fn ranked(
     let labels = |(kind, id): Key| {
         premise.and_then(|x| x.labels(id, kind)).or_else(|| plot.and_then(|x| x.labels(id, kind)))
     };
-    rank_pool(&pool, seed, &labels, authorship, facets, extras, p)
+    let (row, mut inspection) =
+        rank_pool_inner(&pool, seed, &labels, authorship, facets, extras, p, inspect, retrieved);
+    if let (Some(key), Some(i)) = (inspect, &mut inspection) {
+        if key == seed {
+            i.reasons.retain(|r| *r != InspectReason::NotRetrieved);
+            i.reasons.push(InspectReason::Seed);
+        } else if key.0 != media_type && !p.mix_types {
+            i.reasons.retain(|r| *r != InspectReason::NotRetrieved);
+            i.reasons.push(InspectReason::OtherMediaType);
+        }
+    }
+    (row, inspection)
 }
 
 /// A cosine to a title of the other type, read on the seed type's scale: `μ_S + σ_S·(c − μ_C)/σ_C`, with
@@ -1369,8 +1670,32 @@ pub fn rank_pool<'l>(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
+    rank_pool_inner(pool, seed_key, labels, authorship, facets, extras, p, None, false).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rank_pool_inner<'l>(
+    pool: &[Candidate],
+    seed_key: Key,
+    labels: &dyn Fn(Key) -> Option<crate::Labels<'l>>,
+    authorship: Option<&dyn Authorship>,
+    facets: Option<&dyn Facets>,
+    extras: Extras<'_>,
+    p: &SimilarParams,
+    inspect: Option<Key>,
+    retrieved: bool,
+) -> (Vec<Scored>, Option<Inspection>) {
+    let mut inspection = inspect.map(|_| Inspection {
+        retrieved,
+        position: None,
+        scored: None,
+        reasons: if retrieved { Vec::new() } else { vec![InspectReason::NotRetrieved] },
+    });
     let Some(mine) = labels(seed_key) else {
-        return Vec::new();
+        if let Some(i) = &mut inspection {
+            i.reasons.push(InspectReason::MissingLabels);
+        }
+        return (Vec::new(), inspection);
     };
     let own_type = |key: Key| key.0 == seed_key.0;
     let seed = seed_labels(&mine, p.min_confidence);
@@ -1380,6 +1705,7 @@ pub fn rank_pool<'l>(
     let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(seed_key)).unwrap_or_default();
     let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(seed_key)).unwrap_or_default();
     let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(seed_key)).unwrap_or_default();
+    let seed_structural = facets.and_then(|f| f.structural(seed_key));
     let characters: &[(Key, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
     let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
     let members: &[(Key, f64)] = authorship.map(Authorship::series).unwrap_or_default();
@@ -1430,7 +1756,36 @@ pub fn rank_pool<'l>(
         }
         true
     };
-    let raw: Vec<&Candidate> = pool.iter().filter(|c| admitted(c.key)).collect();
+    let raw: Vec<&Candidate> = pool
+        .iter()
+        .filter(|c| {
+            let keep = admitted(c.key);
+            if !keep && Some(c.key) == inspect {
+                let reasons = &mut inspection.as_mut().expect("the inspected key has an inspection").reasons;
+                if !p.mix_types && !own_type(c.key) {
+                    reasons.push(InspectReason::OtherMediaType);
+                }
+                if extras.keep.is_some_and(|f| !f(c.key)) {
+                    reasons.push(InspectReason::RequestFilter);
+                }
+                if let Some((rating, votes)) = audience.and_then(|a| a.rating(c.key)) {
+                    if p.min_rating > 0.0 && rating < p.min_rating {
+                        reasons.push(InspectReason::Rating { value: rating, minimum: p.min_rating });
+                    }
+                    if p.min_votes > 0.0 && votes < p.min_votes {
+                        reasons.push(InspectReason::Votes { value: votes, minimum: p.min_votes });
+                    }
+                }
+                if let Some(popularity) = audience.and_then(|a| a.popularity(c.key)) {
+                    if p.min_popularity > 0.0 && popularity < p.min_popularity {
+                        reasons
+                            .push(InspectReason::Popularity { value: popularity, minimum: p.min_popularity });
+                    }
+                }
+            }
+            keep
+        })
+        .collect();
     // A candidate one index has never seen is scored at that index's pool floor rather than zero, so a
     // missing vector costs it a little and does not disqualify it. The floor, like the spread below, is the
     // SEED'S type's ("anchoring"): read over both, the other type's cosines would move the seed type's own
@@ -1453,9 +1808,15 @@ pub fn rank_pool<'l>(
     for c in &raw {
         let (id, pc, l) = (c.key, c.premise, c.plot);
         let Some(theirs) = labels(id) else {
+            if Some(id) == inspect {
+                inspection.as_mut().unwrap().reasons.push(InspectReason::MissingLabels);
+            }
             continue;
         };
         if p.same_animation && theirs.animated != mine.animated {
+            if Some(id) == inspect {
+                inspection.as_mut().unwrap().reasons.push(InspectReason::AnimationMismatch);
+            }
             continue;
         }
         let t = tone(&seed, &theirs, p.min_confidence);
@@ -1477,6 +1838,13 @@ pub fn rank_pool<'l>(
         // the series' strength has already said whether that fact means "one story" (`W_SERIES`).
         let in_series = p.w_series > 0.0 && series(id) > 0.0;
         if !unlabelled && maker <= 0.0 && !across && !in_series && t < p.tone_floor {
+            if Some(id) == inspect {
+                inspection
+                    .as_mut()
+                    .unwrap()
+                    .reasons
+                    .push(InspectReason::Tone { value: t, minimum: p.tone_floor });
+            }
             continue;
         }
         let base = p.w_premise * pc.unwrap_or(premise_floor) + p.w_plot * l.unwrap_or(plot_floor);
@@ -1490,7 +1858,7 @@ pub fn rank_pool<'l>(
         scored.push((id, base, dominant, pc, l));
     }
     if scored.is_empty() {
-        return Vec::new();
+        return (Vec::new(), inspection);
     }
 
     // The tonal term is expressed in the pool's own units so one weight works for every seed: the seed
@@ -1542,12 +1910,19 @@ pub fn rank_pool<'l>(
             let cr = facets.and_then(|f| noul_cosine(&seed_critique, &f.critique(id))).unwrap_or(0.0);
             let cov =
                 facets.and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id))).unwrap_or(0.0);
+            let structural = facets
+                .and_then(|f| f.structural(id))
+                .and_then(|theirs| {
+                    seed_structural.as_deref().and_then(|mine| probability_agreement(mine, &theirs))
+                })
+                .unwrap_or(0.0);
             let score = base
                 + spread
                     * (p.w_tone * t
                         + p.w_noul * nc
                         + p.w_critique * cr
                         + p.w_coverage * cov
+                        + p.w_structural * structural
                         + p.w_maker * maker
                         + p.w_home * home
                         + p.w_facet * fa
@@ -1571,6 +1946,7 @@ pub fn rank_pool<'l>(
                 noul: nc,
                 critique: cr,
                 coverage: cov,
+                structural,
                 maker,
                 character: ch,
                 series: sr,
@@ -1589,9 +1965,39 @@ pub fn rank_pool<'l>(
         b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.tmdb_id.cmp(&b.tmdb_id))
     });
 
+    // For an inspected title, keep a complete diagnostic ordering before the configured row length truncates
+    // it. This is the position it would hold if the row were long enough; scoring and all gates are unchanged.
+    if let Some(key) = inspect {
+        let all =
+            finish_row(final_scored.clone(), seed_key, &SimilarParams { max_row: final_scored.len(), ..*p });
+        if let Some((at, scored)) = all.iter().enumerate().find(|(_, s)| s.key() == key) {
+            let i = inspection.as_mut().unwrap();
+            i.position = Some(at + 1);
+            i.scored = Some(scored.clone());
+        }
+    }
+
     // Each type is picked on its own — the cap keyed by (type, subgenre), its window counted in that type's
     // titles — and the two are then merged by score. So the seed type's titles come out in exactly the order
     // a row of that type alone would put them in, and a mixed row only adds the other type between them.
+    let row = finish_row(final_scored, seed_key, p);
+    if let Some(key) = inspect {
+        let i = inspection.as_mut().unwrap();
+        if row.iter().all(|s| s.key() != key) {
+            if i.scored.as_ref().is_some_and(|s| s.held) {
+                i.reasons.push(InspectReason::SubgenreCap);
+            }
+            if let Some(position) = i.position {
+                i.reasons.push(InspectReason::RowLimit { position, maximum: p.max_row });
+            }
+        }
+    }
+    (row, inspection)
+}
+
+/// Apply the per-type diversity cap and merge both types, at most `p.max_row`.
+fn finish_row(final_scored: Vec<Scored>, seed_key: Key, p: &SimilarParams) -> Vec<Scored> {
+    let own_type = |key: Key| key.0 == seed_key.0;
     let (own, other): (Vec<Scored>, Vec<Scored>) = final_scored.into_iter().partition(|s| own_type(s.key()));
     let (own, other) = (capped(own, p), capped(other, p));
     let mut row = Vec::with_capacity(p.max_row.min(own.len() + other.len()));
@@ -1866,6 +2272,71 @@ mod tests {
         assert!(on.iter().all(|s| s.tmdb_id != 7), "the tonal floor still applies: {on:?}");
     }
 
+    /// Inspection separates retrieval from gates and ranking: an otherwise valid far title gets a
+    /// counterfactual score, a differently labelled one names the tonal floor, and a retrieved title below
+    /// a short row names its full position and the row limit.
+    #[test]
+    fn inspection_says_why_a_named_candidate_is_not_in_the_row() {
+        let comedy: &[(&str, f64)] = &[("Family Comedy", 0.9)];
+        let warm: &[(&str, f64)] = &[("Feel-good", 0.9)];
+        let index = fixture(&[
+            (1, "tv", "Comedy", false, comedy, warm, [100, 0, 0]),
+            (2, "tv", "Comedy", false, comedy, warm, [99, 0, 0]),
+            (3, "tv", "Comedy", false, comedy, warm, [90, 10, 0]),
+            // Valid but outside a two-neighbour retrieval pool.
+            (4, "tv", "Comedy", false, comedy, warm, [0, 100, 0]),
+            // Also unretrieved, and unlike the seed at the tonal gate.
+            (5, "tv", "Drama", false, &[("Legal Drama", 0.9)], &[("Tense", 0.9)], [0, 90, 10]),
+        ]);
+        let mut p = SimilarParams::default();
+        p.set("pool_k", 2.0).unwrap();
+
+        let far = inspect_more_like_this(
+            None,
+            Some(&index),
+            1,
+            MediaType::Tv,
+            (MediaType::Tv, 4),
+            None,
+            None,
+            Extras::default(),
+            &p,
+        );
+        assert!(!far.retrieved);
+        assert!(far.reasons.contains(&InspectReason::NotRetrieved));
+        assert!(far.scored.is_some() && far.position.is_some(), "{far:?}");
+
+        let unlike = inspect_more_like_this(
+            None,
+            Some(&index),
+            1,
+            MediaType::Tv,
+            (MediaType::Tv, 5),
+            None,
+            None,
+            Extras::default(),
+            &p,
+        );
+        assert!(unlike.reasons.contains(&InspectReason::NotRetrieved));
+        assert!(unlike.reasons.iter().any(|r| matches!(r, InspectReason::Tone { .. })), "{unlike:?}");
+        assert!(unlike.scored.is_some() && unlike.position.is_some(), "the opened gate gives its position");
+
+        p.set("max_row", 1.0).unwrap();
+        let below = inspect_more_like_this(
+            None,
+            Some(&index),
+            1,
+            MediaType::Tv,
+            (MediaType::Tv, 3),
+            None,
+            None,
+            Extras::default(),
+            &p,
+        );
+        assert!(below.retrieved);
+        assert!(below.reasons.iter().any(|r| matches!(r, InspectReason::RowLimit { maximum: 1, .. })));
+    }
+
     /// The Beck case (oxyc/den-atlas#92). Four police procedurals the vectors put nearest, and four entries of
     /// the seed's own series far down: two labelled like the seed, one labelled as something else, one as
     /// close on the vectors as the unrelated titles. At `w_series = 0` the series changes nothing. Weighed,
@@ -2107,7 +2578,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 50, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 52, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {
@@ -2287,6 +2758,36 @@ mod tests {
                 "{name} at its top lifts the title agreeing on that axis alone"
             );
         }
+    }
+
+    /// A zero axis weight really excludes that axis from this rail's profile: it neither earns agreement
+    /// nor leaves a hidden disagreement in the denominator. Other facets continue to participate.
+    #[test]
+    fn a_zero_facet_axis_weight_ignores_only_that_axis() {
+        struct TwoAxes;
+        impl Facets for TwoAxes {
+            fn facets(&self, (_, id): Key) -> Vec<(Axis, ValueId, f64)> {
+                match id {
+                    1 => vec![(0, 1, 1.0), (1, 1, 1.0)],
+                    2 => vec![(0, 1, 1.0), (1, 2, 1.0)],
+                    _ => Vec::new(),
+                }
+            }
+            fn prevalence(&self, _: Axis, _: ValueId) -> f64 {
+                0.1
+            }
+        }
+
+        let facets = TwoAxes;
+        let seed = facets.facets(film(1));
+        let all = [1.0; 12];
+        assert!((facet_agreement(&facets, &seed, film(2), &all).unwrap() - 0.5).abs() < 1e-15);
+
+        let mut selected = all;
+        selected[1] = 0.0;
+        assert_eq!(facet_agreement(&facets, &seed, film(2), &selected), Some(1.0));
+        selected[0] = 0.0;
+        assert_eq!(facet_agreement(&facets, &seed, film(2), &selected), None);
     }
 
     /// The year term: off in production, a lift for the same year once weighted, and the half-life decides

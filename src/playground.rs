@@ -122,8 +122,8 @@ pub const DEFAULT_SUGGEST_SEEDS: &[(MediaType, u32)] = &[
     (MediaType::Movie, 278),  // The Shawshank Redemption
 ];
 
-/// You Might Also Like pools one tuned row per seed; it rides in the same request as the rows, so its seeds
-/// are bounded apart from theirs.
+/// You Might Also Like pools one affinity row per seed; it rides in the same request as the similar rows, so
+/// its seeds are bounded apart from theirs.
 pub const MAX_SUGGEST_SEEDS: usize = 6;
 
 /// Titles You Might Also Like shows: `/index/suggest`'s default.
@@ -204,13 +204,14 @@ fn watched_tilt(watched: &[(MediaType, u32)]) -> Option<crate::plotrows::Tilt> {
     crate::plotrows::Tilt::parse(&format!("{}liked={}", crate::plotrows::TILT_PREFIX, liked.join(",")))
 }
 
-/// `GET /playground/rows.json?seeds=…&suggest=…&<tuning>` — every seed's tuned row in one answer, each the
-/// shape `/playground/similar` gives one seed, with its `key`, and You Might Also Like for the `suggest`
-/// seeds. One request per change of the page's knobs, however many seeds it shows.
+/// `GET /playground/rows.json?seeds=…&suggest=…&inspect=…&<tuning>` — every seed's tuned row in one answer,
+/// each the shape `/playground/similar` gives one seed, with its `key`; an optional arbitrary candidate's
+/// inspection in each row; and You Might Also Like for the `suggest` seeds. One request per page change.
 pub fn rows(
     sources: &Sources<'_>,
     seeds: &[(MediaType, u32)],
     suggest_seeds: &[(MediaType, u32)],
+    inspect: Option<(MediaType, u32)>,
     tuning: &Tuning,
 ) -> Value {
     let rows: Vec<Value> = seeds
@@ -218,27 +219,30 @@ pub fn rows(
         .map(|&(media, id)| {
             let mut row = answer(sources, media, id, tuning);
             row["key"] = json!(seed_key(media, id));
+            if let Some(candidate) = inspect {
+                row["inspection"] = inspection(sources, media, id, candidate, tuning);
+            }
             row
         })
         .collect();
     json!({ "changed": changed(&tuning.params), "rows": rows, "suggest": suggest(sources, suggest_seeds, tuning) })
 }
 
-/// You Might Also Like, tuned: `/index/suggest`'s pooling — each seed's row minus the seeds and the watched
-/// titles, pooled in seed order — over tuned rows, with each pooled title's place in production's pool.
+/// You Might Also Like as `/index/suggest` serves it: each seed's structural-affinity row minus the seeds and
+/// watched titles, pooled in seed order. It intentionally does not move with More Like This's tuning knobs.
 pub fn suggest(sources: &Sources<'_>, seeds: &[(MediaType, u32)], tuning: &Tuning) -> Value {
     let indexes = sources.indexes;
     let seeds: Vec<(u32, MediaType)> = seeds.iter().map(|&(m, id)| (id, m)).collect();
     let mut excluded: std::collections::HashSet<(u32, MediaType)> = seeds.iter().copied().collect();
     let production_pool =
         crate::handler::suggest_pool_mixed(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-            indexes.more_like_this_mixed(id, media).iter().map(|&(m, id)| (id, m)).collect()
+            indexes.you_might_also_like(id, media, true).iter().map(|&(m, id)| (id, m)).collect()
         })
         .1;
     excluded.extend(tuning.watched.iter().map(|&(m, id)| (id, m)));
     let (per_seed, pooled) =
         crate::handler::suggest_pool_mixed(&seeds, &excluded, SUGGEST_SHOWN, |id, media| {
-            tuned_row(sources, media, id, tuning).0.iter().map(|s| (s.tmdb_id, s.media_type)).collect()
+            indexes.you_might_also_like(id, media, true).iter().map(|&(m, id)| (id, m)).collect()
         });
     let card = |media: MediaType, id: u32| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&(media, id)));
@@ -452,6 +456,82 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
     })
 }
 
+/// One arbitrary candidate's real path through a seed's tuned scorer. It is forced into a diagnostic pool
+/// when retrieval missed it, while `retrieved` and the structured reasons keep that counterfactual honest.
+fn inspection(
+    sources: &Sources<'_>,
+    media_type: MediaType,
+    tmdb_id: u32,
+    candidate: (MediaType, u32),
+    tuning: &Tuning,
+) -> Value {
+    type Key = (MediaType, u32);
+    let indexes = sources.indexes;
+    let viewers = Viewers { sources };
+    let allowed: Option<std::collections::HashSet<Key>> = (!tuning.filters.is_empty()).then(|| {
+        [MediaType::Movie, MediaType::Tv]
+            .into_iter()
+            .flat_map(|kind| crate::plotrows::carrying(indexes, kind, &tuning.filters))
+            .map(|(key, _)| key)
+            .collect()
+    });
+    let watched: std::collections::HashSet<Key> = tuning.watched.iter().copied().collect();
+    let keep = |key: Key| !watched.contains(&key) && allowed.as_ref().is_none_or(|a| a.contains(&key));
+    let filtering = allowed.is_some() || !watched.is_empty();
+    let extras = den_index::Extras {
+        audience: Some(&viewers),
+        keep: filtering.then_some(&keep as &dyn Fn(Key) -> bool),
+    };
+    let inspected = indexes.inspect_more_like_this(tmdb_id, media_type, candidate, &tuning.params, extras);
+    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&candidate));
+    let reasons: Vec<Value> = inspected
+        .reasons
+        .iter()
+        .map(|reason| match reason {
+            den_index::InspectReason::Seed => json!({ "code": "seed" }),
+            den_index::InspectReason::NotRetrieved => json!({ "code": "not_retrieved" }),
+            den_index::InspectReason::OtherMediaType => json!({ "code": "other_media_type" }),
+            den_index::InspectReason::RequestFilter => json!({ "code": "request_filter" }),
+            den_index::InspectReason::Rating { value, minimum } => {
+                json!({ "code": "rating", "value": value, "minimum": minimum })
+            }
+            den_index::InspectReason::Votes { value, minimum } => {
+                json!({ "code": "votes", "value": value, "minimum": minimum })
+            }
+            den_index::InspectReason::Popularity { value, minimum } => {
+                json!({ "code": "popularity", "value": value, "minimum": minimum })
+            }
+            den_index::InspectReason::MissingLabels => json!({ "code": "missing_labels" }),
+            den_index::InspectReason::AnimationMismatch => json!({ "code": "animation_mismatch" }),
+            den_index::InspectReason::Tone { value, minimum } => {
+                json!({ "code": "tone", "value": value, "minimum": minimum })
+            }
+            den_index::InspectReason::SubgenreCap => json!({ "code": "subgenre_cap" }),
+            den_index::InspectReason::RowLimit { position, maximum } => {
+                json!({ "code": "row_limit", "position": position, "maximum": maximum })
+            }
+        })
+        .collect();
+    let mut out = json!({
+        "key": seed_key(candidate.0, candidate.1),
+        "title": card.map(|c| c.title.clone()),
+        "year": card.and_then(|c| c.year),
+        "retrieved": inspected.retrieved,
+        "position": inspected.position,
+        "reasons": reasons,
+    });
+    if let Some(s) = inspected.scored {
+        out["score"] = json!(s.score);
+        out["base"] = json!(s.base);
+        out["premiseCosine"] = json!(s.premise);
+        out["plotCosine"] = json!(s.plot);
+        out["subgenre"] = json!(s.subgenre);
+        out["held"] = json!(s.held);
+        out["signals"] = signals(&s, &tuning.params);
+    }
+    out
+}
+
 /// What `/playground/export.json` writes and `/playground/import.json` reads: a stable, versioned file that
 /// Den Web's saved levers will read too. The shape, version 1:
 ///
@@ -465,6 +545,7 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
 ///     "limit": 20,                      // titles per seed
 ///     "seeds": ["series:1438", …],      // More Like This seeds, in order
 ///     "suggestSeeds": ["movie:278", …], // You Might Also Like seeds
+///     "inspect": "series:2004",          // arbitrary candidate explained in every row, or null
 ///     "watched": ["movie:5723", …],     // excluded, and the rows tilted towards them
 ///     "filters": [{ "axis": "tone", "value": "bleak" }]
 ///   },
@@ -493,6 +574,7 @@ pub struct State {
     pub tuning: Tuning,
     pub seeds: Vec<(MediaType, u32)>,
     pub suggest: Vec<(MediaType, u32)>,
+    pub inspect: Option<(MediaType, u32)>,
 }
 
 impl State {
@@ -500,9 +582,19 @@ impl State {
     pub fn parse(query: &str) -> Result<State, String> {
         let (seeds, rest) = take_param(query, "seeds");
         let (suggest, rest) = take_param(&rest, "suggest");
+        let (inspect, rest) = take_param(&rest, "inspect");
+        let inspect = inspect
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                parse_keys(s, "inspect", 1)
+                    .and_then(|keys| keys.first().copied().ok_or("inspect: one title".into()))
+            })
+            .transpose()?;
         Ok(State {
             seeds: parse_seeds(seeds.as_deref())?,
             suggest: parse_suggest_seeds(suggest.as_deref())?,
+            inspect,
             tuning: parse(&rest)?,
         })
     }
@@ -520,6 +612,9 @@ impl State {
         parts.push(format!("limit={}", self.tuning.limit));
         parts.push(format!("seeds={}", keys(&self.seeds)));
         parts.push(format!("suggest={}", keys(&self.suggest)));
+        if let Some((media, id)) = self.inspect {
+            parts.push(format!("inspect={}", seed_key(media, id)));
+        }
         if !self.tuning.watched.is_empty() {
             parts.push(format!("watched={}", keys(&self.tuning.watched)));
         }
@@ -544,6 +639,7 @@ impl State {
             "limit": self.tuning.limit,
             "seeds": keys(&self.seeds),
             "suggestSeeds": keys(&self.suggest),
+            "inspect": self.inspect.map(|(media, id)| seed_key(media, id)),
             "watched": keys(&self.tuning.watched),
             "filters": filters,
         })
@@ -583,6 +679,9 @@ pub fn export(
         .map(|&(media, id)| {
             let mut row = answer(sources, media, id, &shown);
             row["key"] = json!(seed_key(media, id));
+            if let Some(candidate) = state.inspect {
+                row["inspection"] = inspection(sources, media, id, candidate, &shown);
+            }
             row
         })
         .collect();
@@ -660,6 +759,15 @@ pub fn import(file: &Value) -> Result<(State, Vec<String>), String> {
     let state = State {
         seeds: list("seeds", "seeds", MAX_SEEDS)?,
         suggest: list("suggestSeeds", "suggest", MAX_SUGGEST_SEEDS)?,
+        inspect: state
+            .get("inspect")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                parse_keys(s, "inspect", 1)
+                    .and_then(|keys| keys.first().copied().ok_or("inspect: one title".into()))
+            })
+            .transpose()?,
         tuning,
     };
     Ok((state, removed))
@@ -745,6 +853,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
         "noul": term(s.noul, p.w_noul),
         "critique": term(s.critique, p.w_critique),
         "coverage": term(s.coverage, p.w_coverage),
+        "structural": term(s.structural, p.w_structural),
         "tone": term(s.tone, p.w_tone),
         "world": term(s.world, -p.w_world),
         "year": term(s.year, p.w_year),
@@ -848,6 +957,7 @@ mod tests {
             tuning,
             seeds: vec![(MediaType::Tv, 1399), (MediaType::Movie, 278)],
             suggest: vec![(MediaType::Tv, 1438)],
+            inspect: Some((MediaType::Tv, 2004)),
         }
     }
 

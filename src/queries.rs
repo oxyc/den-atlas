@@ -5,7 +5,7 @@
 //!
 //! # One artifact
 //!
-//! Everything below is read out of the mmap'd store (den-spec `wire/store-v1.md`) and nothing else. There
+//! Everything below is read out of the mmap'd store (den-spec `wire/store-v3.md`) and nothing else. There
 //! used to be seven inputs — `labels-t02.json`, `vectors-bge-m3.bin`, `labels-premise.json`,
 //! `vectors-premise.bin`, `metadata-*.json`, `facets.bin`, a facts sidecar and a plot-facets sidecar —
 //! each with its own reader, its own parse and its own idea of how many titles the corpus has. They
@@ -74,6 +74,9 @@ pub struct Indexes {
     /// More Like This answers already worked out, by title (`Indexes::more_like_this`).
     /// Keyed by title and whether the row mixes types.
     similar: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
+    /// You Might Also Like's structural-affinity rows, keyed like `similar` but kept separately because
+    /// the two rails make different promises.
+    affinity: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -108,6 +111,34 @@ const ROW_MEMO: usize = 256;
 const AGGREGATES_MEMO: usize = 8;
 
 impl Indexes {
+    /// You Might Also Like for one seed. Structural affinity leads when store-v3 carries it; the ordinary
+    /// row is appended so partial/old stores still answer and a sparse affinity pass never shortens a rail.
+    pub fn you_might_also_like(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Arc<[Key]> {
+        memoised(&self.affinity, ((media_type, tmdb_id), mix), SIMILAR_MEMO, || {
+            let params = den_index::SimilarParams::default();
+            let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
+                den_index::you_might_also_like(
+                    Some(facets),
+                    (media_type, tmdb_id),
+                    mix,
+                    den_index::MAX_ROW,
+                )
+            });
+            let fallback: Vec<Key> = if mix {
+                self.more_like_this_mixed(tmdb_id, media_type).to_vec()
+            } else {
+                self.more_like_this(tmdb_id, media_type)
+                    .iter()
+                    .map(|&id| (media_type, id))
+                    .collect()
+            };
+            let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
+            row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
+            row.truncate(den_index::MAX_ROW);
+            row.into()
+        })
+    }
+
     /// More Like This for a title, worked out once while the indexes are loaded: it is deterministic for
     /// the dataset, and asked again and again — a billboard's seeds on every Home load, the title a search
     /// names, a detail page.
@@ -164,6 +195,32 @@ impl Indexes {
                 self.premise.as_ref(),
                 tmdb_id,
                 media_type,
+                authorship,
+                Some(facets),
+                extras,
+                params,
+            )
+        })
+    }
+
+    /// Explain one named candidate under exactly the scorer inputs the playground ranks with. Unlike the
+    /// ordinary row this may force an unretrieved candidate into a diagnostic pool; it never memoises or
+    /// changes the served answer.
+    pub fn inspect_more_like_this(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        candidate: Key,
+        params: &den_index::SimilarParams,
+        extras: den_index::Extras<'_>,
+    ) -> den_index::Inspection {
+        self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
+            den_index::inspect_more_like_this(
+                Some(&self.plot),
+                self.premise.as_ref(),
+                tmdb_id,
+                media_type,
+                candidate,
                 authorship,
                 Some(facets),
                 extras,
@@ -885,6 +942,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         ceremonies,
         display,
         similar: Mutex::new(HashMap::new()),
+        affinity: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
@@ -1471,4 +1529,5 @@ mod tests {
         crate::ratings::build(&mapped.view(), &HashMap::from([((0, 1), (8.4, 9000))]))
             .expect("movie 1 is kept")
     }
+
 }

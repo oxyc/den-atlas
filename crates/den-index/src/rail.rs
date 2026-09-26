@@ -19,7 +19,7 @@
 
 use crate::{Axis, Key, MediaType, SimilarParams, ValueId, Weighted};
 use den_store::{Row, Store, StoreError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The critique level at or above which a title "holds" an axis, for the idf `ln(N / holders)`. Baked into
 /// the aggregates, so a request with another value (`SimilarParams::holds`) needs aggregates built for it.
@@ -174,6 +174,8 @@ pub struct SeedFacets<'a> {
     noul_names: &'a [u32],
     noul_k: den_store::List<'a, u8>,
     noul_v: den_store::List<'a, u8>,
+    /// Store-v3's structural-affinity matrix, coverage column and width. Absent on v1/v2 stores.
+    structural: Option<(&'a [u8], &'a [u8], usize)>,
     /// The card's release year, for the year term. Empty when the store lacks the section; the term is
     /// then 0 for every title, which is also what production weighs it at (`w_year = 0`).
     card_year: &'a [i16],
@@ -227,6 +229,16 @@ impl<'a> SeedFacets<'a> {
             noul_names: store.column::<u32>("noul_names")?,
             noul_k: store.list::<u8>("noul_k_v", "noul_k_o")?,
             noul_v: store.list::<u8>("noul_v_v", "noul_v_o")?,
+            structural: (|| {
+                let names = store.column::<u32>("structural_names").ok()?;
+                let values = store.column::<u8>("structural").ok()?;
+                let has = store.per_row::<u8>("structural_has").ok()?;
+                (!names.is_empty() && values.len() == has.len() * names.len()).then_some((
+                    values,
+                    has,
+                    names.len(),
+                ))
+            })(),
             // Optional, unlike the rest: a term production does not weigh cannot be a reason to refuse a
             // store, and the producer has been dropping card sections (oxyc/den#118).
             card_year: store.per_row::<i16>("card_year").unwrap_or(&[]),
@@ -277,6 +289,15 @@ impl<'a> SeedFacets<'a> {
                 (p >= self.critique_floor).then_some((name, p))
             })
             .collect()
+    }
+
+    fn structural_at(&self, row: Row) -> Option<Vec<f64>> {
+        let (values, has, axes) = self.structural?;
+        if has.get(row.0).copied() != Some(1) {
+            return None;
+        }
+        let start = row.0.checked_mul(axes)?;
+        Some(values.get(start..start + axes)?.iter().map(|&p| f64::from(p) / 100.0).collect())
     }
 }
 
@@ -334,6 +355,108 @@ impl crate::Facets for SeedFacets<'_> {
                 (p >= self.noul_floor).then(|| self.noul_names.get(k as usize).map(|&name| (name, p)))?
             })
             .collect()
+    }
+
+    fn structural(&self, key: Key) -> Option<Vec<f64>> {
+        self.structural_at(self.row(key)?)
+    }
+
+    fn structural_nominate(&self, seed: Key, k: usize) -> Vec<Key> {
+        let seed_row = match self.row(seed) {
+            Some(row) => row,
+            None => return Vec::new(),
+        };
+        let mine = match self.structural_at(seed_row) {
+            Some(profile) => profile,
+            None => return Vec::new(),
+        };
+        let weight: f64 = mine.iter().sum();
+        if weight <= 0.0 {
+            return Vec::new();
+        }
+        let ranked: Vec<(Key, f64, f64)> = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &packed)| {
+                let theirs = self.structural_at(Row(row))?;
+                let focused =
+                    1.0 - mine.iter().zip(&theirs).map(|(p, q)| p * (p - q).abs()).sum::<f64>() / weight;
+                let broad = 1.0
+                    - mine.iter().zip(&theirs).map(|(p, q)| (p - q).abs()).sum::<f64>() / mine.len() as f64;
+                let media = if packed >> 32 == 1 { MediaType::Tv } else { MediaType::Movie };
+                Some(((media, packed as u32), broad, focused))
+            })
+            .collect();
+        let mut broad = ranked.clone();
+        broad.sort_by(|(ka, a, _), (kb, b, _)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| ka.cmp(kb))
+        });
+        let mut focused = ranked;
+        focused.sort_by(|(ka, _, a), (kb, _, b)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| ka.cmp(kb))
+        });
+
+        // Half broad agreement (best held-out AUC), half seed-focused agreement (the relevant axes may
+        // differ between “similar” and “you might also like”). Fill duplicates from the remaining tails.
+        let halves = [(broad.as_slice(), (k + 1) / 2), (focused.as_slice(), k / 2)];
+        let mut out = Vec::with_capacity(k);
+        let mut seen = HashSet::new();
+        for (lane, take) in halves {
+            for &(key, _, _) in lane.iter().filter(|(key, _, _)| *key != seed).take(take) {
+                if seen.insert(key) {
+                    out.push(key);
+                }
+            }
+        }
+        for at in 0..broad.len().max(focused.len()) {
+            for lane in [&broad, &focused] {
+                if out.len() == k {
+                    return out;
+                }
+                if let Some(&(key, _, _)) = lane.get(at) {
+                    if key != seed && seen.insert(key) {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn structural_affinity(&self, seed: Key, k: usize, mix_types: bool) -> Vec<Key> {
+        let seed_row = match self.row(seed) {
+            Some(row) => row,
+            None => return Vec::new(),
+        };
+        let mine = match self.structural_at(seed_row) {
+            Some(profile) => profile,
+            None => return Vec::new(),
+        };
+        let weight: f64 = mine.iter().sum();
+        if weight <= 0.0 {
+            return Vec::new();
+        }
+        let mut ranked: Vec<(Key, f64)> = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &packed)| {
+                let media = if packed >> 32 == 1 { MediaType::Tv } else { MediaType::Movie };
+                let key = (media, packed as u32);
+                if key == seed || (!mix_types && media != seed.0) {
+                    return None;
+                }
+                let theirs = self.structural_at(Row(row))?;
+                let agreement =
+                    1.0 - mine.iter().zip(&theirs).map(|(p, q)| p * (p - q).abs()).sum::<f64>() / weight;
+                Some((key, agreement))
+            })
+            .collect();
+        ranked.sort_by(|(ka, a), (kb, b)| {
+            b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| ka.cmp(kb))
+        });
+        ranked.into_iter().take(k).map(|(key, _)| key).collect()
     }
 
     fn critique(&self, key: Key) -> Vec<Weighted> {

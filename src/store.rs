@@ -1,6 +1,6 @@
 //! The store on disk: the one impure step, and the shapes the serving path reads out of it.
 //!
-//! The format and its decoder are not here. `den-spec wire/store-v2.md` is the contract and
+//! The format and its decoder are not here. `den-spec wire/store-v3.md` is the contract and
 //! `den_store` is the reader, in den-core, because that crate must also compile for the browser and for
 //! tvOS where `memmap2` does not. What belongs here is the part that touches the filesystem: map the
 //! file, verify it once, and keep the mapping alive for the life of the process.
@@ -175,7 +175,7 @@ impl LoadedStore {
 /// way a test can say so is to fail.
 #[cfg(test)]
 pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
-    spec_vectors("store-v2.store")
+    spec_vectors("store-v3.store")
 }
 
 /// A file under den-spec's `vectors/`, with `spec_fixture`'s rule for when it is absent. `store-v1.store`
@@ -204,11 +204,11 @@ pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
     )
 }
 
-/// Writes a store-v2 file from test data.
+/// Writes a current-format store file from test data.
 ///
 /// The store is the only artifact the serving path reads, so every test that needs a dataset needs one
 /// written — the route fixture's twelve titles, and the one-row stores `dataset.rs` hangs its manifest
-/// tests on. den-spec's `vectors/store-v2.store` cannot stand in: it describes three titles of its own,
+/// tests on. den-spec's `vectors/store-v3.store` cannot stand in: it describes three titles of its own,
 /// and rewriting the route tests around them would throw away a fixture built to exercise this server
 /// (twelve rows so search's z-score floor has a distribution, four drawable cards, a label with a slash).
 ///
@@ -217,7 +217,7 @@ pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
 /// copy agrees with itself. What keeps it honest is that it is checked by the reader we ship: every store
 /// it writes goes through `den_store::Store::open`, which verifies the magic, the version, the endianness
 /// marker, the content hash over every byte and each section's extent, and then through `MappedStore::check`.
-/// A layout mistake here fails the tests rather than passing them. The store-v2 CONTRACT is still tested
+/// A layout mistake here fails the tests rather than passing them. The store-v3 CONTRACT is still tested
 /// against the real writer's output, by `maps_and_checks_the_spec_fixture` below.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -401,7 +401,7 @@ pub(crate) mod fixture {
         }
     }
 
-    /// Write `titles` (and the entities they credit) to `path` as a store-v2 file.
+    /// Write `titles` (and the entities they credit) to `path` as a current-format store file.
     ///
     /// Panics on anything a fixture can simply get right — a vector of the wrong width, a title count that
     /// does not fit a `u32`. A test fixture that limped on would be describing something other than the
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn maps_and_checks_the_spec_fixture() {
         let Some(path) = fixture() else {
-            eprintln!("SKIP: den-spec/vectors/store-v2.store not found");
+            eprintln!("SKIP: den-spec/vectors/store-v3.store not found");
             return;
         };
         let store = MappedStore::open(&path).expect("the fixture maps");
@@ -1023,6 +1023,31 @@ mod tests {
         assert!(world == 0.0 || world >= floors.world_floor, "world is floored, got {world}");
         // A row with nothing at all reads as zero distance, not as a missing value.
         assert_eq!(movies.world(MOVIE_2), 0.0);
+    }
+
+    #[test]
+    fn structural_profiles_distinguish_unknown_and_nominate_by_agreement() {
+        use den_index::Facets as _;
+        let Some(loaded) = rail_fixture() else { return };
+        let movies = seed(&loaded, den_index::MediaType::Movie);
+
+        let profile = movies.structural(MOVIE_1).expect("movie:1 has an answered structural profile");
+        assert_eq!(profile.len(), 18);
+        assert_eq!(movies.structural(MOVIE_2), None, "facts-only is unknown, not eighteen zeroes");
+        assert_eq!(
+            movies.structural_nominate(MOVIE_1, 20),
+            vec![(den_index::MediaType::Tv, 10)],
+            "only the other answered fixture title can be nominated"
+        );
+        assert!(
+            movies.structural_affinity(MOVIE_1, 20, false).is_empty(),
+            "an own-type affinity row cannot borrow the only answered series"
+        );
+        assert_eq!(
+            movies.structural_affinity(MOVIE_1, 20, true),
+            vec![(den_index::MediaType::Tv, 10)],
+            "the affinity order can mix types when its caller asks"
+        );
     }
 
     /// "Unknown is not none." A row with no critique must return NOTHING, so the cosine term is skipped
