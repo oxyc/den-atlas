@@ -113,24 +113,21 @@ const AGGREGATES_MEMO: usize = 8;
 impl Indexes {
     /// You Might Also Like for one seed. Structural affinity leads when store-v3 carries it; the ordinary
     /// row is appended so partial/old stores still answer and a sparse affinity pass never shortens a rail.
-    pub fn you_might_also_like(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Arc<[Key]> {
+    pub fn you_might_also_like(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        mix: bool,
+    ) -> Arc<[Key]> {
         memoised(&self.affinity, ((media_type, tmdb_id), mix), SIMILAR_MEMO, || {
             let params = den_index::SimilarParams::default();
             let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
-                den_index::you_might_also_like(
-                    Some(facets),
-                    (media_type, tmdb_id),
-                    mix,
-                    den_index::MAX_ROW,
-                )
+                den_index::you_might_also_like(Some(facets), (media_type, tmdb_id), mix, den_index::MAX_ROW)
             });
             let fallback: Vec<Key> = if mix {
                 self.more_like_this_mixed(tmdb_id, media_type).to_vec()
             } else {
-                self.more_like_this(tmdb_id, media_type)
-                    .iter()
-                    .map(|&id| (media_type, id))
-                    .collect()
+                self.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
             };
             let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
             row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
@@ -1529,5 +1526,4 @@ mod tests {
         crate::ratings::build(&mapped.view(), &HashMap::from([((0, 1), (8.4, 9000))]))
             .expect("movie 1 is kept")
     }
-
 }

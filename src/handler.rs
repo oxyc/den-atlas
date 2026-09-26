@@ -1408,11 +1408,7 @@ fn answer_suggest(indexes: &crate::queries::Indexes, body: &[u8]) -> Result<serd
     // Beside the fields every client reads, never instead of them: the same pooling over the rows that mix
     // films and series.
     let (mixed, pooled_mixed) = suggest_pool_mixed(&seeds, &excluded, limit, |id, media_type| {
-        indexes
-            .you_might_also_like(id, media_type, true)
-            .iter()
-            .map(|&(media, id)| (id, media))
-            .collect()
+        indexes.you_might_also_like(id, media_type, true).iter().map(|&(media, id)| (id, media)).collect()
     });
     let per_seed: Vec<serde_json::Value> = per_seed
         .iter()

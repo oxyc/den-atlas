@@ -1090,9 +1090,7 @@ pub fn you_might_also_like(
     mix_types: bool,
     max_row: usize,
 ) -> Vec<Key> {
-    facets
-        .map(|f| f.structural_affinity(seed, max_row.min(MAX_ROW), mix_types))
-        .unwrap_or_default()
+    facets.map(|f| f.structural_affinity(seed, max_row.min(MAX_ROW), mix_types)).unwrap_or_default()
 }
 
 /// Agreement between two titles' facets, confidence-weighted and rarity-weighted, in 0..=1 at production's
