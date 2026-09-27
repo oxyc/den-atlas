@@ -51,6 +51,9 @@ pub struct Indexes {
     /// Each franchise series' strength (`series::SeriesStrength`), out of the facts and the plot index;
     /// empty without the facts.
     pub series: crate::series::SeriesStrength,
+    /// Curated primary franchises, stable eras and release-ordered mixed members. Empty for an old store
+    /// whose optional franchise sections are wholly absent.
+    pub franchises: crate::franchises::Franchises,
     /// The plot facets, and the cards their rows are drawn with; without both, `/index/plot` rows are empty.
     pub plot_facets: Option<PlotFacets>,
     /// The mapped store and its corpus-wide aggregates: the artifact everything above was read out of,
@@ -186,6 +189,15 @@ impl Indexes {
         params: &den_index::SimilarParams,
         extras: den_index::Extras<'_>,
     ) -> Vec<den_index::Scored> {
+        let seed = (media_type, tmdb_id);
+        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let extras = den_index::Extras {
+            primary_franchise: self
+                .franchises
+                .membership(seed)
+                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            ..extras
+        };
         self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
             den_index::more_like_this_with(
                 Some(&self.plot),
@@ -211,6 +223,15 @@ impl Indexes {
         params: &den_index::SimilarParams,
         extras: den_index::Extras<'_>,
     ) -> den_index::Inspection {
+        let seed = (media_type, tmdb_id);
+        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let extras = den_index::Extras {
+            primary_franchise: self
+                .franchises
+                .membership(seed)
+                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            ..extras
+        };
         self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
             den_index::inspect_more_like_this(
                 Some(&self.plot),
@@ -248,6 +269,14 @@ impl Indexes {
         }
         let production = den_index::SimilarParams::default();
         let keys = |row: Vec<den_index::Scored>| -> Arc<[Key]> { row.iter().map(|s| s.key()).collect() };
+        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let extras = den_index::Extras {
+            primary_franchise: self
+                .franchises
+                .membership(seed)
+                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            ..den_index::Extras::default()
+        };
         let (one, mixed) = self.with_seed(tmdb_id, media_type, &production, |authorship, facets| {
             den_index::more_like_this_both(
                 Some(&self.plot),
@@ -256,7 +285,7 @@ impl Indexes {
                 media_type,
                 authorship,
                 Some(facets),
-                den_index::Extras::default(),
+                extras,
                 &production,
             )
         });
@@ -894,6 +923,10 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         eprintln!("awards unusable ({e}) — no award kinds, list or title awards");
         crate::awards::Ceremonies::default()
     });
+    // Fully absent is the old-store-compatible empty index. A partially present or malformed contract is
+    // not silently treated as absence: that would put known franchise members back into More Like This.
+    let (franchises, franchises_took) = timed(|| crate::franchises::Franchises::from_store(&store.view()));
+    let franchises = franchises.map_err(|e| format!("curated franchises unusable: {e}"))?;
 
     // The facts hand their titles' other names to the display index, which is then the only one holding them.
     let (display, display_took) = timed(|| {
@@ -929,7 +962,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     debug_assert!(plot.without_length_ready());
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), facet rows {}, facets {}, display {}, length-free plot {} (wait {})",
+        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), franchises {} ({}), facet rows {}, facets {}, display {}, length-free plot {} (wait {})",
         seconds(store_took),
         seconds(plot_took),
         seconds(premise_took),
@@ -937,6 +970,8 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         seconds(facts_took),
         seconds(series_took),
         series.len(),
+        seconds(franchises_took),
+        franchises.len(),
         seconds(plot_facets_took),
         seconds(facets_took),
         seconds(display_took),
@@ -951,6 +986,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         facets,
         facts,
         series,
+        franchises,
         plot_facets,
         store,
         ratings: sources.ratings.clone(),

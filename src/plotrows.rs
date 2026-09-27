@@ -892,6 +892,9 @@ pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Valu
     let (media_type, id) = key;
     let card = indexes.cards.as_ref()?.get(&key)?;
     let mut title = title_json(indexes, key, card);
+    if let Some(franchise) = crate::franchises::metadata_json(&indexes.franchises, key) {
+        title["franchise"] = franchise;
+    }
     if let Some(labels) = indexes.plot.labels(id, media_type) {
         let shown = |pairs: &[(&str, f64)]| -> Vec<String> {
             pairs.iter().filter(|(_, c)| *c >= LABEL_FLOOR).map(|(name, _)| (*name).to_owned()).collect()

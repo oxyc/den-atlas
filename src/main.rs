@@ -13,6 +13,7 @@ mod descriptor;
 mod facts;
 mod filter;
 mod fit;
+mod franchises;
 mod handler;
 mod http;
 mod justwatch;

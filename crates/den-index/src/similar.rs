@@ -389,7 +389,7 @@ impl SimilarParams {
             0.0,
             W_MAX,
             false,
-            "shared franchise series, by its strength; above 0 also nominates the series' other members",
+            "legacy raw Wikidata P179 series lift; above 0 also nominates the series' other members",
         ),
         knob(
             "w_region",
@@ -808,7 +808,10 @@ const W_CHARACTER: f64 = 1.0;
 /// The row stays ordered by score, not by release date. More Like This is what is like the seed; a series
 /// block in release order would open every entry's row with the same first film. Where TMDB has a collection,
 /// the TV shows it as its own row in order and removes its members from this one.
-const W_SERIES: f64 = 2.0;
+// Raw P179 series is evidence, not the viewer-facing franchise row. #93 lifted it into More Like This;
+// curated franchises now have their own row and are excluded there, so production leaves this legacy
+// experiment off. The playground knob remains for comparisons.
+const W_SERIES: f64 = 0.0;
 /// How hard a shared origin pulls a candidate up, as a fraction of the pool's spread, for a seed from outside
 /// the English-language mainstream (`regional`): a Swedish title favours Swedish ones, then Nordic, then
 /// European.
@@ -1261,6 +1264,8 @@ pub enum InspectReason {
     OtherMediaType,
     /// A request-level filter or watched-title exclusion rejected it.
     RequestFilter,
+    /// Atlas excluded the candidate because it has the same curated primary franchise as the seed.
+    PrimaryFranchise,
     Rating {
         value: f64,
         minimum: f64,
@@ -1320,6 +1325,10 @@ pub struct Extras<'a> {
     /// already watched). Before, so the pool's own statistics — its floors and spread — are over what the
     /// row can actually hold.
     pub keep: Option<&'a dyn Fn(Key) -> bool>,
+    /// A candidate this answers `true` for belongs to the seed's curated primary franchise and is kept
+    /// for the dedicated franchise row instead of More Like This. Separate from `keep` so inspection can
+    /// tell a client exactly why it is absent.
+    pub primary_franchise: Option<&'a dyn Fn(Key) -> bool>,
 }
 
 /// `more_like_this_pooled` with its knobs as an argument, and every title's signals kept. Serving ranks
@@ -1399,7 +1408,7 @@ pub fn inspect_more_like_this(
             candidate,
             authorship,
             facets,
-            Extras { audience: extras.audience, keep: None },
+            Extras { audience: extras.audience, keep: None, primary_franchise: None },
             &open,
         );
         inspected.position = counterfactual.position;
@@ -1738,6 +1747,9 @@ fn rank_pool_inner<'l>(
         if extras.keep.is_some_and(|keep| !keep(id)) {
             return false;
         }
+        if extras.primary_franchise.is_some_and(|same| same(id)) {
+            return false;
+        }
         if p.min_rating > 0.0 || p.min_votes > 0.0 {
             if let Some((rating, votes)) = audience.and_then(|a| a.rating(id)) {
                 if rating < p.min_rating || votes < p.min_votes {
@@ -1765,6 +1777,9 @@ fn rank_pool_inner<'l>(
                 }
                 if extras.keep.is_some_and(|f| !f(c.key)) {
                     reasons.push(InspectReason::RequestFilter);
+                }
+                if extras.primary_franchise.is_some_and(|same| same(c.key)) {
+                    reasons.push(InspectReason::PrimaryFranchise);
                 }
                 if let Some((rating, votes)) = audience.and_then(|a| a.rating(c.key)) {
                     if p.min_rating > 0.0 && rating < p.min_rating {
@@ -2335,6 +2350,43 @@ mod tests {
         assert!(below.reasons.iter().any(|r| matches!(r, InspectReason::RowLimit { maximum: 1, .. })));
     }
 
+    #[test]
+    fn a_primary_franchise_member_is_excluded_with_its_own_inspection_reason() {
+        let labels: &[(&str, f64)] = &[("Family Comedy", 0.9)];
+        let index = fixture(&[
+            (1, "tv", "Comedy", false, labels, &[], [100, 0, 0]),
+            (2, "tv", "Comedy", false, labels, &[], [99, 0, 0]),
+            (3, "tv", "Comedy", false, labels, &[], [90, 10, 0]),
+        ]);
+        let same_primary = |key: Key| key == (MediaType::Tv, 2);
+        let extras = Extras { primary_franchise: Some(&same_primary), ..Extras::default() };
+        let row = more_like_this_with(
+            None,
+            Some(&index),
+            1,
+            MediaType::Tv,
+            None,
+            None,
+            extras,
+            &SimilarParams::default(),
+        );
+        assert_eq!(row.iter().map(Scored::key).collect::<Vec<_>>(), [(MediaType::Tv, 3)]);
+        let inspected = inspect_more_like_this(
+            None,
+            Some(&index),
+            1,
+            MediaType::Tv,
+            (MediaType::Tv, 2),
+            None,
+            None,
+            extras,
+            &SimilarParams::default(),
+        );
+        assert!(inspected.retrieved);
+        assert!(inspected.reasons.contains(&InspectReason::PrimaryFranchise));
+        assert!(inspected.scored.is_some() && inspected.position.is_some(), "{inspected:?}");
+    }
+
     /// The Beck case (oxyc/den-atlas#92). Four police procedurals the vectors put nearest, and four entries of
     /// the seed's own series far down: two labelled like the seed, one labelled as something else, one as
     /// close on the vectors as the unrelated titles. At `w_series = 0` the series changes nothing. Weighed,
@@ -2391,7 +2443,7 @@ mod tests {
         assert_eq!(ranked(off.clone()), ranked(none), "unweighed, the series changes nothing");
         assert!(off.iter().all(|s| ![10, 11, 12, 20].contains(&s.tmdb_id)), "{off:?}");
 
-        p.set("w_series", W_SERIES).unwrap();
+        p.set("w_series", 2.0).unwrap();
         let on = row(&p);
         let ids: Vec<u32> = on.iter().map(|s| s.tmdb_id).collect();
         let mut lead = ids[..4].to_vec();
@@ -2848,7 +2900,7 @@ mod tests {
             (7, "movie", "Drama", false, &[], &[], [40, 0, 0]),
             (8, "movie", "Drama", false, &[], &[], [30, 0, 0]),
         ]);
-        let extras = Extras { audience: Some(&Viewers), keep };
+        let extras = Extras { audience: Some(&Viewers), keep, ..Extras::default() };
         more_like_this_with(None, Some(&premise), 1, MediaType::Movie, None, None, extras, p)
             .iter()
             .map(|s| s.tmdb_id)
