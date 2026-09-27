@@ -1010,7 +1010,7 @@ pub fn answer(
         let eligible = |id: u32, kind: MediaType| {
             wanted(kind) && bound.is_none_or(|set| set.contains(&(kind, id))) && allowed((kind, id))
         };
-        let (near, stats) = indexes.plot.scan_vector(vector, eligible, LANE);
+        let (near, stats) = indexes.plot.scan_semantic_vector(vector, eligible, LANE);
         if stats.sd > 0.0 {
             for n in near {
                 found.entry((n.media_type, n.tmdb_id)).or_default().plot_z =

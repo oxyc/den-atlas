@@ -2540,6 +2540,27 @@ mod tests {
         assert!(std::ptr::eq(plot.without_length(), plot.without_length()));
     }
 
+    /// A new dataset has already paid the projection before quantisation. The old playground knob remains
+    /// accepted, but cannot and need not reconstruct the removed component; either value ranks one mmap.
+    #[test]
+    fn the_legacy_knob_is_a_noop_for_dataset_transformed_plot_rows() {
+        let titles: &[crate::index::tests::Row<'_>] = &[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (2, "movie", "Drama", false, &[], &[], [90, 10, 0]),
+            (3, "movie", "Drama", false, &[], &[], [0, 100, 0]),
+        ];
+        let plot = fixture(titles).with_dataset_length_transform(&[0.0, 0.0, 1.0]);
+        let row = |off| {
+            let p = SimilarParams { plot_length_off: off, ..SimilarParams::default() };
+            more_like_this_scored(Some(&plot), None, 1, MediaType::Movie, None, None, &p)
+                .into_iter()
+                .map(|score| score.tmdb_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row(false), row(true));
+        assert!(std::ptr::eq(plot.without_length(), &plot));
+    }
+
     /// A candidate with no confident labels is not filtered out: unknown is not none.
     #[test]
     fn an_unlabelled_candidate_is_not_gated_by_the_tonal_floor() {

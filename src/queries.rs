@@ -533,6 +533,9 @@ pub struct IndexQueries {
     taxonomy_version: String,
     /// The process's one verified mapping (`Dataset::mapped`): every load reads it, none hashes it again.
     store: Arc<MappedStore>,
+    /// Present only when the producer already projected plot rows. Kept outside the store because the
+    /// signed manifest is the contract that identifies the operation and supplies its exact direction.
+    plot_vector_transform: Option<Arc<[f32]>>,
     loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
@@ -566,6 +569,11 @@ impl IndexQueries {
             dataset_version: ds.meta.dataset_version.clone(),
             taxonomy_version: ds.meta.taxonomy_version.clone(),
             store: Arc::clone(&ds.mapped),
+            plot_vector_transform: ds
+                .meta
+                .plot_vector_transform
+                .as_ref()
+                .map(|transform| Arc::from(transform.direction.clone())),
             loaded: Mutex::new(None),
             loading: tokio::sync::Mutex::new(()),
             facts_unusable: AtomicBool::new(false),
@@ -635,6 +643,7 @@ impl IndexQueries {
             dataset_version: self.dataset_version.clone(),
             taxonomy_version: self.taxonomy_version.clone(),
             store: Arc::clone(&self.store),
+            plot_vector_transform: self.plot_vector_transform.clone(),
             ratings: self.ratings.clone(),
             characters: self.characters.clone(),
         };
@@ -718,6 +727,7 @@ struct Sources {
     /// is a property of the pass that labelled it — so both indexes are stamped with it here.
     taxonomy_version: String,
     store: Arc<MappedStore>,
+    plot_vector_transform: Option<Arc<[f32]>>,
     /// TMDB's kept counts and scores (`tmdb`). The indexes keep the holder — not the index it currently
     /// has — so a rebuild that lands between two loads reaches the rows in between.
     ratings: Option<Arc<Ratings>>,
@@ -736,6 +746,11 @@ pub fn load_for_tools(ds: &Dataset) -> Result<Indexes, String> {
         dataset_version: ds.meta.dataset_version.clone(),
         taxonomy_version: ds.meta.taxonomy_version.clone(),
         store: Arc::clone(&ds.mapped),
+        plot_vector_transform: ds
+            .meta
+            .plot_vector_transform
+            .as_ref()
+            .map(|transform| Arc::from(transform.direction.clone())),
         // No ratings fetch for a one-shot tool: it would download 8 MB to rank the run it then exits
         // from. A tool measures row order off the store's own `votes` column, and says so here.
         ratings: None,
@@ -782,7 +797,13 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         let view = || store.view();
         // Both indexes read their vectors in place, in the mapping, rather than copying ~95 MB of them.
         let mapped = || Arc::clone(&store.store) as Arc<dyn den_index::StoreBytes>;
-        let plot = scope.spawn(move || timed(|| Index::from_store_plot(&view(), mapped())));
+        let transform = sources.plot_vector_transform.clone();
+        let plot = scope.spawn(move || {
+            timed(|| match transform {
+                Some(direction) => Index::from_store_plot_transformed(&view(), mapped(), &direction),
+                None => Index::from_store_plot(&view(), mapped()),
+            })
+        });
         // A premise index that will not read costs premise-led More Like This, not the whole feature.
         let premise = scope.spawn(move || {
             timed(|| {
@@ -807,7 +828,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // carry it and both indexes are stamped from the manifest. Miss this and `/index/schema.json`,
     // `/index/taxonomy.json` and the `atlas_dataset_info` metric all report an empty version.
     let plot = plot.map_err(|e| e.to_string())?.with_taxonomy_version(&sources.taxonomy_version);
-    if !plot.has_length_direction() {
+    if !plot.has_length_direction() && !plot.has_dataset_length_transform() {
         eprintln!(
             "plot vectors are {} dimensions, not the length direction's 1024 — plot_length_off does nothing",
             plot.dimension()
@@ -1217,6 +1238,53 @@ mod tests {
             load_for_tools(&Dataset::load(&dir).expect("the dataset loads")).expect("the indexes load");
         assert!(indexes.plot.has_length_direction(), "the fixture must exercise the copied path");
         assert!(indexes.plot.without_length_ready(), "load returned before the warmer finished");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// New stores already contain the projected rows. Loading one retains its mmap and records only the
+    /// direction needed for raw semantic queries; the legacy warmer must not materialise another matrix.
+    #[test]
+    fn a_dataset_transformed_plot_index_does_not_build_the_legacy_copy() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-transformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let title = crate::store::fixture::Title {
+            media: 0,
+            tmdb_id: 1,
+            plot: std::iter::once(0).chain(std::iter::repeat_n(1, 1023)).collect(),
+            ..Default::default()
+        };
+        crate::store::fixture::write(&dir.join("den-v1.store"), "v1", 1024, &[title], &[]);
+        let direction: Vec<u8> = std::iter::once(1.0f32)
+            .chain(std::iter::repeat_n(0.0, 1023))
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let transform = serde_json::json!({
+            "schema": 1, "algorithm": "unit-orthogonal-projection-v1", "dims": 1024,
+            "inputEmbeddingSpace": "canary-v1:raw", "directionEncoding": "base64-f32-le",
+            "directionBase64": base64::engine::general_purpose::STANDARD.encode(&direction),
+            "directionSha256": hex(&direction),
+            "fitMethod": "ols-unit-int8-on-ln-english-plot-chars-v1", "fitArtifactSha256": "11".repeat(32),
+        });
+        let transform_digest = hex(&serde_json::to_vec(&transform).unwrap());
+        let meta = serde_json::json!({
+            "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 1024,
+            "quantization": "int8", "embeddingSpace": "canary-v1:raw", "storeFile": "den-v1.store",
+            "plotVectorTransform": transform, "plotVectorTransformSha256": transform_digest,
+        });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+
+        let indexes = load_for_tools(&Dataset::load(&dir).expect("the transformed dataset loads"))
+            .expect("the transformed index loads");
+        assert!(indexes.plot.has_dataset_length_transform());
+        assert!(!indexes.plot.has_length_direction(), "the legacy copy path stayed armed");
+        assert!(std::ptr::eq(indexes.plot.without_length(), &indexes.plot));
         let _ = std::fs::remove_dir_all(dir);
     }
 
