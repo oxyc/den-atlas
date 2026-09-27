@@ -181,6 +181,7 @@ fn tuned_row(sources: &Sources<'_>, media: MediaType, tmdb_id: u32, tuning: &Tun
     let extras = den_index::Extras {
         audience: Some(&viewers),
         keep: filtering.then_some(&keep as &dyn Fn(Key) -> bool),
+        ..den_index::Extras::default()
     };
     let row = indexes.more_like_this_with(tmdb_id, media, &tuning.params, extras);
     let Some(tilt) = watched_tilt(&tuning.watched) else { return (row, false) };
@@ -481,6 +482,7 @@ fn inspection(
     let extras = den_index::Extras {
         audience: Some(&viewers),
         keep: filtering.then_some(&keep as &dyn Fn(Key) -> bool),
+        ..den_index::Extras::default()
     };
     let inspected = indexes.inspect_more_like_this(tmdb_id, media_type, candidate, &tuning.params, extras);
     let card = indexes.cards.as_ref().and_then(|cards| cards.get(&candidate));
@@ -492,6 +494,7 @@ fn inspection(
             den_index::InspectReason::NotRetrieved => json!({ "code": "not_retrieved" }),
             den_index::InspectReason::OtherMediaType => json!({ "code": "other_media_type" }),
             den_index::InspectReason::RequestFilter => json!({ "code": "request_filter" }),
+            den_index::InspectReason::PrimaryFranchise => json!({ "code": "primary_franchise" }),
             den_index::InspectReason::Rating { value, minimum } => {
                 json!({ "code": "rating", "value": value, "minimum": minimum })
             }

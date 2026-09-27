@@ -769,6 +769,11 @@ enum IndexQuestion {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     },
+    /// The title's curated primary franchise, with seed-era-first release-ordered mixed members.
+    Franchise {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
     /// Answered in `handle_index`, because it waits on den-embed.
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
@@ -815,6 +820,9 @@ impl IndexQuestion {
             }
             ["title", type_, id] => {
                 Some(Self::Title { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["franchise", type_, id] => {
+                Some(Self::Franchise { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
@@ -897,6 +905,9 @@ impl IndexQuestion {
                         "type": stremio_type(*media_type), "id": tmdb_id, "indexed": false,
                     }),
                 }
+            }
+            Self::Franchise { media_type, tmdb_id } => {
+                crate::franchises::route_json(indexes, (*media_type, *tmdb_id))
             }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
@@ -2223,6 +2234,22 @@ mod tests {
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
     }
 
+    fn franchise_state(name: &str, playground: bool) -> Option<Arc<AppState>> {
+        let fixture = crate::store::spec_fixture()?;
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(fixture, dir.join("s.store")).unwrap();
+        std::fs::write(
+            dir.join("dataset.meta.json"),
+            br#"{"datasetVersion":"fixture","taxonomyVersion":"fixture","embeddingModel":"m","dims":1024,
+                 "quantization":"int8","storeFile":"s.store"}"#,
+        )
+        .unwrap();
+        let ds = crate::dataset::Dataset::load(&dir).expect("franchise fixture dataset");
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        Some(Arc::new(AppState { index: Some(index), playground, ..AppState::for_test(Some(ds)) }))
+    }
+
     /// Off by default: every playground path is a 404, whatever it carries, exactly like an unknown route.
     #[tokio::test]
     async fn the_playground_is_off_unless_enabled() {
@@ -3215,11 +3242,60 @@ mod tests {
         assert!(title["labels"]["subgenres"].as_array().unwrap().iter().any(|s| s == "Heist"), "{title}");
         assert!(title["plotFacets"].is_object(), "{title}");
         assert!(title["makers"].is_array() && title["cast"].is_array(), "{title}");
+        assert!(title.get("franchise").is_none(), "an old store invents no curated franchise");
+
+        let no_franchise = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
+        assert!(no_franchise["franchise"].is_null());
+        assert_eq!(no_franchise["members"], serde_json::json!([]));
+        assert_eq!(no_franchise["total"], 0);
 
         let unknown = json(body_of(get(&state, "/index/title/movie/999999.json").await).await);
         assert_eq!(unknown, serde_json::json!({ "type": "movie", "id": 999999, "indexed": false }));
         assert_eq!(get(&state, "/index/title/anime/1.json").await.status(), 404);
         assert_eq!(get(&state, "/index/title/movie/x.json").await.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn curated_franchise_metadata_members_and_exclusion_share_one_contract() {
+        let Some(state) = franchise_state("den-atlas-curated-franchise", true) else { return };
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let movie = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
+        assert_eq!(movie["franchise"]["id"], "fixture:alpha");
+        assert_eq!(movie["franchise"]["confidence"], 0.85);
+        assert!(movie["franchise"].get("umbrella").is_none());
+        let series = json(body_of(get(&state, "/index/title/series/10.json").await).await);
+        assert_eq!(series["franchise"]["umbrella"]["id"], "fixture:world");
+
+        let movie_row = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
+        let series_row = json(body_of(get(&state, "/index/franchise/series/10.json").await).await);
+        let keys = |row: &serde_json::Value| {
+            row["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| (m["type"].as_str().unwrap().to_owned(), m["id"].as_u64().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&movie_row), [("movie".into(), 1), ("series".into(), 10)]);
+        assert_eq!(keys(&series_row), [("series".into(), 10), ("movie".into(), 1)]);
+        assert_eq!(movie_row["seed"]["era"]["id"], "fixture:alpha:era:film");
+        assert_eq!(series_row["seed"]["era"]["id"], "fixture:alpha:era:tv");
+
+        let similar = json(body_of(get(&state, "/index/similar/movie/1.json?limit=200").await).await);
+        assert!(
+            !similar["mixed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member["type"] == "series" && member["id"] == 10),
+            "the dedicated franchise row, not More Like This, owns the other primary member: {similar}"
+        );
+
+        let inspected = json(
+            body_of(get(&state, "/playground/rows.json?seeds=movie:1&inspect=series:10&limit=5").await).await,
+        );
+        let reasons = inspected["rows"][0]["inspection"]["reasons"].as_array().unwrap();
+        assert!(reasons.iter().any(|reason| reason["code"] == "primary_franchise"), "{inspected}");
     }
 
     /// The titles carrying a selection: the very cards `/index/row` draws, paged, with the page in the

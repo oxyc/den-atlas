@@ -506,7 +506,9 @@ fn routes() -> Value {
             "method": "GET",
             "path": "/index/similar/{type}/{tmdbId}.json",
             "example": "/index/similar/movie/1.json",
-            "about": "More Like This for one title, best first.",
+            "about": "More Like This for one title, best first. Members of its curated primary franchise are \
+                      reserved for /index/franchise and excluded; a display-only umbrella never excludes. The \
+                      raw Wikidata P179 series lift is off by default.",
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
                 with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
@@ -520,6 +522,21 @@ fn routes() -> Value {
                 "total": format!("the length of the ranked list, at most {}", den_index::MAX_ROW),
                 "mixedTotal": format!("the length of the mixed list, at most {}", den_index::MAX_ROW),
             },
+        },
+        {
+            "method": "GET",
+            "path": "/index/franchise/{type}/{tmdbId}.json",
+            "example": "/index/franchise/movie/1.json",
+            "about": "The title's curated primary franchise as one mixed movie/series row: the seed's era first, \
+                      then other eras in stable order, release-ordered within each era. Separate from the raw \
+                      Wikidata franchise filter. Empty for an old store or a title without a curated primary.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+            ],
+            "returns": "{franchise:{id,name,confidence,source}|null, seed:{type,id,era?}, members:[card plus \
+                        era:{id,name,order} and franchiseOrder], total}",
+            "counts": { "total": "curated primary-franchise members across movies and series" },
         },
         {
             "method": "GET",
@@ -582,7 +599,8 @@ fn routes() -> Value {
                         at the display floor, plotFacets {axis: value} at the same floor, and from the facts \
                         countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
                         (cast at most 60, castTotal all of them), and awards [{id: ceremony Q-id, name, won}] \
-                        when it has any",
+                        when it has any, and franchise {id, name, confidence, source, era:{id,name,order}, \
+                        umbrella?:{id,name}} when it has a curated primary membership",
         },
         {
             "method": "GET",

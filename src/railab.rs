@@ -22,10 +22,7 @@
 //! actually does, through the same code.
 
 use crate::queries::Indexes;
-use den_index::{
-    more_like_this, more_like_this_scored, Authorship, Facets, Index, MediaType, SeedAuthorship, SeedFacets,
-    SimilarParams,
-};
+use den_index::{more_like_this, Authorship, Index, MediaType, SeedAuthorship, SimilarParams};
 use std::collections::HashMap;
 
 /// Anchors chosen to cover the reported defects and the cases the rail already gets right, so a change
@@ -130,20 +127,8 @@ fn title(index: &Index, id: u32, media: MediaType) -> String {
 /// than no print at all. The seed's own type only: the shipped scorer it is compared with never mixes.
 /// Ranked with `params`, production's unless `RAIL_KNOBS` moves them.
 fn pooled(indexes: &Indexes, params: &SimilarParams, id: u32, media: MediaType) -> Option<Vec<u32>> {
-    let view = indexes.store.view();
-    let facets = SeedFacets::new(&view, &indexes.store.aggregates, media).ok()?;
-    let authorship = SeedAuthorship::of(&view, media, id).ok()?;
-    let row = more_like_this_scored(
-        Some(&indexes.plot),
-        indexes.premise.as_ref(),
-        id,
-        media,
-        Some(&authorship as &dyn Authorship),
-        Some(&facets as &dyn Facets),
-        params,
-    )
-    .into_iter()
-    .map(|s| s.key());
+    indexes.plot.labels(id, media)?;
+    let row = indexes.more_like_this_scored(id, media, params).into_iter().map(|s| s.key());
     Some(row.into_iter().filter(|&(kind, _)| kind == media).map(|(_, id)| id).collect())
 }
 
