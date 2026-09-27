@@ -3,6 +3,7 @@
 
 mod awards;
 mod billboardcheck;
+mod billboardeval;
 mod billing;
 mod cache;
 mod catalog;
@@ -263,7 +264,10 @@ async fn main() {
             std::process::exit(raileval::run(std::path::Path::new(path)).await);
         }
         if command == "billboard-check" {
-            std::process::exit(billboardcheck::run(std::path::Path::new(path)).await);
+            std::process::exit(billboardcheck::run(std::path::Path::new(path), false).await);
+        }
+        if command == "billboard-eval" {
+            std::process::exit(billboardcheck::run(std::path::Path::new(path), true).await);
         }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format

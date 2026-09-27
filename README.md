@@ -367,6 +367,15 @@ and Netflix's US Top 10 don't reach a channel. `surface` still filters the types
 and scoring are unchanged. A `service` whose id the install doesn't carry reads no lists and ranks the
 client's `candidates` alone. The response is the same shape.
 
+The invented households in `fixtures/billboard/` can be replayed as one deterministic evaluation surface:
+`CACHE_DIR=<cache> den-atlas billboard-eval <dataset>`. It prints the existing slate-shape checks and, beside
+them, hand-judged nDCG@10, bad@10, judged coverage (with the number of displayed titles as its denominator),
+and holdout recall@40 (with the number of held-out positives as its denominator). `judged/billboard.json` is
+the versioned, validated judgement file. It intentionally contains no relevance labels until a human supplies
+them; an empty case prints relevance as unavailable rather than as zero. Set
+`BILLBOARD_EVAL_UNJUDGED=<file>` to export the current candidates in their original rank order for later human
+labelling. `BILLBOARD_JUDGED=<file>` selects a different judgement file. Neither command calls a model.
+
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
 `atlas_dataset_titles`, and the two catalog signals behind `/health` — `atlas_catalog_fresh` and
