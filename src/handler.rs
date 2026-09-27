@@ -1029,7 +1029,7 @@ fn query_text(query: &str, key: &str) -> String {
 /// again rather than remembered.
 async fn embed_query(state: &AppState, text: &str) -> Result<Vec<i8>, String> {
     let key = state.dataset.as_ref().map(|ds| {
-        (crate::cache::EmbedMemo::key(&ds.meta.embedding_model, ds.meta.dims, text), ds.meta.dims as usize)
+        (crate::cache::EmbedMemo::key(&ds.meta.semantic_query_space(), text), ds.meta.dims as usize)
     });
     if let Some(vector) = key.as_ref().and_then(|(key, _)| state.embed_memo.get(key)) {
         return Ok(vector);
@@ -1097,8 +1097,11 @@ async fn search_answer(
     }
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
     let vector = embed_query(state, &text).await?;
-    let (neighbours, stats) =
-        indexes.plot.scan_vector(&vector, |_, kind| media_type.is_none_or(|want| want == kind), SEMANTIC_K);
+    let (neighbours, stats) = indexes.plot.scan_semantic_vector(
+        &vector,
+        |_, kind| media_type.is_none_or(|want| want == kind),
+        SEMANTIC_K,
+    );
     let titles: Vec<serde_json::Value> = neighbours
         .iter()
         .map(|n| serde_json::json!({ "type": stremio_type(n.media_type), "id": n.tmdb_id, "score": n.score }))

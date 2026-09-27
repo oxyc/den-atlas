@@ -280,6 +280,10 @@ pub struct Index {
     /// The length direction to remove for `without_length`: the plot index's, when its dimension fits;
     /// `None` for the premise index, which is another space.
     length_direction: Option<Box<[f32]>>,
+    /// A dataset-side transform already removed this direction from every stored plot row. Raw semantic
+    /// query vectors must lose it too; title-to-title scans do not, because both rows are already transformed.
+    /// Premise indexes never carry it.
+    semantic_query_direction: Option<Box<[f32]>>,
     without_length: OnceLock<Box<Index>>,
 }
 
@@ -335,6 +339,26 @@ impl Index {
         bytes: Arc<dyn StoreBytes>,
     ) -> Result<Index, LoadError> {
         Index::from_store_space(store, bytes, Space::Plot)
+    }
+
+    /// A plot matrix whose producer already removed `direction` before quantisation. Unlike the legacy
+    /// runtime knob this keeps no second corpus-wide matrix: only raw outside query vectors are projected.
+    pub fn from_store_plot_transformed(
+        store: &den_store::Store<'_>,
+        bytes: Arc<dyn StoreBytes>,
+        direction: &[f32],
+    ) -> Result<Index, LoadError> {
+        let mut index = Index::from_store_space(store, bytes, Space::Plot)?;
+        if direction.len() != index.dim {
+            return Err(LoadError::Vectors(format!(
+                "plot transform direction has {} dimensions, vectors have {}",
+                direction.len(),
+                index.dim
+            )));
+        }
+        index.length_direction = None;
+        index.semantic_query_direction = Some(direction.into());
+        Ok(index)
     }
 
     /// The premise index, out of the store: `labels-premise.json` + `vectors-premise.bin`, which cover the
@@ -484,6 +508,11 @@ impl Index {
         self.length_direction.is_some()
     }
 
+    /// Whether stored plot rows are already length-projected by the dataset producer.
+    pub fn has_dataset_length_transform(&self) -> bool {
+        self.semantic_query_direction.is_some()
+    }
+
     /// This index with the plot-length direction (`PLOT_LENGTH_DIRECTION`) projected out of every vector:
     /// each row is read as a unit vector, loses its component along the direction, and is re-normalised and
     /// requantised to int8, so every scorer below reads it exactly as it reads the original. A seed is a row
@@ -513,6 +542,15 @@ impl Index {
         self
     }
 
+    /// A fixture whose rows are already projected, with raw outside queries still needing the operation.
+    #[cfg(test)]
+    pub(crate) fn with_dataset_length_transform(mut self, direction: &[f32]) -> Index {
+        assert_eq!(direction.len(), self.dim);
+        self.length_direction = None;
+        self.semantic_query_direction = Some(direction.into());
+        self
+    }
+
     /// The copy's vectors are its own — built here, in atlas's process — while its records, names and label
     /// buckets are this index's, shared rather than cloned.
     fn with_direction_removed(&self, direction: &[f32]) -> Index {
@@ -521,21 +559,14 @@ impl Index {
         vectors.extend_from_slice(&(self.records.len() as i32).to_le_bytes());
         vectors.extend_from_slice(&(self.dim as i32).to_le_bytes());
         let matrix = self.matrix();
-        let mut unit = vec![0.0f64; self.dim];
+        let mut unit = Vec::with_capacity(self.dim);
         for row in 0..self.records.len() {
-            for (x, &v) in unit.iter_mut().zip(matrix.row(row)) {
-                *x = f64::from(v as i8);
-            }
-            let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if norm > 0.0 {
-                unit.iter_mut().for_each(|x| *x /= norm);
-                let along: f64 = unit.iter().zip(direction).map(|(x, &d)| x * f64::from(d)).sum();
-                unit.iter_mut().zip(direction).for_each(|(x, &d)| *x -= along * f64::from(d));
-            }
-            // A row that WAS the direction has nothing left; it stays the zero vector it now is.
-            let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let scale = if norm > 0.0 { QUANTUM / norm } else { 0.0 };
-            vectors.extend(unit.iter().map(|x| (x * scale).round().clamp(-QUANTUM, QUANTUM) as i8 as u8));
+            project_and_quantize(
+                matrix.row(row).iter().map(|&byte| byte as i8),
+                direction,
+                &mut unit,
+                &mut vectors,
+            );
         }
         Index {
             taxonomy_version: self.taxonomy_version.clone(),
@@ -547,6 +578,7 @@ impl Index {
             subgenres: Arc::clone(&self.subgenres),
             moods: Arc::clone(&self.moods),
             length_direction: None,
+            semantic_query_direction: None,
             without_length: OnceLock::new(),
         }
     }
@@ -735,12 +767,10 @@ impl Index {
 
     /// The `k` titles nearest to an outside vector — one embedded by the same model and quantiser as this
     /// index (semantic search, or a synopsis standing in for an unindexed title). Empty on a dimension
-    /// mismatch: that's another vector space.
+    /// mismatch: that's another vector space. A producer-transformed plot index projects this raw outside
+    /// vector first; a premise or legacy plot index leaves it alone.
     pub fn nearest_to_vector(&self, query: &[i8], media_type: Option<MediaType>, k: usize) -> Vec<Neighbor> {
-        if query.len() != self.dim {
-            return Vec::new();
-        }
-        let query: Vec<u8> = query.iter().map(|&v| v as u8).collect();
+        let Some(query) = self.semantic_query_bytes(query) else { return Vec::new() };
         self.top_k(
             k,
             |row| {
@@ -981,6 +1011,45 @@ impl Index {
         (self.best(scored, k), stats)
     }
 
+    /// Scan an outside raw semantic vector. A dataset-transformed plot index applies its declared
+    /// projection; legacy plot indexes and every premise index are byte-for-byte the ordinary scan.
+    pub fn scan_semantic_vector(
+        &self,
+        query: &[i8],
+        include: impl Fn(u32, MediaType) -> bool,
+        k: usize,
+    ) -> (Vec<Neighbor>, ScanStats) {
+        let Some(direction) = &self.semantic_query_direction else {
+            return self.scan_vector(query, include, k);
+        };
+        let Some(projected) = self.semantic_query_bytes(query) else {
+            return (Vec::new(), ScanStats::default());
+        };
+        debug_assert!(direction.len() == self.dim);
+        let scored = self.scores(
+            |row| {
+                let record = &self.records[row];
+                record.media_type.is_some_and(|kind| include(record.tmdb_id, kind))
+            },
+            &projected,
+        );
+        let stats = ScanStats::of(&scored);
+        (self.best(scored, k), stats)
+    }
+
+    fn semantic_query_bytes(&self, query: &[i8]) -> Option<Vec<u8>> {
+        if query.len() != self.dim {
+            return None;
+        }
+        let Some(direction) = &self.semantic_query_direction else {
+            return Some(query.iter().map(|&byte| byte as u8).collect());
+        };
+        let mut unit = Vec::with_capacity(self.dim);
+        let mut projected = Vec::with_capacity(self.dim);
+        project_and_quantize(query.iter().copied(), direction, &mut unit, &mut projected);
+        Some(projected)
+    }
+
     fn top_k(&self, k: usize, include: impl Fn(usize) -> bool, query: &[u8]) -> Vec<Neighbor> {
         self.best(self.scores(include, query), k)
     }
@@ -1110,8 +1179,32 @@ fn assemble(
         subgenres: Arc::new(subgenres),
         moods: Arc::new(moods),
         length_direction: None,
+        semantic_query_direction: None,
         without_length: OnceLock::new(),
     }
+}
+
+/// Remove one unit direction from a quantised unit vector, normalise what remains, and quantise it again.
+/// Used for the legacy corpus copy and for a raw semantic query entering a producer-transformed plot space.
+fn project_and_quantize(
+    values: impl Iterator<Item = i8>,
+    direction: &[f32],
+    unit: &mut Vec<f64>,
+    output: &mut Vec<u8>,
+) {
+    unit.clear();
+    unit.extend(values.map(f64::from));
+    debug_assert_eq!(unit.len(), direction.len());
+    let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        unit.iter_mut().for_each(|x| *x /= norm);
+        let along: f64 = unit.iter().zip(direction).map(|(x, &d)| x * f64::from(d)).sum();
+        unit.iter_mut().zip(direction).for_each(|(x, &d)| *x -= along * f64::from(d));
+    }
+    // A vector that WAS the direction has nothing left; it stays the zero vector it now is.
+    let norm = unit.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let scale = if norm > 0.0 { QUANTUM / norm } else { 0.0 };
+    output.extend(unit.iter().map(|x| (x * scale).round().clamp(-QUANTUM, QUANTUM) as i8 as u8));
 }
 
 /// The label → titles buckets for one label family. A record joins each label once, with the confidence of
@@ -1254,6 +1347,37 @@ pub(crate) mod tests {
             (Vec::new(), ScanStats::default()),
             "another space"
         );
+    }
+
+    /// Producer-transformed plot rows stay mmap-backed: only a raw outside query is projected. The same
+    /// raw vector entering premise space is untouched, and asking for the legacy knob creates no copy.
+    #[test]
+    fn a_dataset_transform_projects_semantic_queries_without_copying_the_matrix() {
+        let rows: &[Row<'_>] = &[
+            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
+            (2, "movie", "Drama", false, &[], &[], [0, 100, 0]),
+        ];
+        let plot = fixture(rows).with_dataset_length_transform(&[0.0, 0.0, 1.0]);
+        let premise = fixture(rows);
+        let query = [60, 0, 80];
+
+        let (raw_plot, _) = plot.scan_vector(&query, |_, _| true, 2);
+        let (semantic_plot, _) = plot.scan_semantic_vector(&query, |_, _| true, 2);
+        let (semantic_premise, _) = premise.scan_semantic_vector(&query, |_, _| true, 2);
+        assert_eq!(raw_plot[0].score, 6_000, "the low-level scan is still byte-for-byte raw");
+        assert_eq!(
+            semantic_plot[0].score, 12_700,
+            "the plot query lost its length component and renormalised"
+        );
+        assert_eq!(semantic_premise[0].score, 6_000, "premise is the raw embedding space");
+        assert_eq!(
+            plot.nearest_to_vector(&query, None, 1)[0].score,
+            12_700,
+            "the other semantic API drifted"
+        );
+        assert!(plot.has_dataset_length_transform());
+        assert!(std::ptr::eq(plot.without_length(), &plot), "already-transformed rows were copied");
+        assert!(plot.without_length.get().is_none());
     }
 
     #[test]

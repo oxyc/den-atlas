@@ -14,7 +14,9 @@
 //! fetches them and are gone: no field describes them and no route streams them (#113).
 
 use crate::store::MappedStore;
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +34,17 @@ pub struct Meta {
     pub embedding_model: String,
     pub dims: u32,
     pub quantization: String,
+    /// The raw embedder space named by the producer's canary. Old manifests predate this field; a
+    /// transformed plot matrix may not, because its transform explicitly names the raw space it accepts.
+    #[serde(rename = "embeddingSpace", default)]
+    pub embedding_space: Option<String>,
+    /// Plot rows already have the measured length direction removed. The decoded direction is kept so raw
+    /// den-embed query vectors can undergo the same operation before scanning the plot matrix. Premise rows
+    /// remain in `embeddingSpace` and never read this.
+    #[serde(rename = "plotVectorTransform", default)]
+    pub plot_vector_transform: Option<PlotVectorTransform>,
+    #[serde(rename = "plotVectorTransformSha256", default)]
+    pub plot_vector_transform_sha256: Option<String>,
     /// FP-3 — the producer's Ed25519 signature over the canonical descriptor payload ("ed25519:<base64>").
     /// Passed through verbatim to `/dataset.json`; den-atlas neither creates nor validates it. Signing
     /// happens where the dataset is published (`den/scripts/sign-dataset.swift`) and verification happens in
@@ -60,6 +73,131 @@ pub struct Meta {
     /// are not signed and not collected.
     #[serde(skip)]
     pub sha256: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PlotVectorTransform {
+    pub schema: u32,
+    pub algorithm: String,
+    pub dims: u32,
+    #[serde(rename = "inputEmbeddingSpace")]
+    pub input_embedding_space: String,
+    #[serde(rename = "directionEncoding")]
+    pub direction_encoding: String,
+    #[serde(rename = "directionBase64")]
+    direction_base64: String,
+    #[serde(rename = "directionSha256")]
+    pub direction_sha256: String,
+    #[serde(rename = "fitMethod")]
+    pub fit_method: String,
+    #[serde(rename = "fitArtifactSha256")]
+    pub fit_artifact_sha256: String,
+    /// Decoded only after every manifest checksum and shape check passes.
+    #[serde(skip)]
+    pub direction: Box<[f32]>,
+}
+
+impl Meta {
+    /// Identity for anything memoising a semantic query. `embeddingSpace` names the raw result from
+    /// den-embed; the suffix names the plot-space operation Atlas applies before one of the two scans.
+    /// Keeping it in the key prevents a hot process from reusing a vector under a changed transform.
+    pub fn semantic_query_space(&self) -> String {
+        let raw = self
+            .embedding_space
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}:{}", self.embedding_model, self.dims, self.quantization));
+        self.plot_vector_transform_sha256
+            .as_ref()
+            .map_or(raw.clone(), |digest| format!("{raw}:plot-transform:{digest}"))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn validate_sha256(name: &str, digest: &str) -> Result<(), String> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(format!("{name} must be 64 lowercase hexadecimal characters"));
+    }
+    Ok(())
+}
+
+fn parse_plot_vector_transform(value: &serde_json::Value, meta: &mut Meta) -> Result<(), String> {
+    let object = value.get("plotVectorTransform");
+    let digest = value.get("plotVectorTransformSha256");
+    match (object, digest) {
+        (None, None) => return Ok(()),
+        (None, Some(_)) | (Some(_), None) => {
+            return Err("plotVectorTransform and plotVectorTransformSha256 must appear together".into());
+        }
+        (Some(_), Some(_)) => {}
+    }
+    let object = object.expect("matched above");
+    if !object.is_object() {
+        return Err("plotVectorTransform must be an object".into());
+    }
+    let digest =
+        digest.and_then(serde_json::Value::as_str).ok_or("plotVectorTransformSha256 must be a string")?;
+    validate_sha256("plotVectorTransformSha256", digest)?;
+    let canonical =
+        serde_json::to_vec(object).map_err(|e| format!("canonicalise plotVectorTransform: {e}"))?;
+    if sha256_hex(&canonical) != digest {
+        return Err("plotVectorTransformSha256 does not match the canonical transform object".into());
+    }
+
+    let transform =
+        meta.plot_vector_transform.as_mut().ok_or("plotVectorTransform did not parse as an object")?;
+    if transform.schema != 1 {
+        return Err(format!("unsupported plotVectorTransform schema {}", transform.schema));
+    }
+    if transform.algorithm != "unit-orthogonal-projection-v1" {
+        return Err(format!("unsupported plotVectorTransform algorithm {:?}", transform.algorithm));
+    }
+    if transform.direction_encoding != "base64-f32-le" {
+        return Err(format!(
+            "unsupported plotVectorTransform directionEncoding {:?}",
+            transform.direction_encoding
+        ));
+    }
+    if transform.fit_method != "ols-unit-int8-on-ln-english-plot-chars-v1" {
+        return Err(format!("unsupported plotVectorTransform fitMethod {:?}", transform.fit_method));
+    }
+    if transform.dims != meta.dims {
+        return Err(format!(
+            "plotVectorTransform dims {} do not match manifest dims {}",
+            transform.dims, meta.dims
+        ));
+    }
+    let embedding_space =
+        meta.embedding_space.as_deref().ok_or("plotVectorTransform requires manifest embeddingSpace")?;
+    if transform.input_embedding_space != embedding_space {
+        return Err("plotVectorTransform inputEmbeddingSpace does not match manifest embeddingSpace".into());
+    }
+    validate_sha256("plotVectorTransform directionSha256", &transform.direction_sha256)?;
+    validate_sha256("plotVectorTransform fitArtifactSha256", &transform.fit_artifact_sha256)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&transform.direction_base64)
+        .map_err(|e| format!("plotVectorTransform directionBase64 is invalid: {e}"))?;
+    let expected = transform.dims as usize * std::mem::size_of::<f32>();
+    if bytes.len() != expected {
+        return Err(format!("plotVectorTransform direction is {} bytes, expected {expected}", bytes.len()));
+    }
+    if sha256_hex(&bytes) != transform.direction_sha256 {
+        return Err("plotVectorTransform directionSha256 does not match directionBase64".into());
+    }
+    let direction: Box<[f32]> =
+        bytes.as_chunks::<4>().0.iter().map(|&chunk| f32::from_le_bytes(chunk)).collect();
+    if direction.iter().any(|value| !value.is_finite()) {
+        return Err("plotVectorTransform direction contains a non-finite value".into());
+    }
+    let norm = direction.iter().map(|&value| f64::from(value).powi(2)).sum::<f64>().sqrt();
+    if (norm - 1.0).abs() > 1e-3 {
+        return Err(format!("plotVectorTransform direction is not unit length (norm {norm})"));
+    }
+    transform.direction = direction;
+    Ok(())
 }
 
 /// The top-level `…Sha256` string fields of a parsed `dataset.meta.json`, in key byte order.
@@ -108,8 +246,9 @@ impl Dataset {
             serde_json::from_slice(&raw).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
         let sha256 = top_level_sha256(&value);
         let mut meta: Meta =
-            serde_json::from_value(value).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
+            serde_json::from_value(value.clone()).map_err(|e| format!("parse dataset.meta.json: {e}"))?;
         meta.sha256 = sha256;
+        parse_plot_vector_transform(&value, &mut meta)?;
 
         // Verified here, once for the process, so the row count below is the store's OWN — the one number
         // about this dataset that has been checked against the bytes rather than claimed by the manifest —
@@ -151,6 +290,30 @@ fn safe_blob_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transform_object() -> serde_json::Value {
+        let direction: Vec<u8> = [1.0f32, 0.0].into_iter().flat_map(f32::to_le_bytes).collect();
+        serde_json::json!({
+            "schema": 1,
+            "algorithm": "unit-orthogonal-projection-v1",
+            "dims": 2,
+            "inputEmbeddingSpace": "canary-v1:raw",
+            "directionEncoding": "base64-f32-le",
+            "directionBase64": base64::engine::general_purpose::STANDARD.encode(&direction),
+            "directionSha256": sha256_hex(&direction),
+            "fitMethod": "ols-unit-int8-on-ln-english-plot-chars-v1",
+            "fitArtifactSha256": "11".repeat(32),
+        })
+    }
+
+    fn transformed_manifest(transform: serde_json::Value) -> serde_json::Value {
+        let digest = sha256_hex(&serde_json::to_vec(&transform).unwrap());
+        serde_json::json!({
+            "datasetVersion": "v9", "taxonomyVersion": "t", "embeddingModel": "m", "dims": 2,
+            "quantization": "int8", "embeddingSpace": "canary-v1:raw", "storeFile": "s.store",
+            "plotVectorTransform": transform, "plotVectorTransformSha256": digest,
+        })
+    }
 
     /// A one-title store in `dir`, named as the manifests below declare it. Every `Dataset::load` test
     /// that is meant to succeed needs one, because the store is the only artifact a dataset has.
@@ -239,6 +402,71 @@ mod tests {
         .unwrap();
         assert_eq!(Dataset::load(&root).expect("an old manifest must still load").store_rows, 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plot_transform_is_verified_and_becomes_part_of_semantic_space_identity() {
+        let root = std::env::temp_dir().join(format!("den-atlas-transform-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        store_in(&root);
+        let manifest = transformed_manifest(transform_object());
+        assert_eq!(
+            manifest["plotVectorTransformSha256"],
+            "4cfbf2bf1ab60d49d19cd09b69751568d4cb0846b9cf2a6a4a85bc1cb784bb99",
+            "must equal Python json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=False)"
+        );
+        std::fs::write(root.join("dataset.meta.json"), manifest.to_string()).unwrap();
+
+        let dataset = Dataset::load(&root).expect("a complete signed transform must load");
+        let transform = dataset.meta.plot_vector_transform.as_ref().expect("the transform is retained");
+        assert_eq!(&*transform.direction, &[1.0, 0.0]);
+        let digest = manifest["plotVectorTransformSha256"].as_str().unwrap();
+        assert_eq!(dataset.meta.semantic_query_space(), format!("canary-v1:raw:plot-transform:{digest}"));
+        assert_eq!(dataset.meta.sha256.get("plotVectorTransformSha256").map(String::as_str), Some(digest));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_or_misbinding_plot_transforms_are_refused() {
+        let root = std::env::temp_dir().join(format!("den-atlas-transform-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        store_in(&root);
+        let mut cases = Vec::new();
+
+        let mut wrong_object_digest = transformed_manifest(transform_object());
+        wrong_object_digest["plotVectorTransformSha256"] = serde_json::Value::String("00".repeat(32));
+        cases.push((wrong_object_digest, "canonical transform object"));
+
+        let mut wrong_algorithm = transform_object();
+        wrong_algorithm["algorithm"] = serde_json::Value::String("something-else".into());
+        cases.push((transformed_manifest(wrong_algorithm), "unsupported plotVectorTransform algorithm"));
+
+        let mut wrong_space = transform_object();
+        wrong_space["inputEmbeddingSpace"] = serde_json::Value::String("another-space".into());
+        cases.push((transformed_manifest(wrong_space), "inputEmbeddingSpace"));
+
+        let mut wrong_direction = transform_object();
+        wrong_direction["directionBase64"] = serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD
+                .encode([0.0f32, 1.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()),
+        );
+        cases.push((transformed_manifest(wrong_direction), "directionSha256"));
+
+        let mut missing_space = transformed_manifest(transform_object());
+        missing_space.as_object_mut().unwrap().remove("embeddingSpace");
+        cases.push((missing_space, "requires manifest embeddingSpace"));
+
+        for (manifest, reason) in cases {
+            std::fs::write(root.join("dataset.meta.json"), manifest.to_string()).unwrap();
+            let error = match Dataset::load(&root) {
+                Err(error) => error,
+                Ok(_) => panic!("bad transform loaded; expected {reason}"),
+            };
+            assert!(error.contains(reason), "{error:?} did not name {reason:?}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// ...and the store is the one blob whose absence IS fatal, because nothing else is read. A dataset

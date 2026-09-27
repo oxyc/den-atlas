@@ -198,9 +198,11 @@ impl EmbedMemo {
         Self { ttl, max_entries, map: Mutex::default() }
     }
 
-    /// The memo key for `text` in the space of `model` at `dims`.
-    pub fn key(model: &str, dims: u32, text: &str) -> String {
-        format!("{model}\u{0}{dims}\u{0}{text}")
+    /// The memo key for `text` in a complete semantic-query space identity. That identity includes a
+    /// dataset-declared plot transform: the raw den-embed bytes may be equal, but the plot scan derived from
+    /// them is not, and a cache entry must never silently straddle those contracts.
+    pub fn key(space: &str, text: &str) -> String {
+        format!("{space}\u{0}{text}")
     }
 
     /// A kept vector still inside its TTL; an expired one is dropped here.
@@ -317,18 +319,19 @@ mod tests {
         assert_eq!(memo.len(), 0, "an expired vector was kept");
     }
 
-    /// One text in two embedding spaces is two keys, so a vector never reaches a corpus of another model.
+    /// One text in two full semantic spaces is two keys. A plot transform is part of that identity even
+    /// though both spaces obtain the same raw bytes from den-embed.
     #[test]
-    fn the_embed_memo_key_names_the_model_and_width() {
+    fn the_embed_memo_key_names_the_transform_as_well_as_the_raw_space() {
         let text = "korean heist";
         let keys = [
-            EmbedMemo::key("bge-m3", 1024, text),
-            EmbedMemo::key("bge-m3", 512, text),
-            EmbedMemo::key("other", 1024, text),
+            EmbedMemo::key("canary-v1:raw", text),
+            EmbedMemo::key("canary-v1:raw:plot-transform:aaa", text),
+            EmbedMemo::key("canary-v1:raw:plot-transform:bbb", text),
         ];
         assert_ne!(keys[0], keys[1]);
-        assert_ne!(keys[0], keys[2]);
-        assert_eq!(keys[0], EmbedMemo::key("bge-m3", 1024, text));
+        assert_ne!(keys[1], keys[2]);
+        assert_eq!(keys[0], EmbedMemo::key("canary-v1:raw", text));
     }
 
     #[test]
