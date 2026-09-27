@@ -504,6 +504,25 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/index/suggest/{type}/{tmdbId}.json",
+            "example": "/index/suggest/movie/1.json",
+            "about": "You Might Also Like for one title, films and series together, as cards: the row POST \
+                      /index/suggest.json answers as a seed's mixed, paged.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+                with(param("skip", "integer", "titles to skip"), json!({ "default": 0 })),
+                with(param("limit", "integer", "titles in the page"),
+                     json!({ "default": SIMILAR_PAGE, "max": den_index::MAX_ROW })),
+            ],
+            "returns": "{mixed:[{type,id}], titles:[card], total}: titles the page's cards in mixed's order, \
+                        leaving out a title the corpus has no card for",
+            "counts": {
+                "total": format!("the length of the row, at most {}", den_index::MAX_ROW),
+            },
+        },
+        {
+            "method": "GET",
             "path": "/index/similar/{type}/{tmdbId}.json",
             "example": "/index/similar/movie/1.json",
             "about": "More Like This for one title, best first. Members of its curated primary franchise are \

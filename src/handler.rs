@@ -751,6 +751,11 @@ enum IndexQuestion {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     },
+    /// One seed's You Might Also Like, paged and as cards (`suggest_json`).
+    Suggest {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
     Neighbours {
         media_type: den_index::MediaType,
         tmdb_id: u32,
@@ -812,6 +817,9 @@ impl IndexQuestion {
             }
             ["neighbours", type_, id] => {
                 Some(Self::Neighbours { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["suggest", type_, id] => {
+                Some(Self::Suggest { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["studios"] => Some(Self::Studios),
             ["awards"] => Some(Self::Awards),
@@ -893,6 +901,7 @@ impl IndexQuestion {
                 })
             }
             Self::Similar { media_type, tmdb_id } => similar_json(indexes, *media_type, *tmdb_id, query),
+            Self::Suggest { media_type, tmdb_id } => suggest_json(indexes, *media_type, *tmdb_id, query),
             // A title the corpus has no card for is answered, not refused: `indexed: false` says Den has nothing
             // on it, which is not the same as it not existing.
             Self::Title { media_type, tmdb_id } => {
@@ -988,6 +997,41 @@ pub(crate) fn similar_json(
         "total": row.len(),
         "mixed": titles_json(&mixed_page),
         "mixedTotal": mixed.len(),
+    })
+}
+
+/// `/index/suggest/<type>/<id>.json`: one seed's You Might Also Like with films and series mixed — the row
+/// `POST /index/suggest.json` answers as a seed's `mixed` — paged like `/index/similar`, and each title as the
+/// card a client draws. A GET, so a title page's row is cached like every other index answer, and cards, so
+/// the row needs no metadata request per title. `mixed` names every title of the page; `titles` holds the
+/// cards of those the corpus has one for, in the same order.
+pub(crate) fn suggest_json(
+    indexes: &crate::queries::Indexes,
+    media_type: den_index::MediaType,
+    tmdb_id: u32,
+    query: &str,
+) -> serde_json::Value {
+    let row = indexes.you_might_also_like(tmdb_id, media_type, true);
+    let seed = (media_type, tmdb_id);
+    let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit = query_param(query, "limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SIMILAR_PAGE)
+        .min(den_index::MAX_ROW);
+    let page: Vec<(den_index::MediaType, u32)> =
+        row.iter().copied().filter(|&key| key != seed).skip(skip).take(limit).collect();
+    let titles: Vec<serde_json::Value> = page
+        .iter()
+        .filter_map(|&key| {
+            let card = indexes.cards.as_ref()?.get(&key)?;
+            Some(crate::plotrows::title_json(indexes, key, card))
+        })
+        .collect();
+    let refs: Vec<(u32, den_index::MediaType)> = page.iter().map(|&(media, id)| (id, media)).collect();
+    serde_json::json!({
+        "mixed": titles_json(&refs),
+        "titles": titles,
+        "total": row.iter().filter(|&&key| key != seed).count(),
     })
 }
 
@@ -3847,6 +3891,28 @@ mod tests {
         );
         assert!(!mixed.iter().any(|t| t["type"] == "movie" && t["id"] == 2), "{mixed:?}");
         assert_eq!(suggest["pooledMixed"][0], serde_json::json!({"type": "series", "id": 4}));
+
+        // The same seed's mixed row by GET, paged, with each title as a card in the row's order.
+        let whole = json(
+            body_of(post(&state, "/index/suggest.json", r#"{"seeds":[{"type":"movie","id":1}]}"#).await)
+                .await,
+        );
+        let whole = whole["perSeed"][0]["mixed"].as_array().unwrap().clone();
+        let resp = get(&state, "/index/suggest/movie/1.json?limit=200").await;
+        assert_eq!(resp.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        let got = json(body_of(resp).await);
+        assert_eq!(got["mixed"].as_array().unwrap(), &whole);
+        assert_eq!(got["total"], whole.len());
+        let cards = got["titles"].as_array().unwrap();
+        assert!(!cards.is_empty(), "{got}");
+        let carded: Vec<_> = whole.iter().filter(|t| cards.iter().any(|c| c["id"] == t["id"])).collect();
+        for (card, title) in cards.iter().zip(carded) {
+            assert_eq!((&card["type"], &card["id"]), (&title["type"], &title["id"]));
+            assert!(card["title"].is_string(), "{card}");
+        }
+        let second = json(body_of(get(&state, "/index/suggest/movie/1.json?skip=1&limit=1").await).await);
+        assert_eq!(second["mixed"].as_array().unwrap(), &whole[1..2]);
+        assert_eq!(get(&state, "/index/suggest/film/1.json").await.status(), 404);
 
         assert_eq!(post(&state, "/index/labels.json", "not json").await.status(), 400);
         assert_eq!(post(&state, "/index/score.json", r#"{"space":"x","candidates":[]}"#).await.status(), 400);
