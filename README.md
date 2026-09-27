@@ -376,6 +376,16 @@ them; an empty case prints relevance as unavailable rather than as zero. Set
 `BILLBOARD_EVAL_UNJUDGED=<file>` to export the current candidates in their original rank order for later human
 labelling. `BILLBOARD_JUDGED=<file>` selects a different judgement file. Neither command calls a model.
 
+The curated-franchise corpus has its own stronger, no-network acceptance command:
+`den-atlas franchise-check <dataset>`. It is intentionally separate from the general `check`, because an old
+store without the optional sections is still a valid backward-compatible store. `franchise-check` reads
+`judged/franchise.json` and refuses the generation unless the exact 46-title Beck group, the Wallander and
+Van Veeteren controls, Bond, Spider-Man and Star Wars group correctly; the named adaptation/catalogue controls
+stay apart; each row leads with the seed era and retains release order; and More Like This contains none of
+the seed's actual primary-franchise members. Run it on the staged post-rebuild store before deployment. The
+ordinary `rail-eval` also removes those reserved members from its judged ideals: a sequel owned by the dedicated
+franchise row is no longer counted as a recommendation the More Like This ranker failed to return.
+
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
 `atlas_dataset_titles`, and the two catalog signals behind `/health` — `atlas_catalog_fresh` and
