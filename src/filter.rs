@@ -1362,9 +1362,11 @@ impl FilterIndex {
                     None => break,
                 }
             }
-            entities.push(
-                (postings.len() == entity.sections.len()).then_some(EntityKind { postings, known, qids }),
-            );
+            entities.push((postings.len() == entity.sections.len()).then_some(EntityKind {
+                postings,
+                known,
+                qids,
+            }));
         }
 
         let bitset = |b: &Bits| b.len() * 8;
@@ -1606,7 +1608,8 @@ fn invert_qids(
     words: usize,
 ) -> Option<(Postings, Bits, Vec<u32>)> {
     let list = view.list::<u32>(values, offsets).ok()?;
-    let mut qids: Vec<u32> = (0..rows).flat_map(|row| list.get(den_store::Row(row)).iter().copied()).collect();
+    let mut qids: Vec<u32> =
+        (0..rows).flat_map(|row| list.get(den_store::Row(row)).iter().copied()).collect();
     qids.sort_unstable();
     qids.dedup();
     let mut counts = vec![0u32; qids.len() + 1];
@@ -2303,9 +2306,9 @@ impl<'a> Context<'a> {
             Data::Bits if spec.name == "region" => den_index::region(id).is_some(),
             Data::Bits => self.filter.bits.get(spec.name).is_some_and(|v| v.values.contains_key(id)),
             Data::Rating => self.derived.rating.as_ref().is_some_and(|v| v.values.contains_key(id)),
-            Data::Entity(i) => self.filter.entities[i]
-                .as_ref()
-                .is_some_and(|kind| self.entity_value(i, kind, id).is_some()),
+            Data::Entity(i) => {
+                self.filter.entities[i].as_ref().is_some_and(|kind| self.entity_value(i, kind, id).is_some())
+            }
             Data::Character => {
                 self.characters.as_ref().is_some_and(|c| !c.named().rows(&id.replace('-', " ")).is_empty())
             }
