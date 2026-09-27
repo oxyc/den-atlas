@@ -223,11 +223,12 @@ pub fn tmdb_kinds() -> Vec<&'static str> {
 }
 
 /// An entity kind: the store's entity-list sections it reads, the fewest titles a value needs to be listed,
-/// and whether it exists for series alone. A kind whose sections a store lacks is unavailable; a later one —
-/// director, writer, award, franchise — slots in as a row here once the store carries its section.
+/// and whether it exists for series alone. Most lists hold entity-table indices; `franchise_v` instead holds
+/// raw Q-ids. A kind whose sections a store lacks is not offered.
 struct EntitySpec {
     name: &'static str,
     sections: &'static [(&'static str, &'static str)],
+    raw_qids: bool,
     min_titles: usize,
     series_only: bool,
     /// When not empty, the only values listed and searched (any may still be selected).
@@ -261,6 +262,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "person",
         sections: &[("makers_v", "makers_o"), ("cast_v", "cast_o")],
+        raw_qids: false,
         min_titles: 1,
         series_only: false,
         only: &[],
@@ -269,14 +271,43 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "made",
         sections: &[("makers_v", "makers_o")],
+        raw_qids: false,
         min_titles: 1,
         series_only: false,
         only: &[],
         about: "a director, creator or screenwriter",
     },
     EntitySpec {
+        name: "director",
+        sections: &[("directors_v", "directors_o")],
+        raw_qids: false,
+        min_titles: 1,
+        series_only: false,
+        only: &[],
+        about: "a director credited on the title",
+    },
+    EntitySpec {
+        name: "writer",
+        sections: &[("writers_v", "writers_o")],
+        raw_qids: false,
+        min_titles: 1,
+        series_only: false,
+        only: &[],
+        about: "a screenwriter credited on the title",
+    },
+    EntitySpec {
+        name: "creator",
+        sections: &[("creators_v", "creators_o")],
+        raw_qids: false,
+        min_titles: 1,
+        series_only: false,
+        only: &[],
+        about: "a creator credited on the title",
+    },
+    EntitySpec {
         name: "cast",
         sections: &[("cast_v", "cast_o")],
+        raw_qids: false,
         min_titles: 1,
         series_only: false,
         only: &[],
@@ -285,6 +316,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "author",
         sections: &[("src_authors_v", "src_authors_o")],
+        raw_qids: false,
         min_titles: 1,
         series_only: false,
         only: &[],
@@ -294,6 +326,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "company",
         sections: &[("companies_v", "companies_o")],
+        raw_qids: false,
         min_titles: 5,
         series_only: false,
         only: &[],
@@ -302,14 +335,25 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "network",
         sections: &[("broadcasters_v", "broadcasters_o")],
+        raw_qids: false,
         min_titles: 1,
         series_only: true,
         only: &[],
         about: "the network or service a series first aired on (P449)",
     },
     EntitySpec {
+        name: "franchise",
+        sections: &[("franchise_v", "franchise_o")],
+        raw_qids: true,
+        min_titles: 1,
+        series_only: false,
+        only: &[],
+        about: "a film or television series the title is part of (P179)",
+    },
+    EntitySpec {
         name: "subject",
         sections: &[("subjects_v", "subjects_o")],
+        raw_qids: false,
         min_titles: 5,
         series_only: false,
         only: &[],
@@ -318,6 +362,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "place",
         sections: &[("locations_v", "locations_o")],
+        raw_qids: false,
         min_titles: 5,
         series_only: false,
         only: &[],
@@ -326,6 +371,7 @@ const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
         name: "format",
         sections: &[("instance_of_v", "instance_of_o")],
+        raw_qids: false,
         min_titles: 5,
         series_only: false,
         only: FORMATS,
@@ -872,12 +918,19 @@ struct EntityKind {
     postings: Vec<Arc<Postings>>,
     /// Rows crediting anyone in the kind.
     known: Bits,
+    /// For a section that stores raw Q-ids, the compact posting-list slot to Q-id table. Entity-index
+    /// sections leave this absent and use the store's entity table directly.
+    qids: Option<Vec<u32>>,
 }
 
 impl EntityKind {
     /// Titles crediting an entity, across the kind's sections: listed only from `min_titles`.
     fn titles(&self, entity: u32) -> usize {
         self.postings.iter().map(|p| p.of(entity).len()).max().unwrap_or(0)
+    }
+
+    fn values(&self, entities: usize) -> usize {
+        self.qids.as_ref().map_or(entities, Vec::len)
     }
 }
 
@@ -1280,7 +1333,20 @@ impl FilterIndex {
         for entity in ENTITY_KINDS {
             let mut postings = Vec::new();
             let mut known = zeros();
+            let mut qids = None;
             for &(values, offsets) in entity.sections {
+                if entity.raw_qids {
+                    let Some((section, section_known, section_qids)) =
+                        invert_qids(&view, values, offsets, rows, words)
+                    else {
+                        break;
+                    };
+                    postings_bytes += (section.starts.len() + section.rows.len() + section_qids.len()) * 4;
+                    known.iter_mut().zip(section_known.iter()).for_each(|(k, s)| *k |= s);
+                    postings.push(Arc::new(section));
+                    qids = Some(section_qids);
+                    continue;
+                }
                 let built = inverted.entry(values).or_insert_with(|| {
                     let built = invert(&view, values, offsets, rows, entity_count, words);
                     if let Some((p, _)) = &built {
@@ -1296,8 +1362,11 @@ impl FilterIndex {
                     None => break,
                 }
             }
-            entities
-                .push((postings.len() == entity.sections.len()).then_some(EntityKind { postings, known }));
+            entities.push((postings.len() == entity.sections.len()).then_some(EntityKind {
+                postings,
+                known,
+                qids,
+            }));
         }
 
         let bitset = |b: &Bits| b.len() * 8;
@@ -1528,6 +1597,49 @@ fn invert(
     Some((Postings { starts, rows: out }, known))
 }
 
+/// Invert a list whose values are raw Wikidata Q-id numbers rather than entity-table indices. Keeping a
+/// compact sorted vocabulary makes even a missing entity-table row selectable; its display name falls back
+/// to the Q-id.
+fn invert_qids(
+    view: &den_store::Store<'_>,
+    values: &'static str,
+    offsets: &'static str,
+    rows: usize,
+    words: usize,
+) -> Option<(Postings, Bits, Vec<u32>)> {
+    let list = view.list::<u32>(values, offsets).ok()?;
+    let mut qids: Vec<u32> =
+        (0..rows).flat_map(|row| list.get(den_store::Row(row)).iter().copied()).collect();
+    qids.sort_unstable();
+    qids.dedup();
+    let mut counts = vec![0u32; qids.len() + 1];
+    let mut known = vec![0u64; words];
+    for row in 0..rows {
+        let values = list.get(den_store::Row(row));
+        if !values.is_empty() {
+            set(&mut known, row);
+        }
+        for qid in values {
+            let at = qids.binary_search(qid).expect("a Q-id collected from the same list");
+            counts[at + 1] += 1;
+        }
+    }
+    let mut starts = counts;
+    for i in 1..starts.len() {
+        starts[i] += starts[i - 1];
+    }
+    let mut fill = starts.clone();
+    let mut out = vec![0u32; *starts.last().unwrap_or(&0) as usize];
+    for row in 0..rows {
+        for qid in list.get(den_store::Row(row)) {
+            let at = qids.binary_search(qid).expect("a Q-id collected from the same list");
+            out[fill[at] as usize] = row as u32;
+            fill[at] += 1;
+        }
+    }
+    Some((Postings { starts, rows: out }, known, qids))
+}
+
 /// Every entity's name and aliases, folded (`facts::name_key`), in one arena, scanned per search: a scan of a
 /// few MB answers in about a millisecond, where a sorted index of every word would hold several times that.
 struct NameIndex {
@@ -1756,7 +1868,7 @@ impl<'a> Context<'a> {
                 let Some(kind) = self.filter.entities[i].as_ref() else {
                     return (vec![0; words], vec![0; words]);
                 };
-                let bits = match self.entity_of(id) {
+                let bits = match self.entity_value(i, kind, id) {
                     Some(e) => {
                         from_rows(&mut kind.postings.iter().flat_map(|p| p.of(e).iter().map(|&r| r as usize)))
                     }
@@ -1786,6 +1898,56 @@ impl<'a> Context<'a> {
         let number: u32 = qid.strip_prefix('Q')?.parse().ok()?;
         let ids = self.view.column::<u32>("ent_qid").ok()?;
         ids.binary_search(&number).ok().map(|i| i as u32)
+    }
+
+    /// A Q-id as the compact value a kind's postings use: an entity-table row for ordinary entity lists,
+    /// or a slot in the raw-Q-id vocabulary for franchises.
+    fn entity_value(&self, i: usize, kind: &EntityKind, qid: &str) -> Option<u32> {
+        match &kind.qids {
+            Some(qids) => {
+                let number: u32 = qid.strip_prefix('Q')?.parse().ok()?;
+                qids.binary_search(&number).ok().map(|at| at as u32)
+            }
+            None => {
+                debug_assert!(!ENTITY_KINDS[i].raw_qids);
+                self.entity_of(qid)
+            }
+        }
+    }
+
+    /// Convert an entity-table row found by the name index to this kind's posting-list value.
+    fn entity_value_from_index(&self, kind: &EntityKind, entity: u32) -> Option<u32> {
+        let Some(qids) = &kind.qids else { return Some(entity) };
+        let qid = *self.view.column::<u32>("ent_qid").ok()?.get(entity as usize)?;
+        qids.binary_search(&qid).ok().map(|at| at as u32)
+    }
+
+    fn entity_qid(&self, kind: &EntityKind, value: u32) -> String {
+        kind.qids
+            .as_ref()
+            .and_then(|qids| qids.get(value as usize))
+            .map_or_else(|| self.qid(value), |qid| format!("Q{qid}"))
+    }
+
+    fn entity_index(&self, kind: &EntityKind, value: u32) -> Option<u32> {
+        let Some(qids) = &kind.qids else { return Some(value) };
+        let qid = *qids.get(value as usize)?;
+        self.view.column::<u32>("ent_qid").ok()?.binary_search(&qid).ok().map(|at| at as u32)
+    }
+
+    fn entity_name(&self, kind: &EntityKind, value: u32) -> String {
+        self.entity_index(kind, value)
+            .and_then(|entity| self.label(entity))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.entity_qid(kind, value))
+    }
+
+    fn entity_tmdb(&self, kind: &EntityKind, value: u32) -> Option<u32> {
+        if kind.qids.is_some() {
+            return None;
+        }
+        self.entity_index(kind, value).and_then(|entity| self.tmdb(entity))
     }
 
     fn qid(&self, entity: u32) -> String {
@@ -1921,7 +2083,7 @@ impl<'a> Context<'a> {
         let Some(kind) = self.filter.entities[i].as_ref() else { return Vec::new() };
         let lists: Vec<_> =
             entity.sections.iter().filter_map(|&(v, o)| self.view.list::<u32>(v, o).ok()).collect();
-        let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len);
+        let size = kind.values(self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len));
         let mut counts = vec![0u32; size];
         let mut touched: Vec<u32> = Vec::new();
         let mut seen: Vec<u32> = Vec::new();
@@ -1930,7 +2092,14 @@ impl<'a> Context<'a> {
         for row in ones(base) {
             seen.clear();
             for list in &lists {
-                for &e in list.get(den_store::Row(row)) {
+                for &stored in list.get(den_store::Row(row)) {
+                    let e = match &kind.qids {
+                        Some(qids) => match qids.binary_search(&stored) {
+                            Ok(at) => at as u32,
+                            Err(_) => continue,
+                        },
+                        None => stored,
+                    };
                     if merge {
                         if seen.contains(&e) {
                             continue;
@@ -1954,7 +2123,7 @@ impl<'a> Context<'a> {
         kind.titles(entity) >= spec.min_titles
             && (spec.only.is_empty()
                 || self
-                    .qid(entity)
+                    .entity_qid(kind, entity)
                     .strip_prefix('Q')
                     .and_then(|q| q.parse().ok())
                     .is_some_and(|q| spec.only.contains(&q)))
@@ -2008,12 +2177,15 @@ impl<'a> Context<'a> {
                 }
             }
             Data::Entity(i) => {
+                let kind = self.filter.entities[i].as_ref();
                 let mut counted = self.entity_tallies(i, base);
                 counted.sort_unstable_by(|a, b| b.1.total.cmp(&a.1.total).then(a.0.cmp(&b.0)));
                 complete = counted.len() <= TOP_K;
                 for &(e, tally) in counted.iter().take(TOP_K) {
-                    let id = self.qid(e);
-                    if let Some(label) = self.label(e) {
+                    let Some(kind) = kind else { continue };
+                    let id = self.entity_qid(kind, e);
+                    let label = self.entity_name(kind, e);
+                    if label != id || kind.qids.is_some() {
                         labels.insert(id.clone(), label.into());
                     }
                     put(&mut values, id, tally);
@@ -2029,9 +2201,14 @@ impl<'a> Context<'a> {
                 put(&mut values, id.clone(), tally);
             }
             match spec.data {
-                Data::Entity(_) => {
-                    if let Some(label) = self.entity_of(id).and_then(|e| self.label(e)) {
-                        labels.insert(id.clone(), label.into());
+                Data::Entity(i) => {
+                    if let Some(kind) = self.filter.entities[i].as_ref() {
+                        if let Some(value) = self.entity_value(i, kind, id) {
+                            let label = self.entity_name(kind, value);
+                            if label.as_str() != id.as_str() || kind.qids.is_some() {
+                                labels.insert(id.clone(), label.into());
+                            }
+                        }
                     }
                 }
                 Data::Character => {
@@ -2129,7 +2306,9 @@ impl<'a> Context<'a> {
             Data::Bits if spec.name == "region" => den_index::region(id).is_some(),
             Data::Bits => self.filter.bits.get(spec.name).is_some_and(|v| v.values.contains_key(id)),
             Data::Rating => self.derived.rating.as_ref().is_some_and(|v| v.values.contains_key(id)),
-            Data::Entity(_) => self.entity_of(id).is_some(),
+            Data::Entity(i) => {
+                self.filter.entities[i].as_ref().is_some_and(|kind| self.entity_value(i, kind, id).is_some())
+            }
             Data::Character => {
                 self.characters.as_ref().is_some_and(|c| !c.named().rows(&id.replace('-', " ")).is_empty())
             }
@@ -2308,7 +2487,10 @@ impl<'a> Context<'a> {
                                 .names(self.indexes)
                                 .matching(q)
                                 .into_iter()
-                                .filter(|&(e, _)| self.listable(i, kind, e))
+                                .filter_map(|(entity, tier)| {
+                                    let e = self.entity_value_from_index(kind, entity)?;
+                                    self.listable(i, kind, e).then_some((e, tier))
+                                })
                                 .filter_map(|(e, tier)| {
                                     let mut rows: Vec<u32> =
                                         kind.postings.iter().flat_map(|p| p.of(e).iter().copied()).collect();
@@ -2338,8 +2520,15 @@ impl<'a> Context<'a> {
                             ranked.retain(|value| rank(value) <= last);
                         }
                         for (e, tier, n, titles) in ranked {
-                            let name = self.label(e).unwrap_or_default().to_owned();
-                            found.push((tier, self.qid(e), name, n, titles, self.tmdb(e)));
+                            let name = self.entity_name(kind, e);
+                            found.push((
+                                tier,
+                                self.entity_qid(kind, e),
+                                name,
+                                n,
+                                titles,
+                                self.entity_tmdb(kind, e),
+                            ));
                         }
                     }
                 }
@@ -2653,6 +2842,102 @@ mod tests {
         let feature = counts(&indexes, Movie, "sel=format:Q90");
         assert_eq!(feature["total"], 2);
         assert_eq!(feature["kinds"]["format"]["labels"], json!({ "Q90": "feature film" }));
+    }
+
+    /// Split credits and franchises are first-class title filters. Franchise lists hold raw Q-id numbers,
+    /// including values absent from the entity table; those remain selectable and use their Q-id as a name.
+    #[test]
+    fn direct_credit_and_franchise_kinds_count_select_and_search() {
+        use crate::store::fixture::{Entity, Title};
+        let title = |media, tmdb_id, directors, writers, creators, franchise| Title {
+            media,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            votes: 100,
+            directors,
+            writers,
+            creators,
+            franchise,
+            ..Title::default()
+        };
+        let titles = [
+            title(0, 1, vec![10], vec![20], vec![], vec![100]),
+            title(0, 2, vec![10], vec![20], vec![], vec![100, 999]),
+            title(1, 3, vec![], vec![20], vec![30], vec![100]),
+        ];
+        let entities = [
+            Entity { qid: 10, name: "A Director", ..Entity::default() },
+            Entity { qid: 20, name: "A Writer", ..Entity::default() },
+            Entity { qid: 30, name: "A Creator", ..Entity::default() },
+            Entity { qid: 100, name: "A Saga", ..Entity::default() },
+        ];
+        let indexes = store_of("direct-credits", &titles, &entities);
+
+        let movies = counts(&indexes, Movie, "");
+        assert_eq!(movies["kinds"]["director"]["values"], json!({ "Q10": 2 }));
+        assert_eq!(movies["kinds"]["writer"]["values"], json!({ "Q20": 2 }));
+        assert_eq!(movies["kinds"]["creator"]["values"], json!({}));
+        assert_eq!(movies["kinds"]["franchise"]["values"], json!({ "Q100": 2, "Q999": 1 }));
+        assert_eq!(movies["kinds"]["franchise"]["labels"]["Q100"], "A Saga");
+        assert_eq!(movies["kinds"]["franchise"]["labels"]["Q999"], "Q999");
+        assert_eq!(sorted_ids(&indexes, "sel=director:Q10,writer:Q20"), [1, 2]);
+        assert_eq!(sorted_ids(&indexes, "sel=franchise:Q999"), [2]);
+
+        let all = counts(&indexes, Scope::All, "sel=creator:Q30");
+        assert_eq!(all["total"], 1);
+        assert_eq!(all["kinds"]["creator"]["labels"]["Q30"], "A Creator");
+
+        let context = Context::new(&indexes, Movie, None);
+        let found = |kind: &str, q: &str| {
+            let spec = spec(kind).unwrap();
+            context.values(spec, &request(Route::Values(spec), &format!("q={q}"))).0
+        };
+        assert_eq!(found("director", "director")["values"][0]["id"], "Q10");
+        assert_eq!(found("franchise", "saga")["values"][0]["id"], "Q100");
+    }
+
+    /// Stores from before split credit sections still offer the combined `made` kind, while the three direct
+    /// kinds are absent and selections naming them are explicitly ignored rather than read as empty matches.
+    #[test]
+    fn a_store_without_split_credits_does_not_offer_direct_role_kinds() {
+        use crate::store::fixture::{Entity, Title};
+        let titles = [Title {
+            media: 0,
+            tmdb_id: 1,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            makers: vec![10],
+            ..Title::default()
+        }];
+        let entities = [Entity { qid: 10, name: "A Maker", ..Entity::default() }];
+        let indexes = store_of("combined-credits", &titles, &entities);
+        let all = counts(&indexes, Movie, "");
+        assert_eq!(all["kinds"]["made"]["values"], json!({ "Q10": 1 }));
+        for kind in ["director", "writer", "creator"] {
+            assert!(all["kinds"].get(kind).is_none(), "{kind}: {all}");
+            let answer = Context::new(&indexes, Movie, None)
+                .titles(&request(Route::Titles, &format!("sel={kind}:Q10")))
+                .0;
+            assert_eq!(answer["ignored"], json!([kind]));
+            assert_eq!(answer["total"], 1);
+        }
+    }
+
+    #[test]
+    fn schema_describes_direct_credit_and_franchise_kinds() {
+        let schema = schema();
+        for kind in ["director", "writer", "creator", "franchise"] {
+            assert_eq!(schema["kinds"][kind]["mode"], "and");
+            assert_eq!(schema["kinds"][kind]["id"], "Wikidata Q-id");
+            assert_eq!(schema["kinds"][kind]["listing"], "top");
+            assert_eq!(schema["kinds"][kind]["top"], TOP_K);
+            assert_eq!(schema["kinds"][kind]["minTitles"], 1);
+        }
     }
 
     /// A kind whose source did not load is reported unavailable, and a selection naming it is answered around
