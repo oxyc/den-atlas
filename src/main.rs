@@ -14,6 +14,7 @@ mod descriptor;
 mod facts;
 mod filter;
 mod fit;
+mod franchisecheck;
 mod franchises;
 mod handler;
 mod http;
@@ -262,6 +263,9 @@ async fn main() {
         }
         if command == "rail-eval" {
             std::process::exit(raileval::run(std::path::Path::new(path)).await);
+        }
+        if command == "franchise-check" {
+            std::process::exit(franchisecheck::run(std::path::Path::new(path)).await);
         }
         if command == "billboard-check" {
             std::process::exit(billboardcheck::run(std::path::Path::new(path), false).await);

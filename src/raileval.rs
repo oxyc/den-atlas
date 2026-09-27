@@ -377,6 +377,19 @@ fn title(indexes: &Indexes, media: MediaType, id: u32) -> String {
     )
 }
 
+/// A dedicated franchise row owns these titles, so they are not candidates More Like This could rank.
+/// Leaving them in the ideal list makes a correct exclusion look like lost relevance (#92).
+fn available_grades(indexes: &Indexes, seed: Key, grades: &HashMap<Key, Grade>) -> HashMap<Key, Grade> {
+    grades_without_reserved(grades, |candidate| indexes.franchises.shares_primary(seed, candidate))
+}
+
+fn grades_without_reserved(
+    grades: &HashMap<Key, Grade>,
+    reserved: impl Fn(Key) -> bool,
+) -> HashMap<Key, Grade> {
+    grades.iter().filter(|&(candidate, _)| !reserved(*candidate)).map(|(&key, &grade)| (key, grade)).collect()
+}
+
 /// The row scored for a seed: production's mixed row, as `/index/similar` serves it, or the one `params` ranks.
 fn row_for(indexes: &Indexes, params: &den_index::SimilarParams, (media, id): Key) -> Vec<Key> {
     if *params == den_index::SimilarParams::default() {
@@ -429,14 +442,15 @@ pub(crate) fn case_shape_failures(
     shape: &Shape,
 ) -> Vec<String> {
     let seed = (c.media, c.id);
+    let grades = available_grades(indexes, seed, &c.grades);
     let row = row_for(indexes, params, seed);
     let best_row = row.first().map_or_else(Vec::new, |&best| row_for(indexes, params, best));
     let seen = Seen {
         seed,
         row: &row,
         best_row: &best_row,
-        rail: score(&row, &c.grades, K),
-        plot: score(&plot_row(indexes, seed), &c.grades, K),
+        rail: score(&row, &grades, K),
+        plot: score(&plot_row(indexes, seed), &grades, K),
     };
     shape_failures(shape, &seen, &|key, field| values_of(indexes, key, field))
 }
@@ -549,11 +563,14 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     let mut gaps: Vec<String> = Vec::new();
     let mut shape_lines: Vec<String> = Vec::new();
     let (mut shape_pass, mut shape_total, mut shape_changed) = (0, 0, 0);
+    let mut reserved_judgements = 0;
     for c in &cases {
         let seed = (c.media, c.id);
+        let grades = available_grades(&indexes, seed, &c.grades);
+        reserved_judgements += c.grades.len() - grades.len();
         let row = row_for(&indexes, &params, seed);
         let plot = plot_row(&indexes, seed);
-        let (s, p) = (score(&row, &c.grades, K), score(&plot, &c.grades, K));
+        let (s, p) = (score(&row, &grades, K), score(&plot, &grades, K));
         let shares = (genre_share(&indexes, seed, &row), genre_share(&indexes, seed, &plot));
         let verdict = match &c.shape {
             None => String::new(),
@@ -586,7 +603,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
         line(&format!("{name} [{}]", c.case.split), &s, &p, shares, &verdict);
         if show.as_deref() == Some(c.case.seed.as_str()) {
             for (at, &(media, id)) in row.iter().take(K).enumerate() {
-                let grade = match c.grades.get(&(media, id)) {
+                let grade = match grades.get(&(media, id)) {
                     Some(Grade::Good) => "good",
                     Some(Grade::Ok) => "ok",
                     Some(Grade::Bad) => "bad",
@@ -606,7 +623,10 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             let mut seen = HashSet::new();
             for (arm, list) in [("rail", &row), ("plot", &plot)] {
                 for (at, &(media, id)) in list.iter().take(unjudged).enumerate() {
-                    if !c.grades.contains_key(&(media, id)) && seen.insert((media, id)) {
+                    if !grades.contains_key(&(media, id))
+                        && !indexes.franchises.shares_primary(seed, (media, id))
+                        && seen.insert((media, id))
+                    {
                         let key = match media {
                             MediaType::Movie => format!("movie:{id}"),
                             MediaType::Tv => format!("series:{id}"),
@@ -642,6 +662,9 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     }
     println!("\nnDCG' ignores unjudged titles; bad and jdg are totals over the cases, of {K} per case.");
     println!(
+        "{reserved_judgements} judgements reserved for dedicated primary-franchise rows were excluded from both ideals"
+    );
+    println!(
         "genre is the share of the first {SHAPE_K} carrying the seed's own primary genre: 1.00 is a genre shelf. \
          Read it beside nDCG; lowering one by breaking the other is not an improvement."
     );
@@ -661,6 +684,14 @@ pub async fn run(dir: &std::path::Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_franchise_members_are_not_part_of_the_judged_ideal() {
+        let movie = |id| (MediaType::Movie, id);
+        let grades = HashMap::from([(movie(2), Grade::Good), (movie(3), Grade::Ok), (movie(4), Grade::Bad)]);
+        let available = grades_without_reserved(&grades, |candidate| candidate == movie(2));
+        assert_eq!(available, HashMap::from([(movie(3), Grade::Ok), (movie(4), Grade::Bad)]));
+    }
 
     /// The shipped set parses, every key is one the rail can return, and every case sits in the half
     /// den-dataset's split.py gives its seed — `sha256(SALT|key)[0] & 1`, 1 is test.
