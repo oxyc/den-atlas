@@ -226,7 +226,7 @@ pub async fn run(dir: &std::path::Path, evaluate: bool) -> i32 {
                 return 1;
             }
         };
-        let answer = recommend::answer(&indexes, export.as_deref(), &request, &lists, now);
+        let answer = recommend::answer(&indexes, export.as_deref(), &request, &lists, now, None);
         let slides = answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default();
         let slate = measure(slides, |a, b| plots_near(&indexes, a, b));
         let both = request.surface.as_deref().is_none_or(|s| s == "home");
@@ -255,10 +255,13 @@ pub async fn run(dir: &std::path::Path, evaluate: bool) -> i32 {
                 .enumerate()
                 .filter_map(|(rank, slide)| {
                     let (media, id) = key(slide)?;
+                    let (award_recognised, award_won) = crate::awards::recognition(&indexes, media, id);
                     Some(crate::billboardeval::Candidate {
                         rank: rank + 1,
                         id: format!("{}:{id}", if media == MediaType::Movie { "movie" } else { "series" }),
                         title: name(&indexes, slide),
+                        award_recognised,
+                        award_won,
                     })
                 })
                 .collect(),
@@ -296,6 +299,7 @@ pub async fn run(dir: &std::path::Path, evaluate: bool) -> i32 {
         };
         let evaluation = crate::billboardeval::evaluate(&judged, &ranked);
         crate::billboardeval::print(&evaluation);
+        crate::billboardeval::print_signal_coverage(&evaluation, &ranked, !indexes.ceremonies.is_empty());
         if let Some(export) = std::env::var("BILLBOARD_EVAL_UNJUDGED").ok().filter(|s| !s.is_empty()) {
             if let Err(e) = crate::billboardeval::write_unjudged(&export, &evaluation) {
                 eprintln!("billboard-eval: {e}");

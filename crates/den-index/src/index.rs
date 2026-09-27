@@ -781,6 +781,29 @@ impl Index {
         )
     }
 
+    /// An outside semantic vector transformed into this index's space and normalised. This is the same
+    /// projection `nearest_to_vector` applies, exposed for callers that need to compare corpus rows with an
+    /// unindexed title without first replacing it with a nearest indexed title.
+    pub fn semantic_unit_vector(&self, query: &[i8]) -> Option<Vec<f64>> {
+        let projected = self.semantic_query_bytes(query)?;
+        let norm = projected.iter().map(|&byte| f64::from(byte as i8).powi(2)).sum::<f64>().sqrt();
+        (norm > 0.0).then(|| projected.iter().map(|&byte| f64::from(byte as i8) / norm).collect())
+    }
+
+    /// A row's cosine to a unit vector already in this index's space.
+    pub fn row_cosine(&self, row: u32, unit: &[f64]) -> Option<f64> {
+        if unit.len() != self.dim || row as usize >= self.records.len() {
+            return None;
+        }
+        let (mut dot, mut norm) = (0.0, 0.0);
+        for (&v, &u) in self.row_vector(row as usize).iter().zip(unit) {
+            let x = f64::from(v as i8);
+            dot += x * u;
+            norm += x * x;
+        }
+        Some(if norm > 0.0 { dot / norm.sqrt() } else { 0.0 })
+    }
+
     /// The unit-length mean of the given titles' vectors — a taste centroid in THIS index's space. Titles not
     /// in the index are skipped; `None` when none are. Double precision, so a candidate's cosine to it isn't
     /// quantised twice.
@@ -1415,7 +1438,12 @@ pub(crate) mod tests {
         let idx = sample();
         let near = idx.nearest_to_vector(&[0, 0, 100], None, 1);
         assert_eq!((near[0].tmdb_id, near[0].media_type), (1, MediaType::Tv));
+        let unit = idx.semantic_unit_vector(&[0, 0, 100]).unwrap();
+        let row = idx.row_of(1, MediaType::Tv).unwrap();
+        assert!((idx.row_cosine(row, &unit).unwrap() - 1.0).abs() < 1e-9);
         assert!(idx.nearest_to_vector(&[1, 2], None, 1).is_empty(), "another dimension is another space");
+        assert!(idx.semantic_unit_vector(&[1, 2]).is_none());
+        assert!(idx.semantic_unit_vector(&[0, 0, 0]).is_none());
     }
 
     #[test]

@@ -98,6 +98,68 @@ pub fn of_title(indexes: &Indexes, media_type: MediaType, tmdb_id: u32) -> Vec<V
     awards_of(indexes, &awards, row)
 }
 
+/// Whether a title has any recorded nomination/award, and whether any is a win. Used by offline coverage
+/// measurement; absence is not interpreted as a negative judgement.
+pub(crate) fn recognition(indexes: &Indexes, media_type: MediaType, tmdb_id: u32) -> (bool, bool) {
+    let view = indexes.store.view();
+    let (Ok(Some(row)), Ok(awards)) =
+        (view.row_of(u8::from(media_type == MediaType::Tv), tmdb_id), view.awards())
+    else {
+        return (false, false);
+    };
+    let entries: Vec<_> = awards.get(row).collect();
+    (!entries.is_empty(), entries.iter().any(|award| award.won))
+}
+
+fn coverage(indexes: &Indexes, titles: impl Iterator<Item = (MediaType, u32)>) -> Value {
+    let (mut total, mut recognised, mut won) = (0, 0, 0);
+    for (media_type, id) in titles {
+        total += 1;
+        let (has_award, has_win) = recognition(indexes, media_type, id);
+        recognised += usize::from(has_award);
+        won += usize::from(has_win);
+    }
+    json!({ "titles": total, "recognised": recognised, "won": won })
+}
+
+/// Objective coverage for signal triage. `critics.available` is deliberately false: the current store has
+/// semantic critique axes and audience ratings, but no critic-review score, and neither is relabelled as one.
+pub(crate) fn coverage_json(indexes: &Indexes, now: i64) -> Value {
+    json!({
+        "datasetVersion": indexes.dataset_version,
+        "awards": {
+            "available": !indexes.ceremonies.is_empty(),
+            "corpus": coverage(indexes, indexes.corpus().titles()),
+            "recent730Days": coverage(indexes, indexes.corpus().released_between(now - 730, now)),
+        },
+        "critics": {
+            "available": false,
+            "reason": "the dataset/store contract carries no critic-review score"
+        },
+        "rankingChanged": false,
+        "gate": "coverage is not relevance; compare against human-judged billboard fixtures before changing ranking"
+    })
+}
+
+pub(crate) fn run_coverage(dir: &std::path::Path) -> i32 {
+    let dataset = match crate::dataset::Dataset::load(dir) {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            eprintln!("signal-coverage: {e}");
+            return 1;
+        }
+    };
+    let indexes = match crate::queries::load_for_tools(&dataset) {
+        Ok(indexes) => indexes,
+        Err(e) => {
+            eprintln!("signal-coverage: {e}");
+            return 1;
+        }
+    };
+    println!("{}", coverage_json(&indexes, crate::recommend::today() as i64));
+    0
+}
+
 fn awards_of(indexes: &Indexes, awards: &den_store::Awards<'_>, row: Row) -> Vec<Value> {
     awards
         .get(row)
@@ -202,6 +264,11 @@ mod tests {
                 json!({ "id": "Q42369", "name": "Cannes Film Festival", "won": false }),
             ]
         );
+        let measured = coverage_json(&indexes, crate::recommend::day(2026, 1, 1) as i64);
+        assert_eq!(measured["awards"]["available"], true);
+        assert_eq!(measured["awards"]["corpus"], json!({ "titles": 4, "recognised": 3, "won": 2 }));
+        assert_eq!(measured["critics"]["available"], false);
+        assert_eq!(measured["rankingChanged"], false);
         assert!(of_title(&indexes, Movie, 4).is_empty());
         assert!(of_title(&indexes, Movie, 99).is_empty());
         let list = list_json(&indexes);

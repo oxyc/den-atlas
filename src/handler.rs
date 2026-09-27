@@ -1535,6 +1535,27 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
+    // Only titles absent from the plot index are embedded, from bounded transient client hints. A failed or
+    // unconfigured embedder leaves the existing metadata-only fit intact rather than failing the billboard.
+    let embedding = Instant::now();
+    let mut library_embeddings = std::collections::HashMap::new();
+    if state.embed.is_some() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for (key, text) in crate::recommend::library_embedding_requests(&indexes, &request) {
+            let state = Arc::clone(state);
+            tasks.spawn(async move { (key, embed_query(&state, &text).await) });
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((key, Ok(vector))) => {
+                    library_embeddings.insert(key, vector);
+                }
+                Ok((_, Err(e))) => eprintln!("library title left unembedded: {e}"),
+                Err(e) => eprintln!("library embed task failed: {e}"),
+            }
+        }
+    }
+    let embedded = embedding.elapsed();
     // Kept for `den-atlas replay` when `RECOMMEND_FIXTURES` names a directory: the body as sent, library and all.
     let fixtures = std::env::var("RECOMMEND_FIXTURES").ok().filter(|dir| !dir.is_empty());
     let raw: Option<serde_json::Value> = fixtures.as_ref().and_then(|_| serde_json::from_slice(&body).ok());
@@ -1552,7 +1573,14 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             .as_deref()
             .and_then(crate::recommend::parse_now)
             .unwrap_or_else(crate::recommend::today);
-        let mut answer = crate::recommend::answer(&indexes, export.as_deref(), &request, &lists, now);
+        let mut answer = crate::recommend::answer(
+            &indexes,
+            export.as_deref(),
+            &request,
+            &lists,
+            now,
+            Some(&library_embeddings),
+        );
         eprintln!("{}{rid}", crate::recommend::summary(&indexes, &request, &answer));
         if let (Some(dir), Some(raw)) = (&fixtures, &raw) {
             crate::recommend::keep_fixture(std::path::Path::new(dir), raw, &lists, now);
@@ -1572,7 +1600,8 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
     with_timing(
         resp,
         &format!(
-            "{load}lists;dur={}, rank;dur={}, total;dur={}",
+            "{load}embed;dur={}, lists;dur={}, rank;dur={}, total;dur={}",
+            ms(embedded),
             ms(listed),
             ms(ranking.elapsed()),
             ms(started.elapsed())
@@ -3591,6 +3620,9 @@ mod tests {
         assert_eq!(answer["facts"], true);
         assert_eq!(answer["datasetVersion"], "v1");
         assert_eq!(answer["libraryUnjudged"], 0);
+        assert_eq!(answer["pool"]["libraryIndexed"], 1);
+        assert_eq!(answer["pool"]["libraryUnindexed"], 0);
+        assert_eq!(answer["pool"]["libraryEmbedded"], 0);
         // Movie 99 is known to nothing but its hint, which names no genre — and it is hidden, so never asked about.
         assert_eq!(answer["unjudged"], serde_json::json!([]));
         assert_eq!(answer["unjudgedCount"], 1);
@@ -3601,7 +3633,7 @@ mod tests {
         let line = crate::recommend::summary(&indexes, &request, &answer);
         assert!(
             line.starts_with(
-                "recommend movies: library 1 (0 unjudged, 1 indexed), owned 1, candidates 4, pool 4 ("
+                "recommend movies: library 1 (0 unjudged, 1 indexed, 0 embedded, 0 unindexed), owned 1, candidates 4, pool 4 ("
             ),
             "{line}"
         );
@@ -3675,15 +3707,17 @@ mod tests {
             ))
             .unwrap()
         };
-        let channel = answer(&indexes, None, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now);
+        let channel =
+            answer(&indexes, None, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now, None);
         assert_eq!(slides(&channel), vec![("series".to_owned(), 4), ("movie".to_owned(), 3)], "{channel}");
         assert_eq!(channel["pool"]["personal"], 0);
 
-        let movies = answer(&indexes, None, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now);
+        let movies =
+            answer(&indexes, None, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now, None);
         assert_eq!(slides(&movies), vec![("movie".to_owned(), 3)], "{movies}");
 
         // A service atlas doesn't carry has no lists (`lists` reads none): the client's candidates alone.
-        let unknown = answer(&indexes, None, &body(r#","service":{"id":283}"#), &Lists::default(), now);
+        let unknown = answer(&indexes, None, &body(r#","service":{"id":283}"#), &Lists::default(), now, None);
         assert_eq!(slides(&unknown), vec![("series".to_owned(), 4)], "{unknown}");
     }
 

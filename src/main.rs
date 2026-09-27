@@ -269,6 +269,9 @@ async fn main() {
         if command == "billboard-eval" {
             std::process::exit(billboardcheck::run(std::path::Path::new(path), true).await);
         }
+        if command == "signal-coverage" {
+            std::process::exit(awards::run_coverage(std::path::Path::new(path)));
+        }
     }
     // Fail-soft: the manifest + catalog resources don't need the dataset, so a missing/old-format
     // dataset.meta.json must not crash-loop the addon. Keep serving; the dataset routes report 503 and
@@ -497,7 +500,7 @@ async fn replay(dir: &str, path: &str) -> i32 {
         Err(e) => return fail(format!("indexes: {e}")),
     };
     // Without TMDB's export or its kept vote counts, which serving reads: `billboard-check` reads both.
-    let answer = recommend::answer(&indexes, None, &request, &lists, now);
+    let answer = recommend::answer(&indexes, None, &request, &lists, now, None);
     println!("{}", recommend::summary(&indexes, &request, &answer));
     for (at, slide) in answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
         println!("{:>3}. {}", at + 1, recommend::describe(&indexes, slide));

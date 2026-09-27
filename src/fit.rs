@@ -66,6 +66,8 @@ type Value = (usize, u64);
 pub struct Features {
     key: Key,
     row: Option<u32>,
+    /// A transient unindexed title's plot vector, transformed into the plot index's space.
+    vector: Option<Vec<f64>>,
     /// Each family's values once, with the label's confidence (1 for the rest).
     values: Vec<(Value, f64)>,
     /// The people behind it, each once, with how much they count (`recommend::CAST_BILLED`).
@@ -111,6 +113,7 @@ impl Features {
         Features {
             key: (media_type, id),
             row: indexes.plot.row_of(id, media_type),
+            vector: None,
             values,
             people,
             series: title.franchise.clone(),
@@ -120,6 +123,18 @@ impl Features {
     /// Whether the plot index holds a vector for the title.
     pub fn indexed(&self) -> bool {
         self.row.is_some()
+    }
+
+    /// Give an unindexed title a transient embedding. Indexed titles always use their stored vector.
+    pub fn with_embedding(mut self, indexes: &Indexes, embedding: Option<&[i8]>) -> Features {
+        if self.row.is_none() {
+            self.vector = embedding.and_then(|vector| indexes.plot.semantic_unit_vector(vector));
+        }
+        self
+    }
+
+    pub fn embedded(&self) -> bool {
+        self.vector.is_some()
     }
 
     fn has(&self, family: usize) -> bool {
@@ -134,6 +149,7 @@ pub struct Corpus {
     /// How many titles credit each person.
     credits: HashMap<u32, u32>,
     titles: f64,
+    keys: Vec<Key>,
     /// The mean of the index's vectors: a title's projection on it is how central the title is.
     centre: Vec<f64>,
     /// An even sample of the index with vectors, the yardstick every fit is read against.
@@ -183,6 +199,7 @@ impl Corpus {
             shares,
             credits,
             titles: keys.len() as f64,
+            keys,
             centre: indexes.plot.mean_vector(),
             sample,
             dated,
@@ -195,6 +212,10 @@ impl Corpus {
         released_between(&self.dated, from, to)
     }
 
+    pub fn titles(&self) -> impl Iterator<Item = Key> + '_ {
+        self.keys.iter().copied()
+    }
+
     fn share(&self, value: Value) -> f64 {
         self.shares.get(&value).copied().unwrap_or(UNHEARD_OF)
     }
@@ -204,8 +225,8 @@ impl Corpus {
 pub struct Fit<'a> {
     indexes: &'a Indexes,
     corpus: &'a Corpus,
-    liked: Vec<(u32, f64)>,
-    disliked: Vec<u32>,
+    liked: Vec<(Semantic, f64)>,
+    disliked: Vec<Semantic>,
     lift: HashMap<Value, f64>,
     /// The lift of a value the library never carries, by family.
     unseen: [f64; 8],
@@ -219,6 +240,12 @@ pub struct Fit<'a> {
     /// The sample's mean and standard deviation of similar, and of profile.
     similar: (f64, f64),
     profile: (f64, f64),
+}
+
+#[derive(Clone)]
+enum Semantic {
+    Row(u32),
+    Outside(Vec<f64>),
 }
 
 /// A title's fit, and what it rests on.
@@ -262,9 +289,11 @@ impl<'a> Fit<'a> {
         let mut linked: HashMap<Key, f64> = HashMap::new();
         for (features, weight) in library {
             let weight = *weight;
-            match features.row {
-                Some(row) if weight > 0.0 => liked.push((row, weight)),
-                Some(row) => disliked.push(row),
+            let semantic =
+                features.row.map(Semantic::Row).or_else(|| features.vector.clone().map(Semantic::Outside));
+            match semantic {
+                Some(vector) if weight > 0.0 => liked.push((vector, weight)),
+                Some(vector) => disliked.push(vector),
                 None => {}
             }
             for &series in &features.series {
@@ -401,8 +430,15 @@ impl<'a> Fit<'a> {
             return None;
         }
         let plot = &self.indexes.plot;
+        let similarity = |semantic: &Semantic| match semantic {
+            Semantic::Row(liked) => Some(plot.similarity(row, *liked)),
+            Semantic::Outside(vector) => plot.row_cosine(row, vector),
+        };
         let mut near: Vec<(f64, f64)> =
-            self.liked.iter().map(|&(liked, w)| (plot.similarity(row, liked), w)).collect();
+            self.liked.iter().filter_map(|(liked, w)| Some((similarity(liked)?, *w))).collect();
+        if near.is_empty() {
+            return None;
+        }
         near.sort_by(|a, b| b.0.total_cmp(&a.0));
         near.truncate(NEAREST);
         let weight: f64 = near.iter().map(|&(_, w)| w).sum();
@@ -413,8 +449,14 @@ impl<'a> Fit<'a> {
     /// A row's closeness to the nearest disliked title, less its closeness to the index as a whole.
     fn repelled(&self, row: u32) -> Option<f64> {
         let plot = &self.indexes.plot;
-        let nearest =
-            self.disliked.iter().map(|&disliked| plot.similarity(row, disliked)).max_by(f64::total_cmp)?;
+        let nearest = self
+            .disliked
+            .iter()
+            .filter_map(|disliked| match disliked {
+                Semantic::Row(disliked) => Some(plot.similarity(row, *disliked)),
+                Semantic::Outside(vector) => plot.row_cosine(row, vector),
+            })
+            .max_by(f64::total_cmp)?;
         Some(nearest - plot.projection(row, &self.corpus.centre))
     }
 
@@ -548,6 +590,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unindexed_library_embedding_contributes_direct_plot_similarity() {
+        let indexes = indexes("outside-vector").await;
+        let unknown = Features::of(&indexes, (MediaType::Movie, 77), &Title::default())
+            .with_embedding(&indexes, Some(&[100, 0, 0]));
+        assert!(!unknown.indexed());
+        assert!(unknown.embedded());
+        let taste = Fit::new(&indexes, indexes.corpus(), &[(unknown, 1.0)]).unwrap();
+        let (near, far) = (taste.of(&features(&indexes, TWO)), taste.of(&features(&indexes, THREE)));
+        assert!(near.fit > far.fit, "{near:?} {far:?}");
+        assert!(near.similar > far.similar);
+    }
+
+    #[tokio::test]
     async fn nothing_liked_is_no_taste_and_a_title_without_a_vector_leans_on_what_is_known_of_it() {
         let indexes = indexes("thin").await;
         assert!(Fit::new(&indexes, indexes.corpus(), &[(features(&indexes, ONE), -1.5)]).is_none());
@@ -604,13 +659,14 @@ mod tests {
         let bare = |row: Option<u32>| Features {
             key: (MediaType::Movie, 77),
             row,
+            vector: None,
             values: Vec::new(),
             people: Vec::new(),
             series: Vec::new(),
         };
 
         let mut similar = blank();
-        similar.liked.push((features(&indexes, ONE).row.unwrap(), 1.0));
+        similar.liked.push((Semantic::Row(features(&indexes, ONE).row.unwrap()), 1.0));
         let plot_only = bare(features(&indexes, TWO).row);
         let raw = similar.nearest(plot_only.row.unwrap()).unwrap();
         similar.similar = (raw - 2.0, 1.0);
@@ -657,6 +713,7 @@ mod tests {
         let title = |key: Key, series: Vec<u32>| Features {
             key,
             row: None,
+            vector: None,
             values: Vec::new(),
             people: Vec::new(),
             series,
