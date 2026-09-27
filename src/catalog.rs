@@ -303,9 +303,9 @@ pub struct CatalogState {
     /// TMDB poster paths by (media type, tmdb id), from the dataset's metadata sidecar; `None` where the
     /// release ships none.
     ///
-    /// Resident, rather than read from the query indexes that hold the same data: those load on demand and
-    /// are released after ten idle minutes, while rows render on a background refresh. A poster that
-    /// appeared or vanished with index warmth would be worse than one that is simply absent.
+    /// Resident, rather than read from the query indexes that hold the same data: those load after atlas
+    /// starts listening, while rows render on a background refresh. A poster that appeared with index
+    /// warmth would be worse than one that is simply absent.
     posters: Option<Arc<Posters>>,
     /// Movie of the Night's kept lists, which lead a service's rows where they exist (`motn.rs`).
     motn: Option<Arc<Motn>>,

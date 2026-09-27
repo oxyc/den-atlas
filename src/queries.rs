@@ -1,7 +1,8 @@
 //! Index queries (`den-index`) over the dataset's plot and premise indexes: the label taxonomy, label rows
-//! and More Like This — and the Wikidata facts `/recommend` reads beside them. The indexes load on the first
-//! query and are released after a few idle minutes, so an atlas nobody is asking holds none of their ~80 MB
-//! of vectors; the first query after an idle spell pays the load from disk.
+//! and More Like This — and the Wikidata facts `/recommend` reads beside them. The indexes load as atlas
+//! starts (`load_at_start`) and stay for the life of the process. They used to be released after ten idle
+//! minutes to spare their ~80 MB, which made the first query after every quiet spell pay the load: 1.6 s
+//! measured on the homelab against 0.2 s warm, on a container with ~750 MB of its limit to spare.
 //!
 //! # One artifact
 //!
@@ -30,10 +31,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// How long the indexes stay in memory after the last query.
-const IDLE_RELEASE: Duration = Duration::from_secs(10 * 60);
-const SWEEP_EVERY: Duration = Duration::from_secs(60);
-
 pub struct Indexes {
     /// Every title in the corpus — the store's own row count. The indexes below may be partial (the plot
     /// index covers the rows that have a plot vector); this is their denominator.
@@ -61,7 +58,7 @@ pub struct Indexes {
     pub store: crate::store::LoadedStore,
     /// TMDB's vote counts and scores, joined onto the store's rows (`ratings`, kept by `tmdb`). The LIVE
     /// holder, not a snapshot: the indexes outlive a refresh, and a vote count that reached the process should
-    /// reach the next row it orders rather than waiting for an idle release. `None` without the index routes'
+    /// reach the next row it orders rather than waiting for the next load. `None` without the index routes'
     /// TMDB half, and empty while nothing is kept — see `votes_of`.
     pub ratings: Option<Arc<Ratings>>,
     /// Titles that share a character, from TMDB's credits (`characters`). The live holder, like `ratings`.
@@ -106,8 +103,8 @@ type SimilarKey = (Key, bool);
 ///
 /// The bound is on ENTRIES, not bytes, and the entries vary enormously: on the shipped corpus `tone=bleak`
 /// is 1,599 titles and `chronology=linear` is 31,627, at 8 bytes each. 256 of the largest would be 65 MB,
-/// but a handful of axis values are that broad and the ordinary row is a few hundred titles — and the whole
-/// map is dropped anyway when the indexes go idle, ten minutes after the last query.
+/// but a handful of axis values are that broad and the ordinary row is a few hundred titles, and a full map
+/// starts over.
 const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 256;
 /// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
@@ -565,7 +562,7 @@ pub struct IndexQueries {
     /// Present only when the producer already projected plot rows. Kept outside the store because the
     /// signed manifest is the contract that identifies the operation and supplies its exact direction.
     plot_vector_transform: Option<Arc<[f32]>>,
-    loaded: Mutex<Option<(Arc<Indexes>, Instant)>>,
+    loaded: Mutex<Option<Arc<Indexes>>>,
     /// Held while loading, so concurrent first queries wait for one load instead of each starting their own.
     loading: tokio::sync::Mutex<()>,
     /// Whether the last load couldn't read the store's facts sections (`/health`).
@@ -712,37 +709,19 @@ impl IndexQueries {
         // whose `votes` column will not read ordered every row by nothing and said so nowhere.
         self.store_votes_absent.store(!indexes.store_has_votes(), Ordering::Relaxed);
         let indexes = Arc::new(indexes);
-        *lock(&self.loaded) = Some((Arc::clone(&indexes), Instant::now()));
+        *lock(&self.loaded) = Some(Arc::clone(&indexes));
         Ok((indexes, Some(took)))
     }
 
     fn touch(&self) -> Option<Arc<Indexes>> {
-        let mut slot = lock(&self.loaded);
-        let (indexes, last_used) = slot.as_mut()?;
-        *last_used = Instant::now();
-        Some(Arc::clone(indexes))
-    }
-
-    /// Drop the indexes if nobody has queried them for `IDLE_RELEASE`; `true` when it did. A query already
-    /// running holds its own `Arc`, so a release never pulls an index out from under one.
-    fn release_if_idle(&self) -> bool {
-        let mut slot = lock(&self.loaded);
-        if slot.as_ref().is_some_and(|(_, used)| used.elapsed() >= IDLE_RELEASE) {
-            *slot = None;
-            true
-        } else {
-            false
-        }
+        lock(&self.loaded).clone()
     }
 }
 
-/// Look for an idle index once a minute, for as long as atlas runs.
-pub async fn release_when_idle(queries: Arc<IndexQueries>) {
-    loop {
-        tokio::time::sleep(SWEEP_EVERY).await;
-        if queries.release_if_idle() {
-            eprintln!("index released after {} idle minutes", IDLE_RELEASE.as_secs() / 60);
-        }
+/// Load the indexes as atlas starts, so no visitor's request waits for them.
+pub async fn load_at_start(queries: Arc<IndexQueries>) {
+    if let Err(error) = queries.get(|| ()).await {
+        eprintln!("index load at start failed: {error}");
     }
 }
 
@@ -1186,8 +1165,8 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn an_idle_index_is_released_and_reloads_on_the_next_query() {
+    #[tokio::test]
+    async fn the_indexes_load_once_and_stay() {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-{}", std::process::id()));
         let queries = IndexQueries::new(&write_fixture(&dir));
 
@@ -1204,17 +1183,6 @@ mod tests {
         let (_, again) = queries.get(counted).await.unwrap();
         assert!(again.is_none(), "a warm query doesn't");
         assert_eq!(loads.get(), 1, "on_load runs for the load alone");
-
-        tokio::time::advance(IDLE_RELEASE - Duration::from_secs(1)).await;
-        assert!(!queries.release_if_idle(), "released before it was idle");
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(queries.release_if_idle());
-
-        // A query that held the index across the release still has it; the next query reloads.
-        assert_eq!(indexes.plot.len(), 12);
-        let (_, reload) = queries.get(counted).await.unwrap();
-        assert!(reload.is_some(), "the query after a release loads again");
-        assert_eq!(loads.get(), 2);
     }
 
     /// A store that verifies but that the rail cannot read — here, one without its `world` column — fails

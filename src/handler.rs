@@ -1122,8 +1122,8 @@ async fn embed_upstream(state: &AppState, text: &str) -> Result<Vec<i8>, String>
     resp.json::<Embedded>().await.map(|e| e.vector).map_err(|e| format!("den-embed body: {e}"))
 }
 
-/// Wake den-embed as the indexes load. Both drop their memory after ten idle minutes, so a load follows the spell
-/// in which den-embed unloaded its model too, and the search that comes next would wait on that model otherwise.
+/// Wake den-embed as the indexes load on a query, which with the indexes loaded at start (`load_at_start`) is
+/// only a query that beat that load; the search that comes next would wait on den-embed's model otherwise.
 fn warm_embed(state: &Arc<AppState>) {
     if state.embed.is_none() {
         return;

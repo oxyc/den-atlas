@@ -301,7 +301,7 @@ async fn main() {
     catalog = catalog.with_motn(Arc::clone(&motn));
     // A catalog row names TMDB's poster path beside JustWatch's metahub URL for every title the dataset
     // knows, so a client draws first-party art where there is any and keeps metahub for the rest. Read once
-    // here rather than through the query indexes, which are released when idle (see `CatalogState::posters`).
+    // here rather than through the query indexes, which load after atlas listens (see `CatalogState::posters`).
     if let Some(ds) = dataset.as_ref() {
         // Read out of the mapping `Dataset::load` verified, into an owned map. It used to read the
         // metadata sidecar.
@@ -395,7 +395,7 @@ async fn main() {
         tokio::spawn(titles::refresh_forever(Arc::clone(search)));
     }
     if let Some(index) = &state.index {
-        tokio::spawn(queries::release_when_idle(Arc::clone(index)));
+        tokio::spawn(queries::load_at_start(Arc::clone(index)));
     }
     if let Some(tmdb) = &tmdb {
         // The vote counts are awaited, not spawned: a local read. The store carries no vote count of its own, so

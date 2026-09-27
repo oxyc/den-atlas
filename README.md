@@ -165,9 +165,9 @@ search answers empty with `X-Den-Degraded: title_index_building`. The request lo
 
 Index queries (`INDEX_QUERIES`) answer from the dataset's plot and premise indexes through the
 `den-index` crate (`crates/`, portable like `den-titlesearch`), the same way the Den TV app's on-device
-index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load on the first
-query — the answer's `Server-Timing` carries `load;dur=<ms>` then — and are released after 10 idle minutes,
-so an unused atlas holds none of their ~80 MB. The descriptor carries `"queries":true` when they're on.
+index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load as atlas starts
+and stay for the life of the process; a query that arrives before the load has finished waits for it. The
+descriptor carries `"queries":true` when they're on.
 Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`). Unified
 query search scans both plot and premise vectors when the latter exist, normalises each scan against its own
 distribution, and lets the stronger one spend the single semantic weight; a missing premise index preserves
@@ -405,7 +405,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. TMDB's kept numbers and credits live here too (`tmdb-votes.tsv`, `tmdb-credits.tsv`, `tmdb-sweep.tsv`), and nowhere else. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
-| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load on first use and are released after 10 idle minutes |
+| `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load as atlas starts and stay loaded |
 | `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |
 | `TMDB_DAILY_MAX` | `1500` | questions atlas asks the proxy in a UTC day, two seconds apart. A full vote sweep is ~4,800, so it spreads over a few days; den-edge's own ceiling (`TMDB_DAILY_MAX` there) is shared with the web app's guests and must leave room for this |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
