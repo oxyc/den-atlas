@@ -2,6 +2,9 @@
 //!
 //!   CACHE_DIR=<dir> den-atlas billboard-check <dataset dir>
 //!   BILLBOARD_FIXTURES=<dir> CACHE_DIR=<dir> den-atlas billboard-check <dataset dir>   # other households
+//!   CACHE_DIR=<dir> den-atlas billboard-eval <dataset dir>    # plus hand-judged relevance metrics
+//!   BILLBOARD_JUDGED=<file>                                  # another judgement file
+//!   BILLBOARD_EVAL_UNJUDGED=<file>                            # write candidates awaiting human labels
 //!
 //! Each fixture is a `den-atlas replay` file (`recommend::fixture`): a household's request, the service lists it was
 //! ranked with and the moment it was ranked at. The households are invented — one taste each, on three services in
@@ -136,7 +139,7 @@ fn name(indexes: &Indexes, slide: &serde_json::Value) -> String {
 }
 
 /// Exit code, as the other subcommands return one.
-pub async fn run(dir: &std::path::Path) -> i32 {
+pub async fn run(dir: &std::path::Path, evaluate: bool) -> i32 {
     let fixtures = std::env::var("BILLBOARD_FIXTURES").unwrap_or_else(|_| "fixtures/billboard".to_owned());
     let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&fixtures) {
         Ok(entries) => entries
@@ -209,6 +212,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     );
     let mut failed = false;
     let mut leads: Vec<(String, Vec<(MediaType, u32)>)> = Vec::new();
+    let mut ranked = Vec::new();
     let mut shown: Vec<String> = Vec::new();
     for path in &paths {
         let label = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
@@ -244,6 +248,21 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             shown.push(format!("  {:>2}. {}", at + 1, recommend::describe(&indexes, slide)));
         }
         leads.push((label, slides.iter().take(LEAD).filter_map(key).collect()));
+        ranked.push(crate::billboardeval::Ranked {
+            fixture: path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+            candidates: slides
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, slide)| {
+                    let (media, id) = key(slide)?;
+                    Some(crate::billboardeval::Candidate {
+                        rank: rank + 1,
+                        id: format!("{}:{id}", if media == MediaType::Movie { "movie" } else { "series" }),
+                        title: name(&indexes, slide),
+                    })
+                })
+                .collect(),
+        });
     }
     println!("\noverlap (first {LEAD} slides shared, at most {MAX_OVERLAP}):");
     for (i, (a, lead_a)) in leads.iter().enumerate() {
@@ -266,6 +285,25 @@ pub async fn run(dir: &std::path::Path) -> i32 {
         }
     }
     println!("\n{}", shown.join("\n"));
+    if evaluate {
+        let path = std::env::var("BILLBOARD_JUDGED").unwrap_or_else(|_| "judged/billboard.json".to_owned());
+        let judged = match crate::billboardeval::read(&path, ranked.iter().map(|r| r.fixture.as_str())) {
+            Ok(judged) => judged,
+            Err(e) => {
+                eprintln!("billboard-eval: {e}");
+                return 1;
+            }
+        };
+        let evaluation = crate::billboardeval::evaluate(&judged, &ranked);
+        crate::billboardeval::print(&evaluation);
+        if let Some(export) = std::env::var("BILLBOARD_EVAL_UNJUDGED").ok().filter(|s| !s.is_empty()) {
+            if let Err(e) = crate::billboardeval::write_unjudged(&export, &evaluation) {
+                eprintln!("billboard-eval: {e}");
+                return 1;
+            }
+            println!("unjudged candidates written to {export}");
+        }
+    }
     i32::from(failed)
 }
 
