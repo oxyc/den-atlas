@@ -19,6 +19,8 @@ pub(crate) struct Candidate {
     pub(crate) rank: usize,
     pub(crate) id: String,
     pub(crate) title: String,
+    pub(crate) award_recognised: bool,
+    pub(crate) award_won: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,6 +254,46 @@ pub(crate) fn print(evaluation: &Evaluation) {
     );
 }
 
+#[derive(Debug, PartialEq)]
+struct SignalCoverage {
+    displayed: usize,
+    award_recognised: usize,
+    award_won: usize,
+}
+
+fn signal_coverage(ranked: &[Ranked]) -> SignalCoverage {
+    let candidates: Vec<&Candidate> = ranked.iter().flat_map(|row| row.candidates.iter().take(K)).collect();
+    SignalCoverage {
+        displayed: candidates.len(),
+        award_recognised: candidates.iter().filter(|candidate| candidate.award_recognised).count(),
+        award_won: candidates.iter().filter(|candidate| candidate.award_won).count(),
+    }
+}
+
+/// Objective signal availability beside the human relevance evaluation. Coverage alone never decides whether a
+/// signal helps ranking; that decision is explicitly gated on human grades.
+pub(crate) fn print_signal_coverage(evaluation: &Evaluation, ranked: &[Ranked], awards_available: bool) {
+    let coverage = signal_coverage(ranked);
+    println!("\nsignal coverage (displayed top {K}; measurement only):");
+    if awards_available {
+        println!(
+            "awards      {}/{} recognised, {}/{} winners",
+            coverage.award_recognised, coverage.displayed, coverage.award_won, coverage.displayed
+        );
+    } else {
+        println!("awards      unavailable (dataset store has no ceremony table)");
+    }
+    println!("critics     unavailable (dataset/store contract carries no critic-score field)");
+    let judged = evaluation.total().coverage_numerator;
+    if judged == 0 {
+        println!("decision    deferred: 0 human-judged displayed titles; no ranking signal or weight changed");
+    } else {
+        println!(
+            "decision    requires a baseline/candidate relevance comparison over the {judged} human-judged displayed titles"
+        );
+    }
+}
+
 fn print_metrics(label: &str, metrics: &Metrics) {
     let (ndcg, bad) = metrics.relevance.map_or_else(
         || ("-".to_owned(), "-".to_owned()),
@@ -340,6 +382,8 @@ mod tests {
                     rank: rank + 1,
                     id: format!("movie:{id}"),
                     title: format!("Title {id}"),
+                    award_recognised: id == 1 || id == 2,
+                    award_won: id == 1,
                 })
                 .collect(),
         }]
@@ -389,6 +433,10 @@ mod tests {
         assert_eq!((result.metrics.coverage_numerator, result.metrics.coverage_denominator), (0, 6));
         assert_eq!(result.metrics.holdout_recall(), None);
         assert_eq!(result.unjudged.len(), 6);
+        assert_eq!(
+            signal_coverage(&ranked()),
+            SignalCoverage { displayed: 6, award_recognised: 2, award_won: 1 }
+        );
     }
 
     #[test]

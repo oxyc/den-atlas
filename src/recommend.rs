@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Names the scoring rules, so a kept answer can say which rules chose it.
-pub const SCORER: &str = "fit-2";
+pub const SCORER: &str = "fit-3";
 
 type Key = (MediaType, u32);
 
@@ -120,6 +120,9 @@ pub const MAX_LIBRARY: usize = 5000;
 pub const MAX_OWNED: usize = 10_000;
 pub const MAX_CANDIDATES: usize = 2000;
 pub const MAX_SERVICES: usize = 64;
+/// Unindexed library titles embedded per request. This bounds latency and work for a library of thousands.
+pub const MAX_LIBRARY_EMBEDS: usize = 32;
+const MAX_LIBRARY_EMBED_TEXT: usize = 2_000;
 
 // ---------------------------------------------------------------------------------------------------------
 // The request.
@@ -240,6 +243,10 @@ pub struct Offered {
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Hint {
+    /// Transient identity/prose used only to embed a library title absent from the plot index.
+    pub title: Option<String>,
+    pub year: Option<i32>,
+    pub overview: Option<String>,
     pub release_date: Option<String>,
     pub genre_ids: Option<Vec<u16>>,
     pub original_language: Option<String>,
@@ -252,6 +259,38 @@ pub struct Hint {
     pub votes: Option<f64>,
     pub adult: Option<bool>,
     pub imdb_id: Option<String>,
+}
+
+impl Hint {
+    fn embed_text(&self) -> Option<String> {
+        let overview = self.overview.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let title = self.title.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let text = match (overview, title, self.year) {
+            (Some(overview), Some(title), Some(year)) => format!("{title} ({year})\n{overview}"),
+            (Some(overview), Some(title), None) => format!("{title}\n{overview}"),
+            (Some(overview), None, _) => overview.to_owned(),
+            (None, Some(title), Some(year)) => format!("{title} ({year})"),
+            (None, Some(title), None) => title.to_owned(),
+            (None, None, _) => return None,
+        };
+        Some(text.chars().take(MAX_LIBRARY_EMBED_TEXT).collect())
+    }
+}
+
+/// Bounded, deduplicated embedding work for library titles Atlas cannot find in its plot index.
+pub(crate) fn library_embedding_requests(indexes: &Indexes, request: &Request) -> Vec<(Key, String)> {
+    let mut seen = HashSet::new();
+    request
+        .library
+        .iter()
+        .filter(|entry| entry.weight.is_finite() && entry.weight != 0.0)
+        .filter_map(|entry| {
+            let key = (media_type(&entry.type_)?, entry.id);
+            (indexes.plot.row_of(key.1, key.0).is_none() && seen.insert(key))
+                .then(|| entry.hint.embed_text().map(|text| (key, text)))?
+        })
+        .take(MAX_LIBRARY_EMBEDS)
+        .collect()
 }
 
 fn media_type(name: &str) -> Option<MediaType> {
@@ -1016,6 +1055,7 @@ pub fn answer(
     request: &Request,
     lists: &Lists,
     now: f64,
+    library_embeddings: Option<&HashMap<Key, Vec<i8>>>,
 ) -> serde_json::Value {
     let known = Knowledge { indexes };
     let only = request.only();
@@ -1029,11 +1069,20 @@ pub fn answer(
         .collect();
     let library: Vec<(Features, f64)> = weighed
         .iter()
-        .map(|&(key, e)| (Features::of(indexes, key, &known.title(key, Some(&e.hint), None)), e.weight))
+        .map(|&(key, e)| {
+            let embedding = library_embeddings.and_then(|vectors| vectors.get(&key)).map(Vec::as_slice);
+            (
+                Features::of(indexes, key, &known.title(key, Some(&e.hint), None))
+                    .with_embedding(indexes, embedding),
+                e.weight,
+            )
+        })
         .collect();
     let library_unjudged =
         weighed.iter().filter(|&&(key, e)| known.title(key, Some(&e.hint), None).genres.is_empty()).count();
     let library_indexed = library.iter().filter(|(features, _)| features.indexed()).count();
+    let library_embedded = library.iter().filter(|(features, _)| features.embedded()).count();
+    let library_unindexed = library.len() - library_indexed;
     let taste = Fit::new(indexes, indexes.corpus(), &library);
     let fitted = |c: &Candidate<'_>| match &taste {
         Some(taste) => taste.of(&Features::of(indexes, c.key, &c.title)),
@@ -1163,7 +1212,9 @@ pub fn answer(
             .collect::<Vec<_>>(),
         "unjudgedCount": unjudged_count,
         "libraryUnjudged": library_unjudged,
-        "pool": { "titles": pooled, "catalogue": catalogue, "personal": personal_count, "libraryIndexed": library_indexed },
+        "pool": { "titles": pooled, "catalogue": catalogue, "personal": personal_count,
+                  "libraryIndexed": library_indexed, "libraryUnindexed": library_unindexed,
+                  "libraryEmbedded": library_embedded },
     })
 }
 
@@ -1373,12 +1424,14 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         None => String::new(),
     };
     format!(
-        "recommend {}{on}: library {} ({} unjudged, {} indexed), owned {}, candidates {}, pool {} ({} catalogue, \
+        "recommend {}{on}: library {} ({} unjudged, {} indexed, {} embedded, {} unindexed), owned {}, candidates {}, pool {} ({} catalogue, \
          {} unjudged, {} personal), {} slides; {}",
         request.surface.as_deref().unwrap_or("home"),
         request.library.len(),
         answer["libraryUnjudged"],
         answer["pool"]["libraryIndexed"],
+        answer["pool"]["libraryEmbedded"],
+        answer["pool"]["libraryUnindexed"],
         request.owned.len(),
         request.candidates.len(),
         answer["pool"]["titles"],
@@ -1541,6 +1594,22 @@ mod tests {
 
     const CRIME: u16 = 80;
     const DRAMA: u16 = 18;
+
+    #[test]
+    fn an_unindexed_library_hint_has_bounded_embedding_text_without_inventing_prose() {
+        let titled = Hint { title: Some("  Example  ".to_owned()), year: Some(2024), ..Hint::default() };
+        assert_eq!(titled.embed_text().as_deref(), Some("Example (2024)"));
+        let overview = Hint {
+            title: Some("Example".to_owned()),
+            year: None,
+            overview: Some("A supplied synopsis.".to_owned()),
+            ..Hint::default()
+        };
+        assert_eq!(overview.embed_text().as_deref(), Some("Example\nA supplied synopsis."));
+        assert_eq!(Hint::default().embed_text(), None);
+        let long = Hint { overview: Some("x".repeat(MAX_LIBRARY_EMBED_TEXT + 20)), ..Hint::default() };
+        assert_eq!(long.embed_text().unwrap().chars().count(), MAX_LIBRARY_EMBED_TEXT);
+    }
 
     fn now() -> f64 {
         day(2026, 9, 12)

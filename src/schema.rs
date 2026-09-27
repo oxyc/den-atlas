@@ -858,7 +858,7 @@ fn routes() -> Value {
             "path": "/recommend",
             "about": "The titles a featured surface leads with, for one household.",
             "body": "{surface?, service?, now?, services?, library, owned, hide?, candidates?, limit?}",
-            "returns": "{slides, unjudged, unjudgedCount, libraryUnjudged, facts, scorer, datasetVersion}",
+            "returns": "{slides, unjudged, unjudgedCount, libraryUnjudged, pool:{libraryIndexed,libraryUnindexed,libraryEmbedded,…}, facts, scorer, datasetVersion}",
         },
         {
             "method": "GET",
