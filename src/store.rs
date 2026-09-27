@@ -221,8 +221,7 @@ pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
 /// against the real writer's output, by `maps_and_checks_the_spec_fixture` below.
 #[cfg(test)]
 pub(crate) mod fixture {
-    use blake2::digest::{Update, VariableOutput};
-    use blake2::Blake2bVar;
+    use blake2::{digest::consts::U8, Blake2b, Digest};
     use std::collections::HashMap;
 
     const HEADER: usize = 64;
@@ -905,11 +904,16 @@ pub(crate) mod fixture {
 
     /// The writer's `hashlib.blake2b(payload, digest_size=8)`, read little-endian.
     fn blake2b64(body: &[u8]) -> u64 {
-        let mut hasher = Blake2bVar::new(8).expect("8-byte blake2b");
-        hasher.update(body);
-        let mut digest = [0u8; 8];
-        hasher.finalize_variable(&mut digest).expect("digest");
-        u64::from_le_bytes(digest)
+        u64::from_le_bytes(Blake2b::<U8>::digest(body).into())
+    }
+
+    /// Blake2 0.11 moved variable output size to a compile-time parameter. Keep the store header's exact
+    /// eight digest bytes (sixteen hex digits), rather than truncating Blake2b-512 — a different function.
+    /// These are Python `hashlib.blake2b(..., digest_size=8)` vectors, which is what the real writer uses.
+    #[test]
+    fn content_hash_matches_the_python_writer() {
+        assert_eq!(blake2b64(b""), 0xb4b2_7974_57a0_a6e4);
+        assert_eq!(blake2b64(b"den-store fixture hash compatibility"), 0xcf07_0a90_2822_9f41);
     }
 }
 
