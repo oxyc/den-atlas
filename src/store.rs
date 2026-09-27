@@ -913,10 +913,7 @@ pub(crate) mod fixture {
     #[test]
     fn content_hash_matches_the_python_writer() {
         assert_eq!(blake2b64(b""), 0xb4b2_7974_57a0_a6e4);
-        assert_eq!(
-            blake2b64(b"den-store fixture hash compatibility"),
-            0xcf07_0a90_2822_9f41
-        );
+        assert_eq!(blake2b64(b"den-store fixture hash compatibility"), 0xcf07_0a90_2822_9f41);
     }
 }
 
