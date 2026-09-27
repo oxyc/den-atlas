@@ -286,7 +286,9 @@ pub(crate) fn print_signal_coverage(evaluation: &Evaluation, ranked: &[Ranked], 
     println!("critics     unavailable (dataset/store contract carries no critic-score field)");
     let judged = evaluation.total().coverage_numerator;
     if judged == 0 {
-        println!("decision    deferred: 0 human-judged displayed titles; no ranking signal or weight changed");
+        println!(
+            "decision    deferred: 0 human-judged displayed titles; no ranking signal or weight changed"
+        );
     } else {
         println!(
             "decision    requires a baseline/candidate relevance comparison over the {judged} human-judged displayed titles"

@@ -786,11 +786,7 @@ impl Index {
     /// unindexed title without first replacing it with a nearest indexed title.
     pub fn semantic_unit_vector(&self, query: &[i8]) -> Option<Vec<f64>> {
         let projected = self.semantic_query_bytes(query)?;
-        let norm = projected
-            .iter()
-            .map(|&byte| f64::from(byte as i8).powi(2))
-            .sum::<f64>()
-            .sqrt();
+        let norm = projected.iter().map(|&byte| f64::from(byte as i8).powi(2)).sum::<f64>().sqrt();
         (norm > 0.0).then(|| projected.iter().map(|&byte| f64::from(byte as i8) / norm).collect())
     }
 

@@ -289,10 +289,8 @@ impl<'a> Fit<'a> {
         let mut linked: HashMap<Key, f64> = HashMap::new();
         for (features, weight) in library {
             let weight = *weight;
-            let semantic = features
-                .row
-                .map(Semantic::Row)
-                .or_else(|| features.vector.clone().map(Semantic::Outside));
+            let semantic =
+                features.row.map(Semantic::Row).or_else(|| features.vector.clone().map(Semantic::Outside));
             match semantic {
                 Some(vector) if weight > 0.0 => liked.push((vector, weight)),
                 Some(vector) => disliked.push(vector),
@@ -436,11 +434,8 @@ impl<'a> Fit<'a> {
             Semantic::Row(liked) => Some(plot.similarity(row, *liked)),
             Semantic::Outside(vector) => plot.row_cosine(row, vector),
         };
-        let mut near: Vec<(f64, f64)> = self
-            .liked
-            .iter()
-            .filter_map(|(liked, w)| Some((similarity(liked)?, *w)))
-            .collect();
+        let mut near: Vec<(f64, f64)> =
+            self.liked.iter().filter_map(|(liked, w)| Some((similarity(liked)?, *w))).collect();
         if near.is_empty() {
             return None;
         }

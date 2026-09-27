@@ -3707,11 +3707,13 @@ mod tests {
             ))
             .unwrap()
         };
-        let channel = answer(&indexes, None, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now, None);
+        let channel =
+            answer(&indexes, None, &body(r#","service":{"id":8,"country":"FI"}"#), &lists, now, None);
         assert_eq!(slides(&channel), vec![("series".to_owned(), 4), ("movie".to_owned(), 3)], "{channel}");
         assert_eq!(channel["pool"]["personal"], 0);
 
-        let movies = answer(&indexes, None, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now, None);
+        let movies =
+            answer(&indexes, None, &body(r#","surface":"movies","service":{"id":8}"#), &lists, now, None);
         assert_eq!(slides(&movies), vec![("movie".to_owned(), 3)], "{movies}");
 
         // A service atlas doesn't carry has no lists (`lists` reads none): the client's candidates alone.
