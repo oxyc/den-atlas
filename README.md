@@ -204,10 +204,11 @@ pins url → canonical url pairs a client can test against.
   `120-150`, `over-150`; a series per episode), `source` (adapted from), `rating` (the rating provider's average ≥ 6,
   7 or 8 out of 10, on 10+ votes), `technique` (≥ 0.4), `audience` (≥ 0.5), `critique` (≥ 0.6), `warning` (depicts, ≥ 0.5), the twelve
   plot axes (`structure` resolves by value; the merged rows count their members' union), the entity kinds
-  `person` (anyone credited), `made`, `cast`, `author` (the author, P50, of a work the title is adapted from,
+  `person` (anyone credited), `made`, `director`, `writer`, `creator`, `cast`, `author` (the author, P50, of a work the title is adapted from,
   P144: `author:Q39829` is adapted from Stephen King; not a credit), `company`, `network` (series), `subject`,
-  `place` and `format` (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles,
-  formats from a curated list; a store without the source authors does not offer `author`), `studio` (an iconic studio by its own Q-id: every item it is credited as; see **Studios**), `award`
+  `place`, `format` and `franchise` (Wikidata Q-ids; top 30 listed, studios, subjects, places and formats from 5 titles,
+  formats from a curated list; stores without split credit or source-author sections do not offer those kinds;
+  an unnamed franchise is labelled by its Q-id), `studio` (an iconic studio by its own Q-id: every item it is credited as; see **Studios**), `award`
   (a ceremony or awarding body by its Q-id, won or nominated there: `award:Q19020` the Academy Awards) and `won`
   (won at least one award there), from Wikidata's P166/P1411 filed under the ceremony, categories not held — a
   title with no award on record is not known to lack one, so `-won:` keeps only titles recognised elsewhere, and
