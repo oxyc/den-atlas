@@ -855,25 +855,16 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
     // carry it and both indexes are stamped from the manifest. Miss this and `/index/schema.json`,
     // `/index/taxonomy.json` and the `atlas_dataset_info` metric all report an empty version.
     let plot = plot.map_err(|e| e.to_string())?.with_taxonomy_version(&sources.taxonomy_version);
-    if !plot.has_length_direction() && !plot.has_dataset_length_transform() {
+    // The dataset removes the plot-length direction before quantising (oxyc/den-dataset#129); atlas no
+    // longer keeps a corrected copy of its own. An older store ranks on its plot vectors as they are.
+    if !plot.has_dataset_length_transform() {
         eprintln!(
-            "plot vectors are {} dimensions, not the length direction's 1024 — plot_length_off does nothing",
-            plot.dimension()
+            "dataset {} declares no plotVectorTransform — plot similarity keeps the plot-length skew \
+             (oxyc/den-dataset#109)",
+            sources.dataset_version
         );
     }
     let premise = premise.map(|index| index.with_taxonomy_version(&sources.taxonomy_version));
-    // More Like This ranks on the plot vectors with the length direction removed, a second 49 MB copy that
-    // took ~1 s of the first request after every load. Built here instead, on a core the phases below leave
-    // idle, and joined before the indexes are assembled.
-    let plot = Arc::new(plot);
-    let warming = {
-        let plot = Arc::clone(&plot);
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            plot.without_length();
-            started.elapsed()
-        })
-    };
     // `factsFile` was a 43 MB JSON blob that atlas alone read — nothing served it and no client fetched
     // it — and parsing it was 1.04 s of a 1.6 s load, against 0.38 s off the store.
     //
@@ -954,13 +945,9 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             )
         })
     });
-    let (warm_took, warm_wait) =
-        timed(|| warming.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
-    let plot = Arc::into_inner(plot).expect("the warming thread held the only other reference");
-    debug_assert!(plot.without_length_ready());
     let seconds = |took: Duration| format!("{:.2}s", took.as_secs_f64());
     let phases = format!(
-        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), franchises {} ({}), facet rows {}, facets {}, display {}, length-free plot {} (wait {})",
+        "store {}, plot {}, premise {}, cards {}, facts {}, series {} ({}), franchises {} ({}), facet rows {}, facets {}, display {}",
         seconds(store_took),
         seconds(plot_took),
         seconds(premise_took),
@@ -972,9 +959,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         franchises.len(),
         seconds(plot_facets_took),
         seconds(facets_took),
-        seconds(display_took),
-        seconds(warm_took),
-        seconds(warm_wait)
+        seconds(display_took)
     );
     let indexes = Indexes {
         population,
@@ -1244,11 +1229,12 @@ mod tests {
         assert!(!queries.store_unusable());
     }
 
-    /// A completed load has already paid for the length-free plot copy. This is the contract that keeps
-    /// the first More Like This request after an idle release from rebuilding the corpus-wide matrix.
+    /// A store from before oxyc/den-dataset#129 declares no transform. It still loads, and its plot rows
+    /// are ranked as they are: atlas keeps no length-corrected copy of its own any more.
     #[test]
-    fn a_load_warms_the_length_free_plot_copy() {
-        let dir = std::env::temp_dir().join(format!("den-atlas-queries-warmed-{}", std::process::id()));
+    fn a_store_without_the_plot_transform_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("den-atlas-queries-untransformed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let title =
             crate::store::fixture::Title { media: 0, tmdb_id: 1, plot: vec![1; 1024], ..Default::default() };
@@ -1260,15 +1246,15 @@ mod tests {
         std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
         let indexes =
             load_for_tools(&Dataset::load(&dir).expect("the dataset loads")).expect("the indexes load");
-        assert!(indexes.plot.has_length_direction(), "the fixture must exercise the copied path");
-        assert!(indexes.plot.without_length_ready(), "load returned before the warmer finished");
+        assert_eq!(indexes.plot.len(), 1);
+        assert!(!indexes.plot.has_dataset_length_transform());
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// New stores already contain the projected rows. Loading one retains its mmap and records only the
-    /// direction needed for raw semantic queries; the legacy warmer must not materialise another matrix.
+    /// New stores already contain the projected rows. Loading one records only the direction needed for
+    /// raw semantic queries.
     #[test]
-    fn a_dataset_transformed_plot_index_does_not_build_the_legacy_copy() {
+    fn a_dataset_transformed_plot_index_records_the_query_direction() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
 
@@ -1307,8 +1293,6 @@ mod tests {
         let indexes = load_for_tools(&Dataset::load(&dir).expect("the transformed dataset loads"))
             .expect("the transformed index loads");
         assert!(indexes.plot.has_dataset_length_transform());
-        assert!(!indexes.plot.has_length_direction(), "the legacy copy path stayed armed");
-        assert!(std::ptr::eq(indexes.plot.without_length(), &indexes.plot));
         let _ = std::fs::remove_dir_all(dir);
     }
 
