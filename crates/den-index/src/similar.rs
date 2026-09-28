@@ -176,8 +176,10 @@ pub struct SimilarParams {
     /// Weight of TMDB export popularity, log-scaled against the pool's most popular (`Audience`). Off.
     pub w_popularity: f64,
     /// Jev's overall More Like This Noul for the candidates the dataset's cascade weighed for this seed
-    /// (`Authorship::jev`, oxyc/den-dataset#132). Off in production (`W_JEV`).
+    /// (`Authorship::jev`, oxyc/den-dataset#132), added to the score while `jev_mode` is not `Off`.
     pub w_jev: f64,
+    /// How Jev's scores reach the row (`JevMode`).
+    pub jev_mode: JevMode,
     /// Drop a candidate whose TMDB export popularity is below this (0: off). Unknown is kept.
     pub min_popularity: f64,
     /// A critique axis below this says nothing about what the work argues (`RailAggregates`).
@@ -213,10 +215,62 @@ fn percentile_at(len: usize, pct: usize) -> usize {
     (len * pct / 100).min(len.saturating_sub(1))
 }
 
-/// Production does not read Jev's scores yet. At 0 the term adds an exact 0.0, so every row is the row
-/// served before the store carried them; the rail-eval sweep behind a non-zero value is on
-/// oxyc/den-dataset#132.
+/// The additive Jev weight. At 0 the term adds an exact 0.0; the rail-eval sweep is on den-atlas#117.
 const W_JEV: f64 = 0.0;
+
+/// How Jev's More Like This scores (`Authorship::jev`) reach a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JevMode {
+    /// Not read at all, whatever `w_jev` says: the row atlas ranked before the store carried the scores.
+    Off = 0,
+    /// `spread × w_jev × Noul` is added to each weighed candidate's score.
+    Blend = 1,
+    /// The dataset cascade's order (`jev_reranked`), after `w_jev` has been added as in `Blend`.
+    Rerank = 2,
+}
+
+/// Production reranks (den-atlas#117). On the 62 judged seeds and the store carrying the scores
+/// (791b40086762), nDCG′@10 / bad@10 are: off 0.730 / 27, blend at `w_jev = 5` 0.775 / 20, rerank
+/// 0.790 / 6 (the cascade pilot's own result), rerank with blend 0.790 / 7; blend levels off at 0.783 / 18
+/// by `w_jev = 15` (swept to 25). Re-applying the subgenre cap
+/// after the rerank gives the gain back (0.775 / 21): it comes from the titles the cascade promotes past
+/// the cap, so a reranked row can carry more of one subgenre in its first twenty.
+const JEV_MODE: JevMode = JevMode::Rerank;
+
+/// The first titles of a row the dataset's cascade always weighed: atlas's top ten.
+const JEV_TOP: usize = 10;
+
+/// The row the dataset's More Like This cascade (oxyc/den-dataset#132, `more_like_cascade.py`) served:
+/// every weighed candidate still in the row is a finalist, ordered by Jev's Noul (ties by row position),
+/// and the finalists fill the head of the row. A top-ten title Jev did not weigh keeps its slot, and every
+/// other title follows in the row's order. A seed with no scores keeps its row.
+fn jev_reranked(row: Vec<Scored>, weighed: &[(Key, f64)]) -> Vec<Scored> {
+    let noul = |s: &Scored| weighed.iter().find(|&&(c, _)| c == s.key()).map(|&(_, n)| n);
+    let mut finalists: Vec<(usize, f64)> =
+        row.iter().enumerate().filter_map(|(at, s)| noul(s).map(|n| (at, n))).collect();
+    if finalists.is_empty() {
+        return row;
+    }
+    finalists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let fixed: Vec<usize> = (0..row.len().min(JEV_TOP)).filter(|&at| noul(&row[at]).is_none()).collect();
+    // Every top-ten title is either a finalist or fixed, so each fixed slot lies inside the head.
+    let head = finalists.len() + fixed.len();
+    let mut ordered = finalists.iter().map(|&(at, _)| at);
+    let mut order: Vec<usize> =
+        (0..head)
+            .map(|slot| {
+                if fixed.contains(&slot) {
+                    slot
+                } else {
+                    ordered.next().expect("one finalist per free slot")
+                }
+            })
+            .collect();
+    let placed: std::collections::HashSet<usize> = order.iter().copied().collect();
+    order.extend((0..row.len()).filter(|at| !placed.contains(at)));
+    let mut slots: Vec<Option<Scored>> = row.into_iter().map(Some).collect();
+    order.into_iter().map(|at| slots[at].take().expect("each position once")).collect()
+}
 
 /// Production does not weigh release year at all: two titles' years are part of what the facet axis `era`
 /// already reads, and nothing has measured a separate term as better. The knob exists so it can be.
@@ -286,6 +340,7 @@ impl Default for SimilarParams {
             min_votes: MIN_VOTES,
             w_popularity: W_POPULARITY,
             w_jev: W_JEV,
+            jev_mode: JEV_MODE,
             min_popularity: MIN_POPULARITY,
             critique_floor: CRITIQUE_FLOOR,
             holds: HOLDS,
@@ -434,6 +489,14 @@ impl SimilarParams {
             W_MAX,
             false,
             "Jev's overall More Like This judgement, for the candidates the dataset weighed",
+        ),
+        knob(
+            "jev_mode",
+            "signals",
+            0.0,
+            2.0,
+            true,
+            "Jev's scores: 0 off, 1 blend (add w_jev), 2 rerank (order the weighed finalists by Jev)",
         ),
         knob("w_facet_era", "facet axes", 0.0, W_MAX, false, "era's relative importance; 0 ignores it"),
         knob(
@@ -588,6 +651,7 @@ impl SimilarParams {
             "min_votes" => self.min_votes,
             "w_popularity" => self.w_popularity,
             "w_jev" => self.w_jev,
+            "jev_mode" => f64::from(self.jev_mode as u8),
             "min_popularity" => self.min_popularity,
             "critique_floor" => self.critique_floor,
             "holds" => self.holds,
@@ -645,6 +709,13 @@ impl SimilarParams {
             "min_votes" => self.min_votes = value,
             "w_popularity" => self.w_popularity = value,
             "w_jev" => self.w_jev = value,
+            "jev_mode" => {
+                self.jev_mode = match whole {
+                    0 => JevMode::Off,
+                    1 => JevMode::Blend,
+                    _ => JevMode::Rerank,
+                }
+            }
             "min_popularity" => self.min_popularity = value,
             "critique_floor" => self.critique_floor = value,
             "holds" => self.holds = value,
@@ -1715,6 +1786,15 @@ fn rank_pool_inner<'l>(
     let series = |key: Key| members.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
     let weighed: &[(Key, f64)] = authorship.map(Authorship::jev).unwrap_or_default();
     let jev = |key: Key| weighed.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
+    let w_jev = if p.jev_mode == JevMode::Off { 0.0 } else { p.w_jev };
+    let finish = |row: Vec<Scored>, p: &SimilarParams| {
+        let row = finish_row(row, seed_key, p);
+        if p.jev_mode == JevMode::Rerank {
+            jev_reranked(row, weighed)
+        } else {
+            row
+        }
+    };
     // Read only while weighed, and only for a seed from outside the English-language mainstream.
     let seed_origin: Vec<[u8; 2]> = match facets {
         Some(f) if p.w_region > 0.0 => {
@@ -1946,9 +2026,9 @@ fn rank_pool_inner<'l>(
                         + p.w_character * ch
                         + p.w_region * region
                         + p.w_series * sr
-                        // At production's `w_jev = 0` an exact 0.0 too, so a store carrying the scores
-                        // ranks exactly as one without them.
-                        + p.w_jev * jv);
+                        // An exact 0.0 at `jev_mode = Off` or `w_jev = 0`, so a store carrying the
+                        // scores then ranks exactly as one without them.
+                        + w_jev * jv);
             Scored {
                 media_type: id.0,
                 tmdb_id: id.1,
@@ -1984,8 +2064,7 @@ fn rank_pool_inner<'l>(
     // For an inspected title, keep a complete diagnostic ordering before the configured row length truncates
     // it. This is the position it would hold if the row were long enough; scoring and all gates are unchanged.
     if let Some(key) = inspect {
-        let all =
-            finish_row(final_scored.clone(), seed_key, &SimilarParams { max_row: final_scored.len(), ..*p });
+        let all = finish(final_scored.clone(), &SimilarParams { max_row: final_scored.len(), ..*p });
         if let Some((at, scored)) = all.iter().enumerate().find(|(_, s)| s.key() == key) {
             let i = inspection.as_mut().unwrap();
             i.position = Some(at + 1);
@@ -1996,7 +2075,7 @@ fn rank_pool_inner<'l>(
     // Each type is picked on its own — the cap keyed by (type, subgenre), its window counted in that type's
     // titles — and the two are then merged by score. So the seed type's titles come out in exactly the order
     // a row of that type alone would put them in, and a mixed row only adds the other type between them.
-    let row = finish_row(final_scored, seed_key, p);
+    let row = finish(final_scored, p);
     if let Some(key) = inspect {
         let i = inspection.as_mut().unwrap();
         if row.iter().all(|s| s.key() != key) {
@@ -2390,11 +2469,12 @@ mod tests {
         assert!(inspected.scored.is_some() && inspected.position.is_some(), "{inspected:?}");
     }
 
-    /// Jev's scores (oxyc/den-dataset#132) change nothing at `w_jev = 0`: not a title, not a score. Weighed,
-    /// they lift the candidate Jev rated highest, and a title Jev never weighed is neither lifted nor
-    /// nominated.
+    /// Jev's scores (oxyc/den-dataset#132) change nothing while `jev_mode` is off, whatever `w_jev` says: not
+    /// a title, not a score. Blended, they lift the candidate Jev rated highest, and a title Jev never weighed
+    /// is neither lifted nor nominated. Reranked, the weighed titles take the head in Jev's order around an
+    /// unweighed top-ten title, which keeps its slot; a seed without scores keeps its row.
     #[test]
-    fn jev_scores_are_inert_at_zero_and_lift_what_jev_rated_when_weighed() {
+    fn jev_scores_are_inert_when_off_and_lift_or_reorder_what_jev_rated() {
         let subs: &[(&str, f64)] = &[("Police Procedural", 0.9)];
         let moods: &[(&str, f64)] = &[("Dark & Gritty", 0.9)];
         let premise = fixture(&[
@@ -2418,20 +2498,28 @@ mod tests {
         }
         let mut p = SimilarParams::default();
         p.set("pool_k", 3.0).unwrap();
+        p.set("jev_mode", 0.0).unwrap();
+        p.set("w_jev", 5.0).unwrap();
         let ranked =
             |row: Vec<Scored>| -> Vec<(u32, f64)> { row.iter().map(|s| (s.tmdb_id, s.score)).collect() };
         let row = |p: &SimilarParams, a: Option<&dyn Authorship>| {
             more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, a, None, p)
         };
+        let ids = |row: Vec<Scored>| -> Vec<u32> { row.iter().map(|s| s.tmdb_id).collect() };
         let off = row(&p, Some(&Judged));
-        assert_eq!(ranked(off.clone()), ranked(row(&p, None)), "unweighed, Jev changes nothing");
-        assert_eq!(off.iter().map(|s| s.tmdb_id).collect::<Vec<_>>(), [2, 3, 4]);
-        assert_eq!(off.iter().find(|s| s.tmdb_id == 4).map(|s| s.jev), Some(0.9), "reported while unweighed");
+        assert_eq!(ranked(off.clone()), ranked(row(&p, None)), "off, Jev changes nothing");
+        assert_eq!(ids(off.clone()), [2, 3, 4]);
+        assert_eq!(off.iter().find(|s| s.tmdb_id == 4).map(|s| s.jev), Some(0.9), "reported while off");
 
-        p.set("w_jev", 5.0).unwrap();
-        let on: Vec<u32> = row(&p, Some(&Judged)).iter().map(|s| s.tmdb_id).collect();
+        p.set("jev_mode", 1.0).unwrap();
+        let on = ids(row(&p, Some(&Judged)));
         assert_eq!(on[0], 4, "{on:?}");
         assert!(!on.contains(&5), "a weighed title outside the pool is not nominated: {on:?}");
+
+        p.set("jev_mode", 2.0).unwrap();
+        p.set("w_jev", 0.0).unwrap();
+        assert_eq!(ids(row(&p, Some(&Judged))), [4, 3, 2], "3 was not weighed and keeps its slot");
+        assert_eq!(ranked(row(&p, None)), ranked(off), "a seed without scores keeps its row");
     }
 
     /// The Beck case (oxyc/den-atlas#92). Four police procedurals the vectors put nearest, and four entries of
@@ -2665,7 +2753,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 52, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 53, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {

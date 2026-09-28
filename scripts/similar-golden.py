@@ -3,10 +3,12 @@
 
   scripts/similar-golden.py http://127.0.0.1:8080 "<why it was recaptured>"
 
-Asks the atlas for each anchor's whole More Like This row (GET /index/similar/<type>/<id>.json?limit=200)
-and its dataset's version (GET /dataset.json), and rewrites the golden with them. The anchors are the ones
-already in the file. Run it against a binary built from the commit you mean to pin, serving the store the
-golden is for, and say in the second argument what changed.
+Asks the atlas for each anchor's whole More Like This row (GET /index/similar/<type>/<id>.json?limit=200),
+the same row with Jev's scores off (`off`: GET /playground/similar/<type>/<id>.json?jev_mode=0&mix_types=0
+&limit=200, so the atlas needs PLAYGROUND=1 and INDEX_QUERIES=1) and its dataset's version
+(GET /dataset.json), and rewrites the golden with them. The anchors are the ones already in the file. Run
+it against a binary built from the commit you mean to pin, serving the store the golden is for, and say in
+the second argument what changed.
 """
 import json
 import pathlib
@@ -28,11 +30,14 @@ for anchor in golden["anchors"]:
     ids = get(f"/index/similar/{anchor['type']}/{anchor['id']}.json?limit=200")["ids"]
     if not ids:
         sys.exit(f"{anchor['name']}: the atlas answered an empty row; is it serving the right store?")
-    anchors.append({"name": anchor["name"], "type": anchor["type"], "id": anchor["id"], "ids": ids})
+    off = get(f"/playground/similar/{anchor['type']}/{anchor['id']}.json?jev_mode=0&mix_types=0&limit=200")
+    off = [title["id"] for title in off["titles"]]
+    anchors.append({"name": anchor["name"], "type": anchor["type"], "id": anchor["id"], "ids": ids, "off": off})
 
 out = {
     "about": "More Like This rows for these anchors, GET /index/similar/<type>/<id>.json?limit=200 on the store "
-    f"named by datasetVersion, captured by scripts/similar-golden.py. {why}",
+    "named by datasetVersion, and as `off` the same row at jev_mode=0 (the playground route), captured by "
+    f"scripts/similar-golden.py. {why}",
     "datasetVersion": get("/dataset.json")["datasetVersion"],
     "anchors": anchors,
 }
