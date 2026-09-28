@@ -870,6 +870,27 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
 mod tests {
     use super::*;
 
+    /// Every group the page's knob table files a knob under is one it draws. `structural_k` and `w_structural` were
+    /// filed under `structural`, which `GROUPS` did not name: their inputs were never built, and the page's first
+    /// re-rank read `.type` of null and showed nothing but "Could not load the playground".
+    #[test]
+    fn every_knob_group_the_page_names_is_one_it_draws() {
+        let between = |from: &str, to: &str| {
+            let start = PAGE.find(from).expect(from) + from.len();
+            &PAGE[start..start + PAGE[start..].find(to).expect(to)]
+        };
+        let drawn: Vec<&str> =
+            between("const GROUPS = [", "];").lines().filter_map(|line| line.split('"').nth(1)).collect();
+        let filed: Vec<&str> = between("const KNOBS = {", "\n};")
+            .lines()
+            .filter_map(|line| line.split_once(": [\"").map(|(_, rest)| rest.split('"').next().unwrap_or("")))
+            .collect();
+        assert!(!drawn.is_empty() && !filed.is_empty(), "the page's tables were not found");
+        for group in filed {
+            assert!(drawn.contains(&group), "a knob is filed under `{group}`, which the page never draws");
+        }
+    }
+
     #[test]
     fn an_empty_query_is_production() {
         assert_eq!(parse("").unwrap(), Tuning::default());
