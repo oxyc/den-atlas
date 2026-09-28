@@ -209,6 +209,8 @@ pub struct CharacterIndex {
     named: NamedCharacters,
     /// Where each title bills its cast, read from the same credits (`billing.rs`).
     billing: Billing,
+    /// Other versions linked through a title character (`versions::character_links`), by store row.
+    versions: HashMap<u32, Vec<u32>>,
 }
 
 impl std::fmt::Debug for CharacterIndex {
@@ -259,6 +261,11 @@ impl CharacterIndex {
     /// Where each title bills its cast (`billing.rs`).
     pub fn billing(&self) -> &Billing {
         &self.billing
+    }
+
+    /// The store rows a row is another version of through a title character, ascending.
+    pub fn versions_of(&self, row: usize) -> &[u32] {
+        u32::try_from(row).ok().and_then(|row| self.versions.get(&row)).map_or(&[], Vec::as_slice)
     }
 
     /// Resident size, for the log: the links, the names titles are filtered by, and the billing.
@@ -324,12 +331,14 @@ impl Characters {
 pub fn describe(index: &CharacterIndex) -> String {
     let tiers: Vec<String> = index.per_tier().map(|(tier, n)| format!("{} {n}", tier.name())).collect();
     format!(
-        "{} links over {} of {} store rows ({}), {} filterable names, {} billed titles, {:.1} MB resident",
+        "{} links over {} of {} store rows ({}), {} filterable names, {} titles with character versions, {} billed \
+         titles, {:.1} MB resident",
         index.links(),
         index.linked(),
         index.rows(),
         tiers.join(", "),
         index.named().len(),
+        index.versions.len(),
         index.billing().titles(),
         index.bytes() as f64 / 1_000_000.0
     )
@@ -371,7 +380,18 @@ fn build_billed(
         eprintln!("characters: no billing ({e})");
         Billing::default()
     });
-    Ok(CharacterIndex { billing, ..index })
+    // Without them a title shows only the versions the store holds.
+    let versions = crate::versions::character_links(view, &index).unwrap_or_else(|e| {
+        eprintln!("characters: no character versions ({e})");
+        HashMap::new()
+    });
+    Ok(CharacterIndex { billing, versions, ..index })
+}
+
+/// The words of a normalised character name that can name it in a title: three letters or more, and not a
+/// filler or a rank ("the", "captain").
+pub(crate) fn name_words(name: &str) -> impl Iterator<Item = &str> {
+    name.split(' ').filter(|w| w.chars().count() >= 3 && !STOP.contains(w) && !SUBSET_STOP.contains(w))
 }
 
 /// The neighbour list from each row's roles, reading the first `billed` of each.
@@ -803,6 +823,7 @@ fn index(row_count: usize, edges: &HashMap<Pair, (Tier, f32)>) -> CharacterIndex
         per_tier,
         named: NamedCharacters::default(),
         billing: Billing::default(),
+        versions: HashMap::new(),
     }
 }
 

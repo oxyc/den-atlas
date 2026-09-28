@@ -3445,7 +3445,21 @@ mod tests {
         assert_eq!(versions["versions"][0]["id"], 2);
         assert_eq!(versions["versions"][0]["kind"], "remake");
         assert_eq!(versions["versions"][0]["title"], "Beta", "a version is a card: {versions}");
+        assert!(versions["versions"][0].get("group").is_none(), "movie:2 is in no franchise: {versions}");
         assert_eq!(get(&state, "/index/versions/anime/1.json").await.status(), 404);
+        // movie:2's versions are both members of one franchise: shown as that group, each keeping its own kind.
+        let grouped = json(body_of(get(&state, "/index/versions/movie/2.json").await).await);
+        let groups: Vec<_> =
+            grouped["versions"].as_array().unwrap().iter().map(|v| (&v["group"]["id"], &v["kind"])).collect();
+        assert_eq!(
+            groups,
+            [
+                (&serde_json::json!("fixture:alpha"), &serde_json::json!("source")),
+                (&serde_json::json!("fixture:alpha"), &serde_json::json!("remake"))
+            ],
+            "{grouped}"
+        );
+        assert_eq!(grouped["versions"][1]["group"]["era"]["id"], "fixture:alpha:era:tv");
 
         let movie_row = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         let series_row = json(body_of(get(&state, "/index/franchise/series/10.json").await).await);
@@ -3470,6 +3484,21 @@ mod tests {
                 .iter()
                 .any(|member| member["type"] == "series" && member["id"] == 10),
             "the dedicated franchise row, not More Like This, owns the other primary member: {similar}"
+        );
+        // Other versions own theirs too: movie:2 is movie:1's version, and movie:2 reaches the whole franchise.
+        let mixed = |row: &serde_json::Value| {
+            row["mixed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| (m["type"].as_str().unwrap().to_owned(), m["id"].as_u64().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert!(!mixed(&similar).contains(&("movie".into(), 2)), "{similar}");
+        let from_version = json(body_of(get(&state, "/index/similar/movie/2.json?limit=200").await).await);
+        assert!(
+            !mixed(&from_version).iter().any(|k| *k == ("movie".into(), 1) || *k == ("series".into(), 10)),
+            "{from_version}"
         );
 
         let inspected = json(
