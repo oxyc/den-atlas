@@ -59,15 +59,48 @@ impl RatingsIndex {
 }
 
 /// The live holder: `tmdb.rs` swaps a new index in, and the query indexes read whichever is current.
-#[derive(Default)]
 pub struct Ratings {
     index: RwLock<Option<Arc<RatingsIndex>>>,
+    /// Whether the first build has finished, however it ended (`settled`). A holder made with `unsettled` is
+    /// waiting for one; any other has nothing to wait for.
+    settled: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for Ratings {
+    fn default() -> Self {
+        Ratings { index: RwLock::new(None), settled: tokio::sync::watch::Sender::new(true) }
+    }
 }
 
 impl Ratings {
     #[cfg(test)]
     pub fn with_index(index: RatingsIndex) -> Self {
-        Ratings { index: RwLock::new(Some(Arc::new(index))) }
+        let holder = Ratings::default();
+        holder.set(Some(index));
+        holder
+    }
+
+    /// A holder whose first build is still to come: `settled` waits until `settle` says it has finished.
+    pub fn unsettled() -> Self {
+        Ratings { settled: tokio::sync::watch::Sender::new(false), ..Ratings::default() }
+    }
+
+    /// The first build has finished — with an index, or with none.
+    pub fn settle(&self) {
+        self.settled.send_replace(true);
+    }
+
+    /// Whether the first build has finished.
+    pub fn is_settled(&self) -> bool {
+        *self.settled.borrow()
+    }
+
+    /// Once the first build has finished. The index loads wait here, because a load copies the counts into
+    /// the facet index and the search index it builds, and those live as long as the process: a load that
+    /// started before the counts landed would rank every title at 0 votes until the next restart.
+    pub async fn settled(&self) {
+        // The sender lives in `self`, so the channel cannot close while this waits.
+        let _ = self.settled.subscribe().wait_for(|settled| *settled).await;
     }
 
     /// The current index; `None` until the first build, and while nothing is kept.

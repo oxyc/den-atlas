@@ -375,7 +375,7 @@ async fn main() {
 
     // What /health says at boot, so the first change after it is logged against the real starting
     // state (a missing dataset is already reported above).
-    let health = handler::health_state(dataset.is_some(), true, false, false, false, false, false)
+    let health = handler::health_state(dataset.is_some(), true, false, false, false, false, false, false)
         .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
         dataset,
@@ -400,7 +400,8 @@ async fn main() {
     if let Some(tmdb) = &tmdb {
         // The vote counts are awaited, not spawned: a local read. The store carries no vote count of its own, so
         // until this lands every browse row would answer in tmdb-id order — and `atlas-dataset-sync` restarts
-        // this process on every publish, so that window is not rare.
+        // this process on every publish, so that window is not rare. The index load spawned above waits for
+        // them (`Ratings::settled`): it copies them into the search and facet indexes it keeps.
         eprintln!("{}", tmdb.load_votes().await);
         // The character links are most of the boot's TMDB work and nothing but the index routes reads them, so
         // they are built while atlas already answers everything else. The first index load waits for them
