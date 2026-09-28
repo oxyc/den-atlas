@@ -3316,6 +3316,7 @@ mod tests {
         assert!(title["plotFacets"].is_object(), "{title}");
         assert!(title["makers"].is_array() && title["cast"].is_array(), "{title}");
         assert!(title.get("franchise").is_none(), "an old store invents no curated franchise");
+        assert!(title.get("premiseTags").is_none(), "a store without premise tags names none");
 
         let no_franchise = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         assert!(no_franchise["franchise"].is_null());
@@ -3338,6 +3339,16 @@ mod tests {
         assert!(movie["franchise"].get("umbrella").is_none());
         let series = json(body_of(get(&state, "/index/title/series/10.json").await).await);
         assert_eq!(series["franchise"]["umbrella"]["id"], "fixture:world");
+        assert_eq!(
+            movie["premiseTags"],
+            serde_json::json!(["wrongly-convicted-banker", "prison-friendship", "found-family"])
+        );
+        assert_eq!(
+            series["premiseTags"],
+            serde_json::json!(["found-family", "rise-and-fall-of-a-crime-boss"])
+        );
+        let facts_only = json(body_of(get(&state, "/index/title/movie/2.json").await).await);
+        assert!(facts_only.get("premiseTags").is_none(), "a title with no tags names none: {facts_only}");
 
         let movie_row = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         let series_row = json(body_of(get(&state, "/index/franchise/series/10.json").await).await);

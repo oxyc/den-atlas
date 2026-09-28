@@ -618,8 +618,10 @@ fn routes() -> Value {
                         at the display floor, plotFacets {axis: value} at the same floor, and from the facts \
                         countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
                         (cast at most 60, castTotal all of them), and awards [{id: ceremony Q-id, name, won}] \
-                        when it has any, and franchise {id, name, confidence, source, era:{id,name,order}, \
-                        umbrella?:{id,name}} when it has a curated primary membership",
+                        when it has any, franchise {id, name, confidence, source, era:{id,name,order}, \
+                        umbrella?:{id,name}} when it has a curated primary membership, and premiseTags \
+                        [string] — short structural premise phrases, most defining first — when the \
+                        dataset carries them",
         },
         {
             "method": "GET",

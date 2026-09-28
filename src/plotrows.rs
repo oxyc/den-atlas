@@ -930,6 +930,15 @@ pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Valu
             .collect();
         title["plotFacets"] = serde_json::Value::Object(facets);
     }
+    // The premise tags, most defining first. Left out for a title with none or a store without them.
+    if let (Ok(Some(row)), Ok(tags), Ok(strings)) =
+        (store.row_of(media, id), store.premise_tags(), store.strings())
+    {
+        let tags: Vec<&str> = tags.get(row).iter().filter_map(|&s| strings.get(s)).collect();
+        if !tags.is_empty() {
+            title["premiseTags"] = serde_json::json!(tags);
+        }
+    }
     if let Some(facts) = indexes.facts.as_ref() {
         if let Some(record) = facts.get(id, media_type) {
             let people = |qids: &[u32], cap: usize| -> Vec<serde_json::Value> {
