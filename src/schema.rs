@@ -547,7 +547,8 @@ fn routes() -> Value {
             "path": "/index/franchise/{type}/{tmdbId}.json",
             "example": "/index/franchise/movie/1.json",
             "about": "The title's curated primary franchise as one mixed movie/series row: the seed's era first, \
-                      then other eras in stable order, release-ordered within each era. Separate from the raw \
+                      then eras of the seed's kind (animated or live action) before the rest, each nearest the \
+                      seed's release year first; release-ordered within each era. Separate from the raw \
                       Wikidata franchise filter. Empty for an old store or a title without a curated primary.",
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path" })),

@@ -151,7 +151,10 @@ fn audit_case(indexes: &Indexes, case: &Case) -> Vec<String> {
         }
     }
 
-    let Some(row) = indexes.franchises.members_for(seed) else { return failures };
+    let Some(row) = indexes.franchises.members_for(seed, |key| crate::franchises::title_facts(indexes, key))
+    else {
+        return failures;
+    };
     let row_keys: HashSet<Key> = row.iter().map(|member| member.key).collect();
     if row.len() != primary.members.len() || row_keys.len() != primary.members.len() {
         failures.push(format!("{}: franchise row loses or repeats a primary member", case.name));
