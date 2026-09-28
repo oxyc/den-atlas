@@ -1751,6 +1751,9 @@ fn billboards() -> &'static std::sync::Mutex<std::collections::HashMap<String, A
 
 /// Rank `request` (`recommend::answer`): the answer and its `Server-Timing` parts, or the response that says why
 /// not. `raw` is the body as sent, kept as a replay fixture where `RECOMMEND_FIXTURES` asks for them.
+///
+/// The error is the response the handler sends, once per request, so boxing it would only add an allocation.
+#[allow(clippy::result_large_err)]
 async fn rank(
     state: &Arc<AppState>,
     queries: &crate::queries::IndexQueries,
