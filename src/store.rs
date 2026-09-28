@@ -125,6 +125,9 @@ impl MappedStore {
         // `SeedAuthorship` reads Jev's scores per request and its caller drops the whole authorship on an
         // error, so a malformed Jev section must fail here instead of silently unweighting every maker.
         view.jev_more_like()?;
+        // You Might Also Like reads the fan picks per request and falls back to the affinity row on an
+        // error, so a malformed section must fail here instead of silently serving the old row.
+        view.fan_picks()?;
         Ok(())
     }
 }
@@ -292,6 +295,9 @@ pub(crate) mod fixture {
         pub technique: Vec<(&'a str, u8)>,
         pub audience: Vec<(&'a str, u8)>,
         pub depicts: Vec<(&'a str, u8)>,
+        /// Its fan picks as (media, tmdb id) in rank order; `None` for a title not asked. The three fan-pick
+        /// sections are written when any title was asked.
+        pub fan_picks: Option<Vec<(u8, u32)>>,
     }
 
     /// One row of the entity table: a person, a franchise, a place.
@@ -844,6 +850,21 @@ pub(crate) mod fixture {
             let items: Vec<Vec<u32>> =
                 studios.iter().map(|s| s.items.iter().map(|&qid| at(qid)).collect()).collect();
             b.list("studio_ent_v", "studio_ent_o", &items);
+        }
+
+        if titles.iter().any(|t| t.fan_picks.is_some()) {
+            let row_of = |&(media, id): &(u8, u32)| -> u32 {
+                let key = (u64::from(media) << 32) | u64::from(id);
+                u32::try_from(keys.iter().position(|&k| k == key).expect("a fan pick is a fixture title"))
+                    .expect("fixture row")
+            };
+            let rows_of: Vec<Vec<u32>> =
+                titles.iter().map(|t| t.fan_picks.iter().flatten().map(row_of).collect()).collect();
+            b.list("fan_picks_v", "fan_picks_o", &rows_of);
+            b.u8s(
+                "fan_picks_a",
+                &titles.iter().map(|t| u8::from(t.fan_picks.is_some())).collect::<Vec<u8>>(),
+            );
         }
 
         // The rail's own columns. The fixture declares no critique axis and no noul, so the pooled scorer

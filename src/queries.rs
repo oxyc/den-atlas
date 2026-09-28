@@ -113,9 +113,19 @@ const ROW_MEMO: usize = 256;
 /// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
 const AGGREGATES_MEMO: usize = 8;
 
+/// Whether You Might Also Like serves the store's fan picks (oxyc/den-atlas#121) for a title that has them.
+/// Off serves the structural-affinity row for every title, as before the fan picks.
+const FAN_PICKS: bool = true;
+/// The fewest fan picks a row is shown with, after what other rows show is left out. Fewer shows no row:
+/// a title the model was asked about and named little for has no taste row we trust.
+const FAN_PICKS_MIN: usize = 3;
+/// How much of the seed's More Like This a fan-picks row leaves out: the screenful a title page shows.
+const FAN_PICKS_SKIP_SIMILAR: usize = 20;
+
 impl Indexes {
-    /// You Might Also Like for one seed. Structural affinity leads when store-v3 carries it; the ordinary
-    /// row is appended so partial/old stores still answer and a sparse affinity pass never shortens a rail.
+    /// You Might Also Like for one seed. The fan picks where the store has them for it (`fan_pick_row`);
+    /// otherwise structural affinity leads when store-v3 carries it, and the ordinary row is appended so
+    /// partial/old stores still answer and a sparse affinity pass never shortens a rail.
     pub fn you_might_also_like(
         &self,
         tmdb_id: u32,
@@ -123,6 +133,9 @@ impl Indexes {
         mix: bool,
     ) -> Arc<[Key]> {
         memoised(&self.affinity, ((media_type, tmdb_id), mix), SIMILAR_MEMO, || {
+            if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix) {
+                return row.into();
+            }
             let params = den_index::SimilarParams::default();
             let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
                 den_index::you_might_also_like(Some(facets), (media_type, tmdb_id), mix, den_index::MAX_ROW)
@@ -139,6 +152,47 @@ impl Indexes {
             row.truncate(den_index::MAX_ROW);
             row.into()
         })
+    }
+
+    /// The seed's fan picks, in the model's order, as its You Might Also Like — or `None` when the store has
+    /// no answer for it (the title was not asked, or the store has no fan-pick sections), and the affinity
+    /// row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`), which
+    /// have rows of their own, the first screenful of its More Like This, and in a row that does not mix
+    /// types the other type. With fewer than `FAN_PICKS_MIN` left the row is empty.
+    fn fan_pick_row(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Option<Vec<Key>> {
+        if !FAN_PICKS {
+            return None;
+        }
+        let view = self.store.view();
+        // `MappedStore::check` read the sections at load, so an error here is only their absence.
+        let fan = view.fan_picks().ok()?;
+        let row = den_store::Row(row_of(&self.store, media_type, tmdb_id)?);
+        if !fan.asked(row) {
+            return None;
+        }
+        let keys = view.per_row::<u64>("keys").ok()?;
+        let kept_out = crate::versions::kept_out(self, (media_type, tmdb_id));
+        let shown: std::collections::HashSet<Key> = if mix {
+            self.more_like_this_mixed(tmdb_id, media_type)
+                .iter()
+                .take(FAN_PICKS_SKIP_SIMILAR)
+                .copied()
+                .collect()
+        } else {
+            let ids = self.more_like_this(tmdb_id, media_type);
+            ids.iter().take(FAN_PICKS_SKIP_SIMILAR).map(|&id| (media_type, id)).collect()
+        };
+        let picks: Vec<Key> = fan
+            .get(row)
+            .filter_map(|pick| keys.get(pick.0))
+            .map(|&packed| {
+                let media =
+                    if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
+                (media, packed as u32)
+            })
+            .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
+            .collect();
+        Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
     }
 
     /// What `worth_suggesting` weighs about a title.
@@ -1077,21 +1131,31 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
 /// them living in a separate blob.
 #[cfg(test)]
 pub fn write_fixture(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, true)
+    write_fixture_as(dir, "One", true, true, &[])
+}
+
+/// A fixture title as the store writer keys it: (media, tmdb id), media 0 a film and 1 a series.
+#[cfg(test)]
+type FixtureKey = (u8, u32);
+
+/// The same fixture with fan picks: each `(media, id)` named is asked, with its picks.
+#[cfg(test)]
+pub fn write_fixture_fan_picks(dir: &std::path::Path, picks: &[(FixtureKey, Vec<FixtureKey>)]) -> Dataset {
+    write_fixture_as(dir, "One", true, true, picks)
 }
 
 /// The same fixture with every `votes` count zeroed, for the tests about a corpus no source can order:
 /// what the store will look like once the producer stops writing the column.
 #[cfg(test)]
 pub fn write_fixture_voteless(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, false)
+    write_fixture_as(dir, "One", true, false, &[])
 }
 
 /// The same fixture with a different display title for movie 1, for the tests about a word that is both a
 /// facet and a title ("brazil").
 #[cfg(test)]
 pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
-    write_fixture_as(dir, movie_one, true, true)
+    write_fixture_as(dir, movie_one, true, true, &[])
 }
 
 /// The same fixture with no premise vectors, for the tests about a dataset whose store carries only the
@@ -1099,11 +1163,17 @@ pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
 /// section of the store now, so the store is what has to lack it.
 #[cfg(test)]
 pub fn write_fixture_plot_only(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", false, true)
+    write_fixture_as(dir, "One", false, true, &[])
 }
 
 #[cfg(test)]
-fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes: bool) -> Dataset {
+fn write_fixture_as(
+    dir: &std::path::Path,
+    movie_one: &str,
+    premise: bool,
+    votes: bool,
+    fan_picks: &[(FixtureKey, Vec<FixtureKey>)],
+) -> Dataset {
     use crate::store::fixture::{Entity, Title};
     // Days since 1970-01-01, the store's unit for a release date.
     const D1985: i32 = 5479;
@@ -1208,6 +1278,22 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
             title.votes = 0;
         }
     }
+    // Thirty more films, so a seed's More Like This screenful cannot hold every other title and some fan
+    // picks fall outside it.
+    if !fan_picks.is_empty() {
+        titles.extend((201..=230).map(|tmdb_id| Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vector([0, 0, 0], true),
+            premise: vector([0, 0, 0], premise),
+            ..Title::default()
+        }));
+    }
+    for (seed, picks) in fan_picks {
+        let title = titles.iter_mut().find(|t| (t.media, t.tmdb_id) == *seed).expect("a fixture title");
+        title.fan_picks = Some(picks.clone());
+    }
     let entities = [
         Entity { qid: 1, name: "A Director", tmdb: Some(11), ..Entity::default() },
         // People search indexes the aliases as well as the name.
@@ -1241,6 +1327,47 @@ mod tests {
 
     fn profile(animated: bool, year: i64, votes: u32, rating: f32) -> SuggestionProfile {
         SuggestionProfile { animated, year: Some(year), votes, rating: Some(rating), ..Default::default() }
+    }
+
+    /// You Might Also Like serves a title's fan picks in the model's order, less its More Like This screenful;
+    /// fewer than three left, or an asked title with none, is no row; a title not asked keeps the affinity row.
+    #[test]
+    fn you_might_also_like_serves_the_fan_picks_where_the_store_has_them() {
+        use den_index::MediaType::{Movie, Tv};
+        let base = std::env::temp_dir().join(format!("den-atlas-fan-picks-{}", std::process::id()));
+        // Movie 3 is asked with nothing, so the only fan picks here are what the filler needs to exist.
+        let plain = load_for_tools(&write_fixture_fan_picks(&base.join("plain"), &[((0, 3), Vec::new())]))
+            .expect("plain fixture");
+        let similar: Vec<Key> =
+            plain.more_like_this_mixed(1, Movie).iter().take(FAN_PICKS_SKIP_SIMILAR).copied().collect();
+        let others: Vec<Key> = [(Movie, 2), (Movie, 3), (Tv, 4)]
+            .into_iter()
+            .chain((101..=108).map(|id| (Tv, id)))
+            .chain((201..=230).map(|id| (Movie, id)))
+            .collect();
+        let (shown, free): (Vec<Key>, Vec<Key>) = others.iter().partition(|key| similar.contains(key));
+        assert!(free.len() >= FAN_PICKS_MIN && !shown.is_empty(), "shown {shown:?}, free {free:?}");
+        let code = |key: &Key| (u8::from(key.0 == Tv), key.1);
+        // The model's order: the free ones reversed, so the row cannot be sorted by anything else, with the
+        // More Like This titles among them.
+        let named: Vec<Key> = free.iter().rev().chain(&shown).copied().collect();
+        let short: Vec<(u8, u32)> = free.iter().filter(|&&key| key != (Movie, 2)).take(2).map(code).collect();
+        let ds = write_fixture_fan_picks(
+            &base.join("picks"),
+            &[((0, 1), named.iter().map(code).collect()), ((0, 2), short), ((0, 3), Vec::new())],
+        );
+        let indexes = load_for_tools(&ds).expect("fan-picks fixture");
+
+        let want: Vec<Key> = free.iter().rev().copied().collect();
+        assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
+        assert!(indexes.you_might_also_like(2, Movie, true).is_empty(), "two picks is no row");
+        assert!(indexes.you_might_also_like(3, Movie, true).is_empty(), "asked with none is no row");
+        assert_eq!(
+            indexes.you_might_also_like(4, Tv, true),
+            plain.you_might_also_like(4, Tv, true),
+            "not asked: the affinity row"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
