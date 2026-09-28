@@ -175,6 +175,9 @@ pub struct SimilarParams {
     pub min_votes: f64,
     /// Weight of TMDB export popularity, log-scaled against the pool's most popular (`Audience`). Off.
     pub w_popularity: f64,
+    /// Jev's overall More Like This Noul for the candidates the dataset's cascade weighed for this seed
+    /// (`Authorship::jev`, oxyc/den-dataset#132). Off in production (`W_JEV`).
+    pub w_jev: f64,
     /// Drop a candidate whose TMDB export popularity is below this (0: off). Unknown is kept.
     pub min_popularity: f64,
     /// A critique axis below this says nothing about what the work argues (`RailAggregates`).
@@ -209,6 +212,11 @@ const SPREAD_HIGH_PCT: usize = 90;
 fn percentile_at(len: usize, pct: usize) -> usize {
     (len * pct / 100).min(len.saturating_sub(1))
 }
+
+/// Production does not read Jev's scores yet. At 0 the term adds an exact 0.0, so every row is the row
+/// served before the store carried them; the rail-eval sweep behind a non-zero value is on
+/// oxyc/den-dataset#132.
+const W_JEV: f64 = 0.0;
 
 /// Production does not weigh release year at all: two titles' years are part of what the facet axis `era`
 /// already reads, and nothing has measured a separate term as better. The knob exists so it can be.
@@ -277,6 +285,7 @@ impl Default for SimilarParams {
             min_rating: MIN_RATING,
             min_votes: MIN_VOTES,
             w_popularity: W_POPULARITY,
+            w_jev: W_JEV,
             min_popularity: MIN_POPULARITY,
             critique_floor: CRITIQUE_FLOOR,
             holds: HOLDS,
@@ -417,6 +426,14 @@ impl SimilarParams {
             W_MAX,
             false,
             "TMDB popularity, ln-scaled to the pool's most popular",
+        ),
+        knob(
+            "w_jev",
+            "signals",
+            0.0,
+            W_MAX,
+            false,
+            "Jev's overall More Like This judgement, for the candidates the dataset weighed",
         ),
         knob("w_facet_era", "facet axes", 0.0, W_MAX, false, "era's relative importance; 0 ignores it"),
         knob(
@@ -570,6 +587,7 @@ impl SimilarParams {
             "min_rating" => self.min_rating,
             "min_votes" => self.min_votes,
             "w_popularity" => self.w_popularity,
+            "w_jev" => self.w_jev,
             "min_popularity" => self.min_popularity,
             "critique_floor" => self.critique_floor,
             "holds" => self.holds,
@@ -626,6 +644,7 @@ impl SimilarParams {
             "min_rating" => self.min_rating = value,
             "min_votes" => self.min_votes = value,
             "w_popularity" => self.w_popularity = value,
+            "w_jev" => self.w_jev = value,
             "min_popularity" => self.min_popularity = value,
             "critique_floor" => self.critique_floor = value,
             "holds" => self.holds = value,
@@ -1134,6 +1153,11 @@ pub trait Authorship {
     fn series(&self) -> &[(Key, f64)] {
         &[]
     }
+    /// The candidates Jev weighed for the seed, each with its overall More Like This Noul, 0..=1. Empty for
+    /// a seed the dataset gave no scores. Weighed only, never nominated: they came from the seed's own row.
+    fn jev(&self) -> &[(Key, f64)] {
+        &[]
+    }
 }
 
 /// Neighbour ids for More Like This, best first — the pooled scorer.
@@ -1209,6 +1233,9 @@ pub struct Scored {
     pub year: f64,
     /// TMDB popularity against the pool's most popular, `ln(1+p) / ln(1+max)`; 0 when unknown.
     pub popularity: f64,
+    /// Jev's overall More Like This Noul for it (`Authorship::jev`), 0 when the seed's cascade did not
+    /// weigh it.
+    pub jev: f64,
     /// The dominant confident subgenre the cap counts against; empty when there is none.
     pub subgenre: String,
     /// Held back by the subgenre cap and placed after the capped window instead of at its score rank.
@@ -1686,6 +1713,8 @@ fn rank_pool_inner<'l>(
     let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
     let members: &[(Key, f64)] = authorship.map(Authorship::series).unwrap_or_default();
     let series = |key: Key| members.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
+    let weighed: &[(Key, f64)] = authorship.map(Authorship::jev).unwrap_or_default();
+    let jev = |key: Key| weighed.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
     // Read only while weighed, and only for a seed from outside the English-language mainstream.
     let seed_origin: Vec<[u8; 2]> = match facets {
         Some(f) if p.w_region > 0.0 => {
@@ -1885,6 +1914,7 @@ fn rank_pool_inner<'l>(
             let popularity = popularity_of(id);
             let ch = character(id);
             let sr = series(id);
+            let jv = jev(id);
             let region = origin(id);
             let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
             // Already centered, so this can be negative — arguing about different things is evidence
@@ -1915,7 +1945,10 @@ fn rank_pool_inner<'l>(
                         + p.w_popularity * popularity
                         + p.w_character * ch
                         + p.w_region * region
-                        + p.w_series * sr);
+                        + p.w_series * sr
+                        // At production's `w_jev = 0` an exact 0.0 too, so a store carrying the scores
+                        // ranks exactly as one without them.
+                        + p.w_jev * jv);
             Scored {
                 media_type: id.0,
                 tmdb_id: id.1,
@@ -1938,6 +1971,7 @@ fn rank_pool_inner<'l>(
                 world,
                 year,
                 popularity,
+                jev: jv,
                 subgenre: dominant,
                 held: false,
             }
@@ -2356,6 +2390,50 @@ mod tests {
         assert!(inspected.scored.is_some() && inspected.position.is_some(), "{inspected:?}");
     }
 
+    /// Jev's scores (oxyc/den-dataset#132) change nothing at `w_jev = 0`: not a title, not a score. Weighed,
+    /// they lift the candidate Jev rated highest, and a title Jev never weighed is neither lifted nor
+    /// nominated.
+    #[test]
+    fn jev_scores_are_inert_at_zero_and_lift_what_jev_rated_when_weighed() {
+        let subs: &[(&str, f64)] = &[("Police Procedural", 0.9)];
+        let moods: &[(&str, f64)] = &[("Dark & Gritty", 0.9)];
+        let premise = fixture(&[
+            (1, "movie", "Crime", false, subs, moods, [100, 0, 0]),
+            (2, "movie", "Crime", false, subs, moods, [95, 10, 0]),
+            (3, "movie", "Crime", false, subs, moods, [92, 20, 0]),
+            (4, "movie", "Crime", false, subs, moods, [90, 30, 0]),
+            (5, "movie", "Crime", false, subs, moods, [0, 100, 0]),
+        ]);
+        struct Judged;
+        impl Authorship for Judged {
+            fn nominate(&self) -> Vec<Key> {
+                Vec::new()
+            }
+            fn makers(&self, _: Key) -> f64 {
+                0.0
+            }
+            fn jev(&self) -> &[(Key, f64)] {
+                &[((MediaType::Movie, 2), 0.1), ((MediaType::Movie, 4), 0.9), ((MediaType::Movie, 5), 1.0)]
+            }
+        }
+        let mut p = SimilarParams::default();
+        p.set("pool_k", 3.0).unwrap();
+        let ranked =
+            |row: Vec<Scored>| -> Vec<(u32, f64)> { row.iter().map(|s| (s.tmdb_id, s.score)).collect() };
+        let row = |p: &SimilarParams, a: Option<&dyn Authorship>| {
+            more_like_this_scored(None, Some(&premise), 1, MediaType::Movie, a, None, p)
+        };
+        let off = row(&p, Some(&Judged));
+        assert_eq!(ranked(off.clone()), ranked(row(&p, None)), "unweighed, Jev changes nothing");
+        assert_eq!(off.iter().map(|s| s.tmdb_id).collect::<Vec<_>>(), [2, 3, 4]);
+        assert_eq!(off.iter().find(|s| s.tmdb_id == 4).map(|s| s.jev), Some(0.9), "reported while unweighed");
+
+        p.set("w_jev", 5.0).unwrap();
+        let on: Vec<u32> = row(&p, Some(&Judged)).iter().map(|s| s.tmdb_id).collect();
+        assert_eq!(on[0], 4, "{on:?}");
+        assert!(!on.contains(&5), "a weighed title outside the pool is not nominated: {on:?}");
+    }
+
     /// The Beck case (oxyc/den-atlas#92). Four police procedurals the vectors put nearest, and four entries of
     /// the seed's own series far down: two labelled like the seed, one labelled as something else, one as
     /// close on the vectors as the unrelated titles. At `w_series = 0` the series changes nothing. Weighed,
@@ -2587,7 +2665,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 51, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 52, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {

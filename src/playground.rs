@@ -862,6 +862,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
         "world": term(s.world, -p.w_world),
         "year": term(s.year, p.w_year),
         "popularity": term(s.popularity, p.w_popularity),
+        "jev": term(s.jev, p.w_jev),
     })
 }
 

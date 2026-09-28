@@ -46,6 +46,12 @@ fn media_code(media: MediaType) -> u8 {
     }
 }
 
+/// A packed store key as a `Key`.
+fn key_of(key: u64) -> Key {
+    let media = if key >> 32 == 1 { MediaType::Tv } else { MediaType::Movie };
+    (media, key as u32)
+}
+
 /// A title's row: binary search over the keys column, the same as `Store::row_of`, but over a slice
 /// resolved once rather than looked up again for every candidate.
 fn row_in(keys: &[u64], media: u8, tmdb_id: u32) -> Option<Row> {
@@ -513,6 +519,8 @@ pub struct SeedAuthorship<'a> {
     characters: Vec<(Key, f64)>,
     /// The titles sharing a franchise series with the seed (`with_series`): the caller's, like `characters`.
     series: Vec<(Key, f64)>,
+    /// The candidates Jev weighed for the seed, with its overall Noul (`Store::jev_more_like`).
+    jev: Vec<(Key, f64)>,
 }
 
 impl<'a> SeedAuthorship<'a> {
@@ -528,10 +536,17 @@ impl<'a> SeedAuthorship<'a> {
             mine_homes: Vec::new(),
             characters: Vec::new(),
             series: Vec::new(),
+            jev: Vec::new(),
         };
         if let Some(row) = row_in(out.keys, out.media, tmdb_id) {
             out.mine_makers = out.qids(out.makers.get(row)).collect();
             out.mine_homes = out.qids(out.broadcasters.get(row)).collect();
+            let keys = out.keys;
+            out.jev = store
+                .jev_more_like()?
+                .get(row)
+                .filter_map(|(other, p)| keys.get(other.0).map(|&key| (key_of(key), p)))
+                .collect();
         }
         Ok(out)
     }
@@ -586,10 +601,7 @@ impl crate::Authorship for SeedAuthorship<'_> {
             .iter()
             .enumerate()
             .filter(|&(row, _)| self.qids(self.makers.get(Row(row))).any(|q| self.mine_makers.contains(&q)))
-            .map(|(_, &key)| {
-                let media = if key >> 32 == 1 { MediaType::Tv } else { MediaType::Movie };
-                (media, key as u32)
-            })
+            .map(|(_, &key)| key_of(key))
             .collect()
     }
 
@@ -607,5 +619,9 @@ impl crate::Authorship for SeedAuthorship<'_> {
 
     fn series(&self) -> &[(Key, f64)] {
         &self.series
+    }
+
+    fn jev(&self) -> &[(Key, f64)] {
+        &self.jev
     }
 }
