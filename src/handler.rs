@@ -4010,17 +4010,18 @@ mod tests {
         );
         assert_eq!(premise["space"], "premise");
 
+        // Movie 3 is a campy children's comedy, and the seed a bleak crime drama: never suggested beside it.
+        let all = r#"{"seeds":[{"type":"movie","id":1}]}"#;
+        let all = json(body_of(post(&state, "/index/suggest.json", all).await).await);
+        assert_eq!(all["perSeed"][0]["ids"], serde_json::json!([2]));
         let suggest = r#"{"seeds":[{"type":"movie","id":1}],"exclude":[{"type":"movie","id":2}]}"#;
         let suggest = json(body_of(post(&state, "/index/suggest.json", suggest).await).await);
         assert_eq!(suggest["perSeed"][0]["seed"], serde_json::json!({"type": "movie", "id": 1}));
-        assert_eq!(suggest["perSeed"][0]["ids"], serde_json::json!([3]));
-        assert_eq!(suggest["pooled"], serde_json::json!([{"type": "movie", "id": 3}]));
+        assert_eq!(suggest["perSeed"][0]["ids"], serde_json::json!([]));
+        assert_eq!(suggest["pooled"], serde_json::json!([]));
         // Beside them, the mixed rows: series too, the excluded title still gone.
         let mixed = suggest["perSeed"][0]["mixed"].as_array().unwrap();
-        assert_eq!(
-            mixed[..2],
-            [serde_json::json!({"type": "series", "id": 4}), serde_json::json!({"type": "movie", "id": 3})]
-        );
+        assert_eq!(mixed[..1], [serde_json::json!({"type": "series", "id": 4})]);
         assert!(!mixed.iter().any(|t| t["type"] == "movie" && t["id"] == 2), "{mixed:?}");
         assert_eq!(suggest["pooledMixed"][0], serde_json::json!({"type": "series", "id": 4}));
 

@@ -144,8 +144,11 @@ impl Indexes {
     /// What `worth_suggesting` weighs about a title.
     fn suggestion_profile(&self, key: Key) -> SuggestionProfile {
         let (media_type, id) = key;
+        let genres = crate::plotrows::genres(self, key);
         SuggestionProfile {
-            animated: crate::plotrows::genres(self, key).contains(&16),
+            animated: genres.contains(&16),
+            light: genres.iter().any(|genre| LIGHT_GENRES.contains(genre)),
+            specific: genres.iter().copied().filter(|genre| !BROAD_GENRES.contains(genre)).collect(),
             year: self.cards.as_ref().and_then(|cards| cards.get(&key)).and_then(|card| card.year),
             votes: self.votes(media_type, id),
             rating: self.rating(media_type, id).map(|(_, score)| score),
@@ -470,16 +473,25 @@ impl Indexes {
 }
 
 /// What You Might Also Like weighs about a title besides its structure.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SuggestionProfile {
     /// Animated, by its labels or its genres (TMDB's 16).
     animated: bool,
+    /// A comedy or made for families or children (`LIGHT_GENRES`).
+    light: bool,
+    /// Its genres that say what kind of title it is: all of them but `BROAD_GENRES`, as TMDB ids.
+    specific: Vec<u16>,
     year: Option<i64>,
     /// TMDB's vote count, 0 where none is kept (`Indexes::votes`).
     votes: u32,
     /// TMDB's score, where one is kept.
     rating: Option<f32>,
 }
+
+/// TMDB's Comedy, Family and (series) Kids genres: a tone no structural profile carries.
+const LIGHT_GENRES: [u16; 3] = [35, 10751, 10762];
+/// Genres too broad to say what a title is: Drama, Action, Adventure, and the series' Action & Adventure.
+const BROAD_GENRES: [u16; 4] = [18, 28, 12, 10759];
 
 /// A suggestion's vote count must reach a tenth of the seed's, at most this many: a floor that scales, so an obscure
 /// seed's row is not emptied by it.
@@ -493,11 +505,21 @@ const CLASSIC_VOTES: u32 = 2000;
 
 /// Whether `title` belongs in `seed`'s You Might Also Like beyond sharing its structure. Structural affinity alone
 /// put Robin Hood: Men in Tights, El Cid (1961) and seven anime beside Dune: Part Two — 7 of its first 40 animated,
-/// 15 from before 1970. So: animation only beside animation and live action beside live action; seen and rated
-/// enough to be a real suggestion; and, beside a title from 1990 on, of its era unless a classic. What is not known
-/// (no year, no score) does not count against a title.
+/// 15 from before 1970. So: animation only beside animation and live action beside live action; a comedy or a
+/// family film only beside one (with those gone, Dune still had Robin Hood: Men in Tights, Descendants 3 and
+/// Galavant); of no other kind than the seed, sharing one of its genres that say what it is where both have any —
+/// with those gone, Dune's row was Kuruluş: Osman, Merlin and The Ten Commandments, historical and fantasy epics
+/// sharing its structure but not its science fiction; seen and rated enough to be a real suggestion; and, beside a
+/// title from 1990 on, of its era unless a classic. What is not known (no year, no score, only broad genres) does
+/// not count against a title.
 fn worth_suggesting(seed: &SuggestionProfile, title: &SuggestionProfile) -> bool {
-    if seed.animated != title.animated {
+    if seed.animated != title.animated || (title.light && !seed.light) {
+        return false;
+    }
+    if !seed.specific.is_empty()
+        && !title.specific.is_empty()
+        && !seed.specific.iter().any(|genre| title.specific.contains(genre))
+    {
         return false;
     }
     if title.votes < (seed.votes / 10).min(SUGGESTION_VOTES) {
@@ -1218,7 +1240,7 @@ mod tests {
     use super::*;
 
     fn profile(animated: bool, year: i64, votes: u32, rating: f32) -> SuggestionProfile {
-        SuggestionProfile { animated, year: Some(year), votes, rating: Some(rating) }
+        SuggestionProfile { animated, year: Some(year), votes, rating: Some(rating), ..Default::default() }
     }
 
     #[test]
@@ -1238,6 +1260,22 @@ mod tests {
         // The floor scales with the seed: a niche seed keeps its niche neighbours, and an old seed its era.
         let niche = profile(false, 1972, 60, 7.0);
         assert!(worth_suggesting(&niche, &profile(false, 1935, 12, 6.5)));
+        // A comedy or family film beside a serious one: out; beside another: in.
+        let comedy = SuggestionProfile { light: true, ..profile(false, 1993, 3000, 6.7) };
+        assert!(!worth_suggesting(&dune, &comedy));
+        assert!(worth_suggesting(&SuggestionProfile { light: true, ..dune.clone() }, &comedy));
+        // Of the seed's kind: science fiction beside Dune, a medieval epic sharing only Adventure not.
+        let dune = SuggestionProfile { specific: vec![878], ..dune };
+        let star_wars = SuggestionProfile { specific: vec![878, 14], ..profile(false, 2005, 7000, 7.4) };
+        let epic = SuggestionProfile { specific: vec![36], ..profile(false, 2019, 900, 7.8) };
+        assert!(worth_suggesting(&dune, &star_wars));
+        assert!(!worth_suggesting(&dune, &epic));
+        // A seed with broad genres alone asks no genre of its suggestions, and a plain drama or action film is no
+        // other kind beside any seed.
+        assert!(worth_suggesting(&profile(false, 2019, 900, 7.0), &epic));
+        assert!(worth_suggesting(&dune, &profile(false, 2022, 900, 7.0)));
+        // A serious film may still follow a comedy.
+        assert!(worth_suggesting(&comedy, &profile(false, 2000, 3000, 7.0)));
         // What is not known does not count against a title.
         let unknown = SuggestionProfile { votes: 7000, ..SuggestionProfile::default() };
         assert!(worth_suggesting(&dune, &unknown));
