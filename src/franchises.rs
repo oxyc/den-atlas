@@ -106,7 +106,12 @@ impl Franchises {
     }
 
     pub fn primary(&self, key: Key) -> Option<&Franchise> {
-        self.groups.get(self.membership(key)?.franchise as usize)
+        self.group(self.membership(key)?.franchise)
+    }
+
+    /// A franchise by its index, as `Membership::franchise` names it.
+    pub fn group(&self, franchise: u32) -> Option<&Franchise> {
+        self.groups.get(franchise as usize)
     }
 
     pub fn umbrella(&self, key: Key) -> Option<&Umbrella> {
@@ -121,8 +126,9 @@ impl Franchises {
     }
 
     /// The seed's era first, then the others closest to it: eras of the seed's own kind (animated or live
-    /// action) before the rest, each nearest the seed's release year first. Release order is retained inside
-    /// each era, and every member appears exactly once. Stable order settles ties and titles with no year.
+    /// action) before the rest, each nearest the seed's release year first. Inside each era the newest member
+    /// comes first — the latest film of a line is the one a viewer is likelier to be looking for — and every
+    /// member appears exactly once. Stable order settles ties and titles with no year.
     ///
     /// The stable era order alone led with whatever era came first. Spider-Man (2002) went from its trilogy to
     /// the 1977–79 films before The Amazing Spider-Man; Beck (1997), a series filed in an era of its own, opened
@@ -146,7 +152,7 @@ impl Franchises {
         eras.extend(others);
         Some(
             eras.into_iter()
-                .flat_map(|era| franchise.members.iter().filter(move |member| member.era == era))
+                .flat_map(|era| franchise.members.iter().filter(move |member| member.era == era).rev())
                 .collect(),
         )
     }
@@ -184,8 +190,8 @@ pub fn title_facts(indexes: &crate::queries::Indexes, key: Key) -> TitleFacts {
     }
 }
 
-/// `/index/franchise/<type>/<id>.json`: the seed's primary franchise, grouped seed-era first while
-/// retaining release order inside every era. A known title without a curated primary returns `null` and
+/// `/index/franchise/<type>/<id>.json`: the seed's primary franchise, grouped seed-era first, newest first
+/// inside every era (`Franchises::members_for`). A known title without a curated primary returns `null` and
 /// an empty row, which lets old stores and ungrouped titles use the same client fallback.
 pub fn route_json(indexes: &crate::queries::Indexes, seed: Key) -> serde_json::Value {
     let Some(membership) = indexes.franchises.membership(seed) else {
@@ -319,7 +325,7 @@ mod tests {
     }
 
     /// Spider-Man (2002): its trilogy, then the live-action eras nearest it, the 1977–79 films after those, and
-    /// the animated Spider-Verse last.
+    /// the animated Spider-Verse last; newest first inside each era.
     #[test]
     fn eras_follow_the_seed_by_kind_then_by_nearness_in_time() {
         let (franchises, facts) = franchise(&[
@@ -331,9 +337,9 @@ mod tests {
             (3, 2021, 2021, false),
             (4, 2023, 2023, true),
         ]);
-        assert_eq!(row(&franchises, &facts, 2002), [2002, 2004, 2012, 2021, 1977, 1979, 2023]);
+        assert_eq!(row(&franchises, &facts, 2002), [2004, 2002, 2012, 2021, 1979, 1977, 2023]);
         // From the animated era, the live-action ones follow nearest first.
-        assert_eq!(row(&franchises, &facts, 2023), [2023, 2021, 2012, 2002, 2004, 1977, 1979]);
+        assert_eq!(row(&franchises, &facts, 2023), [2023, 2021, 2012, 2004, 2002, 1979, 1977]);
     }
 
     /// Beck (1997), a series alone in its era: the films it runs alongside lead, not the older ones.
@@ -345,7 +351,7 @@ mod tests {
             (1, 1998, 1998, false),
             (2, 1997, 1997, false),
         ]);
-        assert_eq!(row(&franchises, &facts, 1997), [1997, 1998, 1976, 1994]);
+        assert_eq!(row(&franchises, &facts, 1997), [1997, 1998, 1994, 1976]);
     }
 
     #[test]

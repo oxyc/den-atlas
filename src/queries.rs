@@ -189,13 +189,10 @@ impl Indexes {
         params: &den_index::SimilarParams,
         extras: den_index::Extras<'_>,
     ) -> Vec<den_index::Scored> {
-        let seed = (media_type, tmdb_id);
-        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let kept_out = crate::versions::kept_out(self, (media_type, tmdb_id));
+        let reserved = |candidate| kept_out.contains(&candidate);
         let extras = den_index::Extras {
-            primary_franchise: self
-                .franchises
-                .membership(seed)
-                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
             ..extras
         };
         self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
@@ -223,13 +220,10 @@ impl Indexes {
         params: &den_index::SimilarParams,
         extras: den_index::Extras<'_>,
     ) -> den_index::Inspection {
-        let seed = (media_type, tmdb_id);
-        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let kept_out = crate::versions::kept_out(self, (media_type, tmdb_id));
+        let reserved = |candidate| kept_out.contains(&candidate);
         let extras = den_index::Extras {
-            primary_franchise: self
-                .franchises
-                .membership(seed)
-                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
             ..extras
         };
         self.with_seed(tmdb_id, media_type, params, |authorship, facets| {
@@ -269,12 +263,10 @@ impl Indexes {
         }
         let production = den_index::SimilarParams::default();
         let keys = |row: Vec<den_index::Scored>| -> Arc<[Key]> { row.iter().map(|s| s.key()).collect() };
-        let same_primary = |candidate| candidate != seed && self.franchises.shares_primary(seed, candidate);
+        let kept_out = crate::versions::kept_out(self, seed);
+        let reserved = |candidate| kept_out.contains(&candidate);
         let extras = den_index::Extras {
-            primary_franchise: self
-                .franchises
-                .membership(seed)
-                .map(|_| &same_primary as &dyn Fn(Key) -> bool),
+            primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
             ..den_index::Extras::default()
         };
         let (one, mixed) = self.with_seed(tmdb_id, media_type, &production, |authorship, facets| {

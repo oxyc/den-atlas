@@ -377,10 +377,12 @@ fn title(indexes: &Indexes, media: MediaType, id: u32) -> String {
     )
 }
 
-/// A dedicated franchise row owns these titles, so they are not candidates More Like This could rank.
-/// Leaving them in the ideal list makes a correct exclusion look like lost relevance (#92).
+/// The franchise and Other versions rows own these titles (`versions::kept_out`), so they are not candidates
+/// More Like This could rank. Leaving them in the ideal list makes a correct exclusion look like lost
+/// relevance (#92).
 fn available_grades(indexes: &Indexes, seed: Key, grades: &HashMap<Key, Grade>) -> HashMap<Key, Grade> {
-    grades_without_reserved(grades, |candidate| indexes.franchises.shares_primary(seed, candidate))
+    let kept_out = crate::versions::kept_out(indexes, seed);
+    grades_without_reserved(grades, |candidate| kept_out.contains(&candidate))
 }
 
 fn grades_without_reserved(
@@ -620,11 +622,12 @@ pub async fn run(dir: &std::path::Path) -> i32 {
             entry.plot_genre.extend(shares.1);
         }
         if unjudged > 0 {
+            let kept_out = crate::versions::kept_out(&indexes, seed);
             let mut seen = HashSet::new();
             for (arm, list) in [("rail", &row), ("plot", &plot)] {
                 for (at, &(media, id)) in list.iter().take(unjudged).enumerate() {
                     if !grades.contains_key(&(media, id))
-                        && !indexes.franchises.shares_primary(seed, (media, id))
+                        && !kept_out.contains(&(media, id))
                         && seen.insert((media, id))
                     {
                         let key = match media {
@@ -662,7 +665,7 @@ pub async fn run(dir: &std::path::Path) -> i32 {
     }
     println!("\nnDCG' ignores unjudged titles; bad and jdg are totals over the cases, of {K} per case.");
     println!(
-        "{reserved_judgements} judgements reserved for dedicated primary-franchise rows were excluded from both ideals"
+        "{reserved_judgements} judgements reserved for the franchise and Other versions rows were excluded from both ideals"
     );
     println!(
         "genre is the share of the first {SHAPE_K} carrying the seed's own primary genre: 1.00 is a genre shelf. \

@@ -167,8 +167,8 @@ fn audit_case(indexes: &Indexes, case: &Case) -> Vec<String> {
         if !row_eras.insert(same_era[0].era) {
             failures.push(format!("{}: franchise row splits one era into multiple runs", case.name));
         }
-        if !same_era.windows(2).all(|pair| pair[0].order < pair[1].order) {
-            failures.push(format!("{}: franchise row is not release ordered within an era", case.name));
+        if !same_era.windows(2).all(|pair| pair[0].order > pair[1].order) {
+            failures.push(format!("{}: franchise row is not newest first within an era", case.name));
         }
     }
 
@@ -181,9 +181,10 @@ fn audit_case(indexes: &Indexes, case: &Case) -> Vec<String> {
             case.minimum_similar
         ));
     }
-    if let Some(key) = similar.iter().find(|&&key| indexes.franchises.shares_primary(seed, key)) {
+    let kept_out = crate::versions::kept_out(indexes, seed);
+    if let Some(key) = similar.iter().find(|&&key| kept_out.contains(&key)) {
         failures.push(format!(
-            "{}: More Like This still contains primary member {}",
+            "{}: More Like This still contains {}, a franchise member or other version",
             case.name,
             key_name(*key)
         ));
