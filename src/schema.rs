@@ -621,7 +621,9 @@ fn routes() -> Value {
                         when it has any, franchise {id, name, confidence, source, era:{id,name,order}, \
                         umbrella?:{id,name}} when it has a curated primary membership, and premiseTags \
                         [string] — short structural premise phrases, most defining first — when the \
-                        dataset carries them",
+                        dataset carries them, and companies, networks, subjects, places and authors \
+                        [{id: Q-id, name, titles}] when it has any: the id selects it in the filter \
+                        (company:, network:, subject:, place:, author:), titles how many titles carry it",
         },
         {
             "method": "GET",

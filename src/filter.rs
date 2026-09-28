@@ -1640,6 +1640,39 @@ fn invert_qids(
     Some((Postings { starts, rows: out }, known, qids))
 }
 
+/// One title's values of an entity kind — its production companies (`company`), networks, subjects, places or
+/// source authors — each as the id a selection names it by (`company:Q16248298`), its name, and how many titles
+/// carry it, so a client can link the value and judge whether a row of it says anything. Empty for a kind the
+/// store does not carry, and for the raw-Q-id kinds (franchise), which `/index/franchise` answers.
+pub fn title_values(indexes: &Indexes, kind: &str, (media_type, id): Key) -> Vec<Value> {
+    let Some(at) = ENTITY_KINDS.iter().position(|spec| spec.name == kind && !spec.raw_qids) else {
+        return Vec::new();
+    };
+    let Some(Some(entity)) = indexes.filter().entities.get(at) else { return Vec::new() };
+    let view = indexes.store.view();
+    let (Ok(Some(row)), Ok(qids), Ok(names), Ok(strings)) = (
+        view.row_of(u8::from(media_type == MediaType::Tv), id),
+        view.column::<u32>("ent_qid"),
+        view.column::<u32>("ent_name"),
+        view.strings(),
+    ) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    ENTITY_KINDS[at]
+        .sections
+        .iter()
+        .filter_map(|&(values, offsets)| view.list::<u32>(values, offsets).ok())
+        .flat_map(|list| list.get(row).to_vec())
+        .filter(|&value| seen.insert(value))
+        .filter_map(|value| {
+            let qid = format!("Q{}", qids.get(value as usize)?);
+            let name = names.get(value as usize).and_then(|&n| strings.get(n)).filter(|n| !n.is_empty());
+            Some(json!({ "id": qid, "name": name.unwrap_or(&qid), "titles": entity.titles(value) }))
+        })
+        .collect()
+}
+
 /// Every entity's name and aliases, folded (`facts::name_key`), in one arena, scanned per search: a scan of a
 /// few MB answers in about a millisecond, where a sorted index of every word would hold several times that.
 struct NameIndex {

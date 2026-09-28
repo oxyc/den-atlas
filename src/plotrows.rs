@@ -964,6 +964,20 @@ pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Valu
             title["castTotal"] = serde_json::json!(record.cast.len());
         }
     }
+    // What the title can be browsed by beyond its people: each value with its filter id and how many titles
+    // carry it, so a page can link it and leave out a row that would say nothing. Left out when there are none.
+    for (field, kind) in [
+        ("companies", "company"),
+        ("networks", "network"),
+        ("subjects", "subject"),
+        ("places", "place"),
+        ("authors", "author"),
+    ] {
+        let values = crate::filter::title_values(indexes, kind, key);
+        if !values.is_empty() {
+            title[field] = serde_json::json!(values);
+        }
+    }
     // The ceremonies it won or was nominated at, left out for a title with none or a store without them.
     let awards = crate::awards::of_title(indexes, media_type, id);
     if !awards.is_empty() {

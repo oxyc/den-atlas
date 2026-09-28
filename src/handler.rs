@@ -3317,6 +3317,23 @@ mod tests {
         assert!(title["makers"].is_array() && title["cast"].is_array(), "{title}");
         assert!(title.get("franchise").is_none(), "an old store invents no curated franchise");
         assert!(title.get("premiseTags").is_none(), "a store without premise tags names none");
+        // What it can be browsed by, each as the filter id it is selected with, named, with its title count.
+        for (field, kind, qid) in
+            [("companies", "company", "Q60"), ("subjects", "subject", "Q70"), ("places", "place", "Q80")]
+        {
+            let value = &title[field][0];
+            assert_eq!(value["id"], qid, "{field}: {title}");
+            assert!(value["name"].is_string() && value["titles"].as_u64() >= Some(1), "{field}: {value}");
+            let path = format!("/index/filter/movie/titles.json?sel={kind}:{qid}");
+            let selected = json(body_of(get(&state, &path).await).await);
+            assert!(
+                selected["titles"].as_array().unwrap().iter().any(|t| t["id"] == 1),
+                "{path}: {selected}"
+            );
+        }
+        assert!(title.get("networks").is_none(), "a film has no network: {title}");
+        let two = json(body_of(get(&state, "/index/title/movie/2.json").await).await);
+        assert!(two.get("companies").is_none(), "a title with none names none: {two}");
 
         let no_franchise = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         assert!(no_franchise["franchise"].is_null());
