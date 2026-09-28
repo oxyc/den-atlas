@@ -904,6 +904,15 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/recommend/{scope}.json",
+            "about": "The billboard for everyone, from atlas's own lists as of a day: scope home, movies, series or \
+                      service/{id}. 100 slides a page; next is the skip of the one after. Kept by a shared cache \
+                      until the day ends.",
+            "query": "day?=YYYY-MM-DD, skip?",
+            "returns": "{slides, next?, day, scorer, datasetVersion}",
+        },
+        {
+            "method": "GET",
             "path": "/catalog/{type}/{id}.json",
             "about": "Stremio catalog rows of the streaming services' most popular titles, and title search \
                       as the den-titles catalog (/catalog/{type}/den-titles/search={q}.json).",

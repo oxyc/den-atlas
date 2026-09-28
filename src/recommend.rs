@@ -102,9 +102,10 @@ const JUDGED_ENOUGH: usize = 20;
 /// Unjudged titles an answer names for the client to describe, best first. Until the facts cover what is new
 /// on the services, a title atlas has never seen is otherwise dropped however much attention it has.
 const UNJUDGED_NAMED: usize = 20;
-/// Slides by default, and at most.
+/// Slides by default, and at most: a billboard for everyone (`GET /recommend`) is re-ranked and filtered by each
+/// browser for its household, so it names a large pool and pages beyond it.
 const SLIDES: usize = 40;
-const MAX_SLIDES: usize = 100;
+pub const MAX_SLIDES: usize = 300;
 /// Service lists read for one request, "new on" before "popular on": every household service in each type, and
 /// then some.
 const SERVICE_LISTS: usize = 48;

@@ -204,6 +204,9 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let query = req.uri().query().unwrap_or("").to_owned();
     let ds = state.dataset.as_ref();
 
+    if let Some(scope) = route.strip_prefix("/recommend/").and_then(|rest| rest.strip_suffix(".json")) {
+        return handle_recommend_get(&state, config, scope, &query).await;
+    }
     if route == "/metrics" {
         if !crate::metrics::authorized(&headers, state.metrics_token.as_deref()) {
             return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
@@ -1629,11 +1632,139 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
     if let Err(detail) = request.check() {
         return bad(detail);
     }
+    // Kept for `den-atlas replay` when `RECOMMEND_FIXTURES` names a directory: the body as sent, library and all.
+    let raw: Option<serde_json::Value> = std::env::var("RECOMMEND_FIXTURES")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .and_then(|_| serde_json::from_slice(&body).ok());
+    match rank(state, queries, config, request, raw, &rid).await {
+        Ok((answer, timing)) => with_timing(
+            json_response(answer.to_string(), StatusCode::OK),
+            &format!("{timing}, total;dur={}", ms(started.elapsed())),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// The billboard's scopes a `GET /recommend/<scope>.json` names, as the request each stands for: `home`, `movies`,
+/// `series`, and `service/<id>`, one service's page. None of them carries a library, so an answer is the same for
+/// everyone and a shared cache keeps it (a household's own taste is applied by its browser). A new kind of page
+/// with a billboard is one more arm here.
+fn scope_request(scope: &str) -> Option<serde_json::Value> {
+    match scope {
+        "home" | "movies" | "series" => Some(serde_json::json!({ "surface": scope })),
+        _ => {
+            let id: i64 = scope.strip_prefix("service/")?.parse().ok().filter(|id| *id > 0)?;
+            Some(serde_json::json!({ "surface": "home", "service": { "id": id } }))
+        }
+    }
+}
+
+/// Slides one page of a `GET /recommend` holds; the next page is asked with `skip`. Large: a browser drops what its
+/// household owns or hides and re-ranks the rest by its taste, so the first page must leave it plenty to choose from.
+const BILLBOARD_PAGE: usize = 100;
+
+/// `GET /recommend/<scope>.json?day=YYYY-MM-DD&skip=N` — the billboard for everyone (`scope_request`), ranked from
+/// atlas's own lists as of that day: a page of slides and where the next starts (`next`, absent at the end). Kept by
+/// a shared cache until the day is over, and served stale for a day after while it is asked again; `day` is in the
+/// address so each day is its own answer. Off (404) unless `INDEX_QUERIES` is set, like the POST.
+async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str, query: &str) -> Response {
+    let started = Instant::now();
+    let Some(queries) = state.index.as_ref() else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let Some(mut body) = scope_request(scope) else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let param = |name: &str| query_param(query, name);
+    let today = crate::recommend::today();
+    let date = param("day").unwrap_or_else(|| crate::tmdb::civil(today.floor() as i64));
+    let start = format!("{date}T00:00:00Z");
+    let Some(day) = crate::recommend::parse_now(&start) else {
+        return json_response(
+            r#"{"error":"bad_request","detail":"day is YYYY-MM-DD"}"#,
+            StatusCode::BAD_REQUEST,
+        );
+    };
+    let skip: usize = param("skip").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Ranked once per scope and day, every slide atlas will give (`MAX_SLIDES`), and kept: each page, and each
+    // shared-cache edge that has not seen it yet, is a slice of that, and every page is from the same ranking.
+    let key = format!("{scope}|{date}");
+    let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
+    let (answer, timing) = match kept {
+        Some(answer) => (answer, "kept;dur=0".to_owned()),
+        None => {
+            body["now"] = serde_json::json!(start);
+            body["limit"] = serde_json::json!(crate::recommend::MAX_SLIDES);
+            let Ok(request) = serde_json::from_value::<crate::recommend::Request>(body) else {
+                return json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let (answer, timing) = match rank(state, queries, config, request, None, "").await {
+                Ok(ranked) => ranked,
+                Err(resp) => return resp,
+            };
+            let answer = Arc::new(answer);
+            if let Ok(mut kept) = billboards().lock() {
+                if kept.len() >= KEPT_BILLBOARDS {
+                    kept.clear();
+                }
+                kept.insert(key, Arc::clone(&answer));
+            }
+            (answer, timing)
+        }
+    };
+    let all = answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let page: Vec<&serde_json::Value> = all.iter().skip(skip).take(BILLBOARD_PAGE).collect();
+    let next = (skip + page.len() < all.len()).then_some(skip + page.len());
+    let body = serde_json::json!({
+        "version": answer["version"],
+        "scorer": answer["scorer"],
+        "datasetVersion": answer["datasetVersion"],
+        "day": date,
+        "slides": page,
+        "next": next,
+    });
+    // Until the day is over in a shared cache (at least a minute, for an answer asked at 23:59:59), then served stale
+    // for a day while it is asked again: a day's first visitor after midnight is answered from yesterday's at once.
+    let left = ((day + 1.0 - today) * 86_400.0).max(60.0) as u64;
+    let mut resp = with_timing(
+        json_response(body.to_string(), StatusCode::OK),
+        &format!("{timing}, total;dur={}", ms(started.elapsed())),
+    );
+    if let Ok(policy) = header::HeaderValue::from_str(&format!(
+        "public, max-age=300, s-maxage={left}, stale-while-revalidate=86400"
+    )) {
+        resp.headers_mut().insert(header::CACHE_CONTROL, policy);
+    }
+    resp
+}
+
+/// Billboards `GET /recommend` has ranked, by scope and day. A handful of scopes a day; cleared whole past this.
+const KEPT_BILLBOARDS: usize = 64;
+
+fn billboards() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<serde_json::Value>>> {
+    static KEPT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<serde_json::Value>>>,
+    > = std::sync::OnceLock::new();
+    KEPT.get_or_init(Default::default)
+}
+
+/// Rank `request` (`recommend::answer`): the answer and its `Server-Timing` parts, or the response that says why
+/// not. `raw` is the body as sent, kept as a replay fixture where `RECOMMEND_FIXTURES` asks for them.
+async fn rank(
+    state: &Arc<AppState>,
+    queries: &crate::queries::IndexQueries,
+    config: Config,
+    request: crate::recommend::Request,
+    raw: Option<serde_json::Value>,
+    rid: &str,
+) -> Result<(serde_json::Value, String), Response> {
+    let rid = rid.to_owned();
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
-            return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
+            return Err(unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT));
         }
     };
     // Only titles absent from the plot index are embedded, from bounded transient client hints. A failed or
@@ -1657,9 +1788,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
         }
     }
     let embedded = embedding.elapsed();
-    // Kept for `den-atlas replay` when `RECOMMEND_FIXTURES` names a directory: the body as sent, library and all.
     let fixtures = std::env::var("RECOMMEND_FIXTURES").ok().filter(|dir| !dir.is_empty());
-    let raw: Option<serde_json::Value> = fixtures.as_ref().and_then(|_| serde_json::from_slice(&body).ok());
     let listing = Instant::now();
     let lists = crate::recommend::lists(state, &config, &request).await;
     let listed = listing.elapsed();
@@ -1687,27 +1816,23 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             crate::recommend::keep_fixture(std::path::Path::new(dir), raw, &lists, now);
         }
         answer["datasetVersion"] = serde_json::json!(version);
-        answer.to_string()
+        answer
     })
-    .await;
-    let resp = match ranked {
-        Ok(body) => json_response(body, StatusCode::OK),
-        Err(e) => {
-            eprintln!("recommend failed: {e}");
-            json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    };
+    .await
+    .map_err(|e| {
+        eprintln!("recommend failed: {e}");
+        json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
-    with_timing(
-        resp,
-        &format!(
-            "{load}embed;dur={}, lists;dur={}, rank;dur={}, total;dur={}",
+    Ok((
+        ranked,
+        format!(
+            "{load}embed;dur={}, lists;dur={}, rank;dur={}",
             ms(embedded),
             ms(listed),
-            ms(ranking.elapsed()),
-            ms(started.elapsed())
+            ms(ranking.elapsed())
         ),
-    )
+    ))
 }
 
 /// `POST /index/labels|score|suggest` — the questions that name many titles at once. JSON in, JSON out,
@@ -3852,6 +3977,61 @@ mod tests {
             vec![r#"{"type":"movie","id":1}"#; crate::recommend::MAX_CANDIDATES + 1].join(",")
         );
         assert_eq!(post(&state, "/recommend", &many).await.status(), 400);
+    }
+
+    /// The billboard for everyone: one per scope and day, kept by a shared cache until the day is over and tagged so
+    /// a deploy drops it; a large first page, and the rest by `skip` from the same ranking. An unknown scope is a
+    /// 404, a day that isn't one a 400, and it is off without `INDEX_QUERIES`.
+    #[tokio::test]
+    async fn recommend_for_everyone_is_a_day_kept_and_paged() {
+        let state = index_state("den-atlas-recommend-get");
+        let resp = get(&state, "/recommend/home.json?day=1995-07-02").await;
+        assert_eq!(resp.status(), 200);
+        let policy = resp.headers()[header::CACHE_CONTROL].to_str().unwrap().to_owned();
+        assert!(
+            policy.starts_with("public, max-age=300, s-maxage=")
+                && policy.ends_with("stale-while-revalidate=86400")
+        );
+        assert_eq!(resp.headers()["cache-tag"], "atlas");
+        let answer: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
+        assert_eq!(answer["day"], "1995-07-02");
+        assert!(answer["slides"].is_array(), "{answer}");
+
+        // A ranking of 250 kept for a day: pages of 100 from it, and where the next starts until the last.
+        let slides: Vec<_> = (1..=250).map(|id| serde_json::json!({"type": "movie", "id": id})).collect();
+        billboards().lock().unwrap().insert(
+            "series|1995-07-01".to_owned(),
+            Arc::new(serde_json::json!({"version": 1, "slides": slides})),
+        );
+        let page = |skip: usize| {
+            let state = Arc::clone(&state);
+            async move {
+                let resp = get(&state, &format!("/recommend/series.json?day=1995-07-01&skip={skip}")).await;
+                serde_json::from_str::<serde_json::Value>(&body_of(resp).await).unwrap()
+            }
+        };
+        let first = page(0).await;
+        assert_eq!(first["slides"].as_array().unwrap().len(), BILLBOARD_PAGE);
+        assert_eq!((first["slides"][0]["id"].as_u64(), first["next"].as_u64()), (Some(1), Some(100)));
+        let last = page(200).await;
+        assert_eq!(last["slides"].as_array().unwrap().len(), 50);
+        assert!(last["next"].is_null(), "{last}");
+
+        assert_eq!(get(&state, "/recommend/person.json").await.status(), 404);
+        assert_eq!(get(&state, "/recommend/service/x.json").await.status(), 404);
+        assert_eq!(get(&state, "/recommend/home.json?day=soon").await.status(), 400);
+        assert_eq!(get(&Arc::new(AppState::for_test(None)), "/recommend/home.json").await.status(), 404);
+    }
+
+    #[test]
+    fn a_billboard_scope_is_a_surface_or_one_service() {
+        assert_eq!(scope_request("movies"), Some(serde_json::json!({"surface": "movies"})));
+        assert_eq!(
+            scope_request("service/8"),
+            Some(serde_json::json!({"surface": "home", "service": {"id": 8}}))
+        );
+        assert_eq!(scope_request("service/0"), None);
+        assert_eq!(scope_request("everything"), None);
     }
 
     /// A service channel ranks what its service's lists named and what the client offered, still only of the
