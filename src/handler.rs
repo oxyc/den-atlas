@@ -801,6 +801,11 @@ enum IndexQuestion {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     },
+    /// The other versions of the title's story (`versions.rs`).
+    Versions {
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    },
     /// Answered in `handle_index`, because it waits on den-embed.
     Search,
     /// Answered in `handle_index`, because a leftover theme waits on den-embed.
@@ -853,6 +858,9 @@ impl IndexQuestion {
             }
             ["franchise", type_, id] => {
                 Some(Self::Franchise { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
+            }
+            ["versions", type_, id] => {
+                Some(Self::Versions { media_type: index_media_type(type_)?, tmdb_id: id.parse().ok()? })
             }
             ["search"] => Some(Self::Search),
             ["facets"] => Some(Self::Facets),
@@ -930,6 +938,11 @@ impl IndexQuestion {
                 match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
                     Some(mut title) => {
                         title["indexed"] = serde_json::json!(true);
+                        if let Some(versions) =
+                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id))
+                        {
+                            title["otherVersions"] = versions;
+                        }
                         title
                     }
                     None => serde_json::json!({
@@ -939,6 +952,9 @@ impl IndexQuestion {
             }
             Self::Franchise { media_type, tmdb_id } => {
                 crate::franchises::route_json(indexes, (*media_type, *tmdb_id))
+            }
+            Self::Versions { media_type, tmdb_id } => {
+                crate::versions::route_json(indexes, export, (*media_type, *tmdb_id))
             }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
@@ -3356,6 +3372,12 @@ mod tests {
         assert!(title.get("networks").is_none(), "a film has no network: {title}");
         let two = json(body_of(get(&state, "/index/title/movie/2.json").await).await);
         assert!(two.get("companies").is_none(), "a title with none names none: {two}");
+        assert!(title.get("otherVersions").is_none(), "a store without versions names none");
+        let no_versions = json(body_of(get(&state, "/index/versions/movie/1.json").await).await);
+        assert_eq!(
+            no_versions,
+            serde_json::json!({ "seed": { "type": "movie", "id": 1 }, "total": 0, "versions": [] })
+        );
 
         let no_franchise = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         assert!(no_franchise["franchise"].is_null());
@@ -3388,6 +3410,28 @@ mod tests {
         );
         let facts_only = json(body_of(get(&state, "/index/title/movie/2.json").await).await);
         assert!(facts_only.get("premiseTags").is_none(), "a title with no tags names none: {facts_only}");
+
+        // Other versions: movie:1 and movie:2 adapt one source, movie:2 and series:10 are remakes. movie:1 and
+        // series:10 share the curated franchise, so neither is the other's version.
+        assert_eq!(
+            movie["otherVersions"],
+            serde_json::json!([{ "type": "movie", "id": 2, "kind": "source" }])
+        );
+        assert_eq!(
+            facts_only["otherVersions"],
+            serde_json::json!([
+                { "type": "movie", "id": 1, "kind": "source" },
+                { "type": "series", "id": 10, "kind": "remake" },
+            ]),
+            "release order: 1999 before 2010"
+        );
+        let versions = json(body_of(get(&state, "/index/versions/series/10.json").await).await);
+        assert_eq!(versions["seed"], serde_json::json!({ "type": "series", "id": 10 }));
+        assert_eq!(versions["total"], 1);
+        assert_eq!(versions["versions"][0]["id"], 2);
+        assert_eq!(versions["versions"][0]["kind"], "remake");
+        assert_eq!(versions["versions"][0]["title"], "Beta", "a version is a card: {versions}");
+        assert_eq!(get(&state, "/index/versions/anime/1.json").await.status(), 404);
 
         let movie_row = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         let series_row = json(body_of(get(&state, "/index/franchise/series/10.json").await).await);

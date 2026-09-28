@@ -38,6 +38,7 @@ mod titles;
 mod tmdb;
 mod tos;
 mod util;
+mod versions;
 
 use std::sync::Arc;
 use std::time::Duration;

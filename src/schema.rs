@@ -559,6 +559,23 @@ fn routes() -> Value {
         },
         {
             "method": "GET",
+            "path": "/index/versions/{type}/{tmdbId}.json",
+            "example": "/index/versions/movie/1.json",
+            "about": "The other versions of the title's story as one mixed movie/series row: remakes, and other \
+                      adaptations of the same source work (Wikidata P144 and P4969). Not More Like This, and not \
+                      the franchise: members of the title's curated primary franchise are left out, since \
+                      /index/franchise shows them. In release order, a title with no date last, the most \
+                      popular first on one date. Empty for a title with none or a dataset without them.",
+            "parameters": [
+                with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
+                with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
+            ],
+            "returns": "{seed:{type,id}, versions:[card plus kind: source (the same source work) or remake \
+                        (linked through a film or series)], total}",
+            "counts": { "total": "other versions across movies and series" },
+        },
+        {
+            "method": "GET",
             "path": "/index/neighbours/{type}/{tmdbId}.json",
             "example": "/index/neighbours/movie/1.json",
             "about": "The plain plot-vector neighbours of one title.",
@@ -619,11 +636,12 @@ fn routes() -> Value {
                         countries, languages, runtimeMinutes, basedOn, makers and cast [{id: Q-id, name, tmdbId?}] \
                         (cast at most 60, castTotal all of them), and awards [{id: ceremony Q-id, name, won}] \
                         when it has any, franchise {id, name, confidence, source, era:{id,name,order}, \
-                        umbrella?:{id,name}} when it has a curated primary membership, and premiseTags \
+                        umbrella?:{id,name}} when it has a curated primary membership, premiseTags \
                         [string] — short structural premise phrases, most defining first — when the \
-                        dataset carries them, and companies, networks, subjects, places and authors \
+                        dataset carries them, companies, networks, subjects, places and authors \
                         [{id: Q-id, name, titles}] when it has any: the id selects it in the filter \
-                        (company:, network:, subject:, place:, author:), titles how many titles carry it",
+                        (company:, network:, subject:, place:, author:), titles how many titles carry it, \
+                        and otherVersions [{type, id, kind}] in /index/versions' order when it has any",
         },
         {
             "method": "GET",
