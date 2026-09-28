@@ -6,7 +6,7 @@
 //! - a shared title character (`character_links`), from TMDB's credits at runtime: *Young Wallander* and the
 //!   British and Swedish *Wallander* all have Kurt Wallander in their name and in their cast. Wikidata cannot
 //!   make this link: *Young Wallander*'s item states no character (P674) and Kurt Wallander names it in no
-//!   "present in work" (P1441).
+//!   "present in work" (P1441). Off (`CHARACTER_VERSIONS`): too many of its links are not versions.
 //!
 //! A version that belongs to a curated franchise stands for that whole franchise: the row shows every member,
 //! grouped and labelled by the franchise, since the British *Wallander*'s version of the Swedish series is
@@ -29,6 +29,14 @@ type Key = (MediaType, u32);
 /// (`pipeline/versions.py`). Kurt Wallander names 19; Sherlock Holmes (70) and Bruce Wayne (67) are
 /// characters every adaptation and spin-off shares, not one story's versions.
 pub const CHARACTER_CUTOFF: usize = 40;
+
+/// Whether a title character links versions (`character_links`). Off: in a hand-check of 30 random links the
+/// rule was right on 21. A shared name word was often a coincidence (*Captain Blood* and *Doctor Blood's
+/// Coffin*, *Shaun of the Dead* and *Shaun the Sheep*), the character a real person (two Hitler films), or
+/// the two titles one series' sequels and knock-offs (*Django*, *Emanuelle*). Keeping only name words that
+/// are not in an English dictionary and leaving out characters who are people in the store did not help:
+/// 18 of a fresh 30 (oxyc/den-atlas#112). The store's own Wikidata links are right on 92%.
+pub const CHARACTER_VERSIONS: bool = false;
 
 /// Every store row's versions through a title character: two titles playing one named character link when
 /// the character names no more than `CHARACTER_CUTOFF` titles and a word of its name is in both titles' names

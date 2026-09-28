@@ -381,10 +381,14 @@ fn build_billed(
         Billing::default()
     });
     // Without them a title shows only the versions the store holds.
-    let versions = crate::versions::character_links(view, &index).unwrap_or_else(|e| {
-        eprintln!("characters: no character versions ({e})");
+    let versions = if crate::versions::CHARACTER_VERSIONS {
+        crate::versions::character_links(view, &index).unwrap_or_else(|e| {
+            eprintln!("characters: no character versions ({e})");
+            HashMap::new()
+        })
+    } else {
         HashMap::new()
-    });
+    };
     Ok(CharacterIndex { billing, versions, ..index })
 }
 
