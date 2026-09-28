@@ -395,7 +395,7 @@ impl Tmdb {
             kept: Mutex::new(Kept::default()),
             state: Mutex::new(State::default()),
             proxy,
-            ratings: Arc::new(Ratings::default()),
+            ratings: Arc::new(Ratings::unsettled()),
             characters: Arc::new(Characters::unsettled()),
         })
     }
@@ -496,12 +496,14 @@ impl Tmdb {
         kept.credits_on_disk = false;
     }
 
-    /// The vote counts joined onto the store from what is kept now, and swapped in. A phrase for the log.
+    /// The vote counts joined onto the store from what is kept now, swapped in, and the holder settled whatever
+    /// the outcome — a build that failed must not hold the index loads back for good. A phrase for the log.
     async fn build_votes(&self) -> String {
         let votes: HashMap<Key, (f32, u32)> =
             crate::util::lock(&self.kept).votes.iter().map(|(&k, v)| (k, (v.average, v.count))).collect();
         let store = Arc::clone(&self.store);
-        match tokio::task::spawn_blocking(move || ratings::build(&store.view(), &votes)).await {
+        let built = tokio::task::spawn_blocking(move || ratings::build(&store.view(), &votes)).await;
+        let line = match built {
             Ok(Ok(index)) => {
                 let line = format!("vote counts for {} of {} store rows", index.matched(), index.rows());
                 self.ratings.set(Some(index));
@@ -514,7 +516,9 @@ impl Tmdb {
             Err(e) => {
                 format!("vote counts not rebuilt (tmdb build task: {e}); the previous ones keep serving")
             }
-        }
+        };
+        self.ratings.settle();
+        line
     }
 
     /// The character links from `credits`, swapped in, and the holder settled whatever the outcome — a build
@@ -1207,6 +1211,40 @@ mod tests {
         assert!(line.contains("credits for 2 titles"), "{line}");
         assert_eq!(load.await.unwrap(), [((Movie, 2), 1.0)]);
         assert!(crate::util::lock(&tmdb.kept).credits.is_empty(), "the credits are read, built and dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atlas spawns the first index load before it reads the vote counts. The load copies the counts into the
+    /// facet and search indexes, which live as long as the process, so a load that started first ranked every
+    /// title at 0 votes for good — country and type searches answered nothing. It waits for them instead.
+    #[tokio::test]
+    async fn the_first_index_load_waits_for_the_vote_counts() {
+        use den_index::MediaType::Movie;
+        let dir = temp("votes-race");
+        let ds = crate::queries::write_fixture(&dir.join("ds"));
+        let now = now_secs();
+        write_votes(
+            &dir.join(VOTES_FILE),
+            &HashMap::from([((0, 1), Votes { average: 8.4, count: 9000, fetched: now - DAY })]),
+        )
+        .unwrap();
+        let tmdb = Tmdb::new(ds.mapped.clone(), Some(dir.clone()), None, DEFAULT_DAILY_MAX).unwrap();
+        let queries = Arc::new(crate::queries::IndexQueries::new(&ds).with_ratings(Some(tmdb.ratings())));
+        assert!(queries.votes_pending(), "the counts are still to be read");
+
+        let mut load = tokio::spawn({
+            let queries = Arc::clone(&queries);
+            async move { queries.get(|| ()).await.expect("the indexes load").0 }
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(2), &mut load).await;
+        assert!(waited.is_err(), "the index load did not wait for the vote counts");
+
+        let line = tmdb.load_votes().await;
+        assert!(line.contains("vote counts for 1 of 12 store rows"), "{line}");
+        let indexes = load.await.unwrap();
+        let facets = indexes.facets.as_ref().expect("the fixture builds a facet index");
+        assert_eq!(facets.title(1, Movie).map(|t| t.votes), Some(9000), "TMDB's count, not the store's 100");
+        assert!(!queries.votes_pending());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -61,6 +61,9 @@ pub struct Indexes {
     /// reach the next row it orders rather than waiting for the next load. `None` without the index routes'
     /// TMDB half, and empty while nothing is kept — see `votes_of`.
     pub ratings: Option<Arc<Ratings>>,
+    /// Whether the load that built these had TMDB's counts to copy into the facet and search indexes
+    /// (`IndexQueries::votes_pending`).
+    built_with_votes: bool,
     /// Titles that share a character, from TMDB's credits (`characters`). The live holder, like `ratings`.
     pub characters: Option<Arc<Characters>>,
     pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
@@ -637,6 +640,16 @@ impl IndexQueries {
             && self.ratings.as_ref().and_then(|r| r.index()).is_none()
     }
 
+    /// Whether TMDB's counts have not reached the indexes: still being read, or the indexes in memory were
+    /// built without counts that are kept now. The second is what a load that raced the counts left behind:
+    /// the facet and search indexes ranked every title at 0 votes — country and type searches answered
+    /// nothing — while the load line said the counts were in and every other signal was green.
+    pub fn votes_pending(&self) -> bool {
+        let Some(ratings) = &self.ratings else { return false };
+        !ratings.is_settled()
+            || (ratings.index().is_some() && self.touch().is_some_and(|indexes| !indexes.built_with_votes))
+    }
+
     /// Whether the last index load failed on the store: every `/index/…` route then answers 503.
     pub fn store_unusable(&self) -> bool {
         self.store_unusable.load(Ordering::Relaxed)
@@ -665,6 +678,12 @@ impl IndexQueries {
         }
         on_load();
         let started = Instant::now();
+        // The load copies the vote counts into the facet index and the search index, and those are kept for the
+        // life of the process, so it cannot START before the counts are in: a copy taken before would rank
+        // every title at 0 votes until the next restart. Atlas spawns this load before the counts are read.
+        if let Some(ratings) = &self.ratings {
+            ratings.settled().await;
+        }
         let sources = Sources {
             dataset_version: self.dataset_version.clone(),
             taxonomy_version: self.taxonomy_version.clone(),
@@ -969,6 +988,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         plot_facets,
         store,
         ratings: sources.ratings.clone(),
+        built_with_votes: ratings.is_some(),
         characters: sources.characters.clone(),
         cards,
         studios,
@@ -1289,6 +1309,21 @@ mod tests {
         assert!(indexes.plot.has_dataset_length_transform());
         assert!(!indexes.plot.has_length_direction(), "the legacy copy path stayed armed");
         assert!(std::ptr::eq(indexes.plot.without_length(), &indexes.plot));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Indexes built without TMDB's counts, while counts are kept now, are reported: the facet and search
+    /// indexes ranked every title at 0 votes and nothing else said so.
+    #[tokio::test]
+    async fn indexes_built_before_the_vote_counts_are_reported() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-pending-{}", std::process::id()));
+        let ds = write_fixture(&dir);
+        let ratings = Arc::new(Ratings::default());
+        let queries = IndexQueries::new(&ds).with_ratings(Some(Arc::clone(&ratings)));
+        queries.get(|| ()).await.unwrap();
+        assert!(!queries.votes_pending(), "nothing kept, nothing missing");
+        ratings.set(Some(kept(&ds)));
+        assert!(queries.votes_pending(), "the counts are kept and the indexes never saw them");
         let _ = std::fs::remove_dir_all(dir);
     }
 
