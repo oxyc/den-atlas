@@ -134,9 +134,22 @@ impl Indexes {
             };
             let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
             row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
+            let seed = self.suggestion_profile((media_type, tmdb_id));
+            row.retain(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)));
             row.truncate(den_index::MAX_ROW);
             row.into()
         })
+    }
+
+    /// What `worth_suggesting` weighs about a title.
+    fn suggestion_profile(&self, key: Key) -> SuggestionProfile {
+        let (media_type, id) = key;
+        SuggestionProfile {
+            animated: crate::plotrows::genres(self, key).contains(&16),
+            year: self.cards.as_ref().and_then(|cards| cards.get(&key)).and_then(|card| card.year),
+            votes: self.votes(media_type, id),
+            rating: self.rating(media_type, id).map(|(_, score)| score),
+        }
     }
 
     /// More Like This for a title, worked out once while the indexes are loaded: it is deterministic for
@@ -454,6 +467,47 @@ impl Indexes {
     ) -> Arc<[(den_index::MediaType, u32)]> {
         memoised(&self.rows, key, ROW_MEMO, || work().into())
     }
+}
+
+/// What You Might Also Like weighs about a title besides its structure.
+#[derive(Clone, Copy, Debug, Default)]
+struct SuggestionProfile {
+    /// Animated, by its labels or its genres (TMDB's 16).
+    animated: bool,
+    year: Option<i64>,
+    /// TMDB's vote count, 0 where none is kept (`Indexes::votes`).
+    votes: u32,
+    /// TMDB's score, where one is kept.
+    rating: Option<f32>,
+}
+
+/// A suggestion's vote count must reach a tenth of the seed's, at most this many: a floor that scales, so an obscure
+/// seed's row is not emptied by it.
+const SUGGESTION_VOTES: u32 = 150;
+/// Below this score a suggestion is noise.
+const SUGGESTION_RATING: f32 = 6.0;
+/// How long before a title from 1990 on a suggestion must be a classic to stand beside it: well rated and widely seen.
+const ERA_YEARS: i64 = 35;
+const CLASSIC_RATING: f32 = 7.5;
+const CLASSIC_VOTES: u32 = 2000;
+
+/// Whether `title` belongs in `seed`'s You Might Also Like beyond sharing its structure. Structural affinity alone
+/// put Robin Hood: Men in Tights, El Cid (1961) and seven anime beside Dune: Part Two — 7 of its first 40 animated,
+/// 15 from before 1970. So: animation only beside animation and live action beside live action; seen and rated
+/// enough to be a real suggestion; and, beside a title from 1990 on, of its era unless a classic. What is not known
+/// (no year, no score) does not count against a title.
+fn worth_suggesting(seed: &SuggestionProfile, title: &SuggestionProfile) -> bool {
+    if seed.animated != title.animated {
+        return false;
+    }
+    if title.votes < (seed.votes / 10).min(SUGGESTION_VOTES) {
+        return false;
+    }
+    if title.rating.is_some_and(|rating| rating < SUGGESTION_RATING) {
+        return false;
+    }
+    let old = matches!((seed.year, title.year), (Some(seed), Some(year)) if seed >= 1990 && year < seed - ERA_YEARS);
+    !old || (title.rating.is_some_and(|rating| rating >= CLASSIC_RATING) && title.votes >= CLASSIC_VOTES)
 }
 
 /// A title's store row, `None` when the store does not hold it.
@@ -1162,6 +1216,32 @@ fn write_fixture_as(dir: &std::path::Path, movie_one: &str, premise: bool, votes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(animated: bool, year: i64, votes: u32, rating: f32) -> SuggestionProfile {
+        SuggestionProfile { animated, year: Some(year), votes, rating: Some(rating) }
+    }
+
+    #[test]
+    fn a_suggestion_is_the_seeds_form_and_era_and_seen_enough() {
+        let dune = profile(false, 2024, 7000, 8.1);
+        // Its own era and well seen: in.
+        assert!(worth_suggesting(&dune, &profile(false, 2013, 7000, 6.6)));
+        // Animation beside live action, and the other way round: out.
+        assert!(!worth_suggesting(&dune, &profile(true, 2018, 900, 7.4)));
+        assert!(worth_suggesting(&profile(true, 2001, 16000, 8.5), &profile(true, 1988, 5000, 7.9)));
+        // A 1953 epic beside a 2024 film: out, unless it is a classic.
+        assert!(!worth_suggesting(&dune, &profile(false, 1953, 400, 6.8)));
+        assert!(worth_suggesting(&dune, &profile(false, 1968, 12000, 8.2)));
+        // Barely seen, or badly rated: out.
+        assert!(!worth_suggesting(&dune, &profile(false, 2020, 40, 7.0)));
+        assert!(!worth_suggesting(&dune, &profile(false, 2020, 3000, 5.1)));
+        // The floor scales with the seed: a niche seed keeps its niche neighbours, and an old seed its era.
+        let niche = profile(false, 1972, 60, 7.0);
+        assert!(worth_suggesting(&niche, &profile(false, 1935, 12, 6.5)));
+        // What is not known does not count against a title.
+        let unknown = SuggestionProfile { votes: 7000, ..SuggestionProfile::default() };
+        assert!(worth_suggesting(&dune, &unknown));
+    }
 
     #[tokio::test]
     async fn the_indexes_load_once_and_stay() {
