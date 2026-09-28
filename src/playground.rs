@@ -11,7 +11,7 @@
 //! cost; how many requests an address may make is the relay's to limit.
 
 use crate::queries::Indexes;
-use den_index::{MediaType, Scored, SimilarParams};
+use den_index::{JevMode, MediaType, Scored, SimilarParams};
 use serde_json::{json, Value};
 
 /// The page, embedded like /configure. Static and dependency-free: it builds its controls from
@@ -862,7 +862,7 @@ fn signals(s: &Scored, p: &SimilarParams) -> Value {
         "world": term(s.world, -p.w_world),
         "year": term(s.year, p.w_year),
         "popularity": term(s.popularity, p.w_popularity),
-        "jev": term(s.jev, p.w_jev),
+        "jev": term(s.jev, if p.jev_mode == JevMode::Off { 0.0 } else { p.w_jev }),
     })
 }
 
@@ -1026,12 +1026,14 @@ mod tests {
     /// serving entry point and through the playground's — against the rows the scorer served for five
     /// anchors BEFORE it took parameters (`similar-golden.json`: the whole row, `limit=200`, first captured
     /// from den-atlas 0.53.0 over HTTP). `scripts/similar-golden.py` recaptures it; it was recaptured when
-    /// the scorer's `ln` moved to `libm`, which moved scores by ULPs and changed no id.
+    /// the scorer's `ln` moved to `libm`, which moved scores by ULPs and changed no id, and when production
+    /// began reranking by Jev's scores (den-atlas#117). Each anchor's `off` is its row at `jev_mode = 0`: the
+    /// row served before that, which the override must still rank byte for byte.
     ///
     /// The golden rows are of one type, and `/index/similar`'s `ids` and `total` — what every client reads —
-    /// are the golden exactly, as on main. The mixed row (`mixed`, `mix_types` on) holds the seed type's
-    /// titles in the golden's order, its first ones; the other type is merged in between and never reorders
-    /// them.
+    /// are the golden exactly, as on main. At `jev_mode = 0` the mixed row (`mixed`, `mix_types` on) holds
+    /// the seed type's titles in `off`'s order, its first ones; the other type is merged in between and never
+    /// reorders them. Jev's rerank orders each row by its own top ten, so it does not keep that relation.
     ///
     /// Opt-in, like every test that needs the real corpus: `DEN_STORE` names a store whose directory holds
     /// its `dataset.meta.json`. It skips unless that store is the generation the golden was captured on,
@@ -1070,19 +1072,38 @@ mod tests {
             let own = |row: &[(MediaType, u32)]| -> Vec<u32> {
                 row.iter().filter(|&&(kind, _)| kind == media).map(|&(_, id)| id).collect()
             };
-            // The mixed row, beside them: its titles of the seed's type are the golden's first ones.
-            let served = own(&indexes.more_like_this_mixed(id, media));
-            assert!(served.len() <= want.len(), "{}", anchor["name"]);
-            assert_eq!(served, want[..served.len()], "{} (mixed, its own type)", anchor["name"]);
-            let tuned: Vec<(MediaType, u32)> = indexes
-                .more_like_this_scored(id, media, &SimilarParams::default())
-                .iter()
-                .map(Scored::key)
-                .collect();
-            assert_eq!(own(&tuned), served, "{} (playground, default parameters)", anchor["name"]);
-            let single: Vec<u32> =
-                indexes.more_like_this_scored(id, media, &one_type).iter().map(|s| s.tmdb_id).collect();
+            let keys = |p: &SimilarParams| -> Vec<(MediaType, u32)> {
+                indexes.more_like_this_scored(id, media, p).iter().map(Scored::key).collect()
+            };
+            let served = indexes.more_like_this_mixed(id, media);
+            assert_eq!(
+                keys(&SimilarParams::default()),
+                &*served,
+                "{} (playground, default parameters)",
+                anchor["name"]
+            );
+            let single: Vec<u32> = own(&keys(&one_type));
             assert_eq!(single, want, "{} (mix_types = 0)", anchor["name"]);
+            // `jev_mode = 0`: the row served before atlas read Jev's scores, byte for byte, and its mixed row's
+            // titles of the seed's type are that row's first ones.
+            let off: Vec<u32> =
+                anchor["off"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+            assert!(!off.is_empty(), "{}", anchor["name"]);
+            let unjudged = SimilarParams { jev_mode: JevMode::Off, ..SimilarParams::default() };
+            assert_eq!(
+                own(&keys(&SimilarParams { mix_types: false, ..unjudged })),
+                off,
+                "{} (jev_mode = 0)",
+                anchor["name"]
+            );
+            let mixed_off = own(&keys(&unjudged));
+            assert!(mixed_off.len() <= off.len(), "{}", anchor["name"]);
+            assert_eq!(
+                mixed_off,
+                off[..mixed_off.len()],
+                "{} (jev_mode = 0, mixed, its own type)",
+                anchor["name"]
+            );
         }
 
         // The character links, built from the credits `CACHE_DIR` keeps, change nothing while unweighed:
@@ -1139,9 +1160,15 @@ mod tests {
             let tuning = parse(query).unwrap();
             tuned_row(&sources, MediaType::Tv, 1438, &tuning).0.iter().take(20).map(|s| s.tmdb_id).collect()
         };
-        let production = wire("");
-        assert_ne!(wire("critique_floor=0.5"), production, "critique_floor");
-        assert_ne!(wire("holds=0.3"), production, "holds");
-        assert_eq!(wire("critique_floor=0.1&holds=0.7"), production, "production's values, spelled out");
+        // Read with Jev's rerank off: its head is ordered by Jev's scores, which neither knob reaches, and on
+        // The Wire it hides what `holds` moves in the first twenty.
+        let production = wire("jev_mode=0");
+        assert_ne!(wire("jev_mode=0&critique_floor=0.5"), production, "critique_floor");
+        assert_ne!(wire("jev_mode=0&holds=0.3"), production, "holds");
+        assert_eq!(
+            wire("jev_mode=0&critique_floor=0.1&holds=0.7"),
+            production,
+            "production's values, spelled out"
+        );
     }
 }

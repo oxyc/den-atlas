@@ -160,8 +160,9 @@ impl Indexes {
     }
 
     /// More Like This mixing films and series (`SimilarParams::mix_types`), typed: the `mixed` lists of
-    /// `/index/similar` and `/index/suggest`. Its titles of the seed's type are `more_like_this`'s first ones,
-    /// in its order.
+    /// `/index/similar` and `/index/suggest`. Before Jev's rerank its titles of the seed's type are
+    /// `more_like_this`'s first ones, in its order; the rerank orders each row by its own top ten
+    /// (`den_index::JevMode`), so a seed with Jev's scores can order them differently.
     pub fn more_like_this_mixed(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
         memoised(&self.similar, ((media_type, tmdb_id), true), SIMILAR_MEMO, || {
             let production = den_index::SimilarParams::default();

@@ -410,7 +410,8 @@ const KNOBS = {
   tone_floor: ["tone", "Minimum tone match", "Drops a candidate sharing less than this of the seed's subgenres and moods."],
   structural_k: ["structural", "Structural candidates", "Adds the nearest social-unit and story-engine profiles to the candidate pool."],
   w_structural: ["structural", "Structural agreement", "Reranks by probability agreement; production keeps this at zero."],
-  w_jev: ["jev", "Jev's More Like This judgement", "Bonus for how likely Jev judged someone wanting more of the seed to want this title, from both Wikipedia plots. Only the candidates the dataset weighed for the seed (its top ten and a few promotions) have a score. Off in production."],
+  jev_mode: ["jev", "How Jev's judgement is used", "Off ignores it. Blend adds the bonus below. Rerank orders the titles Jev weighed (atlas's top ten and a few promotions) by its judgement at the head of the row; an unweighed top-ten title keeps its place, and a title with no scores keeps atlas's row."],
+  w_jev: ["jev", "Jev's More Like This judgement", "Bonus for how likely Jev judged someone wanting more of the seed to want this title, from both Wikipedia plots. Only the candidates the dataset weighed for the seed have a score. Used when the mode is Blend or Rerank."],
   min_confidence: ["tone", "Label confidence needed", "A subgenre or mood label below this confidence is ignored."],
   w_facet_era: facetAxis("era", "Era"),
   w_year: ["era", "Released around the same time", "Bonus for close release years. Off in production."],
@@ -522,7 +523,21 @@ function knobControl(k, value) {
     markKnob(wrap, k);
     return wrap;
   }
-  const at = ((k.default - k.min) / (k.max - k.min)) * 100;
+  if (k.name === "jev_mode") {
+    const modes = ["Off", "Blend", "Rerank"];
+    wrap.innerHTML =
+      `<div class="name"><label for="${id}">${esc(label)}</label><code>${esc(k.name)}</code></div>` +
+      `<p class="about">${esc(about)}</p>` +
+      `<div class="row"><select id="${id}" name="${esc(k.name)}">` +
+      modes.map((m, i) => `<option value="${i}">${m}${i === k.default ? " (production)" : ""}</option>`).join("") +
+      `</select></div>`;
+    const box = wrap.querySelector("select");
+    box.value = String(value ?? k.default);
+    box.addEventListener("change", () => { markKnob(wrap, k); schedule(); });
+    markKnob(wrap, k);
+    return wrap;
+  }
+  const at =((k.default - k.min) / (k.max - k.min)) * 100;
   wrap.innerHTML =
     `<div class="name"><label for="${id}">${esc(label)}</label><code>${esc(k.name)}</code></div>` +
     `<p class="about">${esc(about)}</p>` +
