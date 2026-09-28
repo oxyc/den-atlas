@@ -122,6 +122,9 @@ impl MappedStore {
         //
         // The media type is immaterial — it only packs the search key — so movie stands for both.
         den_index::SeedFacets::new(&view, agg, den_index::MediaType::Movie)?;
+        // `SeedAuthorship` reads Jev's scores per request and its caller drops the whole authorship on an
+        // error, so a malformed Jev section must fail here instead of silently unweighting every maker.
+        view.jev_more_like()?;
         Ok(())
     }
 }

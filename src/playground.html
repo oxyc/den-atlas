@@ -374,6 +374,7 @@ const GROUPS = [
   ["story", "How similar the story is"],
   ["people", "People and studios"],
   ["tone", "Tone and mood"],
+  ["jev", "Jev's judgement"],
   ["era", "Era"],
   ["filters", "Filters"],
   ["advanced", "Advanced"],
@@ -409,6 +410,7 @@ const KNOBS = {
   tone_floor: ["tone", "Minimum tone match", "Drops a candidate sharing less than this of the seed's subgenres and moods."],
   structural_k: ["structural", "Structural candidates", "Adds the nearest social-unit and story-engine profiles to the candidate pool."],
   w_structural: ["structural", "Structural agreement", "Reranks by probability agreement; production keeps this at zero."],
+  w_jev: ["jev", "Jev's More Like This judgement", "Bonus for how likely Jev judged someone wanting more of the seed to want this title, from both Wikipedia plots. Only the candidates the dataset weighed for the seed (its top ten and a few promotions) have a score. Off in production."],
   min_confidence: ["tone", "Label confidence needed", "A subgenre or mood label below this confidence is ignored."],
   w_facet_era: facetAxis("era", "Era"),
   w_year: ["era", "Released around the same time", "Bonus for close release years. Off in production."],
@@ -440,7 +442,7 @@ const SIGNALS = {
   facet: "Similar story shape",
   noul: "Shared subjects", critique: "Argues about similar things", coverage: "Covers the seed's core themes",
   tone: "Same subgenres and mood", world: "Different kind of world", year: "Released around the same time",
-  popularity: "Popularity",
+  popularity: "Popularity", jev: "Jev's judgement",
 };
 // The facet filters `filter.<axis>=` reads: the plot facets and the two label families.
 const FILTER_AXES = [
