@@ -542,7 +542,7 @@ fn inspection(
 /// {
 ///   "format": "den-atlas-playground",   // always this
 ///   "version": 1,                       // FILE_VERSION: the file's shape
-///   "knobSchema": 1,                    // KNOB_SCHEMA: the knob set's meaning
+///   "knobSchema": 2,                    // KNOB_SCHEMA: the knob set's meaning
 ///   "state": {                          // what import restores; nothing else is read
 ///     "knobs": { "<knob>": <number> },  // only knobs moved off production
 ///     "limit": 20,                      // titles per seed
@@ -566,7 +566,8 @@ pub const FILE_FORMAT: &str = "den-atlas-playground";
 pub const FILE_VERSION: u64 = 1;
 /// Bumped when a knob is removed or changes meaning. An older file's knob that no longer exists is reported
 /// and skipped; a same-version file naming an unknown knob is refused, since it can only be a mistake.
-pub const KNOB_SCHEMA: u64 = 1;
+/// 2: `plot_length_off` removed — the dataset removes the length direction itself (oxyc/den-dataset#129).
+pub const KNOB_SCHEMA: u64 = 2;
 /// Titles per seed in a snapshot unless exported in full. In full it is `MAX_ROWS_LIMIT`, what the page
 /// can show: at 200 a twelve-seed export cost ~0.8 s of CPU and 2 MB.
 const SNAPSHOT_TITLES: usize = 20;

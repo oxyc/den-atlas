@@ -186,24 +186,7 @@ pub struct SimilarParams {
     /// The percentiles of the pool's base scores whose difference is `spread`, the unit of every term.
     pub spread_low_pct: usize,
     pub spread_high_pct: usize,
-    /// Rank on plot vectors with the plot-length direction projected out (`Index::without_length`). On.
-    pub plot_length_off: bool,
 }
-
-/// Production ranks on the plot vectors with the length direction projected out (oxyc/den-dataset#109).
-/// Short plots pulled short plots: on store `b2c60751c955` a seed under 400 characters had 49% of its served
-/// first twenty under 1,000 characters and a seed over 2,500 had 7%, against a corpus rate of 22%. `den-atlas
-/// rail-eval`, both judged files, and the served-row skew over the #109 seeds:
-///
-/// ```text
-///              dev nDCG'  dev bad  test nDCG'  test bad   short share <400 / 2500+   gap
-///   off         0.775       12       0.732        16          49.2% / 7.0%          42.2 pp
-///   on          0.777       12       0.732        16          40.0% / 12.1%         27.9 pp
-/// ```
-///
-/// A third of the served skew goes and the judged set does not move; 85–94% of each row's first twenty
-/// stays. `w_plot` stays at 0.45: with the direction removed, 0.35 and 0.55 scored no better.
-const PLOT_LENGTH_OFF: bool = true;
 
 /// Production filters on neither TMDB number nor popularity, and does not weigh popularity: More Like This
 /// is about the seed, and a popularity term would pull every row towards the same few titles.
@@ -300,7 +283,6 @@ impl Default for SimilarParams {
             pool_floor_pct: POOL_FLOOR_PCT,
             spread_low_pct: SPREAD_LOW_PCT,
             spread_high_pct: SPREAD_HIGH_PCT,
-            plot_length_off: PLOT_LENGTH_OFF,
         }
     }
 }
@@ -366,14 +348,6 @@ impl SimilarParams {
             "spread = base at spread_high_pct minus base at this",
         ),
         knob("spread_high_pct", "pool", 51.0, 100.0, true, "... the upper percentile of that spread"),
-        knob(
-            "plot_length_off",
-            "pool",
-            0.0,
-            1.0,
-            true,
-            "1: project the plot-length direction out of the plot vectors, seed and candidates alike",
-        ),
         knob("w_maker", "signals", 0.0, W_MAX, false, "shared director/writer/creator (share of the seed's)"),
         knob(
             "w_character",
@@ -602,7 +576,6 @@ impl SimilarParams {
             "pool_floor_pct" => self.pool_floor_pct as f64,
             "spread_low_pct" => self.spread_low_pct as f64,
             "spread_high_pct" => self.spread_high_pct as f64,
-            "plot_length_off" => f64::from(u8::from(self.plot_length_off)),
             _ => self.w_facet_axis[FACET_AXIS_KNOBS.iter().position(|k| *k == name)?],
         })
     }
@@ -659,7 +632,6 @@ impl SimilarParams {
             "pool_floor_pct" => self.pool_floor_pct = whole,
             "spread_low_pct" => self.spread_low_pct = whole,
             "spread_high_pct" => self.spread_high_pct = whole,
-            "plot_length_off" => self.plot_length_off = whole == 1,
             _ => {
                 let axis = FACET_AXIS_KNOBS
                     .iter()
@@ -1357,7 +1329,6 @@ pub fn more_like_this_with(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
-    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
     let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
     ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p)
 }
@@ -1377,7 +1348,6 @@ pub fn inspect_more_like_this(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Inspection {
-    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
     let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
     let mut inspected = ranked_inspecting(
         &scans, plot, premise, tmdb_id, media_type, candidate, authorship, facets, extras, p,
@@ -1434,7 +1404,6 @@ pub fn more_like_this_both(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> (Vec<Scored>, Vec<Scored>) {
-    let plot = if p.plot_length_off { plot.map(Index::without_length) } else { plot };
     let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, true));
     let (one, mixed) = (SimilarParams { mix_types: false, ..*p }, SimilarParams { mix_types: true, ..*p });
     let rank =
@@ -2559,58 +2528,27 @@ mod tests {
         assert!(!regional(&[], Some(*b"sv")), "no known country");
     }
 
-    /// With the length direction removed, the plot cosine reads what is left of each vector. Along the
-    /// direction (here the third axis) title 2 matches the seed and title 3 does not; off the direction
-    /// title 3 matches and title 2 does not, so the knob swaps them. The premise index is another space
-    /// and is never touched.
+    /// The dataset removed the length direction before quantising (oxyc/den-dataset#129), so More Like This
+    /// reads the stored plot rows as they are and never removes it a second time. The rows here still carry
+    /// a component along the declared direction (the third axis): were it removed, title 2 would score 1.0
+    /// and title 3 0.0. The raw cosines prove it was not.
     #[test]
-    fn plot_length_off_ranks_on_the_plot_vectors_without_the_direction() {
+    fn more_like_this_does_not_project_dataset_transformed_plot_rows_again() {
         let titles: &[crate::index::tests::Row<'_>] = &[
             (1, "movie", "Drama", false, &[], &[], [60, 0, 80]),
             (2, "movie", "Drama", false, &[], &[], [0, 60, 80]),
             (3, "movie", "Drama", false, &[], &[], [100, 0, 0]),
         ];
-        let plot = fixture(titles).with_length_direction(&[0.0, 0.0, 1.0]);
-        let premise = fixture(titles);
-        assert!(std::ptr::eq(premise.without_length(), &premise), "no direction, nothing removed");
-        let cosines = |off: bool| -> Vec<(u32, Option<f64>)> {
-            let p = SimilarParams { plot_length_off: off, ..SimilarParams::default() };
-            let mut row: Vec<(u32, Option<f64>)> =
-                more_like_this_scored(Some(&plot), None, 1, MediaType::Movie, None, None, &p)
-                    .iter()
-                    .map(|s| (s.tmdb_id, s.plot))
-                    .collect();
-            row.sort_by_key(|&(id, _)| id);
-            row
-        };
-        let near = |c: Option<f64>, want: f64| c.is_some_and(|c| (c - want).abs() < 1e-3);
-        let on = cosines(true);
-        assert!(near(on[0].1, 0.0) && near(on[1].1, 1.0), "{on:?}");
-        let off = cosines(false);
-        assert!(near(off[0].1, 6400.0 / 16129.0) && near(off[1].1, 6000.0 / 16129.0), "{off:?}");
-        // The index the knob ranks on is built once and kept.
-        assert!(std::ptr::eq(plot.without_length(), plot.without_length()));
-    }
-
-    /// A new dataset has already paid the projection before quantisation. The old playground knob remains
-    /// accepted, but cannot and need not reconstruct the removed component; either value ranks one mmap.
-    #[test]
-    fn the_legacy_knob_is_a_noop_for_dataset_transformed_plot_rows() {
-        let titles: &[crate::index::tests::Row<'_>] = &[
-            (1, "movie", "Drama", false, &[], &[], [100, 0, 0]),
-            (2, "movie", "Drama", false, &[], &[], [90, 10, 0]),
-            (3, "movie", "Drama", false, &[], &[], [0, 100, 0]),
-        ];
         let plot = fixture(titles).with_dataset_length_transform(&[0.0, 0.0, 1.0]);
-        let row = |off| {
-            let p = SimilarParams { plot_length_off: off, ..SimilarParams::default() };
+        let p = SimilarParams::default();
+        let mut row: Vec<(u32, Option<f64>)> =
             more_like_this_scored(Some(&plot), None, 1, MediaType::Movie, None, None, &p)
-                .into_iter()
-                .map(|score| score.tmdb_id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(row(false), row(true));
-        assert!(std::ptr::eq(plot.without_length(), &plot));
+                .iter()
+                .map(|s| (s.tmdb_id, s.plot))
+                .collect();
+        row.sort_by_key(|&(id, _)| id);
+        let near = |c: Option<f64>, want: f64| c.is_some_and(|c| (c - want).abs() < 1e-3);
+        assert!(near(row[0].1, 6400.0 / 16129.0) && near(row[1].1, 6000.0 / 16129.0), "{row:?}");
     }
 
     /// A candidate with no confident labels is not filtered out: unknown is not none.
@@ -2649,7 +2587,7 @@ mod tests {
             p.set(knob.name, value).unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(p, defaults, "{} did not round-trip", knob.name);
         }
-        assert_eq!(SimilarParams::KNOBS.len(), 52, "a field was added without a knob, or the reverse");
+        assert_eq!(SimilarParams::KNOBS.len(), 51, "a field was added without a knob, or the reverse");
         for knob in SimilarParams::KNOBS {
             assert!(KNOB_GROUPS.contains(&knob.group), "{} is in no known group", knob.name);
             if knob.name.starts_with("w_") {

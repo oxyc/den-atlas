@@ -3,8 +3,8 @@
 //! nothing here mixes them.
 //!
 //! An index built from the store reads its int8 vectors in place, in the store's `vec_*` section, through
-//! the bytes the caller keeps alive for it ([`StoreBytes`]). An index of its own vectors — the tests' blobs,
-//! and the plot-length-free copy — holds them in the layout the old `vectors-*.bin` blob had: a
+//! the bytes the caller keeps alive for it ([`StoreBytes`]). An index of its own vectors — the tests'
+//! blobs — holds them in the layout the old `vectors-*.bin` blob had: a
 //! little-endian `[i32 count][i32 dim]` header, then `count × dim` rows in record order. The blob itself is
 //! no longer read: [`Index::from_blobs`] is kept only for the tests that hold the store reader to what the
 //! blobs answered.
@@ -16,38 +16,16 @@ use crate::MediaType;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// The confidence a label needs to be shown in a row — the tvOS app's `displayConfidenceFloor`. The producer
 /// keeps weaker labels as review material, but a row built from them puts the classifier's least confident
 /// guesses in front of the viewer.
 pub const DISPLAY_CONFIDENCE_FLOOR: f64 = 0.55;
+#[cfg(test)]
 const HEADER_BYTES: usize = 8;
 /// The quantiser's scale: a unit vector's components were stored as `round(x × 127)`.
 const QUANTUM: f64 = 127.0;
-
-/// The direction in the plot space (bge-m3, 1024 dimensions) along which a vector moves with the length of
-/// the plot it was embedded from: 1024 little-endian `f32`, unit length, pointing towards longer plots.
-///
-/// Short plots pull short plots and long ones long (oxyc/den-dataset#109): on store `b2c60751c955` a seed
-/// under 400 characters has 78% of its plot top 20 under 1,000 characters, a seed over 2,500 has 2.5%,
-/// against a corpus rate of 22%. Most of that is this one direction. A vector's projection on it correlates
-/// 0.87 with log plot length.
-///
-/// Fitted offline, because the store carries no plot text and nothing in it stands in for its length. The
-/// best proxy there is (distributor count, correlated 0.36 with log length) gives a direction at cosine 0.86
-/// to this one, whose projection correlates only 0.74 with length. A canonical correlation over every credit
-/// list's count finds popularity instead (cosine 0.18). The fit: the least-squares slope of the unit plot
-/// vectors on `ln(plot characters)`, over the 33,657 titles whose plot is English, the plot counted as it was
-/// embedded (after translation and the 3,500-character cap), then normalised.
-///
-/// It belongs to the embedding model and the way documents are composed, not to one store: a store embedded
-/// by another model has another space, and a direction of another dimension is not applied at all.
-const PLOT_LENGTH_DIRECTION: &[u8] = include_bytes!("plot-length-direction.f32");
-
-fn plot_length_direction() -> Box<[f32]> {
-    PLOT_LENGTH_DIRECTION.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect()
-}
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -242,7 +220,8 @@ impl StoreBytes for Vec<u8> {
 /// An index's int8 vectors, row by row.
 enum Vectors {
     /// A blob of its own: an `[i32 count][i32 dim]` header, then one row per record in record order. The
-    /// test blobs, and the plot-length-free copy (`without_length`).
+    /// test blobs.
+    #[cfg(test)]
     Owned(Vec<u8>),
     /// In place, in the store's `vec_*` section: `offset` is where that section starts in `bytes`, and
     /// `rows[r]` is record `r`'s store row. The section has a row for every title of the store, and the
@@ -267,24 +246,19 @@ impl<'a> Matrix<'a> {
 pub struct Index {
     taxonomy_version: String,
     dim: usize,
-    /// The metadata below is shared (`Arc`) with the plot-length-free copy, which differs only in its vectors.
-    records: Arc<[Record]>,
-    names: Arc<[Box<str>]>,
+    records: Box<[Record]>,
+    names: Box<[Box<str>]>,
     /// (type, tmdb id) → row. Ids collide across the movie and tv namespaces (1399 is both a movie and Game
     /// of Thrones), so a title is always looked up with its type. The first row wins a duplicate.
-    rows: Arc<HashMap<(MediaType, u32), u32>>,
+    rows: HashMap<(MediaType, u32), u32>,
     vectors: Vectors,
     /// Label → titles carrying it, most confident first (stable, so equal confidences keep record order).
-    subgenres: Arc<HashMap<u32, Vec<Entry>>>,
-    moods: Arc<HashMap<u32, Vec<Entry>>>,
-    /// The length direction to remove for `without_length`: the plot index's, when its dimension fits;
-    /// `None` for the premise index, which is another space.
-    length_direction: Option<Box<[f32]>>,
+    subgenres: HashMap<u32, Vec<Entry>>,
+    moods: HashMap<u32, Vec<Entry>>,
     /// A dataset-side transform already removed this direction from every stored plot row. Raw semantic
     /// query vectors must lose it too; title-to-title scans do not, because both rows are already transformed.
     /// Premise indexes never carry it.
     semantic_query_direction: Option<Box<[f32]>>,
-    without_length: OnceLock<Box<Index>>,
 }
 
 impl Index {
@@ -341,8 +315,9 @@ impl Index {
         Index::from_store_space(store, bytes, Space::Plot)
     }
 
-    /// A plot matrix whose producer already removed `direction` before quantisation. Unlike the legacy
-    /// runtime knob this keeps no second corpus-wide matrix: only raw outside query vectors are projected.
+    /// A plot matrix whose producer already removed `direction` before quantisation (the manifest's
+    /// `plotVectorTransform`, oxyc/den-dataset#129). Title-to-title scans read the stored rows as they are;
+    /// only raw outside query vectors are projected.
     pub fn from_store_plot_transformed(
         store: &den_store::Store<'_>,
         bytes: Arc<dyn StoreBytes>,
@@ -356,7 +331,6 @@ impl Index {
                 index.dim
             )));
         }
-        index.length_direction = None;
         index.semantic_query_direction = Some(direction.into());
         Ok(index)
     }
@@ -495,17 +469,7 @@ impl Index {
             );
         }
         let vectors = Vectors::Stored { bytes, offset, rows: store_rows.into() };
-        let mut index = assemble(String::new(), dim, records, names, vectors);
-        if matches!(space, Space::Plot) {
-            index.length_direction = Some(plot_length_direction()).filter(|d| d.len() == dim);
-        }
-        Ok(index)
-    }
-
-    /// Whether `without_length` has a direction to remove: true for a plot index of the dimension the
-    /// shipped direction was fitted in.
-    pub fn has_length_direction(&self) -> bool {
-        self.length_direction.is_some()
+        Ok(assemble(String::new(), dim, records, names, vectors))
     }
 
     /// Whether stored plot rows are already length-projected by the dataset producer.
@@ -513,74 +477,12 @@ impl Index {
         self.semantic_query_direction.is_some()
     }
 
-    /// This index with the plot-length direction (`PLOT_LENGTH_DIRECTION`) projected out of every vector:
-    /// each row is read as a unit vector, loses its component along the direction, and is re-normalised and
-    /// requantised to int8, so every scorer below reads it exactly as it reads the original. A seed is a row
-    /// of the same index, so the seed and the corpus it is compared with lose the direction alike.
-    ///
-    /// Built on first use and kept with the index: a second copy of the vectors (~49 MB on the plot index,
-    /// ~150 ms on glibc, ~1 s on the static musl build), which production ranks on
-    /// (`SimilarParams::plot_length_off`). A caller that does not want the first More Like This of a load to
-    /// pay for it calls this ahead, as den-atlas does beside its load. An index with no direction answers
-    /// itself.
-    pub fn without_length(&self) -> &Index {
-        let Some(direction) = &self.length_direction else { return self };
-        self.without_length.get_or_init(|| Box::new(self.with_direction_removed(direction)))
-    }
-
-    /// Whether the length-free copy is ready without doing any work. An index with no compatible length
-    /// direction needs no copy and is therefore ready from construction.
-    pub fn without_length_ready(&self) -> bool {
-        self.length_direction.is_none() || self.without_length.get().is_some()
-    }
-
-    /// A fixture index given a length direction, as the store path gives the plot index one.
-    #[cfg(test)]
-    pub(crate) fn with_length_direction(mut self, direction: &[f32]) -> Index {
-        assert_eq!(direction.len(), self.dim);
-        self.length_direction = Some(direction.into());
-        self
-    }
-
     /// A fixture whose rows are already projected, with raw outside queries still needing the operation.
     #[cfg(test)]
     pub(crate) fn with_dataset_length_transform(mut self, direction: &[f32]) -> Index {
         assert_eq!(direction.len(), self.dim);
-        self.length_direction = None;
         self.semantic_query_direction = Some(direction.into());
         self
-    }
-
-    /// The copy's vectors are its own — built here, in atlas's process — while its records, names and label
-    /// buckets are this index's, shared rather than cloned.
-    fn with_direction_removed(&self, direction: &[f32]) -> Index {
-        let mut vectors = Vec::with_capacity(HEADER_BYTES + self.records.len() * self.dim);
-        // `from_blobs`' layout; every length here fits, since the index's own rows and dimension do.
-        vectors.extend_from_slice(&(self.records.len() as i32).to_le_bytes());
-        vectors.extend_from_slice(&(self.dim as i32).to_le_bytes());
-        let matrix = self.matrix();
-        let mut unit = Vec::with_capacity(self.dim);
-        for row in 0..self.records.len() {
-            project_and_quantize(
-                matrix.row(row).iter().map(|&byte| byte as i8),
-                direction,
-                &mut unit,
-                &mut vectors,
-            );
-        }
-        Index {
-            taxonomy_version: self.taxonomy_version.clone(),
-            dim: self.dim,
-            records: Arc::clone(&self.records),
-            names: Arc::clone(&self.names),
-            rows: Arc::clone(&self.rows),
-            vectors: Vectors::Owned(vectors),
-            subgenres: Arc::clone(&self.subgenres),
-            moods: Arc::clone(&self.moods),
-            length_direction: None,
-            semantic_query_direction: None,
-            without_length: OnceLock::new(),
-        }
     }
 
     /// Stamp the taxonomy version an index built from the store has no way to know — it is the labelling
@@ -906,6 +808,7 @@ impl Index {
     /// The vectors, resolved for reading row by row: a scan resolves them once rather than per row.
     fn matrix(&self) -> Matrix<'_> {
         match &self.vectors {
+            #[cfg(test)]
             Vectors::Owned(blob) => Matrix { bytes: &blob[HEADER_BYTES..], rows: None, dim: self.dim },
             Vectors::Stored { bytes, offset, rows } => {
                 Matrix { bytes: &bytes.store_bytes()[*offset..], rows: Some(rows), dim: self.dim }
@@ -1197,18 +1100,16 @@ fn assemble(
         dim,
         records: records.into(),
         names: names.into(),
-        rows: Arc::new(rows),
+        rows,
         vectors,
-        subgenres: Arc::new(subgenres),
-        moods: Arc::new(moods),
-        length_direction: None,
+        subgenres,
+        moods,
         semantic_query_direction: None,
-        without_length: OnceLock::new(),
     }
 }
 
 /// Remove one unit direction from a quantised unit vector, normalise what remains, and quantise it again.
-/// Used for the legacy corpus copy and for a raw semantic query entering a producer-transformed plot space.
+/// Used for a raw semantic query entering a producer-transformed plot space.
 fn project_and_quantize(
     values: impl Iterator<Item = i8>,
     direction: &[f32],
@@ -1284,16 +1185,6 @@ pub(crate) mod tests {
         // -128 everywhere: the largest product there is, 1024 times over.
         let extreme = vec![0x80u8; 1024];
         assert_eq!(dot(&extreme, &extreme), 1024 * 16384);
-    }
-
-    /// The shipped direction is bge-m3's 1024 dimensions at unit length; a fixture of another dimension
-    /// would not be given it.
-    #[test]
-    fn the_plot_length_direction_is_a_unit_vector_in_the_plot_space() {
-        let direction = plot_length_direction();
-        assert_eq!(direction.len(), 1024);
-        let norm = direction.iter().map(|&d| f64::from(d) * f64::from(d)).sum::<f64>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "norm {norm}");
     }
 
     /// One fixture title: id, type, primary genre, animated, subgenres, moods, vector.
@@ -1372,8 +1263,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Producer-transformed plot rows stay mmap-backed: only a raw outside query is projected. The same
-    /// raw vector entering premise space is untouched, and asking for the legacy knob creates no copy.
+    /// Producer-transformed plot rows are read as stored: only a raw outside query is projected. The same
+    /// raw vector entering premise space is untouched.
     #[test]
     fn a_dataset_transform_projects_semantic_queries_without_copying_the_matrix() {
         let rows: &[Row<'_>] = &[
@@ -1399,8 +1290,6 @@ pub(crate) mod tests {
             "the other semantic API drifted"
         );
         assert!(plot.has_dataset_length_transform());
-        assert!(std::ptr::eq(plot.without_length(), &plot), "already-transformed rows were copied");
-        assert!(plot.without_length.get().is_none());
     }
 
     #[test]
