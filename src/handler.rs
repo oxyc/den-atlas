@@ -1642,7 +1642,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             json_response(answer.to_string(), StatusCode::OK),
             &format!("{timing}, total;dur={}", ms(started.elapsed())),
         ),
-        Err(resp) => resp,
+        Err(resp) => *resp,
     }
 }
 
@@ -1701,7 +1701,7 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
             };
             let (answer, timing) = match rank(state, queries, config, request, None, "").await {
                 Ok(ranked) => ranked,
-                Err(resp) => return resp,
+                Err(resp) => return *resp,
             };
             let answer = Arc::new(answer);
             if let Ok(mut kept) = billboards().lock() {
@@ -1758,13 +1758,13 @@ async fn rank(
     request: crate::recommend::Request,
     raw: Option<serde_json::Value>,
     rid: &str,
-) -> Result<(serde_json::Value, String), Response> {
+) -> Result<(serde_json::Value, String), Box<Response>> {
     let rid = rid.to_owned();
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
         Err(e) => {
             eprintln!("index load failed: {e}");
-            return Err(unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT));
+            return Err(Box::new(unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT)));
         }
     };
     // Only titles absent from the plot index are embedded, from bounded transient client hints. A failed or
@@ -1821,7 +1821,7 @@ async fn rank(
     .await
     .map_err(|e| {
         eprintln!("recommend failed: {e}");
-        json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
+        Box::new(json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR))
     })?;
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
     Ok((
