@@ -39,6 +39,14 @@ fn with_timing(mut resp: Response, timing: &str) -> Response {
     resp
 }
 
+/// The `Cache-Tag` on every answer a shared cache may keep.
+const CACHE_TAG: &str = "atlas";
+
+/// How long an answer built from the dataset alone is kept: five minutes in a browser, and a month in a shared
+/// cache, which den purges by `CACHE_TAG` whenever atlas or its dataset changes (`den-cloudflare-purge`). An
+/// answer that is still good is served at once while it is asked again, for a day after it goes stale.
+const DATASET_ANSWER: &str = "public, max-age=300, s-maxage=2592000, stale-while-revalidate=86400";
+
 /// Every response leaves through here, so every one carries `Access-Control-Allow-Origin: *` — the
 /// 404, a refused /metrics, a 304 and an /embed error included. Setting it per helper left out
 /// whatever was built outside those helpers (the /metrics body was), and a browser reports a missing
@@ -62,6 +70,17 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After, ETag"),
     );
     resp.headers_mut().insert("timing-allow-origin", header::HeaderValue::from_static("*"));
+    // What a shared cache may keep is named, so the deploy that changes it can drop it by name: den's
+    // `den-cloudflare-purge atlas` runs after every atlas release and every new dataset. Cloudflare reads
+    // the header and removes it before a browser sees the answer.
+    if resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|cc| cc.starts_with("public"))
+    {
+        resp.headers_mut().insert("cache-tag", header::HeaderValue::from_static(CACHE_TAG));
+    }
     if let Some((started, method, path, rid)) = log {
         eprintln!(
             "{}",
@@ -1768,7 +1787,7 @@ async fn filter_answer(
     } else if degraded {
         "public, max-age=300"
     } else {
-        "public, max-age=3600, stale-while-revalidate=86400"
+        DATASET_ANSWER
     };
     Ok((body, cache_control, location, degraded))
 }
@@ -1851,18 +1870,17 @@ async fn handle_index(
         };
     }
     // An answer is the dataset's — and, for search, den-embed's vector for the text, which is fixed for the
-    // dataset's model — so it changes when the dataset does, at most once a day, and its ETag with it: fresh
-    // for an hour, and served stale while it revalidates. A search that should have been ranked through
-    // den-embed and wasn't is the exception: it stays short, so the ranked answer replaces it once den-embed
-    // is back.
-    let long = "public, max-age=3600, stale-while-revalidate=86400";
+    // dataset's model — so it changes when the dataset does, at most once a day, and its ETag with it
+    // (`DATASET_ANSWER`). A search that should have been ranked through den-embed and wasn't is the exception:
+    // it stays short, so the ranked answer replaces it once den-embed is back.
+    let long = DATASET_ANSWER;
     // A tilted row is as cacheable as any other — it is a slice of an order fixed for (row, taste, weights),
     // so every page of it revalidates the same way — but its URL carries the household's liked and disliked
     // titles, and that does not belong in a shared cache's key store or a proxy's log. `private` keeps the
     // TTL and the ETag and moves the copy to the client that asked. A row with no taste in its URL keeps
     // `public` exactly as before.
     let mut cache_control = if query.contains(crate::plotrows::TILT_PREFIX) {
-        "private, max-age=3600, stale-while-revalidate=86400"
+        "private, max-age=300, stale-while-revalidate=86400"
     } else {
         long
     };
@@ -1965,8 +1983,7 @@ async fn handle_title_search(
     let query = extra_value(extra, "search").map(|q| percent_decode(&q)).unwrap_or_default();
     let body = titles::metas_json(&index, &query, media_type);
     let searched = started.elapsed();
-    let resp =
-        serve_json(method, headers, body, "public, max-age=3600, stale-while-revalidate=3600", None).await;
+    let resp = serve_json(method, headers, body, DATASET_ANSWER, None).await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
@@ -2309,7 +2326,7 @@ mod tests {
     async fn title_search_answers_from_the_index() {
         let state = title_state();
         let hit = get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await;
-        assert_eq!(hit.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=3600");
+        assert_eq!(hit.headers()["cache-control"], DATASET_ANSWER);
         let hit = body_of(hit).await;
         assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
         let other_type =
@@ -2585,7 +2602,7 @@ mod tests {
         let state = index_state("den-atlas-index");
         let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
         let taxonomy = get(&state, "/index/taxonomy.json").await;
-        assert_eq!(taxonomy.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        assert_eq!(taxonomy.headers()["cache-control"], DATASET_ANSWER);
         let taxonomy = json(body_of(taxonomy).await);
         assert_eq!(taxonomy["subgenres"], serde_json::json!(["Heist", "Campy/Cult"]));
         assert_eq!(taxonomy["moods"], serde_json::json!(["Tense"]));
@@ -2754,7 +2771,7 @@ mod tests {
         let search = get(&state, "/index/search.json?q=campy+fun").await;
         assert_eq!(
             search.headers()["cache-control"],
-            "public, max-age=3600, stale-while-revalidate=86400",
+            DATASET_ANSWER,
             "an embedded answer changes only with the dataset"
         );
         let search = json(body_of(search).await);
@@ -2830,7 +2847,7 @@ mod tests {
             assert_eq!(resp.headers()["cache-control"], "public, max-age=300", "{path}");
         }
         let unthemed = get(&state, "/index/facets.json?q=korean+movies").await;
-        assert_eq!(unthemed.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        assert_eq!(unthemed.headers()["cache-control"], DATASET_ANSWER);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3236,10 +3253,7 @@ mod tests {
 
         let all = get(&state, "/index/filter/movie/counts.json").await;
         assert_eq!(all.status(), 200);
-        assert_eq!(
-            all.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600, stale-while-revalidate=86400"
-        );
+        assert_eq!(all.headers()[header::CACHE_CONTROL], DATASET_ANSWER);
         assert!(all.headers().get(DEGRADED).is_none(), "every kind this state offers answers");
         let all = json(body_of(all).await);
         assert_eq!(all["total"], 3);
@@ -3479,10 +3493,7 @@ mod tests {
 
         let korean = get(&state, "/index/filter/movie/titles.json?sel=country:KR,subgenre:Heist").await;
         assert_eq!(korean.status(), 200);
-        assert_eq!(
-            korean.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600, stale-while-revalidate=86400"
-        );
+        assert_eq!(korean.headers()[header::CACHE_CONTROL], DATASET_ANSWER);
         let etag = korean.headers()[header::ETAG].clone();
         let korean = json(body_of(korean).await);
         assert_eq!((ids(&korean), &korean["total"]), (vec![2, 1], &serde_json::json!(2)));
@@ -3627,10 +3638,7 @@ mod tests {
 
         let korean = get(&state, "/index/filter/all/counts.json?sel=country:KR").await;
         assert_eq!(korean.status(), 200);
-        assert_eq!(
-            korean.headers()[header::CACHE_CONTROL],
-            "public, max-age=3600, stale-while-revalidate=86400"
-        );
+        assert_eq!(korean.headers()[header::CACHE_CONTROL], DATASET_ANSWER);
         let korean = json(body_of(korean).await);
         assert_eq!(korean["total"], 3, "movies 1 and 2 and series 4");
         assert_eq!(korean["kinds"]["subgenre"]["values"], serde_json::json!({ "Heist": 3 }));
@@ -3715,11 +3723,12 @@ mod tests {
         // The taste travels in the URL, so a tilted page is cacheable to the client that asked and to
         // nobody else; a row with no taste in it keeps the shared TTL it has always had.
         let tilted = get(&state, &format!("{row}&tilt.disliked=m2")).await;
-        assert_eq!(tilted.headers()["cache-control"], "private, max-age=3600, stale-while-revalidate=86400");
-        assert_eq!(
-            get(&state, row).await.headers()["cache-control"],
-            "public, max-age=3600, stale-while-revalidate=86400"
-        );
+        assert_eq!(tilted.headers()["cache-control"], "private, max-age=300, stale-while-revalidate=86400");
+        let shared = get(&state, row).await;
+        assert_eq!(shared.headers()["cache-control"], DATASET_ANSWER);
+        // Only what a shared cache keeps is tagged for purging; a private answer never reaches one.
+        assert_eq!(shared.headers()["cache-tag"], "atlas");
+        assert!(tilted.headers().get("cache-tag").is_none());
     }
 
     /// A ranked answer from a real fixture index and facts: never what the library owns, another type, or a
@@ -3993,7 +4002,7 @@ mod tests {
         );
         let whole = whole["perSeed"][0]["mixed"].as_array().unwrap().clone();
         let resp = get(&state, "/index/suggest/movie/1.json?limit=200").await;
-        assert_eq!(resp.headers()["cache-control"], "public, max-age=3600, stale-while-revalidate=86400");
+        assert_eq!(resp.headers()["cache-control"], DATASET_ANSWER);
         let got = json(body_of(resp).await);
         assert_eq!(got["mixed"].as_array().unwrap(), &whole);
         assert_eq!(got["total"], whole.len());
