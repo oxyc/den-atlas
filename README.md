@@ -381,9 +381,9 @@ labelling. `BILLBOARD_JUDGED=<file>` selects a different judgement file. Neither
 The curated-franchise corpus has its own stronger, no-network acceptance command:
 `den-atlas franchise-check <dataset>`. It is intentionally separate from the general `check`, because an old
 store without the optional sections is still a valid backward-compatible store. `franchise-check` reads
-`judged/franchise.json` and refuses the generation unless the exact 46-title Beck group, the Wallander and
-Van Veeteren controls, Bond, Spider-Man and Star Wars group correctly; the named adaptation/catalogue controls
-stay apart; each row leads with the seed era and retains release order; and More Like This contains none of
+`judged/franchise.json` and refuses the generation unless the exact 46-title Beck group, the Wallander
+control, Bond, Spider-Man and Star Wars group correctly; the named adaptation/catalogue controls stay apart,
+including separate productions of one source (the British Wallander, the non-Eon Bond films); each row leads with the seed era and retains release order; and More Like This contains none of
 the seed's actual primary-franchise members. Run it on the staged post-rebuild store before deployment. The
 ordinary `rail-eval` also removes those reserved members from its judged ideals: a sequel owned by the dedicated
 franchise row is no longer counted as a recommendation the More Like This ranker failed to return.

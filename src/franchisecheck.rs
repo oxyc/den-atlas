@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(beck.seed, "movie:270043");
         assert_eq!(beck.exact_member_count, Some(46));
         assert_eq!(beck.required_members.len(), 46);
-        for name in ["Wallander", "Van Veeteren", "James Bond", "Spider-Man", "Star Wars"] {
+        for name in ["Wallander", "James Bond", "Spider-Man", "Star Wars"] {
             assert!(file.cases.iter().any(|case| case.name == name), "missing {name}");
         }
         assert!(!file.apart.is_empty() && !file.none.is_empty());

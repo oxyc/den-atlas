@@ -2,9 +2,10 @@
   "schemaVersion": 1,
   "about": {
     "issue": "oxyc/den-atlas#92",
-    "what": "Corpus-visible acceptance for curated franchise rows and More Like This exclusion. The keys and era controls come from den-dataset's hand-checked franchise golden set; Van Veeteren is the issue's named Scandinavian-crime control.",
+    "what": "Corpus-visible acceptance for curated franchise rows and More Like This exclusion. The keys and era controls come from den-dataset's hand-checked franchise golden set. The issue's Van Veeteren control is not a case: none of its films is in the corpus, so no store can pass or fail it.",
+    "rule": "A franchise is one continuity or rights line, with eras (Spider-Man's reboots, Beck's recasts, Eon's Bond). A separate production of the same source (the British Wallander, the non-Eon Bond films, a Sherlock Holmes adaptation) is not an era of it; it is apart, and reached through the title's Other versions row (owner's decision on #92, 2026-09-28; #112).",
     "scope": "Run `den-atlas franchise-check <dataset dir>` on the staged rebuilt store before deployment. This makes no network or model calls.",
-    "ordering": "The seed era leads its route and every era retains release order. Beck's exact 46-title corpus group is pinned because the completed derive explicitly recorded that result.",
+    "ordering": "The seed era leads its route and every era retains release order, so each era below lists its titles in release order: the year, then Wikidata's finer date where it gives one. Beck's exact 46-title corpus group is pinned because the completed derive explicitly recorded that result.",
     "moreLikeThis": "Every case requires a full first screen and no member of the seed's actual curated primary franchise anywhere in the mixed row. Umbrella labels do not count."
   },
   "cases": [
@@ -26,13 +27,13 @@
         "movie:918913"
       ],
       "eras": [
-        ["movie:25699", "movie:34527", "movie:34645", "movie:44581", "movie:46320", "movie:33121", "movie:34644"],
+        ["movie:25699", "movie:34645", "movie:44581", "movie:34527", "movie:46320", "movie:34644", "movie:33121"],
         [
-          "movie:24771", "movie:270043", "movie:270046", "movie:383623", "movie:270044",
+          "movie:270043", "movie:270046", "movie:383623", "movie:24771", "movie:270044",
           "movie:270045", "movie:270047", "movie:270105", "movie:119644", "movie:270106",
-          "movie:263120", "movie:270112", "movie:263116", "movie:270199", "movie:270111",
-          "movie:137190", "movie:164431", "movie:270117", "movie:270116", "movie:270114",
-          "movie:128692", "movie:265981", "movie:270113", "movie:265980", "movie:119671",
+          "movie:137190", "movie:263116", "movie:263120", "movie:270111", "movie:270112",
+          "movie:270199", "movie:164431", "movie:270114", "movie:270117", "movie:128692",
+          "movie:265980", "movie:265981", "movie:270113", "movie:270116", "movie:119671",
           "movie:164435", "movie:315360", "movie:315362", "movie:315364", "movie:315367",
           "movie:375486", "movie:375880", "movie:380590", "movie:387656", "movie:514961",
           "movie:771622", "movie:781766", "movie:918913"
@@ -43,15 +44,8 @@
     {
       "name": "Wallander",
       "seed": "movie:221868",
-      "requiredMembers": ["movie:221868", "movie:227246", "movie:218939", "tv:7263"],
-      "eras": [["movie:221868", "movie:227246", "movie:218939"], ["tv:7263"]]
-    },
-    {
-      "name": "Van Veeteren",
-      "seed": "movie:156158",
-      "requiredMembers": [
-        "movie:156158", "movie:125955", "movie:125961", "movie:100521", "movie:80621", "movie:125950"
-      ]
+      "requiredMembers": ["movie:221868", "movie:227246", "movie:218939", "tv:31766"],
+      "eras": [["movie:221868", "movie:227246", "movie:218939"], ["tv:31766"]]
     },
     {
       "name": "James Bond",
@@ -80,7 +74,10 @@
     ["movie:138", "movie:11868"],
     ["movie:138", "movie:6114"],
     ["movie:11868", "movie:6114"],
-    ["movie:1726", "movie:10195"]
+    ["movie:1726", "movie:10195"],
+    ["movie:221868", "tv:7263"],
+    ["movie:646", "movie:12208"],
+    ["movie:646", "movie:36670"]
   ],
   "none": ["movie:29735", "movie:129", "movie:128", "movie:4935", "movie:4638", "movie:747", "movie:107985"]
 }
