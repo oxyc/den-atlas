@@ -91,6 +91,8 @@ pub struct Indexes {
     filter: OnceLock<FilterIndex>,
     /// `/index/schema.json`, serialised (`Indexes::schema_json`).
     schema: OnceLock<String>,
+    /// Per store row, the titles whose fan picks name it: each as (where it stands in their picks, their row).
+    fan_links: OnceLock<Vec<Vec<(u32, u32)>>>,
 }
 
 type Key = (den_index::MediaType, u32);
@@ -154,10 +156,11 @@ impl Indexes {
         })
     }
 
-    /// The seed's fan picks, in the model's order, as its You Might Also Like — or `None` when the store has
-    /// no answer for it (the title was not asked, or the store has no fan-pick sections), and the affinity
-    /// row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`), which
-    /// have rows of their own, the first screenful of its More Like This, and in a row that does not mix
+    /// The seed's fan picks, in the model's order, then the titles whose fan picks name the seed (`fan_links`):
+    /// those naming it nearer the top of their picks first, and among equals the most voted. `None` when the
+    /// store has no answer for the seed (it was not asked, or the store has no fan-pick sections), and the
+    /// affinity row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`),
+    /// which have rows of their own, the first screenful of its More Like This, and in a row that does not mix
     /// types the other type. With fewer than `FAN_PICKS_MIN` left the row is empty.
     fn fan_pick_row(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Option<Vec<Key>> {
         if !FAN_PICKS {
@@ -182,17 +185,46 @@ impl Indexes {
             let ids = self.more_like_this(tmdb_id, media_type);
             ids.iter().take(FAN_PICKS_SKIP_SIMILAR).map(|&id| (media_type, id)).collect()
         };
-        let picks: Vec<Key> = fan
-            .get(row)
-            .filter_map(|pick| keys.get(pick.0))
-            .map(|&packed| {
+        let key_of = |row: usize| {
+            keys.get(row).map(|&packed| {
                 let media =
                     if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
                 (media, packed as u32)
             })
+        };
+        let mut linked: Vec<(u32, Key)> = self
+            .fan_links(&fan)
+            .get(row.0)
+            .into_iter()
+            .flatten()
+            .filter_map(|&(rank, from)| Some((rank, key_of(from as usize)?)))
+            .collect();
+        linked.sort_by_key(|&(rank, (media, id))| (rank, std::cmp::Reverse(self.votes(media, id))));
+        let mut offered = std::collections::HashSet::new();
+        let picks: Vec<Key> = fan
+            .get(row)
+            .filter_map(|pick| key_of(pick.0))
+            .chain(linked.into_iter().map(|(_, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
+            .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
+            .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
+    }
+
+    /// Per store row, the titles whose fan picks name it (`Indexes::fan_links`), worked out on first use.
+    fn fan_links(&self, fan: &den_store::FanPicks) -> &[Vec<(u32, u32)>] {
+        self.fan_links.get_or_init(|| {
+            let mut links = vec![Vec::new(); self.population];
+            for from in 0..self.population {
+                for (rank, pick) in fan.get(den_store::Row(from)).enumerate() {
+                    if let Some(to) = links.get_mut(pick.0) {
+                        to.push((rank as u32, from as u32));
+                    }
+                }
+            }
+            links
+        })
     }
 
     /// What `worth_suggesting` weighs about a title.
@@ -1109,6 +1141,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         aggregates: Mutex::new(HashMap::new()),
         filter: OnceLock::new(),
         schema: OnceLock::new(),
+        fan_links: OnceLock::new(),
     };
     eprintln!("{}", indexes.row_order_source());
     let (_, fit_took) = timed(|| {
@@ -1349,8 +1382,9 @@ mod tests {
         assert!(free.len() >= FAN_PICKS_MIN && !shown.is_empty(), "shown {shown:?}, free {free:?}");
         let code = |key: &Key| (u8::from(key.0 == Tv), key.1);
         // The model's order: the free ones reversed, so the row cannot be sorted by anything else, with the
-        // More Like This titles among them.
-        let named: Vec<Key> = free.iter().rev().chain(&shown).copied().collect();
+        // More Like This titles among them. Not movie 2, whose short row a title naming it would lengthen.
+        let named: Vec<Key> =
+            free.iter().rev().chain(&shown).copied().filter(|&key| key != (Movie, 2)).collect();
         let short: Vec<(u8, u32)> = free.iter().filter(|&&key| key != (Movie, 2)).take(2).map(code).collect();
         let ds = write_fixture_fan_picks(
             &base.join("picks"),
@@ -1358,7 +1392,7 @@ mod tests {
         );
         let indexes = load_for_tools(&ds).expect("fan-picks fixture");
 
-        let want: Vec<Key> = free.iter().rev().copied().collect();
+        let want: Vec<Key> = free.iter().rev().copied().filter(|&key| key != (Movie, 2)).collect();
         assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
         assert!(indexes.you_might_also_like(2, Movie, true).is_empty(), "two picks is no row");
         assert!(indexes.you_might_also_like(3, Movie, true).is_empty(), "asked with none is no row");
@@ -1367,6 +1401,42 @@ mod tests {
             plain.you_might_also_like(4, Tv, true),
             "not asked: the affinity row"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn you_might_also_like_goes_on_with_the_titles_whose_fan_picks_name_the_seed() {
+        use den_index::MediaType::Movie;
+        let base = std::env::temp_dir().join(format!("den-atlas-fan-links-{}", std::process::id()));
+        let plain = load_for_tools(&write_fixture_fan_picks(&base.join("plain"), &[((0, 3), Vec::new())]))
+            .expect("plain fixture");
+        // Titles outside the seed's first screen of More Like This, which the row leaves out.
+        let similar: Vec<Key> =
+            plain.more_like_this_mixed(1, Movie).iter().take(FAN_PICKS_SKIP_SIMILAR).copied().collect();
+        let kept_out = crate::versions::kept_out(&plain, (Movie, 1));
+        let free: Vec<u32> = (2..=3)
+            .chain(201..=230)
+            .filter(|&id| !similar.contains(&(Movie, id)) && !kept_out.contains(&(Movie, id)))
+            .collect();
+        assert!(free.len() >= 6, "free {free:?}");
+        let [a, b, c, d, e, f] = [free[0], free[1], free[2], free[3], free[4], free[5]];
+        let code = |id: u32| (0u8, id);
+        // Movie 1 names three; three others name it, at different places in their picks, and `a` names it
+        // back, which the row already offers.
+        let ds = write_fixture_fan_picks(
+            &base.join("links"),
+            &[
+                (code(1), vec![code(a), code(b), code(c)]),
+                (code(a), vec![code(1)]),
+                (code(d), vec![code(b), code(c), code(1)]),
+                (code(e), vec![code(1)]),
+                (code(f), vec![code(b), code(1)]),
+            ],
+        );
+        let indexes = load_for_tools(&ds).expect("fan-links fixture");
+        // Its own picks in the model's order, then the titles naming it, nearest the top of their picks first.
+        let want: Vec<Key> = [a, b, c, e, f, d].into_iter().map(|id| (Movie, id)).collect();
+        assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
         std::fs::remove_dir_all(&base).ok();
     }
 
