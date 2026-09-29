@@ -3682,6 +3682,12 @@ mod tests {
             json(body_of(get(&state, "/index/filter/movie/titles.json?sel=genre:35,like:1").await).await);
         assert_eq!(ids(&comedy), vec![3]);
 
+        // Fans of movie 1: its You Might Also Like, ordered as that row.
+        let fans = get(&state, "/index/filter/movie/titles.json?sel=fans:1").await;
+        assert_eq!(fans.status(), 200);
+        assert_eq!(json(body_of(fans).await)["order"], "fans:1");
+        assert_eq!(get(&state, "/index/filter/movie/titles.json?sel=fans:1|2").await.status(), 400);
+
         // Excluded violence: movie 1 depicts it, movie 2 is on record as not, movie 3 was described and
         // scores nothing — known clean.
         let calm =
@@ -3822,12 +3828,20 @@ mod tests {
         assert_eq!(typed(&like), mixed, "the mixed row, in its order, the titles with a card");
         assert_eq!(like["order"], "like:movie-1");
 
+        let fans = json(body_of(get(&state, "/index/filter/all/titles.json?sel=fans:movie-1").await).await);
+        let suggest = json(body_of(get(&state, "/index/suggest/movie/1.json?limit=200").await).await);
+        assert!(!typed(&suggest).is_empty(), "{suggest}");
+        assert_eq!(typed(&fans), typed(&suggest), "the row a title page shows, in its order");
+        assert_eq!(fans["order"], "fans:movie-1");
+
         let spelled = get(&state, "/index/filter/all/counts.json?sel=like:Movie-01").await;
         assert_eq!(spelled.status(), 200);
         assert_eq!(spelled.headers()[header::CONTENT_LOCATION], "counts.json?sel=like:movie-1");
-        for path in
-            ["/index/filter/all/titles.json?sel=like:1", "/index/filter/all/counts.json?sel=like:tv-1"]
-        {
+        for path in [
+            "/index/filter/all/titles.json?sel=like:1",
+            "/index/filter/all/counts.json?sel=like:tv-1",
+            "/index/filter/all/titles.json?sel=fans:1",
+        ] {
             assert_eq!(get(&state, path).await.status(), 400, "{path}");
         }
         assert_eq!(get(&state, "/index/filter/both/counts.json").await.status(), 404);
