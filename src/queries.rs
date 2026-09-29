@@ -123,6 +123,13 @@ const FAN_PICKS: bool = true;
 const FAN_PICKS_MIN: usize = 3;
 /// How much of the seed's More Like This a fan-picks row leaves out: the screenful a title page shows.
 const FAN_PICKS_SKIP_SIMILAR: usize = 20;
+/// What a title whose own picks name the seed scores, against a pick of a pick. Low: the link runs one
+/// way, so a fan of Real Housewives of New Jersey liking The Sopranos says little about the reverse.
+const FAN_BACKLINK: f64 = 0.25;
+/// What a title named alongside the seed, in another title's picks, scores against a pick of a pick.
+const FAN_COCITED: f64 = 0.5;
+/// How hard a title that many titles name is damped: its score over (titles naming it + 1) to this power.
+const FAN_HUB_DAMPING: f64 = 0.25;
 
 impl Indexes {
     /// You Might Also Like for one seed. The fan picks where the store has them for it (`fan_pick_row`);
@@ -156,10 +163,9 @@ impl Indexes {
         })
     }
 
-    /// The seed's fan picks, in the model's order, then the titles whose fan picks name the seed (`fan_links`):
-    /// those naming it nearer the top of their picks first, and among equals the most voted. `None` when the
-    /// store has no answer for the seed (it was not asked, or the store has no fan-pick sections), and the
-    /// affinity row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`),
+    /// The seed's fan picks, in the model's order, then the titles the fan-picks graph ties to it
+    /// (`fan_tail`). `None` when the store has no answer for the seed (it was not asked, or the store has no
+    /// fan-pick sections), and the affinity row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`),
     /// which have rows of their own, the first screenful of its More Like This, and in a row that does not mix
     /// types the other type. With fewer than `FAN_PICKS_MIN` left the row is empty.
     fn fan_pick_row(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Option<Vec<Key>> {
@@ -192,24 +198,63 @@ impl Indexes {
                 (media, packed as u32)
             })
         };
-        let mut linked: Vec<(u32, Key)> = self
-            .fan_links(&fan)
-            .get(row.0)
+        let mut tail: Vec<(f64, u32, Key)> = self
+            .fan_tail(&fan, row)
             .into_iter()
-            .flatten()
-            .filter_map(|&(rank, from)| Some((rank, key_of(from as usize)?)))
+            .filter_map(|(at, score)| {
+                let key = key_of(at)?;
+                Some((score, self.votes(key.0, key.1), key))
+            })
             .collect();
-        linked.sort_by_key(|&(rank, (media, id))| (rank, std::cmp::Reverse(self.votes(media, id))));
+        // Highest score first, then the most voted; the key last, so the order never depends on the map's.
+        tail.sort_by(|a, b| {
+            b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)).then(
+                (a.2 .1, a.2 .0 == den_index::MediaType::Tv)
+                    .cmp(&(b.2 .1, b.2 .0 == den_index::MediaType::Tv)),
+            )
+        });
         let mut offered = std::collections::HashSet::new();
         let picks: Vec<Key> = fan
             .get(row)
             .filter_map(|pick| key_of(pick.0))
-            .chain(linked.into_iter().map(|(_, key)| key))
+            .chain(tail.into_iter().map(|(_, _, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
             .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
             .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
+    }
+
+    /// What follows the seed's own picks, as store rows and their scores: the picks of its picks, the
+    /// titles whose picks name it (`FAN_BACKLINK`), and the titles named alongside it in those picks
+    /// (`FAN_COCITED`), each weighted by where it stands in the lists that tie it to the seed, and damped by
+    /// how many titles name it (`FAN_HUB_DAMPING`) so what everyone names does not lead every row. Measured
+    /// against the backlinks alone on 24 blind-judged seeds, the first twenty of this tail scored 0.87 against
+    /// 0.73, and it fills most rows to `den_index::MAX_ROW` (oxyc/den-atlas#121).
+    fn fan_tail(&self, fan: &den_store::FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
+        // Nearer the top of a list counts more: 1 for its first title, 0.63 for its second, 0.5 for its third.
+        let weight = |rank: usize| 1.0 / ((rank + 2) as f64).log2();
+        let links = self.fan_links(fan);
+        let mut score: HashMap<usize, f64> = HashMap::new();
+        for (i, pick) in fan.get(seed).enumerate() {
+            for (j, next) in fan.get(pick).enumerate() {
+                *score.entry(next.0).or_default() += weight(i) * weight(j);
+            }
+        }
+        for &(rank, from) in links.get(seed.0).into_iter().flatten() {
+            let tie = weight(rank as usize);
+            *score.entry(from as usize).or_default() += FAN_BACKLINK * tie;
+            for (j, beside) in fan.get(den_store::Row(from as usize)).enumerate() {
+                if beside.0 != seed.0 {
+                    *score.entry(beside.0).or_default() += FAN_COCITED * tie * weight(j);
+                }
+            }
+        }
+        for (at, value) in score.iter_mut() {
+            let named_by = links.get(*at).map_or(0, Vec::len);
+            *value /= ((named_by + 1) as f64).powf(FAN_HUB_DAMPING);
+        }
+        score
     }
 
     /// Per store row, the titles whose fan picks name it (`Indexes::fan_links`), worked out on first use.
@@ -1382,9 +1427,10 @@ mod tests {
         assert!(free.len() >= FAN_PICKS_MIN && !shown.is_empty(), "shown {shown:?}, free {free:?}");
         let code = |key: &Key| (u8::from(key.0 == Tv), key.1);
         // The model's order: the free ones reversed, so the row cannot be sorted by anything else, with the
-        // More Like This titles among them. Not movie 2, whose short row a title naming it would lengthen.
-        let named: Vec<Key> =
-            free.iter().rev().chain(&shown).copied().filter(|&key| key != (Movie, 2)).collect();
+        // More Like This titles among them. Not movies 2 and 3, whose short rows a title naming them would
+        // lengthen.
+        let asked_short = |key: &Key| *key != (Movie, 2) && *key != (Movie, 3);
+        let named: Vec<Key> = free.iter().rev().chain(&shown).copied().filter(asked_short).collect();
         let short: Vec<(u8, u32)> = free.iter().filter(|&&key| key != (Movie, 2)).take(2).map(code).collect();
         let ds = write_fixture_fan_picks(
             &base.join("picks"),
@@ -1392,7 +1438,7 @@ mod tests {
         );
         let indexes = load_for_tools(&ds).expect("fan-picks fixture");
 
-        let want: Vec<Key> = free.iter().rev().copied().filter(|&key| key != (Movie, 2)).collect();
+        let want: Vec<Key> = free.iter().rev().copied().filter(asked_short).collect();
         assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
         assert!(indexes.you_might_also_like(2, Movie, true).is_empty(), "two picks is no row");
         assert!(indexes.you_might_also_like(3, Movie, true).is_empty(), "asked with none is no row");
@@ -1405,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn you_might_also_like_goes_on_with_the_titles_whose_fan_picks_name_the_seed() {
+    fn you_might_also_like_goes_on_with_the_titles_the_fan_picks_tie_to_the_seed() {
         use den_index::MediaType::Movie;
         let base = std::env::temp_dir().join(format!("den-atlas-fan-links-{}", std::process::id()));
         let plain = load_for_tools(&write_fixture_fan_picks(&base.join("plain"), &[((0, 3), Vec::new())]))
@@ -1418,24 +1464,29 @@ mod tests {
             .chain(201..=230)
             .filter(|&id| !similar.contains(&(Movie, id)) && !kept_out.contains(&(Movie, id)))
             .collect();
-        assert!(free.len() >= 6, "free {free:?}");
-        let [a, b, c, d, e, f] = [free[0], free[1], free[2], free[3], free[4], free[5]];
+        assert!(free.len() >= 8, "free {free:?}");
+        let [a, b, c, d, e, f, g, h] =
+            [free[0], free[1], free[2], free[3], free[4], free[5], free[6], free[7]];
         let code = |id: u32| (0u8, id);
-        // Movie 1 names three; three others name it, at different places in their picks, and `a` names it
-        // back, which the row already offers.
+        // Movie 1 names three, and `b`, its second, names `g`. Four others name movie 1, at different places
+        // in their picks — `a` back, which the row already offers — and `e` names `h` beside it.
         let ds = write_fixture_fan_picks(
             &base.join("links"),
             &[
                 (code(1), vec![code(a), code(b), code(c)]),
                 (code(a), vec![code(1)]),
+                (code(b), vec![code(g)]),
                 (code(d), vec![code(b), code(c), code(1)]),
-                (code(e), vec![code(1)]),
+                (code(e), vec![code(1), code(h)]),
                 (code(f), vec![code(b), code(1)]),
             ],
         );
         let indexes = load_for_tools(&ds).expect("fan-links fixture");
-        // Its own picks in the model's order, then the titles naming it, nearest the top of their picks first.
-        let want: Vec<Key> = [a, b, c, e, f, d].into_iter().map(|id| (Movie, id)).collect();
+        // Its own picks in the model's order, then by score: `g` a pick of a pick (0.63, damped for the one
+        // title naming it: 0.53), `h` named beside it (0.5 × 0.63 = 0.32, damped: 0.27), then the titles naming
+        // it at 0.25 × their weight for where they name it: `e` first (0.25), `f` second (0.16), `d` third
+        // (0.125).
+        let want: Vec<Key> = [a, b, c, g, h, e, f, d].into_iter().map(|id| (Movie, id)).collect();
         assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
         std::fs::remove_dir_all(&base).ok();
     }
