@@ -171,6 +171,9 @@ enum Data {
     /// More Like This for a title: under one type the set `/index/similar` answers as `ids`, under `all` the
     /// one it answers as `mixed`.
     Like,
+    /// You Might Also Like for a title: the row `/index/suggest` serves, of the route's type alone under one
+    /// type, films and series mixed under `all`.
+    Fans,
 }
 
 /// One kind a selection may name.
@@ -186,12 +189,12 @@ pub struct Spec {
 impl Spec {
     /// Whether `counts.json` lists the kind's values; the others appear there only as selected.
     fn listed(&self) -> bool {
-        !matches!(self.data, Data::Character | Data::Like)
+        !matches!(self.data, Data::Character | Data::Like | Data::Fans)
     }
 
     /// Whether `values/<kind>.json` answers for it.
     pub fn searchable(&self) -> bool {
-        !matches!(self.data, Data::Like)
+        !matches!(self.data, Data::Like | Data::Fans)
     }
 
     fn min_prefix(&self) -> usize {
@@ -400,7 +403,7 @@ const DENSE_KINDS: [(&str, &str, &str, u8, &str); 4] = [
 
 /// Every kind, in the order `counts.json` lists them.
 static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
-    use Data::{Bits as B, Character, Entity, Like, Rating};
+    use Data::{Bits as B, Character, Entity, Fans, Like, Rating};
     let spec = |name, mode, id, data, about| Spec { name, mode, id, data, about };
     let mut specs = vec![
         spec(
@@ -481,6 +484,14 @@ static SPECS: LazyLock<Vec<Spec>> = LazyLock::new(|| {
         Id::Title,
         Like,
         "More Like This for a title of the route's type; under all, for a typed title, films and series mixed",
+    ));
+    specs.push(spec(
+        "fans",
+        Mode::Single,
+        Id::Title,
+        Fans,
+        "You Might Also Like for a title of the route's type (its fan picks, then the titles they tie to it); \
+         under all, for a typed title, films and series mixed",
     ));
     specs
 });
@@ -709,8 +720,8 @@ impl Request {
     ///
     /// The error is a request that cannot be answered as sent: a malformed item, an id its kind cannot read
     /// (a `like` under `all` without its type), too many values (a group counts each of its values), a group
-    /// whose values resolve to different kinds or of a kind that takes one value an item (`like`, a `born`
-    /// range), a query too long, a `skip` that is not a page boundary, a prefix too short, an order
+    /// whose values resolve to different kinds or of a kind that takes one value an item (`like`, `fans`, a
+    /// `born` range), a query too long, a `skip` that is not a page boundary, a prefix too short, an order
     /// `people.json` does not know.
     pub fn parse(route: Route, scope: Scope, query: &str) -> Result<Request, String> {
         if query.len() > MAX_QUERY {
@@ -776,8 +787,10 @@ impl Request {
                 items.dedup();
                 Ok(items)
             };
-        // `like` orders `titles.json` by one title's similar set, so it names one title an item.
-        let items = read_items("sel", &|kind, id| normalise(kind, id, scope), &|kind, _| kind == "like")?;
+        // `like` and `fans` order `titles.json` by one title's row, so each names one title an item.
+        let items = read_items("sel", &|kind, id| normalise(kind, id, scope), &|kind, _| {
+            kind == "like" || kind == "fans"
+        })?;
         let traits =
             read_items("traits", &|kind, id| people::normalise(kind, id, scope), &people::one_value)?;
         people::check(&traits)?;
@@ -1803,7 +1816,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The title a `like` id names: under one type a TMDB id of it, under `all` a typed one.
+    /// The title a `like` or `fans` id names: under one type a TMDB id of it, under `all` a typed one.
     fn like_key(&self, id: &str) -> Option<Key> {
         match self.scope {
             Scope::Type(media_type) => Some((media_type, id.parse().ok()?)),
@@ -1811,15 +1824,23 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The rows of a `like`'s similar set, in its order: the seed's type alone, or under `all` the row that
-    /// mixes films and series (`/index/similar`'s `mixed`).
-    fn like_rows(&self, id: &str) -> Vec<u32> {
+    /// The rows of a title's row, in its order. `like`: its similar set, the seed's type alone, or under
+    /// `all` the row that mixes films and series (`/index/similar`'s `mixed`). `fans`: its You Might Also
+    /// Like as `/index/suggest` serves it, without the seed, one type or mixed the same way.
+    fn like_rows(&self, data: Data, id: &str) -> Vec<u32> {
         let Some((media_type, tmdb_id)) = self.like_key(id) else { return Vec::new() };
-        let keys: Vec<Key> = match self.scope {
-            Scope::Type(_) => {
+        let keys: Vec<Key> = match (data, self.scope) {
+            (Data::Fans, scope) => self
+                .indexes
+                .you_might_also_like(tmdb_id, media_type, scope == Scope::All)
+                .iter()
+                .copied()
+                .filter(|&key| key != (media_type, tmdb_id))
+                .collect(),
+            (_, Scope::Type(_)) => {
                 self.indexes.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
             }
-            Scope::All => self.indexes.more_like_this_mixed(tmdb_id, media_type).to_vec(),
+            (_, Scope::All) => self.indexes.more_like_this_mixed(tmdb_id, media_type).to_vec(),
         };
         keys.into_iter()
             .filter_map(|(media_type, id)| {
@@ -1847,7 +1868,7 @@ impl<'a> Context<'a> {
             // is simply absent: it is search-only, so nothing a client lists goes missing.
             Data::Character if self.characters.is_some() => Status::Ready,
             Data::Character => Status::NotOffered,
-            Data::Like => Status::Ready,
+            Data::Like | Data::Fans => Status::Ready,
         }
     }
 
@@ -1919,9 +1940,9 @@ impl<'a> Context<'a> {
                 known.resize(words, 0);
                 (from_rows(&mut rows.iter().map(|&r| r as usize)), known)
             }
-            Data::Like => {
+            Data::Like | Data::Fans => {
                 let known = self.filter.types[self.t()].clone();
-                (from_rows(&mut self.like_rows(id).into_iter().map(|row| row as usize)), known)
+                (from_rows(&mut self.like_rows(spec.data, id).into_iter().map(|row| row as usize)), known)
             }
         }
     }
@@ -2224,7 +2245,7 @@ impl<'a> Context<'a> {
                     put(&mut values, id, tally);
                 }
             }
-            Data::Character | Data::Like => complete = false,
+            Data::Character | Data::Like | Data::Fans => complete = false,
         }
         // Every selected value, a group's each, with its label, even at 0.
         for id in selected.iter().flat_map(|item| &item.ids) {
@@ -2345,7 +2366,7 @@ impl<'a> Context<'a> {
             Data::Character => {
                 self.characters.as_ref().is_some_and(|c| !c.named().rows(&id.replace('-', " ")).is_empty())
             }
-            Data::Like => self.like_key(id).is_some_and(|(media_type, tmdb_id)| {
+            Data::Like | Data::Fans => self.like_key(id).is_some_and(|(media_type, tmdb_id)| {
                 self.view.row_of(u8::from(media_type == MediaType::Tv), tmdb_id).ok().flatten().is_some()
             }),
         }
@@ -2396,9 +2417,10 @@ impl<'a> Context<'a> {
             .unwrap_or(0)
     }
 
-    /// `titles.json`: the titles carrying the selection, most voted first — or, with a `like` selected, in
-    /// its similarity order — as `/index/row`'s cards. Every confident match comes first; the likely ones
-    /// follow, by their lowest tentative probability and then in the same order, each card marked `likely`.
+    /// `titles.json`: the titles carrying the selection, most voted first — or, with a `like` or `fans`
+    /// selected, in its row's order — as `/index/row`'s cards. Every confident match comes first; the likely
+    /// ones follow, by their lowest tentative probability and then in the same order, each card marked
+    /// `likely`.
     pub fn titles(&self, request: &Request) -> (Value, bool) {
         let (applied, ignored) = self.split(&request.items);
         let matched = self.matched(&applied, None);
@@ -2406,10 +2428,12 @@ impl<'a> Context<'a> {
         let confident = popcount(&matched.sure);
         let like = applied
             .iter()
-            .find(|(s, i)| s.data == Data::Like && !i.exclude && self.like_key(&i.ids[0]).is_some())
-            .map(|(_, i)| i.ids[0].as_str());
+            .find(|(s, i)| {
+                matches!(s.data, Data::Like | Data::Fans) && !i.exclude && self.like_key(&i.ids[0]).is_some()
+            })
+            .map(|(s, i)| (*s, i.ids[0].as_str()));
         let (order, order_id): (Vec<u32>, String) = match like {
-            Some(id) => (self.like_rows(id), format!("like:{id}")),
+            Some((spec, id)) => (self.like_rows(spec.data, id), format!("{}:{id}", spec.name)),
             None => (self.derived.order[self.t()].clone(), self.derived.order_id[self.t()].clone()),
         };
         let sure = order.iter().copied().filter(|&row| has(&matched.sure, row as usize));
@@ -2582,7 +2606,7 @@ impl<'a> Context<'a> {
                         }
                     }
                 }
-                Data::Like => {}
+                Data::Like | Data::Fans => {}
             }
         }
         found.sort_by(|a, b| {
@@ -2626,7 +2650,7 @@ pub fn schema() -> Value {
             let listing = match spec.data {
                 Data::Entity(_) => "top",
                 Data::Character => "search",
-                Data::Like => "selected",
+                Data::Like | Data::Fans => "selected",
                 _ => "full",
             };
             let mut about = json!({ "mode": spec.mode.name(), "id": spec.id.format(), "listing": listing, "about": spec.about });
@@ -2661,8 +2685,8 @@ pub fn schema() -> Value {
                 ascending, films first on a tie), so series run at their share, spread evenly, and each card \
                 names its type. Every kind answers for both; a kind or value only one type has \
                 (network, a series-only genre, a composite genre) matches only that type's titles, and a film \
-                genre id matches the series filed under it too. like names its title's type: \
-                like:movie-550, like:series-1396; a bare id is a 400 there",
+                genre id matches the series filed under it too. like and fans name their title's type: \
+                like:movie-550, fans:series-1396; a bare id is a 400 there",
         "kinds": kinds,
         "aliases": {
             "structure": {
@@ -2710,8 +2734,8 @@ pub fn schema() -> Value {
                decade:1980|1990 the 1980s or 1990s. Separate items still AND, within a kind and across kinds: \
                country:FR,country:IT is both, country:FR|IT,decade:1990 either of the 1990s. -<kind>:<a>|<b> is \
                neither: the titles known for the kind carrying none of the values. Every kind takes a group but \
-               like (one title an item); a group's values must resolve to one kind (structure:single-day|nonlinear \
-               is refused). A group counts toward maxSelection by its values. '|' is literal in the canonical \
+               like and fans (one title an item); a group's values must resolve to one kind \
+               (structure:single-day|nonlinear is refused). A group counts toward maxSelection by its values. '|' is literal in the canonical \
                URL, and %7C reads the same. A value the kind does not hold is named in unknownValues as \
                [-]<kind>:<id> and the group's other values apply; a group of none matches nothing. On a plot \
                axis a group matches either tier as a lone value does, and its exclusion reads the confident \
@@ -2778,7 +2802,7 @@ mod tests {
         assert_eq!(kinds["warning"]["values"], json!({ "violence": 1 }), "at the floor, not under it");
         assert_eq!(kinds["source"]["values"], json!({ "book": 1, "play": 1 }));
         assert!(kinds.get("network").is_none(), "a series-only kind is no film's");
-        assert!(kinds.get("character").is_none() && kinds.get("like").is_none(), "never listed");
+        assert!(["character", "like", "fans"].iter().all(|kind| kinds.get(kind).is_none()), "never listed");
 
         let korean = counts(&indexes, Movie, "sel=country:KR");
         assert_eq!(korean["total"], 2);
@@ -3313,6 +3337,41 @@ mod tests {
         assert_eq!(counted["kinds"]["like"]["mode"], "single");
     }
 
+    /// Fans of a title, as a kind: its You Might Also Like row, filtered with everything else, in its order.
+    #[test]
+    fn fans_is_the_you_might_also_like_row_in_its_order() {
+        let indexes = fixture("fans");
+        let context = Context::new(&indexes, Movie, None);
+        let row: Vec<u64> = indexes
+            .you_might_also_like(1, Movie, false)
+            .iter()
+            .filter(|&&key| key != (Movie, 1))
+            .map(|&(_, id)| u64::from(id))
+            .collect();
+        assert!(!row.is_empty(), "the fixture's row");
+        let fans = context.titles(&request(Route::Titles, "sel=fans:1")).0;
+        assert_eq!(ids(&fans), row);
+        assert_eq!(fans["order"], "fans:1");
+        let counted = context.counts(&request(Route::Counts, "sel=fans:1")).0;
+        assert_eq!(counted["total"], row.len());
+        assert_eq!(counted["kinds"]["fans"]["mode"], "single");
+    }
+
+    /// A title the fan picks were asked about and named nothing for has no row, so its fans match nothing;
+    /// the title is still known, so the answer names no unknown value.
+    #[test]
+    fn fans_of_a_title_with_no_row_is_empty() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-filter-fans-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ds = crate::queries::write_fixture_fan_picks(&dir, &[((0, 3), Vec::new())]);
+        let indexes = crate::queries::load_for_tools(&ds).expect("the fixture loads");
+        let context = Context::new(&indexes, Movie, None);
+        let none = context.titles(&request(Route::Titles, "sel=fans:3")).0;
+        assert_eq!((&none["total"], &none["order"]), (&0.into(), &"fans:3".into()));
+        assert!(none.get("unknownValues").is_none(), "{none}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn typed(answer: &Value) -> Vec<(String, u64)> {
         let titles = answer["titles"].as_array().unwrap();
         titles.iter().map(|t| (t["type"].as_str().unwrap().to_owned(), t["id"].as_u64().unwrap())).collect()
@@ -3644,6 +3703,29 @@ mod tests {
         assert!(Request::parse(Route::Titles, Scope::Type(Movie), "sel=like:movie-1").is_err());
         let nobody = context.counts(&request_all(Route::Counts, "sel=like:series-1")).0;
         assert_eq!(nobody["unknownValues"], json!(["like:series-1"]));
+    }
+
+    /// Under `all` a `fans` names its title's type, and answers the row `/index/suggest` serves, films and
+    /// series mixed, in its order; a bare id is refused as `like`'s is.
+    #[test]
+    fn fans_under_all_is_the_typed_mixed_row() {
+        let indexes = fixture("all-fans");
+        let context = Context::new(&indexes, Scope::All, None);
+        let mixed: Vec<(String, u64)> = indexes
+            .you_might_also_like(1, Movie, true)
+            .iter()
+            .filter(|&&key| key != (Movie, 1))
+            .map(|&(m, id)| pair(if m == Tv { "series" } else { "movie" }, u64::from(id)))
+            .collect();
+        assert!(!mixed.is_empty(), "the fixture's row");
+        let fans = context.titles(&request_all(Route::Titles, "sel=fans:movie-1")).0;
+        assert_eq!(typed(&fans), mixed);
+        assert_eq!(fans["order"], "fans:movie-1");
+        assert_eq!(context.counts(&request_all(Route::Counts, "sel=fans:movie-1")).0["total"], mixed.len());
+        assert!(Request::parse(Route::Titles, Scope::All, "sel=fans:1").is_err());
+        assert!(Request::parse(Route::Titles, Scope::Type(Movie), "sel=fans:movie-1").is_err());
+        let nobody = context.counts(&request_all(Route::Counts, "sel=fans:series-1")).0;
+        assert_eq!(nobody["unknownValues"], json!(["fans:series-1"]));
     }
 
     /// A region is the union of its countries: a title with two members counts once. One pick at a time, its

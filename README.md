@@ -218,23 +218,24 @@ pins url → canonical url pairs a client can test against.
   (won at least one award there), from Wikidata's P166/P1411 filed under the ceremony, categories not held — a
   title with no award on record is not known to lack one, so `-won:` keeps only titles recognised elsewhere, and
   a store without the award sections offers neither; `character`
-  (role names played in 2+ titles, from the character provider; search-only) and `like:<tmdbId>` (the set
-  `/index/similar` answers).
+  (role names played in 2+ titles, from the character provider; search-only), `like:<tmdbId>` (the set
+  `/index/similar` answers) and `fans:<tmdbId>` (the title's You Might Also Like, as `/index/suggest` serves it).
 - **`all`** asks every question of films and series together: counts and values over both; titles are the two
   types' own orders merged by rank within type (position in its type's order ÷ that type's size, ascending,
   films first on a tie), so series run at their share of the corpus, evenly spread, and the most popular series
   sit beside the most popular films. A selection merges the filtered lists by the same keys. Every kind answers there; one only a type has (`network`, a series-only genre such as 10762 kids, a
   composite) matches only that type's titles, and a film genre id matches the series filed under it too
   (`genre:28` is action films and Action & Adventure series). `like` names its title's type —
-  `like:movie-550`, `like:series-1396` — and answers `/index/similar`'s `mixed` row; a bare id is a `400` there.
+  `like:movie-550`, `like:series-1396` — and answers `/index/similar`'s `mixed` row; `fans` names its type the
+  same way and answers `/index/suggest`'s row; a bare id is a `400` there.
 - **Mode.** `and` kinds hold several values a title (two genres are both genres) and count under the whole
-  selection. `single` kinds hold one (decade, runtime, rating, primary, animated, the plot axes, like) and count
+  selection. `single` kinds hold one (decade, runtime, rating, primary, animated, the plot axes, like, fans) and count
   each value under the selection WITHOUT the kind's own pick, so the other decades read as alternatives.
 - **Exclude** with `-kind:id`: the titles known for the kind (something on record for it) and not carrying the
   value. `coverage` in every answer says how many titles of the type each applied kind is known for.
 - **Or** with `|`: `country:FR|IT` is one item, French OR Italian; separate items still AND
   (`country:FR,country:IT` is both, `country:FR|IT,decade:1990` either of the 1990s), and `-country:FR|IT` is
-  neither (known for the kind, carrying none). Every kind takes a group except `like`; a one-pick kind's group is
+  neither (known for the kind, carrying none). Every kind takes a group except `like` and `fans`; a one-pick kind's group is
   how to ask for several (`decade:1980|1990`). A value the kind lacks is named in `unknownValues` and the rest of
   its group applies. On a plot axis a group matches both tiers as a lone value does. `counts.json` and
   `values/<kind>.json` count a kind with a group without the group — each value is what adding it would give —
