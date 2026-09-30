@@ -56,6 +56,9 @@ pub struct AppState {
     pub embed: Option<EmbedProxy>,
     /// Search query vectors den-embed already gave, by query text and embedding space.
     pub embed_memo: cache::EmbedMemo,
+    /// Unindexed library-title vectors, persisted under `CACHE_DIR`. Unlike search queries its keys contain
+    /// no prose: title identity plus a hash of the embed text, so changed hints naturally miss.
+    pub library_embed_memo: cache::EmbedMemo,
     /// Fuzzy title search over TMDB's daily exports (env `TITLE_SEARCH`). `None` — off — declares no
     /// search catalog.
     pub titles: Option<Arc<titles::TitleSearch>>,
@@ -128,6 +131,7 @@ impl AppState {
             default_country: "US".to_owned(),
             embed: None,
             embed_memo: cache::EmbedMemo::new(cache::EMBED_MEMO_TTL, cache::EMBED_MEMO_ENTRIES),
+            library_embed_memo: cache::EmbedMemo::new(Duration::MAX, cache::LIBRARY_EMBED_MEMO_ENTRIES),
             titles: None,
             index: None,
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
@@ -384,6 +388,10 @@ async fn main() {
         default_country,
         embed,
         embed_memo: cache::EmbedMemo::new(cache::EMBED_MEMO_TTL, cache::EMBED_MEMO_ENTRIES),
+        library_embed_memo: cache_dir.as_deref().map(std::path::Path::new).map_or_else(
+            || cache::EmbedMemo::new(Duration::MAX, cache::LIBRARY_EMBED_MEMO_ENTRIES),
+            cache::EmbedMemo::persisted_library,
+        ),
         titles: title_search,
         index,
         motn,

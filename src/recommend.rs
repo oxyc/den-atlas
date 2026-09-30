@@ -278,7 +278,8 @@ impl Hint {
     }
 }
 
-/// Bounded, deduplicated embedding work for library titles Atlas cannot find in its plot index.
+/// Deduplicated embedding candidates for library titles Atlas cannot find in its plot index. The handler
+/// serves every memo hit and applies `MAX_LIBRARY_EMBEDS` only to misses, so successive loads make progress.
 pub(crate) fn library_embedding_requests(indexes: &Indexes, request: &Request) -> Vec<(Key, String)> {
     let mut seen = HashSet::new();
     request
@@ -290,7 +291,6 @@ pub(crate) fn library_embedding_requests(indexes: &Indexes, request: &Request) -
             (indexes.plot.row_of(key.1, key.0).is_none() && seen.insert(key))
                 .then(|| entry.hint.embed_text().map(|text| (key, text)))?
         })
-        .take(MAX_LIBRARY_EMBEDS)
         .collect()
 }
 
