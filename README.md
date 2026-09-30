@@ -86,8 +86,9 @@ TypeScript server is preserved at the `legacy-ts` git tag.)
 
 ## Caching
 Every response is cache-friendly (`src/http.rs`): a strong `ETag` (the body's 64-bit FNV-1a plus its
-length) honoring `If-None-Match` (→ `304`), plus `HEAD` and `Range` (`Accept-Ranges` / `206` / `416`). A
-JSON answer ignores `Range` and is always sent whole, since the prose guard can only judge a whole body.
+length) honoring `If-None-Match` (→ `304`), plus `HEAD`. Range-capable representations advertise and
+honor byte ranges (`Accept-Ranges` / `206` / `416`); JSON answers are whole-only, do not advertise range
+support, and ignore `Range`, since the prose guard can only judge a whole body.
 `dataset.json` carries no `Last-Modified`: its body moves with the embed/index flags under an unchanged
 dataset date, so only its ETag can say it changed. Nothing varies on a request header. Sit a CDN in front
 and it caches everything by URL with correct revalidation.

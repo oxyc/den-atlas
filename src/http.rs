@@ -45,6 +45,9 @@ pub struct Servable {
     pub content_type: String,
     pub cache_control: String,
     pub last_modified: Option<String>,
+    /// Whether this representation supports byte ranges. Whole-only JSON responses leave this false so
+    /// they neither process `Range` nor advertise a capability they intentionally do not implement.
+    pub accept_ranges: bool,
     pub body: Bytes,
 }
 
@@ -53,11 +56,11 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
     let size = s.body.len() as u64;
     let etag = format!("\"{}\"", s.etag_base);
 
-    let mut base: Vec<(&'static str, String)> = vec![
-        ("etag", etag.clone()),
-        ("cache-control", s.cache_control.clone()),
-        ("accept-ranges", "bytes".to_owned()),
-    ];
+    let mut base: Vec<(&'static str, String)> =
+        vec![("etag", etag.clone()), ("cache-control", s.cache_control.clone())];
+    if s.accept_ranges {
+        base.push(("accept-ranges", "bytes".to_owned()));
+    }
     if let Some(lm) = &s.last_modified {
         base.push(("last-modified", lm.clone()));
     }
@@ -66,7 +69,9 @@ pub async fn serve(method: &Method, headers: &HeaderMap, s: Servable) -> Respons
         return build(StatusCode::NOT_MODIFIED, &base, Body::empty());
     }
 
-    if let Some(rh) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(rh) =
+        s.accept_ranges.then(|| headers.get(header::RANGE)).flatten().and_then(|v| v.to_str().ok())
+    {
         // RFC 9110 §13.1.5: a Range with an If-Range that does not match the current representation
         // must be answered with the WHOLE thing, not the requested slice.
         // A non-matching If-Range falls through to the full 200 below.
@@ -239,6 +244,7 @@ mod tests {
             content_type: "application/octet-stream".to_owned(),
             cache_control: "public, max-age=3600".to_owned(),
             last_modified: Some(LAST_MODIFIED.to_owned()),
+            accept_ranges: true,
             body: Bytes::from(vec![b'x'; 1000]),
         }
     }

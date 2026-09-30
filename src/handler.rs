@@ -2126,6 +2126,7 @@ async fn serve_html(method: &Method, headers: &axum::http::HeaderMap, html: &'st
             content_type: "text/html; charset=utf-8".to_owned(),
             cache_control: "public, max-age=3600, stale-while-revalidate=600".to_owned(),
             last_modified: None,
+            accept_ranges: true,
             body: Bytes::from_static(html.as_bytes()),
         },
     )
@@ -2141,16 +2142,15 @@ async fn serve_json(
     cache_control: &str,
     last_modified: Option<String>,
 ) -> Response {
-    let mut headers = headers.clone();
-    headers.remove(header::RANGE);
     serve(
         method,
-        &headers,
+        headers,
         Servable {
             etag_base: fnv1a(&body),
             content_type: "application/json".to_owned(),
             cache_control: cache_control.to_owned(),
             last_modified,
+            accept_ranges: false,
             body: Bytes::from(body.into_bytes()),
         },
     )
@@ -3208,6 +3208,7 @@ mod tests {
         let req = HttpRequest::builder().uri("/index/schema.json").header("range", "bytes=0-9");
         let resp = handle(State(Arc::clone(&state)), req.body(Body::empty()).unwrap()).await;
         assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("accept-ranges").is_none(), "whole-only JSON advertised byte ranges");
         assert!(serde_json::from_str::<serde_json::Value>(&body_of(resp).await).is_ok());
     }
 
