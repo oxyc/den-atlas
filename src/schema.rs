@@ -768,8 +768,8 @@ fn routes() -> Value {
                         "traits",
                         "string",
                         "[-]<trait>:<id>, comma-separated, in canonical order, <trait>:<id>|<id> OR-ing values \
-                         as sel does (citizenship:Q30|Q145); born takes a decade (born:1970) or one range of \
-                         birth years (born:1976-1996, born:1976-, born:-1996), never in a group: \
+                         as sel does (citizenship:Q30|Q145); born takes one range of birth years \
+                         (born:1976-1996, born:1976-, born:-1996), never in a group: \
                          filter.traits.kinds.born",
                     ),
                     json!({ "max": crate::filter::MAX_SELECTION }),
@@ -807,7 +807,7 @@ fn routes() -> Value {
             "path": "/index/filter/{type}/people/counts.json",
             "example": "/index/filter/movie/people/counts.json?sel=decade:1980",
             "about": "For every value of every person trait, the people credited under the selection and the \
-                      other traits holding it; a one-pick trait (gender, born) counted without its own pick, a \
+                      other traits holding it; gender counted without its own pick, a \
                       trait with an OR group without its groups.",
             "parameters": [
                 with(
@@ -828,8 +828,8 @@ fn routes() -> Value {
                 "traitCoverage": "per applied trait, the credited people it is on record for (count) out of \
                                   every person credited under the selection and role (denominator); for a born \
                                   range, the people whose birth is dated finely enough to be in or out of it",
-                "traits.born": "counted by decade even under a born range, as if the range were not picked; \
-                                the range is named in selected or excluded",
+                "traits.born": "range-only, with no enumerated decade values; the range is named in selected \
+                                or excluded",
                 "traits.birthcountry.codes": "the ISO 3166-1 alpha-2 code of each listed country that has \
                                               one; a code picked is counted as every country carrying it",
             },

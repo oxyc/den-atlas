@@ -269,24 +269,25 @@ pins url → canonical url pairs a client can test against.
 - **People** (`people.json`, `people/counts.json`; `src/filter/people.rs`) answer who is credited on the titles
   `sel` matches. `traits` is a second list in `sel`'s grammar and canonical order, placed after it, because a
   trait is about a person and means nothing to the title routes. Kinds: `gender`, `citizenship`, `occupation`
-  (Wikidata Q-ids of the items the store names: P21 with every value it holds, P27, P106), `birthplace` (the
+  (Wikidata Q-ids of the items the store names: P21, P27, P106), `birthplace` (the
   place of birth, P19, by Q-id: `birthplace:Q1754` is Stockholm), `birthcountry` (the country, P17, of that
   place — never read from citizenship — by ISO 3166-1 alpha-2 code or Q-id: `birthcountry:SE` and
   `birthcountry:Q34` are the same question; canonical as written, the code uppercased; a code matches every
   country carrying it, and one with none, the Soviet Union or the Netherlands' Q55, is asked by Q-id;
-  `people/counts.json` names the codes of the countries it lists in `codes`), `born` (decade of
-  P569, `born:1970` for 1970–1979; a century-precision birth has none) and `role` (`cast`, `director`, `writer`,
+  `people/counts.json` names the codes of the countries it lists in `codes`), `born` (a range of P569 birth
+  years) and `role` (`cast`, `director`, `writer`,
   `creator`: the credit on a matching title; two roles mean both on one title, `role:cast|director` either,
   `-role:cast` credited without it). Every trait takes an OR group as `sel` does (`citizenship:Q30|Q145` is
   American or British, `citizenship:Q30,citizenship:Q145` dual citizens); `people/counts.json` counts a trait
   with a group without it and the others under it, `role` over the credits walked without the group.
-  `born` also takes a range of birth years, both ends inclusive and either left open — `born:1976-1996`,
+  `born` takes a range of birth years, both ends inclusive and either left open — `born:1976-1996`,
   `born:1976-`, `born:-1996`, each year 1800 to next year — one per request, never in a group, and with no other
   positive `born` beside it; a reversed range, a year that is not digits or out of that span is a 400. A birth dated only to its
   decade or century is in a range when its whole span is, out of it when none of it is, and unknown when it
   straddles an end. `gender`, `birthplace`, `birthcountry` and `born` are one pick and count without their own pick: under a range,
-  `people/counts.json` still counts `born` by decade, as if the range were not picked, and names the range in
-  `selected`/`excluded`. Unknown is never a match: a person with no gender on record matches neither `gender:`
+  `people/counts.json` names the range in `selected`/`excluded` and exposes no duplicate birth-decade values.
+  Gender values held by at most three people in the full corpus are counted together as `gender:other`; the
+  P21 value “gender not disclosed in work” is omitted. Unknown is never a match: a person with no gender on record matches neither `gender:`
   nor `-gender:` — nor a person born in a place in no country any `birthcountry:` — and `traitCoverage` says how many credited people each applied trait is on record for (for a
   range, those it is decidable for). A store without the trait sections answers credits and roles and names the rest in `ignoredTraits`; one
   with the traits and not the birthplaces (published before them) names `birthplace` and `birthcountry` there.
