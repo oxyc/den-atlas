@@ -130,6 +130,9 @@ const FAN_BACKLINK: f64 = 0.25;
 const FAN_COCITED: f64 = 0.5;
 /// How hard a title that many titles name is damped: its score over (titles naming it + 1) to this power.
 const FAN_HUB_DAMPING: f64 = 0.25;
+/// A graph candidate needs this many separate paths from the seed. One accidental edge was the weak part of
+/// deep rows; requiring corroboration raised both the blind first-screen score and the MovieLens ruler (#127).
+const FAN_MIN_PATHS: usize = 2;
 
 impl Indexes {
     /// You Might Also Like for one seed. The fan picks where the store has them for it (`fan_pick_row`);
@@ -230,26 +233,32 @@ impl Indexes {
     /// (`FAN_COCITED`), each weighted by where it stands in the lists that tie it to the seed, and damped by
     /// how many titles name it (`FAN_HUB_DAMPING`) so what everyone names does not lead every row. Measured
     /// against the backlinks alone on 24 blind-judged seeds, the first twenty of this tail scored 0.87 against
-    /// 0.73, and it fills most rows to `den_index::MAX_ROW` (oxyc/den-atlas#121).
+    /// 0.73 (#121). Requiring two paths raised it again (0.868 to 0.872) and MovieLens hit@20 (1.470 to
+    /// 1.494); median length is 77 and 1.7% of rows have fewer than 40 titles (#127).
     fn fan_tail(&self, fan: &den_store::FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
         // Nearer the top of a list counts more: 1 for its first title, 0.63 for its second, 0.5 for its third.
         let weight = |rank: usize| 1.0 / ((rank + 2) as f64).log2();
         let links = self.fan_links(fan);
         let mut score: HashMap<usize, f64> = HashMap::new();
+        let mut paths: HashMap<usize, usize> = HashMap::new();
         for (i, pick) in fan.get(seed).enumerate() {
             for (j, next) in fan.get(pick).enumerate() {
                 *score.entry(next.0).or_default() += weight(i) * weight(j);
+                *paths.entry(next.0).or_default() += 1;
             }
         }
         for &(rank, from) in links.get(seed.0).into_iter().flatten() {
             let tie = weight(rank as usize);
             *score.entry(from as usize).or_default() += FAN_BACKLINK * tie;
+            *paths.entry(from as usize).or_default() += 1;
             for (j, beside) in fan.get(den_store::Row(from as usize)).enumerate() {
                 if beside.0 != seed.0 {
                     *score.entry(beside.0).or_default() += FAN_COCITED * tie * weight(j);
+                    *paths.entry(beside.0).or_default() += 1;
                 }
             }
         }
+        score.retain(|at, _| paths.get(at).copied().unwrap_or_default() >= FAN_MIN_PATHS);
         for (at, value) in score.iter_mut() {
             let named_by = links.get(*at).map_or(0, Vec::len);
             *value /= ((named_by + 1) as f64).powf(FAN_HUB_DAMPING);
@@ -1468,25 +1477,24 @@ mod tests {
         let [a, b, c, d, e, f, g, h] =
             [free[0], free[1], free[2], free[3], free[4], free[5], free[6], free[7]];
         let code = |id: u32| (0u8, id);
-        // Movie 1 names three, and `b`, its second, names `g`. Four others name movie 1, at different places
-        // in their picks — `a` back, which the row already offers — and `e` names `h` beside it.
+        // Movie 1 names three. `b` and `c` both name `g`; `a` reaches `e`, which also names the seed; and
+        // `e` and `f` both name `h` beside it. `d` and `f` have only their backlink and are left out.
         let ds = write_fixture_fan_picks(
             &base.join("links"),
             &[
                 (code(1), vec![code(a), code(b), code(c)]),
-                (code(a), vec![code(1)]),
+                (code(a), vec![code(1), code(e)]),
                 (code(b), vec![code(g)]),
+                (code(c), vec![code(g)]),
                 (code(d), vec![code(b), code(c), code(1)]),
                 (code(e), vec![code(1), code(h)]),
-                (code(f), vec![code(b), code(1)]),
+                (code(f), vec![code(b), code(1), code(h)]),
             ],
         );
         let indexes = load_for_tools(&ds).expect("fan-links fixture");
-        // Its own picks in the model's order, then by score: `g` a pick of a pick (0.63, damped for the one
-        // title naming it: 0.53), `h` named beside it (0.5 × 0.63 = 0.32, damped: 0.27), then the titles naming
-        // it at 0.25 × their weight for where they name it: `e` first (0.25), `f` second (0.16), `d` third
-        // (0.125).
-        let want: Vec<Key> = [a, b, c, g, h, e, f, d].into_iter().map(|id| (Movie, id)).collect();
+        // Its own picks stay in the model's order. The tail keeps `g`, `e` and `h`, each tied by two paths,
+        // and drops the one-path backlinks `d` and `f`.
+        let want: Vec<Key> = [a, b, c, e, g, h].into_iter().map(|id| (Movie, id)).collect();
         assert_eq!(&*indexes.you_might_also_like(1, Movie, true), &want[..]);
         std::fs::remove_dir_all(&base).ok();
     }
