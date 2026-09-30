@@ -261,6 +261,8 @@ pub(crate) mod fixture {
         pub imdb: Option<&'a str>,
         /// (days since 1970-01-01, precision: 0 day / 1 month / 2 year).
         pub released: Option<(i32, u8)>,
+        /// A series' last air date, as `released`; its two sections are written when any title has one.
+        pub ended: Option<(i32, u8)>,
         pub runtime: u16,
         /// TMDB genre ids, as the store keeps them — folded by the reader, not here.
         pub genres: Vec<u32>,
@@ -636,6 +638,17 @@ pub(crate) mod fixture {
             titles.iter().flat_map(|t| t.released.map_or(i32::MIN, |(d, _)| d).to_le_bytes()).collect(),
         );
         b.u8s("released_prec", &titles.iter().map(|t| t.released.map_or(0, |(_, p)| p)).collect::<Vec<u8>>());
+        if titles.iter().any(|t| t.ended.is_some()) {
+            b.section(
+                "ended",
+                4,
+                titles.iter().flat_map(|t| t.ended.map_or(i32::MIN, |(d, _)| d).to_le_bytes()).collect(),
+            );
+            b.u8s(
+                "ended_prec",
+                &titles.iter().map(|t| t.ended.map_or(0xFF, |(_, p)| p)).collect::<Vec<u8>>(),
+            );
+        }
         b.section("runtime", 2, titles.iter().flat_map(|t| t.runtime.to_le_bytes()).collect());
         let franchise_rows: Vec<Vec<u32>> = titles.iter().map(|t| t.franchise.clone()).collect();
         b.list("franchise_v", "franchise_o", &franchise_rows);

@@ -899,7 +899,7 @@ fn routes() -> Value {
             "method": "POST",
             "path": "/recommend",
             "about": "The titles a featured surface leads with, for one household.",
-            "body": "{surface?, service?, now?, services?, library, owned, hide?, candidates?, limit?}",
+            "body": "{surface?, service?, now?, services?, library, owned, hide?, candidates?, limit?, fresh?}",
             "returns": "{slides, unjudged, unjudgedCount, libraryUnjudged, pool:{libraryIndexed,libraryUnindexed,libraryEmbedded,…}, facts, scorer, datasetVersion}",
         },
         {
@@ -908,7 +908,7 @@ fn routes() -> Value {
             "about": "The billboard for everyone, from atlas's own lists as of a day: scope home, movies, series or \
                       service/{id}. 100 slides a page; next is the skip of the one after. Kept by a shared cache \
                       until the day ends.",
-            "query": "day?=YYYY-MM-DD, skip?",
+            "query": "day?=YYYY-MM-DD, skip?, fresh?=1 (only titles out within a year or due, and new seasons)",
             "returns": "{slides, next?, day, scorer, datasetVersion}",
         },
         {

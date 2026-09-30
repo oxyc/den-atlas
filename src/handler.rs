@@ -1689,7 +1689,7 @@ fn scope_request(scope: &str) -> Option<serde_json::Value> {
 /// household owns or hides and re-ranks the rest by its taste, so the first page must leave it plenty to choose from.
 const BILLBOARD_PAGE: usize = 100;
 
-/// `GET /recommend/<scope>.json?day=YYYY-MM-DD&skip=N` — the billboard for everyone (`scope_request`), ranked from
+/// `GET /recommend/<scope>.json?day=YYYY-MM-DD&skip=N[&fresh=1]` — the billboard for everyone (`scope_request`), ranked from
 /// atlas's own lists as of that day: a page of slides and where the next starts (`next`, absent at the end). Kept by
 /// a shared cache until the day is over, and served stale for a day after while it is asked again; `day` is in the
 /// address so each day is its own answer. Off (404) unless `INDEX_QUERIES` is set, like the POST.
@@ -1712,15 +1712,20 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
         );
     };
     let skip: usize = param("skip").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // `fresh=1`: only new titles (`Request::fresh`), kept apart from the billboard without it.
+    let fresh = param("fresh").is_some_and(|v| v == "1");
     // Ranked once per scope and day, every slide atlas will give (`MAX_SLIDES`), and kept: each page, and each
     // shared-cache edge that has not seen it yet, is a slice of that, and every page is from the same ranking.
-    let key = format!("{scope}|{date}");
+    let key = if fresh { format!("{scope}|{date}|fresh") } else { format!("{scope}|{date}") };
     let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
     let (answer, timing) = match kept {
         Some(answer) => (answer, "kept;dur=0".to_owned()),
         None => {
             body["now"] = serde_json::json!(start);
             body["limit"] = serde_json::json!(crate::recommend::MAX_SLIDES);
+            if fresh {
+                body["fresh"] = serde_json::json!(true);
+            }
             let Ok(request) = serde_json::from_value::<crate::recommend::Request>(body) else {
                 return json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             };
@@ -4121,6 +4126,16 @@ mod tests {
         let last = page(200).await;
         assert_eq!(last["slides"].as_array().unwrap().len(), 50);
         assert!(last["next"].is_null(), "{last}");
+
+        // Only new titles (`fresh=1`) is a ranking of its own, kept apart from the one without it.
+        billboards().lock().unwrap().insert(
+            "series|1995-07-01|fresh".to_owned(),
+            Arc::new(serde_json::json!({"version": 1, "slides": [{"type": "series", "id": 7}]})),
+        );
+        let resp = get(&state, "/recommend/series.json?day=1995-07-01&fresh=1").await;
+        let fresh: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
+        assert_eq!(fresh["slides"], serde_json::json!([{"type": "series", "id": 7}]));
+        assert_eq!(page(0).await["slides"].as_array().unwrap().len(), BILLBOARD_PAGE);
 
         assert_eq!(get(&state, "/recommend/person.json").await.status(), 404);
         assert_eq!(get(&state, "/recommend/service/x.json").await.status(), 404);

@@ -116,6 +116,16 @@ const PERSONAL_AHEAD: i64 = 2 * ANTICIPATION_DAYS as i64;
 /// … narrowed to this many on a sketch of their fit, and to this many of the best fits after the whole of it.
 const PERSONAL_SKETCHED: usize = 400;
 const PERSONAL: usize = 60;
+/// A fresh billboard (`Request::fresh`, `newness`): titles out within about a year, and titles due within this many
+/// days on a known date — to the day or the month (`NEW_DATED_SPAN`), since "some time next year" is not a date.
+const NEW_BEHIND: i64 = 365;
+const NEW_AHEAD: i64 = 180;
+const NEW_DATED_SPAN: i64 = 31;
+/// How far back a film a "new on" list names still counts as new: its date is often a festival premiere (`newness`).
+const NEW_ARRIVAL_BEHIND: i64 = 548;
+/// The catalogue's new titles a fresh billboard adds, most attended first (`new_catalogue`): once `newness` has
+/// dropped the old titles atlas's lists push, these keep the pool full, with or without a library.
+const NEW_CATALOGUE: usize = 150;
 /// The most any one request may name.
 pub const MAX_LIBRARY: usize = 5000;
 pub const MAX_OWNED: usize = 10_000;
@@ -156,6 +166,11 @@ pub struct Request {
     pub candidates: Vec<Offered>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Only new titles (oxyc/den#161, `newness`): the pool holds titles out within `NEW_BEHIND`, titles due on a
+    /// known day or month within `NEW_AHEAD`, and older series with a season in that window. Off by default, so
+    /// the pool with it and without it can be compared before it becomes the default.
+    #[serde(default)]
+    pub fresh: bool,
 }
 
 impl Request {
@@ -391,6 +406,8 @@ pub struct LabelSet<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct Title<'a> {
     pub released: Option<Released>,
+    /// A series' last air date, from the facts (`Record::ended`).
+    pub ended: Option<Released>,
     pub rating: Option<f64>,
     pub votes: Option<f64>,
     /// Whether `votes` is a stand-in for a count nobody gave (JustWatch's IMDb score comes without one).
@@ -570,6 +587,7 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.released))
             .or_else(|| facets.and_then(|f| f.year).map(|y| Released::year(i64::from(y))))
             .or_else(|| listed.and_then(|l| l.year).map(Released::year));
+        title.ended = record.and_then(|r| r.ended);
         // TMDB's own score and count for this title, kept on the box and joined onto the store (`ratings`,
         // `tmdb`): a real rating for 99.9% of the corpus, where the branches below used to depend on some
         // upstream list having named the title at all. Asked for only where it is needed — this runs once per
@@ -667,12 +685,18 @@ pub struct Candidate<'a> {
     pub rank: Option<Placing>,
     /// Its place in a "new on <service>" list.
     pub arrival: Option<Placing>,
+    /// An older series on a fresh billboard for a season in the window (`Newness::Season`).
+    pub new_season: bool,
 }
 
 /// Peaks on release day and falls away either side of it; unknown dates score as old. A date known only to
 /// its month or year scores the mean over the days it could be.
 pub fn freshness(title: &Title<'_>, now: f64) -> f64 {
-    let Some(released) = title.released else { return 0.0 };
+    title.released.map_or(0.0, |released| freshness_on(released, now))
+}
+
+/// `freshness` of one date.
+fn freshness_on(released: Released, now: f64) -> f64 {
     let at = |day: i64| {
         let days = now - day as f64;
         if days <= 0.0 {
@@ -698,9 +722,10 @@ pub fn buzz(candidate: &Candidate<'_>, busiest: f64) -> f64 {
 }
 
 /// Newly watchable on a service this household has — half as much when it is catalogue (`CATALOGUE_DAYS`). A title
-/// of unknown date counts in full: nothing says it is old.
+/// of unknown date counts in full: nothing says it is old, and neither is a series' new season.
 pub fn arrival(candidate: &Candidate<'_>, now: f64) -> f64 {
-    let catalogue = candidate.title.released.is_some_and(|r| now - r.first_day as f64 > CATALOGUE_DAYS);
+    let catalogue = !candidate.new_season
+        && candidate.title.released.is_some_and(|r| now - r.first_day as f64 > CATALOGUE_DAYS);
     standing(candidate.arrival) * if catalogue { CATALOGUE_ARRIVAL } else { 1.0 }
 }
 
@@ -736,6 +761,8 @@ pub enum Reason {
     Recent,
     Upcoming,
     Timely,
+    /// An older series with a season in the fresh window (`Newness::Season`).
+    NewSeason,
     Quality,
     Buzz,
 }
@@ -751,6 +778,7 @@ impl Reason {
             Self::Recent => "recent",
             Self::Upcoming => "upcoming",
             Self::Timely => "timely",
+            Self::NewSeason => "new_season",
             Self::Quality => "quality",
             Self::Buzz => "buzz",
         }
@@ -764,7 +792,13 @@ const REASON_LIFT: f64 = 0.05;
 /// and buzz. Across a real household's pool fit² spans about 35×, merit and timeliness 5× each and buzz 1.1×; what
 /// fit alone can't balance, `assemble` does.
 pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> Why {
-    let fresh = freshness(&candidate.title, now);
+    // A new season is as fresh as its last air date, where the facts give one.
+    let fresh = if candidate.new_season {
+        let season = candidate.title.ended.map_or(0.0, |ended| freshness_on(ended, now));
+        freshness(&candidate.title, now).max(season)
+    } else {
+        freshness(&candidate.title, now)
+    };
     let arrived = arrival(candidate, now);
     let quality = quality(&candidate.title);
     let buzz = buzz(candidate, busiest);
@@ -815,6 +849,8 @@ pub fn score(candidate: &Candidate<'_>, now: f64, busiest: f64, fit: Fitted) -> 
         consider(Reason::Buzz, (1.0 + BUZZ_BONUS * buzz).ln());
     }
     let reason = strongest.filter(|(_, lift)| *lift >= REASON_LIFT).map(|(reason, _)| reason);
+    // An older series is on a fresh billboard only for its new season, so that is what its slide says.
+    let reason = if candidate.new_season { Some(Reason::NewSeason) } else { reason };
     Why { fit, fresh, arrived, quality, buzz, score, reason }
 }
 
@@ -883,6 +919,7 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         key: a.key,
         title: Title {
             released,
+            ended: x.ended.or(y.ended),
             rating,
             votes,
             estimated_votes,
@@ -902,7 +939,25 @@ fn merge<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         },
         rank: best(a.rank, b.rank),
         arrival: best(a.arrival, b.arrival),
+        new_season: a.new_season || b.new_season,
     }
+}
+
+/// Every title once, holding everything its copies knew (`merge`), in the order each first came.
+fn merged(candidates: Vec<Candidate<'_>>) -> Vec<Candidate<'_>> {
+    let mut order: Vec<Key> = Vec::new();
+    let mut by_key: HashMap<Key, Candidate<'_>> = HashMap::new();
+    for candidate in candidates {
+        let merged = match by_key.remove(&candidate.key) {
+            Some(already) => merge(already, candidate),
+            None => {
+                order.push(candidate.key);
+                candidate
+            }
+        };
+        by_key.insert(merged.key, merged);
+    }
+    order.into_iter().filter_map(|key| by_key.remove(&key)).collect()
 }
 
 /// The slides, best first: deduped, filtered, scored, and only then assembled into `slides` (`assemble`). `near` says
@@ -915,22 +970,9 @@ pub fn pick<'a>(
     fit: impl Fn(&Candidate<'a>) -> Fitted,
     near: impl Fn(&Candidate<'a>, &Candidate<'a>) -> bool,
 ) -> Vec<(Candidate<'a>, Why)> {
-    let mut order: Vec<Key> = Vec::new();
-    let mut by_key: HashMap<Key, Candidate<'a>> = HashMap::new();
-    for candidate in candidates {
-        let merged = match by_key.remove(&candidate.key) {
-            Some(already) => merge(already, candidate),
-            None => {
-                order.push(candidate.key);
-                candidate
-            }
-        };
-        by_key.insert(merged.key, merged);
-    }
     // Judged once everything known about a title is together: filtering each copy first let a copy that knew
     // nothing — atlas's own lists name a title by id — through a rule its described copy was dropped by.
-    let running: Vec<Candidate<'a>> =
-        order.into_iter().filter_map(|key| by_key.remove(&key)).filter(|c| keep(c)).collect();
+    let running: Vec<Candidate<'a>> = merged(candidates).into_iter().filter(|c| keep(c)).collect();
     let busiest = running.iter().filter_map(|c| c.title.popularity).fold(0.0, f64::max);
     let mut scored: Vec<(Candidate<'a>, Why)> = running
         .into_iter()
@@ -942,6 +984,59 @@ pub fn pick<'a>(
     // Stable, so equal scores keep the order their sources put them in.
     scored.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(std::cmp::Ordering::Equal));
     assemble(scored, slides, near)
+}
+
+/// Why a title belongs on a fresh billboard (`Request::fresh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Newness {
+    /// Out within `NEW_BEHIND`, or due within `NEW_AHEAD` on a known date.
+    Title,
+    /// An older series with a season in that window.
+    Season,
+}
+
+/// Whether a title belongs on a fresh billboard, and as what.
+///
+/// A date is in the window when the middle of the span it could be is within `NEW_BEHIND` — so a title known only
+/// as "2025" is not a title of last month — or, for a title not out yet, when it is due within `NEW_AHEAD` on a day
+/// or in a month (`NEW_DATED_SPAN`).
+///
+/// A film's date is Wikidata's earliest publication date, often a festival premiere months before anyone could see
+/// it: Tuner's is 2025-08-30 (Telluride). So a film a "new on <service>" list names is new within
+/// `NEW_ARRIVAL_BEHIND` — its streaming debut is the release a household sees — while Wicked (2024-11) joining a
+/// service is not. A series' date is its first air date, which needs no such grace.
+///
+/// A series out before the window is a new season when its last air date (`Title::ended`) is in the window, or when a
+/// "new on <service>" list names it and the facts record no end. Atlas holds no season air dates: Wikidata states only
+/// when a series ended, and TMDB's last and next air dates are not fetched. JustWatch's arrivals surface a new
+/// season as its show, so a listed arrival is the proxy for a season of a series still running — one that also
+/// takes an old series joining a service for a new season.
+pub fn newness(candidate: &Candidate<'_>, now: f64) -> Option<Newness> {
+    let within = |behind: i64| {
+        move |date: Released| {
+            let first = date.first_day as f64;
+            if first > now {
+                date.span_days <= NEW_DATED_SPAN && first <= now + NEW_AHEAD as f64
+            } else {
+                first + date.span_days as f64 / 2.0 >= now - behind as f64
+            }
+        }
+    };
+    let title = &candidate.title;
+    let arriving = candidate.arrival.is_some();
+    let film = candidate.key.0 == MediaType::Movie;
+    let behind = if film && arriving { NEW_ARRIVAL_BEHIND } else { NEW_BEHIND };
+    if title.released.is_some_and(within(behind)) {
+        return Some(Newness::Title);
+    }
+    if film {
+        return None;
+    }
+    let season = match title.ended {
+        Some(ended) => within(NEW_BEHIND)(ended),
+        None => title.released.is_some() && arriving,
+    };
+    season.then_some(Newness::Season)
 }
 
 /// Whether a slide is catalogue: neither new nor newly arrived (`STALE_FRESH`, `STALE_ARRIVAL`).
@@ -1094,7 +1189,7 @@ pub fn answer(
     // then the client's own lists.
     let mut pool: Vec<Candidate<'_>> = Vec::new();
     let mut push = |key: Key, title, rank: Option<Placing>, arrival: Option<Placing>| {
-        pool.push(Candidate { key, title, rank, arrival });
+        pool.push(Candidate { key, title, rank, arrival, new_season: false });
     };
     for list in &lists.arrivals {
         let of = list.len() as f64;
@@ -1137,9 +1232,29 @@ pub fn answer(
             && !hidden(c, &request.hide)
     };
     // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.
-    let personal = taste.as_ref().map_or_else(Vec::new, |taste| personal(indexes, &known, taste, now, keep));
+    let fresh = request.fresh;
+    let personal = taste.as_ref().map_or_else(Vec::new, |taste| {
+        if fresh {
+            let new = |c: &Candidate<'_>| keep(c) && newness(c, now).is_some();
+            personal(indexes, &known, taste, now, (NEW_BEHIND, NEW_AHEAD), new)
+        } else {
+            personal(indexes, &known, taste, now, (PERSONAL_BEHIND, PERSONAL_AHEAD), keep)
+        }
+    });
     let personal_count = personal.len();
     pool.extend(personal);
+    // Only new titles: every title once, with what all its copies knew, since one list's arrival can make a series'
+    // season new; the old ones dropped; and the catalogue's own new titles added, so the pool stays full.
+    if fresh {
+        pool.extend(new_catalogue(indexes, export, &known, now, keep));
+        pool = merged(pool)
+            .into_iter()
+            .filter_map(|mut candidate| {
+                candidate.new_season = newness(&candidate, now)? == Newness::Season;
+                Some(candidate)
+            })
+            .collect();
+    }
     pool.iter_mut().for_each(|candidate| attend(indexes, export, candidate));
     let near = |a: &Candidate<'_>, b: &Candidate<'_>| {
         let row = |c: &Candidate<'_>| indexes.plot.row_of(c.key.1, c.key.0);
@@ -1237,7 +1352,8 @@ fn on_service(request: &Request, lists: &Lists) -> Option<HashSet<Key>> {
     Some(listed.map(|l| l.key).chain(offered).collect())
 }
 
-/// The catalogue's titles out lately or coming soon (`PERSONAL_BEHIND`, `PERSONAL_AHEAD`) that fit this household
+/// The catalogue's titles out lately or coming soon (`PERSONAL_BEHIND`, `PERSONAL_AHEAD`, or a fresh billboard's
+/// `NEW_BEHIND` and `NEW_AHEAD`) that fit this household
 /// best, `PERSONAL` of them at most and none below `LEAD_FIT`. The lists only know what services and charts push; a
 /// film from a director the household follows, or a series like the ones it finishes, can be on none of them. Each
 /// is sketched first (`Fit::sketch`) and only the best `PERSONAL_SKETCHED` get the whole fit.
@@ -1246,14 +1362,16 @@ fn personal<'a>(
     known: &Knowledge<'a>,
     taste: &Fit<'_>,
     now: f64,
+    (behind, ahead): (i64, i64),
     keep: impl Fn(&Candidate<'a>) -> bool,
 ) -> Vec<Candidate<'a>> {
     let today = now as i64;
     let mut sketched: Vec<(f64, Candidate<'a>, Features)> = indexes
         .corpus()
-        .released_between(today - PERSONAL_BEHIND, today + PERSONAL_AHEAD)
+        .released_between(today - behind, today + ahead)
         .filter_map(|key| {
-            let candidate = Candidate { key, title: known.title(key, None, None), rank: None, arrival: None };
+            let title = known.title(key, None, None);
+            let candidate = Candidate { key, title, rank: None, arrival: None, new_season: false };
             if candidate.title.genres.is_empty() || !keep(&candidate) {
                 return None;
             }
@@ -1267,6 +1385,47 @@ fn personal<'a>(
         sketched.into_iter().map(|(_, candidate, features)| (taste.of(&features).fit, candidate)).collect();
     fitted.sort_by(|a, b| b.0.total_cmp(&a.0));
     fitted.into_iter().take(PERSONAL).take_while(|(fit, _)| *fit >= LEAD_FIT).map(|(_, c)| c).collect()
+}
+
+/// The catalogue's new titles (`newness`) that something is known about and the household's rules keep: out within
+/// the window or due in it, and series whose last season aired in it. `NEW_CATALOGUE` of them, most attended first
+/// (`attend`), then by key so the same day ranks the same.
+fn new_catalogue<'a>(
+    indexes: &'a Indexes,
+    export: Option<&TitleIndex>,
+    known: &Knowledge<'a>,
+    now: f64,
+    keep: impl Fn(&Candidate<'a>) -> bool,
+) -> Vec<Candidate<'a>> {
+    let today = now as i64;
+    let (from, to) = (today - NEW_BEHIND, today + NEW_AHEAD);
+    let mut keys: Vec<Key> = indexes.corpus().released_between(from, to).collect();
+    if let Some(facts) = &indexes.facts {
+        let ended = |&(media_type, id): &Key| {
+            let ended = facts.get(id, media_type).and_then(|r| r.ended);
+            ended.is_some_and(|e| e.first_day + e.span_days > from && e.first_day <= to)
+        };
+        keys.extend(facts.keys().filter(|key| key.0 == MediaType::Tv && ended(key)));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let mut new: Vec<Candidate<'a>> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let title = known.title(key, None, None);
+            let mut candidate = Candidate { key, title, rank: None, arrival: None, new_season: false };
+            let new =
+                !candidate.title.genres.is_empty() && keep(&candidate) && newness(&candidate, now).is_some();
+            new.then(|| {
+                attend(indexes, export, &mut candidate);
+                candidate
+            })
+        })
+        .collect();
+    let attention = |c: &Candidate<'_>| c.title.popularity.unwrap_or(0.0);
+    new.sort_by(|a, b| attention(b).total_cmp(&attention(a)).then(a.key.cmp(&b.key)));
+    new.truncate(NEW_CATALOGUE);
+    new
 }
 
 /// Slides an answer's log line names.
@@ -1425,9 +1584,10 @@ pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value)
         None => String::new(),
     };
     format!(
-        "recommend {}{on}: library {} ({} unjudged, {} indexed, {} embedded, {} unindexed), owned {}, candidates {}, pool {} ({} catalogue, \
+        "recommend {}{}{on}: library {} ({} unjudged, {} indexed, {} embedded, {} unindexed), owned {}, candidates {}, pool {} ({} catalogue, \
          {} unjudged, {} personal), {} slides; {}",
         request.surface.as_deref().unwrap_or("home"),
+        if request.fresh { " fresh" } else { "" },
         request.library.len(),
         answer["libraryUnjudged"],
         answer["pool"]["libraryIndexed"],
@@ -1634,7 +1794,7 @@ mod tests {
     }
 
     fn cand(id: u32, title: Title<'static>) -> Candidate<'static> {
-        Candidate { key: (MediaType::Movie, id), title, rank: None, arrival: None }
+        Candidate { key: (MediaType::Movie, id), title, rank: None, arrival: None, new_season: false }
     }
 
     fn ids(picked: &[(Candidate<'_>, Why)]) -> Vec<u32> {
@@ -1766,6 +1926,178 @@ mod tests {
         assert!((fresh("2026-09-10") - 0.983).abs() < 0.005);
         assert!((fresh("2026-12-01") - 0.169).abs() < 0.001);
         assert!(fresh("2024-01-01") < 0.01);
+    }
+
+    /// Out within a year, or due on a known date; an older series only for a season in that window.
+    #[test]
+    fn a_title_is_new_when_it_came_out_within_a_year_or_is_due_on_a_known_date() {
+        let series = |released: Option<Released>, ended: Option<Released>, arriving: bool| Candidate {
+            key: (MediaType::Tv, 1),
+            arrival: arriving.then_some(Placing { rank: 0.0, of: 10.0 }),
+            ..cand(1, Title { released, ended, ..Title::default() })
+        };
+        let film = |released| cand(1, Title { released, ..Title::default() });
+        let new = |c: &Candidate<'_>| newness(c, now());
+        assert_eq!(new(&film(on("2015-06-01"))), None, "an old film");
+        assert_eq!(new(&film(on("2025-10-01"))), Some(Newness::Title), "within the year");
+        assert_eq!(new(&film(on("2025-09-01"))), None, "a year and a bit ago");
+        assert_eq!(
+            new(&film(Some(Released::year(2026)))),
+            Some(Newness::Title),
+            "this year, known by the year"
+        );
+        assert_eq!(new(&film(Some(Released::year(2025)))), None, "last year: its middle is over a year ago");
+        assert_eq!(new(&film(on("2026-12-24"))), Some(Newness::Title), "due on a day");
+        assert_eq!(new(&film(Released::parse("2026-11", "month"))), Some(Newness::Title), "due in a month");
+        assert_eq!(new(&film(Some(Released::year(2027)))), None, "some time next year is not a date");
+        assert_eq!(new(&film(on("2027-09-01"))), None, "due too far ahead");
+        assert_eq!(new(&film(None)), None, "nothing says an undated film is new");
+
+        let old = on("2012-01-01");
+        assert_eq!(new(&series(on("2026-01-10"), None, false)), Some(Newness::Title), "a new series");
+        assert_eq!(
+            new(&series(old, on("2026-08-15"), false)),
+            Some(Newness::Season),
+            "its last season aired"
+        );
+        assert_eq!(new(&series(old, None, true)), Some(Newness::Season), "still running, and listed as new");
+        assert_eq!(new(&series(old, None, false)), None, "still running, and nothing new of it");
+        assert_eq!(
+            new(&series(old, on("2015-05-01"), true)),
+            None,
+            "ended long ago: catalogue joining a service"
+        );
+        assert_eq!(new(&series(None, None, true)), None, "nothing says it is old, so not a new season");
+        let listed =
+            |released| Candidate { arrival: Some(Placing { rank: 0.0, of: 10.0 }), ..film(released) };
+        assert_eq!(new(&listed(old)), None, "a film has no seasons");
+        assert_eq!(
+            new(&listed(on("2025-06-01"))),
+            Some(Newness::Title),
+            "premiered 15 months ago, streaming now"
+        );
+        assert_eq!(new(&film(on("2025-06-01"))), None, "premiered 15 months ago, and nothing new of it");
+        assert_eq!(new(&listed(on("2024-11-20"))), None, "a film from two years ago joining a service");
+    }
+
+    /// A new season says so, is as fresh as its last air date, and is no catalogue when it arrives.
+    #[test]
+    fn a_new_season_is_the_reason_and_counts_as_new() {
+        let old = on("2012-01-01");
+        let series = |new_season, ended| Candidate {
+            key: (MediaType::Tv, 1),
+            arrival: Some(Placing { rank: 0.0, of: 10.0 }),
+            new_season,
+            ..cand(
+                1,
+                Title { released: old, ended, rating: Some(8.5), votes: Some(5000.0), ..Title::default() },
+            )
+        };
+        let fit = Fitted { fit: 0.8, ..Fitted::default() };
+        let catalogue = score(&series(false, None), now(), 0.0, fit);
+        let season = score(&series(true, None), now(), 0.0, fit);
+        assert_eq!((catalogue.arrived, season.arrived), (CATALOGUE_ARRIVAL, 1.0));
+        assert_eq!(season.reason, Some(Reason::NewSeason));
+        assert_eq!(Reason::NewSeason.code(), "new_season");
+        let aired = score(&series(true, on("2026-09-05")), now(), 0.0, fit);
+        assert!(aired.fresh > 0.9 && catalogue.fresh < 0.01, "{} {}", aired.fresh, catalogue.fresh);
+    }
+
+    /// A corpus dated around 2026-09-30 for the fresh billboard, ranked for everyone as `GET /recommend` does: films
+    /// 1 (2015), 2 (this June), 3 (due 1 December), 4 (due "2027"); series 10 (2010, last aired in August), 11 (2012,
+    /// still running), 12 (2012, ended 2015), 13 (2014, still running); and eighty films from March, 100–179, that no
+    /// list names. The lists name 1, 13 and 2 as popular, and 11 and 12 as new on a service.
+    async fn dated_answer(fresh: Option<bool>) -> serde_json::Value {
+        use crate::store::fixture::{write, Title as Stored};
+        const NOW: i32 = 20726;
+        let stored = |media, tmdb_id, released, ended| Stored {
+            media,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![0, 0, 0],
+            premise: vec![0, 0, 0],
+            released: Some(released),
+            ended,
+            ..Stored::default()
+        };
+        let mut titles = vec![
+            stored(0, 1, (16587, 0), None),
+            stored(0, 2, (NOW - 121, 0), None),
+            stored(0, 3, (NOW + 62, 0), None),
+            stored(0, 4, (20819, 2), None),
+            stored(1, 10, (14610, 2), Some((NOW - 46, 0))),
+            stored(1, 11, (15340, 2), None),
+            stored(1, 12, (15340, 2), Some((16587, 0))),
+            stored(1, 13, (16071, 2), None),
+        ];
+        titles.extend((100..180).map(|id| stored(0, id, (NOW - 213, 0), None)));
+        let dir = std::env::temp_dir().join(format!("den-atlas-fresh-{}-{fresh:?}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir.join("den-v1.store"), "v1", 3, &titles, &[]);
+        let meta = serde_json::json!({
+            "datasetVersion": "v1", "taxonomyVersion": "t02", "embeddingModel": "m", "dims": 3,
+            "quantization": "int8", "storeFile": "den-v1.store",
+        });
+        std::fs::write(dir.join("dataset.meta.json"), meta.to_string()).unwrap();
+        let dataset = crate::dataset::Dataset::load(&dir).unwrap();
+        let indexes = crate::queries::IndexQueries::new(&dataset).get(|| ()).await.unwrap().0;
+        let item =
+            |media_type, id| Listed { key: (media_type, id), imdb_id: None, rating: Some(7.5), year: None };
+        let lists = Lists {
+            arrivals: vec![vec![item(MediaType::Tv, 11), item(MediaType::Tv, 12)]],
+            popular: vec![vec![
+                item(MediaType::Movie, 1),
+                item(MediaType::Tv, 13),
+                item(MediaType::Movie, 2),
+            ]],
+            ..Lists::default()
+        };
+        let mut body = serde_json::json!({"surface": "home", "limit": MAX_SLIDES});
+        if let Some(fresh) = fresh {
+            body["fresh"] = serde_json::json!(fresh);
+        }
+        let request = Request::deserialize(&body).unwrap();
+        answer(&indexes, None, &request, &lists, f64::from(NOW), None)
+    }
+
+    fn slid(answer: &serde_json::Value) -> Vec<(String, u64, String)> {
+        let slides = answer["slides"].as_array().unwrap().iter();
+        slides
+            .map(|s| {
+                let reason = s["why"]["reason"].as_str().unwrap_or("-").to_owned();
+                (s["type"].as_str().unwrap().to_owned(), s["id"].as_u64().unwrap(), reason)
+            })
+            .collect()
+    }
+
+    /// Only new titles, from the lists and from the catalogue, so the pool still fills; the new seasons say so.
+    #[tokio::test]
+    async fn a_fresh_billboard_holds_only_new_titles_and_still_fills() {
+        let fresh = dated_answer(Some(true)).await;
+        let slides = slid(&fresh);
+        let has = |kind: &str, id| slides.iter().any(|(k, i, _)| k == kind && *i == id);
+        for (kind, id) in
+            [("movie", 2), ("movie", 3), ("series", 10), ("series", 11), ("movie", 100), ("movie", 179)]
+        {
+            assert!(has(kind, id), "{kind} {id} is new: {slides:?}");
+        }
+        for (kind, id) in [("movie", 1), ("movie", 4), ("series", 12), ("series", 13)] {
+            assert!(!has(kind, id), "{kind} {id} is not: {slides:?}");
+        }
+        let reason = |id| slides.iter().find(|(k, i, _)| k == "series" && *i == id).unwrap().2.clone();
+        assert_eq!((reason(10), reason(11)), ("new_season".to_owned(), "new_season".to_owned()));
+        assert_eq!(slides.len(), 84, "every new title, where the lists alone had two");
+    }
+
+    /// Off — asked for or left out — the pool is today's: the lists' titles, old ones included, and nothing more.
+    #[tokio::test]
+    async fn without_fresh_the_billboard_is_unchanged() {
+        let (unasked, off) = (dated_answer(None).await, dated_answer(Some(false)).await);
+        assert_eq!(unasked.to_string(), off.to_string());
+        let mut ids: Vec<u64> = slid(&off).into_iter().map(|(_, id, _)| id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 11, 12, 13]);
+        assert!(slid(&off).iter().all(|(_, _, reason)| reason != "new_season"));
     }
 
     #[test]

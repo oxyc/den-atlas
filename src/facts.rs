@@ -140,6 +140,9 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 pub struct Record {
     pub imdb_id: Option<String>,
     pub released: Option<Released>,
+    /// A series' last air date (P582 end time). Wikidata states it once a series has ended, so an ongoing
+    /// series has none — and neither has one nobody dated: absent is unknown, not "still airing".
+    pub ended: Option<Released>,
     /// TMDB genre ids through the file's `genreMap`, series' genres named as films' (see `recommend::fold_genre`).
     pub genres: Vec<u16>,
     /// Its country of origin (ISO 3166-1).
@@ -371,6 +374,8 @@ impl Facts {
         let released = store.per_row::<i32>("released").map_err(err)?;
         let released_prec = store.per_row::<u8>("released_prec").map_err(err)?;
         let runtime = store.per_row::<u16>("runtime").map_err(err)?;
+        // Optional: a store written before series carried an end date has neither section.
+        let ended = store.per_row::<i32>("ended").ok().zip(store.per_row::<u8>("ended_prec").ok());
         // A list in store-v2, one value in store-v1: `franchises` reads either as a list.
         let franchises = store.franchises().map_err(err)?;
         // u32 in the store, u16 here: a TMDB genre id fits in 16 bits and `Record` has always held them
@@ -447,6 +452,7 @@ impl Facts {
                 Record {
                     imdb_id: strings.get(imdb[i]).map(str::to_owned).filter(|id| id.starts_with("tt")),
                     released: Released::from_days(released[i], released_prec[i]),
+                    ended: ended.and_then(|(days, prec)| Released::from_days(days[i], prec[i])),
                     // Folded HERE, not in the writer: `fold_genre` expands TMDB's series composites
                     // (10765 "Sci-Fi & Fantasy" → Sci-Fi and Fantasy) and lives in one language.
                     genres: {
@@ -594,6 +600,7 @@ impl Facts {
                 imdb_id: raw.imdb_id.and_then(OneOrMany::first).filter(|id| id.starts_with("tt")),
                 // A film is released; a series starts.
                 released: raw.released.or(raw.started).and_then(|r| Released::parse(&r.date, &r.precision)),
+                ended: raw.ended.and_then(|r| Released::parse(&r.date, &r.precision)),
                 genres,
                 // `countries` alone. This used to prefer a `productionCountries` field that the harvester
                 // has never shipped — 0 of 47,618 records — so the preferred branch was unreachable and a
@@ -752,6 +759,7 @@ struct RawRecord {
     imdb_id: Option<OneOrMany>,
     released: Option<RawReleased>,
     started: Option<RawReleased>,
+    ended: Option<RawReleased>,
     genres: Option<Vec<String>>,
     countries: Option<Vec<String>>,
     languages: Option<Vec<String>>,
@@ -860,6 +868,9 @@ pub(crate) mod tests {
                 }
                 if got.released != want.released {
                     fields.push("released");
+                }
+                if got.ended != want.ended {
+                    fields.push("ended");
                 }
                 if got.genres != want.genres {
                     fields.push("genres");
