@@ -234,7 +234,8 @@ impl Indexes {
     /// how many titles name it (`FAN_HUB_DAMPING`) so what everyone names does not lead every row. Measured
     /// against the backlinks alone on 24 blind-judged seeds, the first twenty of this tail scored 0.87 against
     /// 0.73 (#121). Requiring two paths raised it again (0.868 to 0.872) and MovieLens hit@20 (1.470 to
-    /// 1.494); median length is 77 and 1.7% of rows have fewer than 40 titles (#127).
+    /// 1.494). On the ten seeds already judged at positions 101–120, the deep band rose from 0.662 to
+    /// 0.748; median length is 77 and 1.7% of rows have fewer than 40 titles (#127).
     fn fan_tail(&self, fan: &den_store::FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
         // Nearer the top of a list counts more: 1 for its first title, 0.63 for its second, 0.5 for its third.
         let weight = |rank: usize| 1.0 / ((rank + 2) as f64).log2();
