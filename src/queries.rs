@@ -1790,7 +1790,8 @@ mod tests {
         }]);
         let attended = |id, popularity| {
             let title = Title { popularity, ..Title::default() };
-            let mut candidate = Candidate { key: (Movie, id), title, rank: None, arrival: None };
+            let mut candidate =
+                Candidate { key: (Movie, id), title, rank: None, arrival: None, new_season: false };
             attend(&indexes, Some(&export), &mut candidate);
             (candidate.title.popularity, candidate.title.popularity_from_votes)
         };
