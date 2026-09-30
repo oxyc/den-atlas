@@ -52,7 +52,7 @@ use crate::ratings::RatingsIndex;
 use den_index::MediaType;
 use den_titlesearch::TitleIndex;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod people;
@@ -243,23 +243,27 @@ struct EntitySpec {
 /// store are the near-universal (film Q11424 on 36,102 titles, television series Q5398426 on 5,517, television
 /// program Q15416), the bookkeeping (a series' episode or season, "conflation", "video work") and everything
 /// under twenty titles.
-const FORMATS: &[u32] = &[
-    506_240,     // television film
-    202_866,     // animated film
-    63_952_888,  // anime television series
-    24_862,      // short film
-    117_467_246, // animated television series
-    1_259_759,   // miniseries
-    17_517_379,  // animated short film
-    20_650_540,  // anime film
-    526_877,     // web series
-    1_261_214,   // television special
-    98_701_476,  // television film broadcast in two parts
-    20_667_187,  // silent short film
-    113_671_041, // original net animation series
-    98_807_719,  // animated television film
-    123_126_551, // animated television special
+const FORMATS: &[(u32, &str)] = &[
+    (506_240, "Television film"),
+    (202_866, "Animated film"),
+    (63_952_888, "Anime television series"),
+    (24_862, "Short film"),
+    (117_467_246, "Animated series"),
+    (1_259_759, "Miniseries"),
+    (17_517_379, "Animated short film"),
+    (20_650_540, "Anime film"),
+    (526_877, "Web series"),
+    (1_261_214, "Television special"),
+    (98_701_476, "Television film broadcast in two parts"),
+    (20_667_187, "Silent short film"),
+    (113_671_041, "Original net animation series"),
+    (98_807_719, "Animated television film"),
+    (123_126_551, "Animated television special"),
 ];
+
+fn format_label(qid: u32) -> Option<&'static str> {
+    FORMATS.iter().find(|(id, _)| *id == qid).map(|(_, label)| *label)
+}
 
 const ENTITY_KINDS: &[EntitySpec] = &[
     EntitySpec {
@@ -377,7 +381,23 @@ const ENTITY_KINDS: &[EntitySpec] = &[
         raw_qids: false,
         min_titles: 5,
         series_only: false,
-        only: FORMATS,
+        only: &[
+            506_240,
+            202_866,
+            63_952_888,
+            24_862,
+            117_467_246,
+            1_259_759,
+            17_517_379,
+            20_650_540,
+            526_877,
+            1_261_214,
+            98_701_476,
+            20_667_187,
+            113_671_041,
+            98_807_719,
+            123_126_551,
+        ],
         about: "what the title is an instance of (P31): feature film, miniseries, animated series, …",
     },
 ];
@@ -1007,6 +1027,8 @@ pub struct FilterIndex {
     unavailable: Vec<&'static str>,
     derived: Mutex<Option<Arc<Derived>>>,
     names: OnceLock<NameIndex>,
+    /// Full-corpus P21 values represented by the synthetic `gender:other` people trait.
+    other_genders: OnceLock<HashSet<u32>>,
     build_bytes: usize,
 }
 
@@ -1403,6 +1425,7 @@ impl FilterIndex {
             unavailable,
             derived: Mutex::new(None),
             names: OnceLock::new(),
+            other_genders: OnceLock::new(),
             build_bytes,
         }
     }
@@ -1997,6 +2020,18 @@ impl<'a> Context<'a> {
             .unwrap_or_else(|| self.entity_qid(kind, value))
     }
 
+    fn entity_name_for(&self, spec: &Spec, kind: &EntityKind, value: u32) -> String {
+        if spec.name == "format" {
+            return self
+                .entity_index(kind, value)
+                .and_then(|entity| self.qid_number(entity))
+                .and_then(format_label)
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.entity_name(kind, value));
+        }
+        self.entity_name(kind, value)
+    }
+
     fn entity_tmdb(&self, kind: &EntityKind, value: u32) -> Option<u32> {
         if kind.qids.is_some() {
             return None;
@@ -2005,8 +2040,12 @@ impl<'a> Context<'a> {
     }
 
     fn qid(&self, entity: u32) -> String {
-        let id = self.view.column::<u32>("ent_qid").ok().and_then(|ids| ids.get(entity as usize).copied());
+        let id = self.qid_number(entity);
         format!("Q{}", id.unwrap_or(0))
+    }
+
+    fn qid_number(&self, entity: u32) -> Option<u32> {
+        self.view.column::<u32>("ent_qid").ok()?.get(entity as usize).copied()
     }
 
     fn label(&self, entity: u32) -> Option<&'a str> {
@@ -2238,7 +2277,7 @@ impl<'a> Context<'a> {
                 for &(e, tally) in counted.iter().take(TOP_K) {
                     let Some(kind) = kind else { continue };
                     let id = self.entity_qid(kind, e);
-                    let label = self.entity_name(kind, e);
+                    let label = self.entity_name_for(spec, kind, e);
                     if label != id || kind.qids.is_some() {
                         labels.insert(id.clone(), label.into());
                     }
@@ -2258,7 +2297,7 @@ impl<'a> Context<'a> {
                 Data::Entity(i) => {
                     if let Some(kind) = self.filter.entities[i].as_ref() {
                         if let Some(value) = self.entity_value(i, kind, id) {
-                            let label = self.entity_name(kind, value);
+                            let label = self.entity_name_for(spec, kind, value);
                             if label.as_str() != id.as_str() || kind.qids.is_some() {
                                 labels.insert(id.clone(), label.into());
                             }
@@ -2539,6 +2578,14 @@ impl<'a> Context<'a> {
                 Data::Entity(i) => {
                     if let Some(kind) = self.filter.entities[i].as_ref() {
                         let candidates: Vec<(u32, u8, Counted)> = match q {
+                            Some(_) if spec.name == "format" => self
+                                .entity_tallies(i, &base)
+                                .into_iter()
+                                .filter_map(|(e, tally)| {
+                                    let name = self.entity_name_for(spec, kind, e);
+                                    tier(&name).map(|tier| (e, tier, tally))
+                                })
+                                .collect(),
                             Some(q) => self
                                 .filter
                                 .names(self.indexes)
@@ -2577,7 +2624,7 @@ impl<'a> Context<'a> {
                             ranked.retain(|value| rank(value) <= last);
                         }
                         for (e, tier, n, titles) in ranked {
-                            let name = self.entity_name(kind, e);
+                            let name = self.entity_name_for(spec, kind, e);
                             found.push((
                                 tier,
                                 self.entity_qid(kind, e),
@@ -2873,6 +2920,10 @@ mod tests {
     /// to be listed — a studio needs five titles to be offered, but may always be asked for.
     #[test]
     fn entity_kinds_list_labelled_top_values_and_every_selected_one() {
+        assert_eq!(format_label(202_866), Some("Animated film"));
+        assert_eq!(format_label(117_467_246), Some("Animated series"));
+        assert_eq!(format_label(24_862), Some("Short film"));
+        assert_eq!(format_label(526_877), Some("Web series"));
         let indexes = fixture("entities");
         let all = counts(&indexes, Movie, "");
         let person = &all["kinds"]["person"];

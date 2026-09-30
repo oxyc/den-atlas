@@ -20,14 +20,15 @@
 //! Every trait takes an OR group as `sel` does: `citizenship:Q30|Q145` is American or British, where
 //! `citizenship:Q30,citizenship:Q145` is both. A `born` range stands alone, never in a group.
 //!
-//! The person traits are stored as Wikidata states them, as the items it names — `gender` (P21) with whatever
+//! The person traits are stored as Wikidata states them, as the items it names — `gender` (P21),
 //! values it holds, `citizenship` (P27), `occupation` (P106), `birthplace` (P19) and `birthcountry` (P17 of that
-//! place, by ISO code or Q-id) — and `born` (P569) by decade, or by a range of
-//! years (`born:1976-1996`, `born:1976-`, `born:-1996`). Nothing is inferred, and unknown is never a match: a
-//! person with no gender on record matches no `gender:`, and no `-gender:` either, since they are not known to
-//! lack it — nor any group of values, nor its exclusion. A birth dated only to its century has no decade; a
-//! birth dated only to its decade or century is in a range when its whole span is, out of it when none of its
-//! span is, and unknown when the span straddles an end. `traitCoverage` says how many of the credited people each applied trait is on record for.
+//! place, by ISO code or Q-id) — and `born` (P569) by a range of years (`born:1976-1996`, `born:1976-`,
+//! `born:-1996`). Gender values held by at most three people in the full corpus are offered together as
+//! `gender:other`; "gender not disclosed in work" is not a gender facet. Nothing is inferred, and unknown is
+//! never a match: a person with no gender on record matches no `gender:`, and no `-gender:` either, since they
+//! are not known to lack it — nor any group of values, nor its exclusion. A birth dated only to its decade or
+//! century is in a range when its whole span is, out of it when none of its span is, and unknown when the span
+//! straddles an end. `traitCoverage` says how many of the credited people each applied trait is on record for.
 //!
 //! # Order
 //!
@@ -55,7 +56,12 @@ use crate::billing::{Billed, Billing};
 use crate::characters::CharacterIndex;
 use den_store::{Birthplaces, List, PersonDate, PersonTraits, Row};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+const GENDER_OTHER_ID: &str = "other";
+const GENDER_OTHER_VALUE: i64 = -1;
+const GENDER_RARE_MAX: u32 = 3;
+const GENDER_NOT_DISCLOSED_QID: u32 = 116_254_116;
 
 const CAST: u8 = 1;
 const DIRECTOR: u8 = 2;
@@ -104,13 +110,11 @@ const TRAITS: [TraitSpec; 7] = [
     TraitSpec {
         name: "born",
         mode: Mode::Single,
-        id: Id::Decade,
+        id: Id::Lower,
         data: Trait::Born,
-        about: "the decade of birth (P569), born:1970 for 1970-1979; a birth dated only to its century has none. \
-                Or a range of birth years, both ends inclusive and either left open: born:1976-1996, \
-                born:1976-, born:-1996; one range, never in a group, and no other born pick beside it, per \
-                request. A birth dated only to its decade or century matches a range when its whole span lies \
-                inside it, and is unknown when the span straddles an end. Decades OR: born:1970|1980",
+        about: "a range of birth years (P569), both ends inclusive and either left open: born:1976-1996, \
+                born:1976-, born:-1996. A birth dated only to its decade or century matches when its whole span \
+                lies inside the range, and is unknown when the span straddles an end",
     },
     TraitSpec {
         name: "citizenship",
@@ -210,7 +214,7 @@ fn trait_spec(name: &str) -> Option<&'static TraitSpec> {
 }
 
 /// The traits `people/values/<trait>.json` answers for: those whose values are Wikidata items, too many to
-/// list whole. A decade or a role is listed whole by `people/counts.json` already.
+/// list whole. A role is listed whole by `people/counts.json` already.
 pub(super) fn values_kind(name: &str) -> Option<&'static str> {
     trait_spec(name).filter(|t| t.entities()).map(|t| t.name)
 }
@@ -233,27 +237,28 @@ pub(super) fn normalise(kind: &str, id: &str, scope: Scope) -> Result<(String, S
         return Err(format!("{kind}: an empty id"));
     }
     let Some(spec) = trait_spec(&kind) else { return Ok((kind, id.to_owned())) };
-    if spec.data == Trait::Born && id.contains('-') {
+    if spec.data == Trait::Born {
         return Ok((kind, Years::parse(id)?.spelled()));
+    }
+    if spec.data == Trait::Gender && id.eq_ignore_ascii_case(GENDER_OTHER_ID) {
+        return Ok((kind, GENDER_OTHER_ID.to_owned()));
     }
     let id = normalise_id(&kind, id, spec.id, scope)?;
     Ok((kind, id))
 }
 
-/// A request's traits, refused when they cannot be answered as sent: a `born` range beside another positive
-/// `born` pick, which could only narrow it — one range says it.
+/// A request's traits, refused when they cannot be answered as sent: one birth range already says the span.
 pub(super) fn check(traits: &[Item]) -> Result<(), String> {
     let picks: Vec<&Item> = traits.iter().filter(|i| i.kind == "born" && !i.exclude).collect();
-    if picks.len() > 1 && picks.iter().any(|i| i.ids.iter().any(|id| id.contains('-'))) {
-        return Err("born: one range per request, and no other born pick beside it".to_owned());
+    if picks.len() > 1 {
+        return Err("born: one range per request".to_owned());
     }
     Ok(())
 }
 
-/// Whether a group of these ids is refused as one item: a `born` range stands alone, as it stands alone among
-/// the `born` picks (`check`) — one range already says any span of years, and decades OR-ed are `born:1970|1980`.
+/// Whether a group of these ids is refused as one item: a birth range stands alone.
 pub(super) fn one_value(kind: &str, ids: &[String]) -> bool {
-    kind == "born" && ids.iter().any(|id| id.contains('-'))
+    kind == "born" && !ids.is_empty()
 }
 
 /// The earliest birth year a `born` range may name; the latest is next year.
@@ -473,11 +478,6 @@ fn keep_top(top: &mut Top, weight: f64, row: u32) {
     }
 }
 
-/// The decade a birth falls in, when it is dated finely enough to have one.
-fn birth_decade(born: Option<PersonDate>) -> Option<i64> {
-    born.filter(|d| d.precision <= 3).map(|d| crate::facts::civil_year(i64::from(d.days)).div_euclid(10) * 10)
-}
-
 /// The years a birth may fall in, as far as it is dated: its year, its decade's ten, or its century's hundred.
 fn birth_span(born: Option<PersonDate>) -> Option<(i64, i64)> {
     let born = born?;
@@ -609,10 +609,16 @@ impl<'a> Context<'a> {
             let mut targets = Vec::with_capacity(item.ids.len());
             for id in &item.ids {
                 let found: Vec<Target> = match spec.data {
-                    Trait::Born if id.contains('-') => {
-                        Years::parse(id).ok().map(Target::Years).into_iter().collect()
+                    Trait::Born => Years::parse(id).ok().map(Target::Years).into_iter().collect(),
+                    Trait::Gender if id == GENDER_OTHER_ID => {
+                        self.other_genders(sources).iter().map(|&e| Target::Value(i64::from(e))).collect()
                     }
-                    Trait::Born => id.parse::<i64>().ok().map(Target::Value).into_iter().collect(),
+                    Trait::Gender => self
+                        .entities_of(sources, spec, id)
+                        .into_iter()
+                        .filter(|e| self.qid_number(*e) != Some(GENDER_NOT_DISCLOSED_QID))
+                        .map(|e| Target::Value(i64::from(e)))
+                        .collect(),
                     _ => self
                         .entities_of(sources, spec, id)
                         .into_iter()
@@ -640,6 +646,27 @@ impl<'a> Context<'a> {
                 .collect();
         }
         self.entity_of(id).into_iter().collect()
+    }
+
+    /// Raw P21 values represented by `gender:other`. The whole store decides membership so narrowing the
+    /// current people selection cannot move an identity in or out of the bucket.
+    fn other_genders(&self, sources: &Sources<'a>) -> &HashSet<u32> {
+        self.filter.other_genders.get_or_init(|| {
+            let size = self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len) as u32;
+            let mut counts: HashMap<u32, u32> = HashMap::new();
+            for e in 0..size {
+                let mut seen = HashSet::new();
+                for &gender in sources.traits.genders(e) {
+                    if seen.insert(gender) && self.qid_number(gender) != Some(GENDER_NOT_DISCLOSED_QID) {
+                        *counts.entry(gender).or_default() += 1;
+                    }
+                }
+            }
+            counts
+                .into_iter()
+                .filter_map(|(gender, count)| (count <= GENDER_RARE_MAX).then_some(gender))
+                .collect()
+        })
     }
 
     /// A country's ISO code, when the store gives it one.
@@ -729,15 +756,22 @@ impl<'a> Context<'a> {
         let among =
             |values: &[u32]| (!values.is_empty()).then(|| values.iter().any(|&v| named(i64::from(v))));
         match data {
-            Trait::Gender
-            | Trait::Citizenship
-            | Trait::Occupation
-            | Trait::Birthplace
-            | Trait::BirthCountry => among(sources.values(data, e)),
+            Trait::Gender => {
+                let values: Vec<u32> = sources
+                    .values(data, e)
+                    .iter()
+                    .copied()
+                    .filter(|&v| self.qid_number(v) != Some(GENDER_NOT_DISCLOSED_QID))
+                    .collect();
+                among(&values)
+            }
+            Trait::Citizenship | Trait::Occupation | Trait::Birthplace | Trait::BirthCountry => {
+                among(sources.values(data, e))
+            }
             // A range stands alone in its item (`one_value`).
             Trait::Born => match targets {
                 [Target::Years(years)] => birth_span(sources.traits.born(e)).and_then(|s| years.holds(s)),
-                _ => birth_decade(sources.traits.born(e)).map(named),
+                _ => None,
             },
             Trait::Role => None,
         }
@@ -793,7 +827,7 @@ impl<'a> Context<'a> {
     }
 
     /// `people/counts.json`: for every value of every trait, the people credited under the selection and the
-    /// other traits holding it — a one-pick kind (gender, born) counted without its own pick, and a kind with
+    /// other traits holding it — gender counted without its own pick, and a kind with
     /// an OR group (`citizenship:Q30|Q145`, `role:cast|director`) without its groups, as `counts.json` counts
     /// them.
     pub fn people_counts(&self, request: &Request) -> (Value, bool) {
@@ -804,6 +838,7 @@ impl<'a> Context<'a> {
         let mut known = [0usize; PERSON_KINDS];
         let mut total = 0usize;
         let apart: [u32; PERSON_KINDS] = std::array::from_fn(|i| split.apart(i));
+        let other_genders = self.other_genders(sources);
         // A code may name several country entities. Count its selected value as the union of their people,
         // not the sum of the per-country counts: one person can carry two such entities.
         let country_spec =
@@ -851,17 +886,30 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 let alone = fails & !apart[i];
-                let decade = match spec.data {
-                    Trait::Born => birth_decade(sources.traits.born(e)),
-                    _ => None,
-                };
                 let entities = sources.values(spec.data, e);
                 if self.on_record(sources, &split.applied, spec.data, e) {
                     known[i] += 1;
                 }
                 if alone == 0 {
-                    for value in entities.iter().map(|&v| i64::from(v)).chain(decade) {
-                        *values[i].entry(value).or_default() += 1;
+                    if spec.data == Trait::Gender {
+                        let mut counted_other = false;
+                        for &value in entities {
+                            if self.qid_number(value) == Some(GENDER_NOT_DISCLOSED_QID) {
+                                continue;
+                            }
+                            if other_genders.contains(&value) {
+                                counted_other = true;
+                            } else {
+                                *values[i].entry(i64::from(value)).or_default() += 1;
+                            }
+                        }
+                        if counted_other {
+                            *values[i].entry(GENDER_OTHER_VALUE).or_default() += 1;
+                        }
+                    } else if spec.data != Trait::Born {
+                        for &value in entities {
+                            *values[i].entry(i64::from(value)).or_default() += 1;
+                        }
                     }
                     if spec.data == Trait::BirthCountry {
                         for (code, countries) in &country_codes {
@@ -908,7 +956,8 @@ impl<'a> Context<'a> {
     }
 
     /// One trait kind's object in `people/counts.json`, shaped as `counts.json`'s kinds are: an entity kind its
-    /// top `TOP_K` values, labelled; a decade or a role every value; every selected id, even at 0.
+    /// top `TOP_K` values, labelled; a role every value; every selected id, even at 0. Born is range-only and
+    /// therefore has no enumerated values.
     fn trait_answer(
         &self,
         sources: &Sources<'a>,
@@ -920,7 +969,7 @@ impl<'a> Context<'a> {
         let selected: Vec<&Item> = items.iter().filter(|i| i.kind == spec.name).collect();
         let id_of = |value: i64| -> String {
             match spec.data {
-                Trait::Born => value.to_string(),
+                Trait::Gender if value == GENDER_OTHER_VALUE => GENDER_OTHER_ID.to_owned(),
                 Trait::Role => ROLES.iter().find(|r| i64::from(r.1) == value).map_or("", |r| r.0).to_owned(),
                 _ => self.qid(value as u32),
             }
@@ -935,7 +984,12 @@ impl<'a> Context<'a> {
         for &(value, n) in ranked.iter().take(if spec.entities() { TOP_K } else { usize::MAX }) {
             let id = id_of(value);
             if spec.entities() {
-                if let Some(label) = self.label(value as u32) {
+                let label = if spec.data == Trait::Gender && value == GENDER_OTHER_VALUE {
+                    Some("Other")
+                } else {
+                    self.label(value as u32)
+                };
+                if let Some(label) = label {
                     labels.insert(id.clone(), label.into());
                 }
             }
@@ -947,20 +1001,26 @@ impl<'a> Context<'a> {
             values.insert(id, n.into());
         }
         for id in selected.iter().flat_map(|item| &item.ids) {
-            // A born range is no decade value: it is named in `selected` or `excluded` alone.
-            if values.contains_key(id) || (spec.data == Trait::Born && id.contains('-')) {
+            // A birth range is not an enumerated value: it is named in `selected` or `excluded` alone.
+            if values.contains_key(id) || spec.data == Trait::Born {
                 continue;
             }
             // A country code counts the people of every country carrying it.
             let found: Vec<i64> = match spec.data {
-                Trait::Born => id.parse().ok().into_iter().collect(),
+                Trait::Born => Vec::new(),
                 Trait::Role => ROLES.iter().filter(|r| r.0 == id).map(|r| i64::from(r.1)).collect(),
+                Trait::Gender if id == GENDER_OTHER_ID => vec![GENDER_OTHER_VALUE],
                 _ => self.entities_of(sources, spec, id).into_iter().map(i64::from).collect(),
             };
             let n: u32 =
                 grouped.get(id).copied().unwrap_or_else(|| found.iter().filter_map(|v| counted.get(v)).sum());
             if spec.entities() {
-                if let Some(label) = found.first().and_then(|&e| self.label(e as u32)) {
+                let label = if spec.data == Trait::Gender && id == GENDER_OTHER_ID {
+                    Some("Other")
+                } else {
+                    found.first().and_then(|&e| self.label(e as u32))
+                };
+                if let Some(label) = label {
                     labels.insert(id.clone(), label.into());
                 }
             }
@@ -1002,7 +1062,9 @@ impl<'a> Context<'a> {
             Some(named) => named.binary_search_by_key(&v, |&(e, _)| e).ok().map(|at| named[at].1),
             None => Some(0),
         };
-        let mut counted: HashMap<u32, u32> = HashMap::new();
+        let other_genders =
+            (spec.data == Trait::Gender).then(|| self.other_genders(sources)).cloned().unwrap_or_default();
+        let mut counted: HashMap<i64, u32> = HashMap::new();
         let mut denominator = 0usize;
         if sources.status_of(spec.data) == Status::Ready {
             for &e in &tally.touched {
@@ -1010,19 +1072,33 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 denominator += 1;
+                let mut counted_other = false;
                 for &v in sources.values(spec.data, e) {
-                    if tier(v).is_some() {
-                        *counted.entry(v).or_default() += 1;
+                    if spec.data == Trait::Gender && self.qid_number(v) == Some(GENDER_NOT_DISCLOSED_QID) {
+                        continue;
                     }
+                    if spec.data == Trait::Gender && other_genders.contains(&v) {
+                        counted_other |= request.q.is_none();
+                    } else if tier(v).is_some() {
+                        *counted.entry(i64::from(v)).or_default() += 1;
+                    }
+                }
+                if counted_other {
+                    *counted.entry(GENDER_OTHER_VALUE).or_default() += 1;
                 }
             }
         }
         // (match tier, id, name, people, entity): the value `q` names first, as `values/<kind>.json` orders
         // them.
-        let mut found: Vec<(u8, String, String, u32, u32)> = counted
+        let mut found: Vec<(u8, String, String, u32, i64)> = counted
             .into_iter()
             .map(|(v, n)| {
-                (tier(v).unwrap_or(0), self.qid(v), self.label(v).unwrap_or_default().to_owned(), n, v)
+                if spec.data == Trait::Gender && v == GENDER_OTHER_VALUE {
+                    (0, GENDER_OTHER_ID.to_owned(), "Other".to_owned(), n, v)
+                } else {
+                    let e = v as u32;
+                    (tier(e).unwrap_or(0), self.qid(e), self.label(e).unwrap_or_default().to_owned(), n, v)
+                }
             })
             .collect();
         found.sort_by(|a, b| {
@@ -1035,7 +1111,7 @@ impl<'a> Context<'a> {
             .map(|(_, id, name, count, e)| {
                 let mut value = json!({ "id": id, "name": name, "count": count });
                 if spec.id == Id::Country {
-                    if let Some(code) = self.iso(sources, e) {
+                    if let Some(code) = self.iso(sources, e as u32) {
                         value["iso"] = json!(code);
                     }
                 }
@@ -1181,7 +1257,14 @@ impl<'a> Context<'a> {
             person["tmdbId"] = json!(tmdb);
         }
         for spec in &TRAITS[..PERSON_KINDS] {
-            let values = sources.values(spec.data, e);
+            let values: Vec<u32> = sources
+                .values(spec.data, e)
+                .iter()
+                .copied()
+                .filter(|&value| {
+                    spec.data != Trait::Gender || self.qid_number(value) != Some(GENDER_NOT_DISCLOSED_QID)
+                })
+                .collect();
             if values.is_empty() || sources.status_of(spec.data) != Status::Ready {
                 continue;
             }
@@ -1252,8 +1335,7 @@ pub(super) fn schema() -> Value {
                     "id": "<from>-<to>: birth years, both inclusive, either end left out (1976-1996, 1976-, \
                            -1996)",
                     "years": format!("{FIRST_BIRTH_YEAR} to next year"),
-                    "counted": "people/counts.json counts born by decade whatever is picked; a range is \
-                                named in selected or excluded",
+                    "counted": "born is range-only; a range is named in selected or excluded",
                 });
             }
             (t.name.to_owned(), about)
@@ -1272,7 +1354,7 @@ pub(super) fn schema() -> Value {
                   group nor its exclusion. Gender, citizenship and occupation are the Wikidata items the store \
                   names, labelled in labels. A value a trait does not hold is named in unknownTraits as \
                   [-]<kind>:<id>, a group's one by one. people/counts.json and people/values/<trait>.json count \
-                  a trait with a positive group without its groups, gender and born without any of their \
+                  a trait with a positive group without its groups, gender without any of its \
                   items, and every other trait under them; role:cast|director counts role over the credits \
                   walked without the group",
     })
@@ -1289,6 +1371,9 @@ mod tests {
     const FEMALE: u32 = 200;
     const MALE: u32 = 201;
     const NON_BINARY: u32 = 202;
+    const RARE_GENDER_A: u32 = 203;
+    const RARE_GENDER_B: u32 = 204;
+    const NOT_DISCLOSED: u32 = GENDER_NOT_DISCLOSED_QID;
     const SWEDEN: u32 = 300;
     const US: u32 = 301;
     const SECOND_SE: u32 = 302;
@@ -1366,7 +1451,7 @@ mod tests {
                 qid: 101,
                 name: "Ann",
                 tmdb: Some(5001),
-                genders: vec![FEMALE],
+                genders: vec![FEMALE, RARE_GENDER_A, RARE_GENDER_B],
                 citizenships: vec![SWEDEN],
                 occupations: vec![ACTOR],
                 born: Some((days(1974, 7, 29), 0)),
@@ -1377,7 +1462,7 @@ mod tests {
             Entity {
                 qid: 102,
                 name: "Bob",
-                genders: vec![MALE],
+                genders: vec![MALE, NOT_DISCLOSED],
                 citizenships: vec![US, SWEDEN],
                 occupations: vec![ACTOR, DIRECTOR_JOB],
                 born: Some((days(1980, 1, 1), 2)),
@@ -1410,6 +1495,19 @@ mod tests {
             label(FEMALE, "female"),
             label(MALE, "male"),
             label(NON_BINARY, "non-binary"),
+            label(RARE_GENDER_A, "rare a"),
+            label(RARE_GENDER_B, "rare b"),
+            label(NOT_DISCLOSED, "gender not disclosed in work"),
+            // Keep the three ordinary gender values above the full-corpus rare-value threshold. These entities
+            // are not credited on a title, so they do not change any People answer.
+            Entity { qid: 110, name: "F1", genders: vec![FEMALE], ..Entity::default() },
+            Entity { qid: 111, name: "F2", genders: vec![FEMALE], ..Entity::default() },
+            Entity { qid: 112, name: "F3", genders: vec![FEMALE], ..Entity::default() },
+            Entity { qid: 113, name: "M1", genders: vec![MALE], ..Entity::default() },
+            Entity { qid: 114, name: "M2", genders: vec![MALE], ..Entity::default() },
+            Entity { qid: 115, name: "N1", genders: vec![NON_BINARY], ..Entity::default() },
+            Entity { qid: 116, name: "N2", genders: vec![NON_BINARY], ..Entity::default() },
+            Entity { qid: 117, name: "N3", genders: vec![NON_BINARY], ..Entity::default() },
             Entity {
                 qid: SWEDEN,
                 name: "Sweden",
@@ -1508,15 +1606,18 @@ mod tests {
         assert_eq!(counts["traitCoverage"]["gender"], json!({ "count": 4, "denominator": 5 }));
     }
 
-    /// Gender lists whatever values the data holds, labelled from the store's entities, and counts as one
-    /// pick: selecting male leaves the other values readable as alternatives.
+    /// Gender lists established values, unions full-corpus values held by at most three people into Other, and
+    /// drops the non-gender "not disclosed in work" value. Selecting male leaves alternatives readable.
     #[test]
     fn gender_counts_every_value_the_data_holds() {
         let indexes = people_store("gender-counts");
         let counts = ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020");
         let gender = &counts["traits"]["gender"];
-        assert_eq!(gender["values"], json!({ "Q200": 1, "Q201": 2, "Q202": 1 }));
-        assert_eq!(gender["labels"], json!({ "Q200": "female", "Q201": "male", "Q202": "non-binary" }));
+        assert_eq!(gender["values"], json!({ "Q200": 1, "Q201": 2, "Q202": 1, "other": 1 }));
+        assert_eq!(
+            gender["labels"],
+            json!({ "Q200": "female", "Q201": "male", "Q202": "non-binary", "other": "Other" })
+        );
         assert_eq!(gender["mode"], "single");
         assert_eq!(counts["total"], 5);
         let male = ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020&traits=gender:Q201");
@@ -1524,24 +1625,24 @@ mod tests {
         assert_eq!(male["traits"]["gender"]["values"], gender["values"], "counted without its own pick");
         assert_eq!(male["traits"]["gender"]["selected"], json!(["Q201"]));
         assert_eq!(male["traits"]["occupation"]["values"], json!({ "Q400": 2, "Q401": 1 }), "under the pick");
-        assert_eq!(male["traits"]["born"]["values"], json!({ "1970": 1, "1980": 1 }));
+        assert_eq!(male["traits"]["born"]["values"], json!({}));
         assert_eq!(male["traits"]["role"]["values"], json!({ "cast": 2, "director": 1 }));
+        let other = ask(&indexes, Movie, Route::People, "sel=decade:2020&traits=gender:other");
+        assert_eq!(sorted_names(&other), vec!["Ann"], "two rare raw values count Ann once");
+        assert_eq!(other["people"][0]["gender"], json!(["Q200", "Q203", "Q204"]));
+        assert_eq!(other["labels"]["Q203"], "rare a", "person records keep raw rare genders");
+        let bob = ask(&indexes, Movie, Route::People, "sel=decade:2020&traits=gender:Q116254116");
+        assert_eq!(bob["total"], 0);
+        assert_eq!(bob["unknownTraits"], json!(["gender:Q116254116"]));
     }
 
-    /// Births by decade: a day, a year and a decade each have one; a century does not.
+    /// Birth dates retain their source precision, while counts expose no duplicate decade vocabulary.
     #[test]
-    fn born_reads_a_decade_only_from_a_fine_enough_date() {
+    fn born_is_range_only_and_dates_keep_their_precision() {
         let indexes = people_store("born");
         let counts = ask(&indexes, Scope::All, Route::PeopleCounts, "");
-        assert_eq!(
-            counts["traits"]["born"]["values"],
-            json!({ "1970": 2, "1980": 1 }),
-            "Cid's century has none"
-        );
-        let seventies = ask(&indexes, Scope::All, Route::People, "traits=born:1975");
-        let mut found: Vec<String> = names(&seventies).into_iter().map(|(n, _)| n).collect();
-        found.sort();
-        assert_eq!(found, vec!["Ann", "Eve"]);
+        assert_eq!(counts["traits"]["born"]["values"], json!({}));
+        assert!(Request::parse(Route::People, Scope::All, "traits=born:1975").is_err());
         let everyone = ask(&indexes, Scope::All, Route::People, "");
         let person =
             |name: &str| everyone["people"].as_array().unwrap().iter().find(|p| p["name"] == name).cloned();
@@ -1618,8 +1719,7 @@ mod tests {
         assert_eq!(sorted_names(&genders), vec!["Ann", "Cid"]);
         let other = ask(&indexes, Scope::All, Route::People, "traits=-gender:Q200|Q202");
         assert_eq!(sorted_names(&other), vec!["Bob", "Eve"], "Dee has no gender on record");
-        let decades = ask(&indexes, Scope::All, Route::People, "traits=born:1970|1980");
-        assert_eq!(sorted_names(&decades), vec!["Ann", "Bob", "Eve"], "Cid's century has no decade");
+        assert!(Request::parse(Route::People, Scope::All, "traits=born:1970|1980").is_err());
         let unknown = ask(&indexes, Scope::All, Route::People, "traits=citizenship:Q300|Q999999");
         assert_eq!(sorted_names(&unknown), vec!["Ann", "Bob"]);
         assert_eq!(unknown["unknownTraits"], json!(["citizenship:Q999999"]));
@@ -1658,7 +1758,11 @@ mod tests {
             "Ann and Bob Swedish, Bob American"
         );
         assert_eq!(citizenship["selected"], json!(["Q300", "Q301"]));
-        assert_eq!(either["traits"]["gender"]["values"], json!({ "Q200": 1, "Q201": 1 }), "under the group");
+        assert_eq!(
+            either["traits"]["gender"]["values"],
+            json!({ "Q200": 1, "Q201": 1, "other": 1 }),
+            "under the group"
+        );
         let both = ask(
             &indexes,
             Movie,
@@ -1673,7 +1777,6 @@ mod tests {
             json!({ "Q400": 3, "Q401": 2, "Q402": 1 }),
             "Ann, Bob and Eve are actors, whatever the group"
         );
-
         let crew = ask(&indexes, Movie, Route::PeopleCounts, "sel=decade:2020&traits=role:director|writer");
         assert_eq!(crew["total"], 2, "Bob directs film 2, Cid directs and writes film 1");
         assert_eq!(
@@ -1800,7 +1903,7 @@ mod tests {
         assert_eq!(people("born:1996-"), born_in(1996..=2100, &["Ivy"]), "an open end");
         assert_eq!(people("born:-1950"), born_in(0..=1950, &["Jon"]), "an open start");
         // A bare decade keeps its meaning: Gus's decade is 1970.
-        assert_eq!(people("born:1975"), born_in(1970..=1979, &["Fay", "Gus"]));
+        assert!(Request::parse(Route::People, Movie.into(), "traits=born:1975").is_err());
     }
 
     /// A birth dated to its decade or century is in a range its whole span lies inside, out of one it does not
@@ -1851,8 +1954,8 @@ mod tests {
         }
     }
 
-    /// `people/counts.json` under a range: the total and the other kinds over the people in it, `born` by
-    /// decade as if the range were not picked, and the range's coverage the people it is known for.
+    /// `people/counts.json` under a range: the total and the other kinds over the people in it, and the range's
+    /// coverage over the people it is known for. Born itself has no duplicate enumerated vocabulary.
     #[test]
     fn a_born_range_is_counted_as_a_pick() {
         let indexes = range_store("born-counts");
@@ -1862,17 +1965,11 @@ mod tests {
         assert_eq!(counts["traits"]["role"]["values"], json!({ "cast": 23 }));
         assert_eq!(counts["traits"]["born"]["values"], all["traits"]["born"]["values"]);
         assert_eq!(counts["traits"]["born"]["selected"], json!(["1976-1996"]));
-        assert!(counts["traits"]["born"]["values"].get("1976-1996").is_none(), "a range is no decade");
+        assert_eq!(counts["traits"]["born"]["values"], json!({}));
         assert_eq!(
             counts["traitCoverage"]["born"],
             json!({ "count": 43, "denominator": 46 }),
             "Gus and Kim straddle the range, Hal has no birth"
-        );
-        let decade = ask(&indexes, Movie, Route::PeopleCounts, "traits=born:1970");
-        assert_eq!(
-            decade["traitCoverage"]["born"],
-            json!({ "count": 44, "denominator": 46 }),
-            "a decade pick: Kim's century and Hal have none"
         );
         let excluded = ask(&indexes, Movie, Route::PeopleCounts, "traits=-born:1976-1996");
         assert_eq!(excluded["total"], 43 - 23);
@@ -2140,7 +2237,7 @@ mod tests {
 
         // Gender is one pick: counted without its own, as people/counts.json counts it.
         let (genders, _) = values("gender", "sel=decade:2020&traits=gender:Q201");
-        assert_eq!(genders, pairs(&[("Q201", 2), ("Q200", 1), ("Q202", 1)]));
+        assert_eq!(genders, pairs(&[("Q201", 2), ("other", 1), ("Q200", 1), ("Q202", 1)]));
         // Occupation holds several: counted under the picks, the gender among them.
         let (jobs, _) = values("occupation", "sel=decade:2020&traits=gender:Q201,occupation:Q400");
         assert_eq!(jobs, pairs(&[("Q400", 2), ("Q401", 1)]), "Bob and Eve act, Bob directs");
@@ -2366,8 +2463,7 @@ mod tests {
         }
     }
 
-    /// A born range over the REAL corpus against the per-decade requests it replaces: the male cast of 2020s
-    /// films born 1976–1996, paged through whole, beside one 100-person page per decade filtered to the years.
+    /// A born range over the REAL corpus: the male cast of 2020s films born 1976–1996, paged through whole.
     /// Opt-in: `DEN_STORE` names a store whose directory holds its `dataset.meta.json`.
     #[test]
     fn real_corpus_born_range() {
@@ -2401,24 +2497,6 @@ mod tests {
         eprintln!(
             "range: total {total}; first page of 100 in {one:?}; all {} pages in {whole:?}",
             total.div_ceil(100)
-        );
-
-        let started = std::time::Instant::now();
-        let (mut kept, mut decade_totals) = (0, Vec::new());
-        for decade in [1970, 1980, 1990] {
-            let query = format!("sel=decade:2020&traits=born:{decade},gender:Q6581097,role:cast&limit=100");
-            let page = run(&query);
-            decade_totals.push(page["total"].as_u64().unwrap());
-            kept += page["people"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|p| p["born"]["year"].as_i64().is_some_and(|y| (1976..=1996).contains(&y)))
-                .count();
-        }
-        eprintln!(
-            "per decade: totals {decade_totals:?}; three 100-person pages in {:?} keep {kept} of the {total}",
-            started.elapsed()
         );
     }
 
@@ -2454,7 +2532,7 @@ mod tests {
             (
                 "Swedish directors born in the 1970s",
                 Scope::All,
-                "traits=citizenship:Q34,role:director,born:1970",
+                "traits=citizenship:Q34,role:director,born:1970-1979",
             ),
             (
                 "Actresses in horror films",
@@ -2566,7 +2644,7 @@ mod tests {
         for (scope, route, query) in [
             (Scope::All, Route::People, ""),
             (Scope::All, Route::PeopleCounts, ""),
-            (Scope::All, Route::People, "traits=born:1970,citizenship:Q34,role:director"),
+            (Scope::All, Route::People, "traits=born:1970-1979,citizenship:Q34,role:director"),
             (Movie.into(), Route::People, "sel=genre:27&traits=gender:Q6581072,role:cast"),
             (
                 Movie.into(),
