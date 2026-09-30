@@ -8,6 +8,7 @@
 
 use crate::util::lock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,6 +174,10 @@ fn write_atomically(file: &Path, body: &[u8]) -> std::io::Result<()> {
 /// How many query vectors the embed memo keeps, and for how long.
 pub const EMBED_MEMO_ENTRIES: usize = 1_000;
 pub const EMBED_MEMO_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Library hints are bounded by `recommend::MAX_LIBRARY`; room for two maximum-size libraries avoids
+/// one household immediately evicting another while keeping the on-disk vector file bounded.
+pub const LIBRARY_EMBED_MEMO_ENTRIES: usize = 10_000;
+const LIBRARY_EMBED_FILE: &str = "library-embeds.v1.json";
 
 /// Query text → the vector den-embed gave it, so a search typed again (another page, the same word from the
 /// next viewer, a client revalidating) does not queue a model call behind the embed permits. Least recently
@@ -184,18 +189,58 @@ pub const EMBED_MEMO_TTL: Duration = Duration::from_secs(24 * 3600);
 pub struct EmbedMemo {
     ttl: Duration,
     max_entries: usize,
-    map: Mutex<HashMap<String, Remembered>>,
+    map: Arc<Mutex<HashMap<String, Remembered>>>,
+    file: Option<PathBuf>,
+    dirty: Arc<AtomicBool>,
+    saving: Arc<AtomicBool>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct Remembered {
     vector: Vec<i8>,
-    stored: std::time::Instant,
-    used: std::time::Instant,
+    stored: SystemTime,
+    used: SystemTime,
 }
 
 impl EmbedMemo {
     pub fn new(ttl: Duration, max_entries: usize) -> Self {
-        Self { ttl, max_entries, map: Mutex::default() }
+        Self {
+            ttl,
+            max_entries,
+            map: Arc::default(),
+            file: None,
+            dirty: Arc::default(),
+            saving: Arc::default(),
+        }
+    }
+
+    /// Library vectors survive deploys without persisting a viewer's search text. Keys contain only the
+    /// semantic space, title identity and a digest of the bounded hint text.
+    pub fn persisted_library(dir: &Path) -> Self {
+        let file = dir.join(LIBRARY_EMBED_FILE);
+        let map = match std::fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                eprintln!("library embed memo: {} is unreadable ({e}) — starting empty", file.display());
+                HashMap::new()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                eprintln!("library embed memo: could not read {} ({e}) — starting empty", file.display());
+                HashMap::new()
+            }
+        };
+        let memo = Self {
+            ttl: Duration::MAX,
+            max_entries: LIBRARY_EMBED_MEMO_ENTRIES,
+            map: Arc::new(Mutex::new(map)),
+            file: Some(file),
+            dirty: Arc::default(),
+            saving: Arc::default(),
+        };
+        while memo.len_unchecked() > memo.max_entries {
+            memo.evict_one();
+        }
+        memo
     }
 
     /// The memo key for `text` in a complete semantic-query space identity. That identity includes a
@@ -205,15 +250,23 @@ impl EmbedMemo {
         format!("{space}\u{0}{text}")
     }
 
+    /// A persistent library key: dataset space and title identity in the clear, bounded hint text only as
+    /// a digest. A changed title, year or overview changes `text`, misses, and re-embeds that title.
+    pub fn library_key(space: &str, kind: &str, id: u32, text: &str) -> String {
+        let digest: String =
+            Sha256::digest(text.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("library-v1\0{space}\0{kind}:{id}\0{digest}")
+    }
+
     /// A kept vector still inside its TTL; an expired one is dropped here.
     pub fn get(&self, key: &str) -> Option<Vec<i8>> {
         let mut map = lock(&self.map);
         let entry = map.get_mut(key)?;
-        if entry.stored.elapsed() >= self.ttl {
+        if entry.stored.elapsed().unwrap_or_default() >= self.ttl {
             map.remove(key);
             return None;
         }
-        entry.used = std::time::Instant::now();
+        entry.used = SystemTime::now();
         Some(entry.vector.clone())
     }
 
@@ -225,8 +278,48 @@ impl EmbedMemo {
                 map.remove(&coldest);
             }
         }
-        let now = std::time::Instant::now();
+        let now = SystemTime::now();
         map.insert(key, Remembered { vector, stored: now, used: now });
+        drop(map);
+        self.save();
+    }
+
+    fn len_unchecked(&self) -> usize {
+        lock(&self.map).len()
+    }
+
+    fn evict_one(&self) {
+        let mut map = lock(&self.map);
+        if let Some(coldest) = map.iter().min_by_key(|(_, entry)| entry.used).map(|(key, _)| key.clone()) {
+            map.remove(&coldest);
+        }
+    }
+
+    fn save(&self) {
+        let Some(file) = self.file.clone() else { return };
+        self.dirty.store(true, Ordering::SeqCst);
+        if self.saving.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (map, dirty, saving) = (Arc::clone(&self.map), Arc::clone(&self.dirty), Arc::clone(&self.saving));
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.saving.store(false, Ordering::SeqCst);
+            return;
+        };
+        runtime.spawn_blocking(move || loop {
+            while dirty.swap(false, Ordering::SeqCst) {
+                let body = serde_json::to_vec(&*lock(&map));
+                if let Err(e) =
+                    body.map_err(std::io::Error::other).and_then(|bytes| write_atomically(&file, &bytes))
+                {
+                    eprintln!("library embed memo: could not write {} ({e})", file.display());
+                }
+            }
+            saving.store(false, Ordering::SeqCst);
+            if !dirty.load(Ordering::SeqCst) || saving.swap(true, Ordering::SeqCst) {
+                break;
+            }
+        });
     }
 
     #[cfg(test)]
@@ -317,6 +410,28 @@ mod tests {
         memo.put("a".into(), vec![1]);
         assert_eq!(memo.get("a"), None);
         assert_eq!(memo.len(), 0, "an expired vector was kept");
+    }
+
+    #[tokio::test]
+    async fn library_embeddings_survive_a_restart_without_storing_hint_text() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-library-embed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(LIBRARY_EMBED_FILE);
+        let memo = EmbedMemo::persisted_library(&dir);
+        let prose = "private plot prose";
+        let key = EmbedMemo::library_key("space", "movie", 42, prose);
+        memo.put(key.to_owned(), vec![1, -2, 3]);
+        for _ in 0..200 {
+            if file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(prose));
+        let restarted = EmbedMemo::persisted_library(&dir);
+        assert_eq!(restarted.get(&key), Some(vec![1, -2, 3]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// One text in two full semantic spaces is two keys. A plot transform is part of that identity even

@@ -1182,6 +1182,31 @@ async fn embed_upstream(state: &AppState, text: &str) -> Result<Vec<i8>, String>
     resp.json::<Embedded>().await.map(|e| e.vector).map_err(|e| format!("den-embed body: {e}"))
 }
 
+/// One bounded den-embed batch. Library coverage is one model batch rather than 32 requests competing for the
+/// same four permits (and timing out in their own queue), while still sharing one permit with interactive search.
+async fn embed_batch_upstream(state: &AppState, texts: &[String]) -> Result<Vec<Vec<i8>>, String> {
+    #[derive(serde::Deserialize)]
+    struct Embedded {
+        vectors: Vec<Vec<i8>>,
+    }
+    let proxy = state.embed.as_ref().ok_or("EMBED_URL is unset")?;
+    let _permit = tokio::time::timeout(crate::EMBED_WAIT, proxy.inflight.clone().acquire_owned())
+        .await
+        .map_err(|_| "den-embed is busy")?
+        .map_err(|_| "den-embed permits are closed")?;
+    let resp = proxy
+        .client
+        .post(format!("{}/embed/batch", proxy.base))
+        .json(&serde_json::json!({ "texts": texts }))
+        .send()
+        .await
+        .map_err(|e| format!("den-embed batch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("den-embed batch answered HTTP {}", resp.status()));
+    }
+    resp.json::<Embedded>().await.map(|e| e.vectors).map_err(|e| format!("den-embed batch body: {e}"))
+}
+
 /// Wake den-embed as the indexes load on a query, which with the indexes loaded at start (`load_at_start`) is
 /// only a query that beat that load; the search that comes next would wait on den-embed's model otherwise.
 fn warm_embed(state: &Arc<AppState>) {
@@ -1749,6 +1774,34 @@ fn billboards() -> &'static std::sync::Mutex<std::collections::HashMap<String, A
     KEPT.get_or_init(Default::default)
 }
 
+type LibraryKey = (den_index::MediaType, u32);
+type LibraryEmbedTask = (LibraryKey, String, String);
+
+/// Every valid memo hit contributes to this request; only the next bounded set of misses costs upstream work.
+/// The persisted key contains title identity and the hint digest, never the hint prose itself.
+fn library_embedding_plan(
+    memo: &crate::cache::EmbedMemo,
+    space: &str,
+    dims: usize,
+    requests: Vec<(LibraryKey, String)>,
+) -> (std::collections::HashMap<LibraryKey, Vec<i8>>, Vec<LibraryEmbedTask>) {
+    let mut hits = std::collections::HashMap::new();
+    let mut misses = Vec::new();
+    for (title, text) in requests {
+        let kind = match title.0 {
+            den_index::MediaType::Movie => "movie",
+            den_index::MediaType::Tv => "series",
+        };
+        let key = crate::cache::EmbedMemo::library_key(space, kind, title.1, &text);
+        if let Some(vector) = memo.get(&key).filter(|vector| vector.len() == dims) {
+            hits.insert(title, vector);
+        } else if misses.len() < crate::recommend::MAX_LIBRARY_EMBEDS {
+            misses.push((title, key, text));
+        }
+    }
+    (hits, misses)
+}
+
 /// Rank `request` (`recommend::answer`): the answer and its `Server-Timing` parts, or the response that says why
 /// not. `raw` is the body as sent, kept as a replay fixture where `RECOMMEND_FIXTURES` asks for them.
 ///
@@ -1773,21 +1826,29 @@ async fn rank(
     // Only titles absent from the plot index are embedded, from bounded transient client hints. A failed or
     // unconfigured embedder leaves the existing metadata-only fit intact rather than failing the billboard.
     let embedding = Instant::now();
-    let mut library_embeddings = std::collections::HashMap::new();
-    if state.embed.is_some() {
-        let mut tasks = tokio::task::JoinSet::new();
-        for (key, text) in crate::recommend::library_embedding_requests(&indexes, &request) {
-            let state = Arc::clone(state);
-            tasks.spawn(async move { (key, embed_query(&state, &text).await) });
-        }
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok((key, Ok(vector))) => {
-                    library_embeddings.insert(key, vector);
+    let (space, dims) = state
+        .dataset
+        .as_ref()
+        .map(|dataset| (dataset.meta.semantic_query_space(), dataset.meta.dims as usize))
+        .unwrap_or_default();
+    let requests = crate::recommend::library_embedding_requests(&indexes, &request);
+    let (mut library_embeddings, missing) =
+        library_embedding_plan(&state.library_embed_memo, &space, dims, requests);
+    if state.embed.is_some() && !missing.is_empty() {
+        let texts: Vec<_> = missing.iter().map(|(_, _, text)| text.clone()).collect();
+        match embed_batch_upstream(state, &texts).await {
+            Ok(vectors) if vectors.len() == missing.len() => {
+                for ((title, memo_key, _), vector) in missing.into_iter().zip(vectors) {
+                    if vector.len() != dims {
+                        eprintln!("library title left unembedded: wrong vector width");
+                        continue;
+                    }
+                    state.library_embed_memo.put(memo_key, vector.clone());
+                    library_embeddings.insert(title, vector);
                 }
-                Ok((_, Err(e))) => eprintln!("library title left unembedded: {e}"),
-                Err(e) => eprintln!("library embed task failed: {e}"),
             }
+            Ok(_) => eprintln!("library titles left unembedded: wrong batch length"),
+            Err(e) => eprintln!("library titles left unembedded: {e}"),
         }
     }
     let embedded = embedding.elapsed();
@@ -2211,6 +2272,32 @@ pub(crate) fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hundred_unindexed_library_titles_fill_in_four_bounded_requests() {
+        let memo = crate::cache::EmbedMemo::new(std::time::Duration::MAX, 1_000);
+        let original: Vec<_> = (0..100)
+            .map(|id| ((den_index::MediaType::Movie, id), format!("Title {id}\nPlot {id}")))
+            .collect();
+        for load in 0..4 {
+            let (hits, misses) = library_embedding_plan(&memo, "test-space", 4, original.clone());
+            assert!(misses.len() <= crate::recommend::MAX_LIBRARY_EMBEDS);
+            let covered = hits.len() + misses.len();
+            assert_eq!(covered, ((load + 1) * crate::recommend::MAX_LIBRARY_EMBEDS).min(100));
+            for (_, key, _) in misses {
+                memo.put(key, vec![1, 2, 3, 4]);
+            }
+        }
+        let (hits, misses) = library_embedding_plan(&memo, "test-space", 4, original.clone());
+        assert_eq!(hits.len(), 100);
+        assert!(misses.is_empty(), "a warm library still queued upstream embeds");
+
+        let mut changed = original;
+        changed[40].1.push_str(" changed");
+        let (hits, misses) = library_embedding_plan(&memo, "test-space", 4, changed);
+        assert_eq!(hits.len(), 99);
+        assert_eq!(misses.len(), 1, "changed text did not re-embed exactly its title");
+    }
 
     /// The request log must not keep an install's config segment or anything from the query.
     #[test]
