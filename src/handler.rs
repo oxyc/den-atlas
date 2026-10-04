@@ -82,6 +82,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
         resp.headers_mut().insert("cache-tag", header::HeaderValue::from_static(CACHE_TAG));
     }
     if let Some((started, method, path, rid)) = log {
+        let degraded = resp.headers().get(DEGRADED).and_then(|v| v.to_str().ok());
         eprintln!(
             "{}",
             request_line(
@@ -89,19 +90,36 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
                 &path,
                 resp.status().as_u16(),
                 started.elapsed().as_millis(),
-                rid.as_deref()
+                rid.as_deref(),
+                degraded
             )
         );
     }
     resp
 }
 
-/// `<METHOD> <path> <status> <ms>ms`, plus ` rid=<id>` when the caller sent an `X-Request-Id`.
-fn request_line(method: &Method, path: &str, status: u16, ms: u128, rid: Option<&str>) -> String {
-    match rid {
-        Some(rid) => format!("{method} {path} {status} {ms}ms rid={rid}"),
-        None => format!("{method} {path} {status} {ms}ms"),
+/// `<METHOD> <path> <status> <ms>ms`, plus ` rid=<id>` when the caller sent an `X-Request-Id` and
+/// ` degraded=<reason>` when the answer carries `x-den-degraded` — the same reason `/health` and
+/// `/ready` report, but on the one request it actually affected, so "why was this slow/empty"
+/// doesn't need a separate `/health` poll timed against the request.
+fn request_line(
+    method: &Method,
+    path: &str,
+    status: u16,
+    ms: u128,
+    rid: Option<&str>,
+    degraded: Option<&str>,
+) -> String {
+    let mut line = format!("{method} {path} {status} {ms}ms");
+    if let Some(rid) = rid {
+        line.push_str(" rid=");
+        line.push_str(rid);
     }
+    if let Some(reason) = degraded {
+        line.push_str(" degraded=");
+        line.push_str(reason);
+    }
+    line
 }
 
 /// The caller's `X-Request-Id`, as a log line may carry it. The Den app sends one per addon request and
@@ -1865,6 +1883,7 @@ async fn rank(
     let version = state.dataset.as_ref().map(|ds| ds.meta.dataset_version.clone());
     // TMDB's export popularity, for the titles no client hint describes (`TITLE_SEARCH`).
     let export = state.titles.as_ref().and_then(|t| t.index());
+    let log_identity = state.log_identity;
     // More Like This for each seed scans the vectors, so the ranking runs off the request threads.
     let ranked = tokio::task::spawn_blocking(move || {
         let now = request
@@ -1880,7 +1899,16 @@ async fn rank(
             now,
             Some(&library_embeddings),
         );
-        eprintln!("{}{rid}", crate::recommend::summary(&indexes, &request, &answer));
+        // One decision line per answer — surface, pool/library counts, slide count, and the top
+        // slides' dominant signals — throttled like every other per-request line in this file
+        // (`util::log_throttled!`): the POST path ranks fresh for every household on every call, so
+        // without a cap a caller hitting it hard turns this into the exact per-request amplifier
+        // `log_due`'s doc comment warns about. The GET path is naturally rate-limited already — it
+        // only reaches here on a cache miss, once per scope per day — so the cap costs it nothing.
+        crate::util::log_throttled!(
+            "{}{rid}",
+            crate::recommend::summary(&indexes, &request, &answer, log_identity)
+        );
         if let (Some(dir), Some(raw)) = (&fixtures, &raw) {
             crate::recommend::keep_fixture(std::path::Path::new(dir), raw, &lists, now);
         }
@@ -2325,16 +2353,56 @@ mod tests {
 
     #[test]
     fn a_request_line_carries_the_callers_request_id() {
-        let line =
-            request_line(&Method::GET, "/<config>/catalog/movie/jw-nfx.json", 200, 12, Some("a1b2c3d4"));
+        let line = request_line(
+            &Method::GET,
+            "/<config>/catalog/movie/jw-nfx.json",
+            200,
+            12,
+            Some("a1b2c3d4"),
+            None,
+        );
         assert_eq!(line, "GET /<config>/catalog/movie/jw-nfx.json 200 12ms rid=a1b2c3d4");
         assert_eq!(rid_of("a1b2-c3_d4").as_deref(), Some("a1b2-c3_d4"));
     }
 
     #[test]
     fn a_request_line_without_an_id_is_unchanged() {
-        assert_eq!(request_line(&Method::HEAD, "/health", 200, 0, None), "HEAD /health 200 0ms");
+        assert_eq!(request_line(&Method::HEAD, "/health", 200, 0, None, None), "HEAD /health 200 0ms");
         assert_eq!(request_id(&axum::http::HeaderMap::new()), None);
+    }
+
+    /// A degraded answer's reason lands on the line that actually carried it — not just in `/health`,
+    /// timed separately against whatever request happened to be degraded.
+    #[test]
+    fn a_degraded_answer_s_reason_is_appended_after_the_request_id() {
+        let line = request_line(
+            &Method::GET,
+            "/<config>/catalog/movie/jw-nfx.json",
+            200,
+            12,
+            None,
+            Some("stale_catalog"),
+        );
+        assert_eq!(line, "GET /<config>/catalog/movie/jw-nfx.json 200 12ms degraded=stale_catalog");
+
+        let with_rid = request_line(
+            &Method::GET,
+            "/index/filter/movie/counts.json",
+            200,
+            8,
+            Some("a1b2c3d4"),
+            Some("filter_kinds_unavailable"),
+        );
+        assert_eq!(
+            with_rid,
+            "GET /index/filter/movie/counts.json 200 8ms rid=a1b2c3d4 degraded=filter_kinds_unavailable"
+        );
+
+        assert_eq!(
+            request_line(&Method::GET, "/manifest.json", 200, 1, None, None),
+            "GET /manifest.json 200 1ms",
+            "a normal answer carries neither field"
+        );
     }
 
     /// The id comes off the network and lands in a log line: nothing may split the line, forge a second
@@ -4041,7 +4109,7 @@ mod tests {
         // The log line names the slides from the cards and counts the library without naming it.
         let request: crate::recommend::Request = serde_json::from_str(body).unwrap();
         let indexes = state.index.as_ref().unwrap().get(|| ()).await.unwrap().0;
-        let line = crate::recommend::summary(&indexes, &request, &answer);
+        let line = crate::recommend::summary(&indexes, &request, &answer, true);
         assert!(
             line.starts_with(
                 "recommend movies: library 1 (0 unjudged, 1 indexed, 0 embedded, 0 unindexed), owned 1, candidates 4, pool 4 ("
@@ -4051,6 +4119,12 @@ mod tests {
         assert!(line.contains(" 1 unjudged, 0 personal), 1 slides; 1. Two "), "{line}");
         assert!(line.contains("fit ") && line.contains("fresh "), "{line}");
         assert!(!line.contains("One"), "a library title is never named: {line}");
+
+        // LOG_IDENTITY off: the slide is named by its type alone, and every other field is unchanged.
+        let off = crate::recommend::summary(&indexes, &request, &answer, false);
+        assert!(!off.contains("Two"), "the slide's name is an identity field: {off}");
+        assert!(off.contains("1. movie "), "named by type alone instead: {off}");
+        assert!(off.contains("fit ") && off.contains("fresh "), "everything else is unchanged: {off}");
 
         // JustWatch's IMDb score rests on TMDB's vote count where the facets hold one. A transient client score on
         // too few votes does not replace it, while a well-counted one may rank this response without being emitted.

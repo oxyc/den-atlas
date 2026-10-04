@@ -1432,16 +1432,21 @@ fn new_catalogue<'a>(
 const SUMMARY_SLIDES: usize = 5;
 
 /// One slide of an answer: its name from the metadata cards, else its IMDb id, and why it scored what it did.
-pub fn describe(indexes: &Indexes, slide: &serde_json::Value) -> String {
+/// The name and every id are identity fields (`LOG_IDENTITY`; `AppState::log_identity`); off, a slide is
+/// named by its type alone, and everything about why it scored what it did is unchanged.
+pub fn describe(indexes: &Indexes, slide: &serde_json::Value, log_identity: bool) -> String {
     let key = slide["type"]
         .as_str()
         .and_then(media_type)
         .zip(slide["id"].as_u64().and_then(|id| id.try_into().ok()));
-    let name = key
-        .and_then(|key| indexes.cards.as_ref()?.get(&key))
-        .map(|card| card.title.clone())
-        .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| slide["id"].to_string());
+    let name = if log_identity {
+        key.and_then(|key| indexes.cards.as_ref()?.get(&key))
+            .map(|card| card.title.clone())
+            .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| slide["id"].to_string())
+    } else {
+        slide["type"].as_str().unwrap_or("title").to_owned()
+    };
     let term = |name: &str| slide["why"][name].as_f64().unwrap_or(0.0);
     let similar = slide["why"]["similar"].as_f64().map_or("-".to_owned(), |z| format!("{z:.1}"));
     let reason = slide["why"]["reason"].as_str().unwrap_or("-");
@@ -1569,14 +1574,20 @@ pub fn keep_fixture(dir: &std::path::Path, raw: &serde_json::Value, lists: &List
 
 /// An answer as one log line: what the request carried, and the slides it leads with, each with why — so a billboard
 /// that leads with something odd can be read off the log rather than reproduced. A slide is named from the metadata
-/// cards, else by its IMDb id. The library's titles are never named, only counted.
-pub fn summary(indexes: &Indexes, request: &Request, answer: &serde_json::Value) -> String {
+/// cards, else by its IMDb id, unless `log_identity` is off (`AppState::log_identity`) — then by its type alone. The
+/// library's titles are never named, only counted, identity or not.
+pub fn summary(
+    indexes: &Indexes,
+    request: &Request,
+    answer: &serde_json::Value,
+    log_identity: bool,
+) -> String {
     let slides = answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default();
     let top: Vec<String> = slides
         .iter()
         .take(SUMMARY_SLIDES)
         .enumerate()
-        .map(|(at, slide)| format!("{}. {}", at + 1, describe(indexes, slide)))
+        .map(|(at, slide)| format!("{}. {}", at + 1, describe(indexes, slide, log_identity)))
         .collect();
     let on = match &request.service {
         Some(pick) if pick.country.is_empty() => format!(" on service {}", pick.id),

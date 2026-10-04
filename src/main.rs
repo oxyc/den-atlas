@@ -74,6 +74,11 @@ pub struct AppState {
     /// else — the rule every den addon uses). Read once at startup, so with it off the request path pays
     /// a single bool check.
     pub log_requests: bool,
+    /// Whether `/recommend`'s decision log (`recommend::summary`) names the titles it ranked — env
+    /// `LOG_IDENTITY`: on by default, `0`/`false`/`off`/`no` (case-insensitive) turns it off. The
+    /// opposite default from `LOG_REQUESTS`, because this trims fields WITHIN a line that is written
+    /// either way, not the line itself.
+    pub log_identity: bool,
     /// The tuning playground (env `PLAYGROUND`, same on/off rule as `LOG_REQUESTS`; needs `INDEX_QUERIES`).
     /// Off — the default — 404s every `/playground…` path (`playground.rs`).
     pub playground: bool,
@@ -137,6 +142,7 @@ impl AppState {
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
             metrics_token: None,
             log_requests: false,
+            log_identity: true,
             playground: false,
             health: std::sync::Mutex::new("ok"),
         }
@@ -397,6 +403,7 @@ async fn main() {
         motn,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
+        log_identity: log_identity_on(std::env::var("LOG_IDENTITY").ok().as_deref()),
         playground: std::env::var("PLAYGROUND").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
@@ -462,12 +469,13 @@ async fn main() {
         None => "dataset=unavailable".to_owned(),
     };
     eprintln!(
-        "den-atlas {} listening on :{port} — metrics={} log_requests={} {dataset} country={} providers={} \
-         catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} motn={} \
-         playground={}",
+        "den-atlas {} listening on :{port} — metrics={} log_requests={} log_identity={} {dataset} country={} \
+         providers={} catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} \
+         motn={} playground={}",
         env!("CARGO_PKG_VERSION"),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
+        on(state.log_identity),
         state.default_country,
         providers.join(","),
         ttl.as_secs(),
@@ -515,9 +523,11 @@ async fn replay(dir: &str, path: &str) -> i32 {
     };
     // Without TMDB's export or its kept vote counts, which serving reads: `billboard-check` reads both.
     let answer = recommend::answer(&indexes, None, &request, &lists, now, None);
-    println!("{}", recommend::summary(&indexes, &request, &answer));
+    // An operator ran this by hand to inspect one fixture — not the standing server log `LOG_IDENTITY`
+    // gates — so it always names the titles.
+    println!("{}", recommend::summary(&indexes, &request, &answer, true));
     for (at, slide) in answer["slides"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
-        println!("{:>3}. {}", at + 1, recommend::describe(&indexes, slide));
+        println!("{:>3}. {}", at + 1, recommend::describe(&indexes, slide, true));
     }
     0
 }
@@ -526,6 +536,14 @@ async fn replay(dir: &str, path: &str) -> i32 {
 /// uses. `EMBED_URL=` read as set produced a proxy to "".
 fn env_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// `LOG_IDENTITY`: on by default — unset, empty, or anything but one of the usual off-tokens. The
+/// opposite default from `LOG_REQUESTS`/`PLAYGROUND`, because this gates fields WITHIN a line that
+/// is written either way, not the line itself: an operator who sets nothing keeps the titles a
+/// decision line names, and has to opt out rather than in.
+pub(crate) fn log_identity_on(v: Option<&str>) -> bool {
+    !matches!(v.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
 /// How serving ended. Separate from the message because the exit code differs: a drain that ran out
@@ -759,6 +777,19 @@ mod tests {
         let meta = std::fs::read_to_string(dir.join("dataset.meta.json")).unwrap();
         std::fs::write(dir.join("dataset.meta.json"), meta.replace(r#""fixture""#, r#""v9""#)).unwrap();
         assert_eq!(check_dataset(&dir), 1, "the store says fixture and the manifest says v9");
+    }
+
+    /// On by default — the opposite default from `LOG_REQUESTS`/`PLAYGROUND` — and off only for one
+    /// of the usual false-y tokens, case-insensitively.
+    #[test]
+    fn log_identity_is_on_by_default_and_off_only_for_a_falsey_token() {
+        assert!(log_identity_on(None));
+        assert!(log_identity_on(Some("")));
+        assert!(log_identity_on(Some("1")));
+        assert!(log_identity_on(Some("anything")));
+        for v in ["0", "false", "off", "no", "FALSE", " Off "] {
+            assert!(!log_identity_on(Some(v)), "{v:?} should turn identity logging off");
+        }
     }
 
     /// A client that opens a socket and sends HALF a request head held the whole process open —
