@@ -245,7 +245,8 @@ pub async fn run(dir: &std::path::Path, evaluate: bool) -> i32 {
         );
         shown.push(format!("{label}:"));
         for (at, slide) in slides.iter().take(LEAD).enumerate() {
-            shown.push(format!("  {:>2}. {}", at + 1, recommend::describe(&indexes, slide)));
+            // An operator's own slate check, not the standing server log `LOG_IDENTITY` gates.
+            shown.push(format!("  {:>2}. {}", at + 1, recommend::describe(&indexes, slide, true)));
         }
         leads.push((label, slides.iter().take(LEAD).filter_map(key).collect()));
         ranked.push(crate::billboardeval::Ranked {

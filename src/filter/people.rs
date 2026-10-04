@@ -526,7 +526,10 @@ impl<'a> Context<'a> {
             Ok(traits) if view.section("ent_gender_v").is_ok() => (traits, Status::Ready),
             Ok(traits) => (traits, Status::NotOffered),
             Err(e) => {
-                eprintln!("people: the person-trait sections do not read: {e}");
+                // Throttled: `sources()` runs on every people/people-counts/people-values request, so an
+                // instance whose store genuinely lacks these sections would otherwise write this line once
+                // per request rather than once for the condition.
+                crate::util::log_throttled!("people: the person-trait sections do not read: {e}");
                 (PersonTraits::default(), Status::Unavailable)
             }
         };
@@ -534,7 +537,7 @@ impl<'a> Context<'a> {
             Ok(births) if !births.is_empty() => (births, Status::Ready),
             Ok(births) => (births, Status::NotOffered),
             Err(e) => {
-                eprintln!("people: the birthplace sections do not read: {e}");
+                crate::util::log_throttled!("people: the birthplace sections do not read: {e}");
                 (Birthplaces::default(), Status::Unavailable)
             }
         };
@@ -550,7 +553,7 @@ impl<'a> Context<'a> {
                 list
             }
             Err(e) => {
-                eprintln!("people: a role list does not read: {e}");
+                crate::util::log_throttled!("people: a role list does not read: {e}");
                 List::default()
             }
         };

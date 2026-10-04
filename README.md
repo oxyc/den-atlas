@@ -420,7 +420,8 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `TITLE_SEARCH` | off | `1` builds the daily title-search index and declares the `den-titles` search catalog. Off by default: the Den TV app fuses every addon search catalog into its text search |
 | `METRICS_TOKEN` | unset | bearer token for `GET /metrics`; unset or empty ⇒ `404` |
 | `PLAYGROUND` | off | `1` turns on the `/playground` tuning routes (only alongside `INDEX_QUERIES`); computed per request, so enable it only where anyone reaching atlas may spend that. `/index/similar` never reads an override |
-| `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped |
+| `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped; a degraded answer adds ` degraded=<reason>` (the same reason `/health`/`/ready` report), so the one request it affected carries why |
+| `LOG_IDENTITY` | on | Gates the title names/ids in `/recommend`'s decision log (one throttled line per answer naming the pool/library counts, slide count, and why the top slides scored what they did). `0`/`false`/`off`/`no` (case-insensitive) drops the names and ids; everything else in the line is unaffected |
 
 ## Run
 ```sh
