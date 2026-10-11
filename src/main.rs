@@ -40,8 +40,23 @@ mod tos;
 mod util;
 mod versions;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// The release the running image carries (`DEN_VERSION`, set from the repo's `VERSION` file at image build).
+/// Keeping it out of Cargo.toml means a release commit does not invalidate the Rust build layer merely to
+/// change its tag. A developer build or test has no image metadata and falls back to the package version.
+pub(crate) fn release_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
 
 pub struct AppState {
     /// `None` when the dataset couldn't be loaded (old/missing meta) — the addon still serves manifest +
@@ -472,7 +487,7 @@ async fn main() {
         "den-atlas {} listening on :{port} — metrics={} log_requests={} log_identity={} {dataset} country={} \
          providers={} catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} \
          motn={} playground={}",
-        env!("CARGO_PKG_VERSION"),
+        release_version(),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
         on(state.log_identity),

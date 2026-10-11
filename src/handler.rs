@@ -5022,7 +5022,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain; version=0.0.4; charset=utf-8");
         let body = body_of(resp).await;
-        let build = format!("atlas_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION"));
+        let build = format!("atlas_build_info{{version=\"{}\"}} 1\n", crate::release_version());
         assert!(body.contains(&build), "{body}");
         assert!(
             body.contains(

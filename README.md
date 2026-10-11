@@ -429,7 +429,7 @@ scripts/fetch-dataset.sh   # prep ./data from the den-dataset `data-latest` rele
 cargo run                  # http://localhost:8080  (add /manifest.json in Den → Plugins)
 cargo test                 # the caching layer (ETag / Range / gzip / 304), routes, catalog, shutdown
 cargo fmt --all --check    # CI gates on this — see below if the command is missing
-scripts/release.sh 0.37.0  # checks, bumps, tags, and WAITS for the image
+scripts/release.sh 0.94.0  # bumps VERSION, waits for its main CI, tags, and WAITS for the promotion
 ```
 **If `cargo fmt` reports "no such command"**, the toolchain has no rustfmt component and there is no rustup
 to add one. Run the formatter through nix instead — it reads this repo's `rustfmt.toml` and matches CI
@@ -459,8 +459,8 @@ The dataset is produced by [den-dataset](https://github.com/oxyc/den-dataset) (`
 → `publish-dataset.sh`) and published as a GitHub Release — the single source of truth this server and the
 Den app both fetch. den-atlas no longer reads the Den repo.
 
-The published image (built by `.github/workflows/docker-publish.yml` on a `v*` tag, after `ci.yml` passes
-and only if the tag equals the `Cargo.toml` version) is the **server only**, so mount the data:
+The published image (the main-CI candidate that `.github/workflows/docker-publish.yml` promotes on a `v*` tag,
+only if the tag equals `VERSION`) is the **server only**, so mount the data:
 ```sh
 docker run -d --name den-atlas -p 8080:8080 --read-only \
   -v "$PWD/data:/app/data:ro" ghcr.io/oxyc/den-atlas:latest
@@ -480,14 +480,21 @@ rollback.
   in a throwaway container before its digest is pinned, and a failed proof rolls back.
 - `EMBED_URL=http://den-embed:8080` over the shared Podman network enables `POST /embed`.
 
-**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run rebuilds
-the newest `v*` tag (never `main`) with the base images re-pulled and no build cache, and publishes it as
-`:X.Y.Z-patch.<date>.<run>` and `:latest`, so a toolchain or musl fix reaches the box between releases
-through `den-update`'s probe and rollback like any release. Trivy scans each image before `:latest` moves:
-a CRITICAL with a fix available fails the run (on the weekly rebuild only in OS packages, the part a
-rebuild can fix), and fixable HIGH and CRITICAL findings go to code scanning. A finding that does not
-apply goes in `.trivyignore` with a reason. Every image carries SLSA provenance and an SBOM and is signed
-keylessly with cosign; verify a digest with:
+**Release images.** Main CI builds `ghcr.io/oxyc/den-atlas:candidate-<sha>` for every main commit while its
+tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. Run
+`scripts/release.sh X.Y.Z`: it changes only `VERSION` (never `Cargo.toml`, so the cached Rust build is
+reused; the image carries the version as `DEN_VERSION`), pushes that commit, waits for its exact main CI and
+only then creates `vX.Y.Z`. The tag's `docker-publish` run verifies that exact digest, signs it, adds the
+`:X.Y.Z`, `:X.Y`, `:X` and `:sha-` tags and moves `:latest`; it does not rebuild or retest.
+
+`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) with the
+base images re-pulled and no build cache, and publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`, so a
+toolchain or musl fix reaches the box between releases through `den-update`'s probe and rollback like any
+release. It fails if the newest tag predates the candidate pipeline (no `VERSION` file); cut one release
+first. Trivy scans each image before `:latest` moves: a CRITICAL with a fix available fails the run (on the
+weekly rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL findings go
+to code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries
+SLSA provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
 ```sh
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/oxyc/den-atlas/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \

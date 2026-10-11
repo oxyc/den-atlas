@@ -13,9 +13,24 @@ COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
 # rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
 RUN cargo build --release --locked
 
+# The release version reaches only the final image configuration (and this marker), never the Rust build above,
+# so a release commit that changes only VERSION reuses the cached compile. A missing or malformed value fails
+# here, before an image can be pushed.
+FROM rust:1-alpine AS release-metadata
+ARG DEN_VERSION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
+    printf '%s' "$DEN_VERSION" > /den-version
+
 FROM scratch AS runtime
+ARG DEN_VERSION
+ARG GIT_REVISION
 ENV DATA_DIR=/app/data \
-    PORT=8080
+    PORT=8080 \
+    DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
+COPY --from=release-metadata /den-version /den-version
 COPY --from=build /app/target/release/den-atlas /den-atlas
 # The dataset blobs (gitignored; fetched via scripts/fetch-dataset.sh). Empty in CI → mount at runtime.
 COPY data /app/data
