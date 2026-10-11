@@ -690,7 +690,7 @@ pub fn export(
         })
         .collect();
     let mut snapshot = json!({
-        "atlas": env!("CARGO_PKG_VERSION"),
+        "atlas": crate::release_version(),
         "datasetVersion": provenance.dataset_version,
         "storeSha256": provenance.store_sha256,
         "at": crate::util::rfc3339(provenance.now),

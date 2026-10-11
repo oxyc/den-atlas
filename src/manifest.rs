@@ -7,9 +7,6 @@ use crate::config::{Config, Region};
 use crate::titles;
 use serde::Serialize;
 
-// Single source of truth: the Cargo package version (bumped per release, asserted == the v* tag in
-// CI). So the manifest can never drift from Cargo.toml, and the tag can't drift from either.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DESCRIPTION: &str = "A map of the catalog: derived labels (genre / subgenre / mood) + semantic vectors the Den app downloads and refreshes, plus \"most popular\" streaming catalogs. Derived data only; catalog data from JustWatch.";
 
 #[derive(Serialize)]
@@ -141,7 +138,7 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
     }
     let m = Manifest {
         id: "com.den.atlas",
-        version: VERSION,
+        version: crate::release_version(),
         name: "Den Atlas",
         description: DESCRIPTION,
         // dataset = the Den app's feature store; catalog = public "most popular" rows (JustWatch).

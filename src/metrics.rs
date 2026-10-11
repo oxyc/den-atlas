@@ -45,7 +45,7 @@ pub fn render(state: &AppState) -> String {
         &mut b,
         "atlas_build_info",
         "Version of the running binary.",
-        &format!("{{version=\"{}\"}}", env!("CARGO_PKG_VERSION")),
+        &format!("{{version=\"{}\"}}", crate::release_version()),
         1,
     );
     // What /health says, as a number a monitor can alert on. `serious` separates "a feature class is off"

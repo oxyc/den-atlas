@@ -166,7 +166,7 @@ impl JustWatchClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
-            .user_agent(concat!("den-atlas/", env!("CARGO_PKG_VERSION"), " (+https://github.com/oxyc/den)"))
+            .user_agent(format!("den-atlas/{} (+https://github.com/oxyc/den)", crate::release_version()))
             .build()
             .map_err(|e| eprintln!("reqwest client build failed ({e}); catalog disabled"))
             .ok();
