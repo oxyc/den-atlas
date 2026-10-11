@@ -627,7 +627,8 @@ fn routes() -> Value {
             "path": "/index/title/{type}/{tmdbId}.json",
             "example": "/index/title/movie/1.json",
             "about": "One title as the corpus describes it. A title with no card is {type, id, indexed: false}: \
-                      Den has nothing on it, which does not mean it does not exist.",
+                      Den has nothing on it, which does not mean it does not exist. Where Wikidata names it, it \
+                      also carries title, year, originalTitle (each when known) and source: \"wikidata\".",
             "parameters": [
                 with(param("type", "enum", "movie or series"), json!({ "in": "path" })),
                 with(param("tmdbId", "integer", "TMDB id"), json!({ "in": "path" })),
