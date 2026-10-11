@@ -973,7 +973,8 @@ impl IndexQuestion {
             Self::Similar { media_type, tmdb_id } => similar_json(indexes, *media_type, *tmdb_id, query),
             Self::Suggest { media_type, tmdb_id } => suggest_json(indexes, *media_type, *tmdb_id, query),
             // A title the corpus has no card for is answered, not refused: `indexed: false` says Den has nothing
-            // on it, which is not the same as it not existing.
+            // on it, which is not the same as it not existing. Wikidata's name for it rides along where the store
+            // carries one (`unindexed_title_json`).
             Self::Title { media_type, tmdb_id } => {
                 match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
                     Some(mut title) => {
@@ -985,9 +986,7 @@ impl IndexQuestion {
                         }
                         title
                     }
-                    None => serde_json::json!({
-                        "type": stremio_type(*media_type), "id": tmdb_id, "indexed": false,
-                    }),
+                    None => unindexed_title_json(indexes, *media_type, *tmdb_id),
                 }
             }
             Self::Franchise { media_type, tmdb_id } => {
@@ -1140,6 +1139,34 @@ fn stremio_type(media_type: den_index::MediaType) -> &'static str {
         den_index::MediaType::Movie => "movie",
         den_index::MediaType::Tv => "series",
     }
+}
+
+/// `/index/title` for a title the store has no card for: `{type, id, indexed: false}`, plus Wikidata's
+/// `title`, `year` and `originalTitle` and `source: "wikidata"` where the store's optional `wd_name_*`
+/// sections name it. Those names are CC0 and never TMDB's, so they may reach an assistant; they are only
+/// ever read here, by key, and never searched, browsed, ranked or counted.
+fn unindexed_title_json(
+    indexes: &crate::queries::Indexes,
+    media_type: den_index::MediaType,
+    tmdb_id: u32,
+) -> serde_json::Value {
+    let mut answer = serde_json::json!({ "type": stremio_type(media_type), "id": tmdb_id, "indexed": false });
+    let view = indexes.store.view();
+    // `MappedStore::check` read the sections at load, so an error here is only their absence.
+    let (Ok(names), Ok(strings)) = (view.wikidata_names(), view.strings()) else { return answer };
+    let Some(name) = names.get(u8::from(media_type == den_index::MediaType::Tv), tmdb_id) else {
+        return answer;
+    };
+    let Some(title) = strings.get(name.title) else { return answer };
+    answer["title"] = title.into();
+    if let Some(year) = name.year {
+        answer["year"] = year.into();
+    }
+    if let Some(original) = name.original.and_then(|id| strings.get(id)) {
+        answer["originalTitle"] = original.into();
+    }
+    answer["source"] = "wikidata".into();
+    answer
 }
 
 /// Titles of mixed types, as `[{"type","id"}]`.
@@ -2664,6 +2691,34 @@ mod tests {
         let ds = crate::dataset::Dataset::load(&dir).expect("franchise fixture dataset");
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         Some(Arc::new(AppState { index: Some(index), playground, ..AppState::for_test(Some(ds)) }))
+    }
+
+    /// A title the store has no card for is still `indexed: false`, and carries Wikidata's name, year and
+    /// original title where the store's `wd_name_*` sections name it. The names are for this route only:
+    /// search does not find them.
+    #[tokio::test]
+    async fn an_unindexed_title_is_named_from_wikidata() {
+        let Some(state) = franchise_state("den-atlas-wikidata-names", false) else { return };
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let named = json(body_of(get(&state, "/index/title/movie/3.json").await).await);
+        assert_eq!(
+            named,
+            serde_json::json!({ "type": "movie", "id": 3, "indexed": false, "title": "Delta", "year": 2001,
+                                "originalTitle": "Délta", "source": "wikidata" })
+        );
+        let bare = json(body_of(get(&state, "/index/title/series/11.json").await).await);
+        assert_eq!(
+            bare,
+            serde_json::json!({ "type": "series", "id": 11, "indexed": false, "title": "Epsilon",
+                                "source": "wikidata" })
+        );
+        let other_type = json(body_of(get(&state, "/index/title/series/3.json").await).await);
+        assert_eq!(other_type, serde_json::json!({ "type": "series", "id": 3, "indexed": false }));
+        let carded = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
+        assert_eq!(carded["indexed"], true);
+        assert!(carded.get("source").is_none(), "a store row is its own card: {carded}");
+        let search = body_of(get(&state, "/index/query.json?q=delta").await).await;
+        assert!(!search.contains("\"Delta\""), "search never finds a Wikidata name: {search}");
     }
 
     /// Off by default: every playground path is a 404, whatever it carries, exactly like an unknown route.

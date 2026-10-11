@@ -128,6 +128,9 @@ impl MappedStore {
         // You Might Also Like reads the fan picks per request and falls back to the affinity row on an
         // error, so a malformed section must fail here instead of silently serving the old row.
         view.fan_picks()?;
+        // `/index/title` names a title the store has no row for from these, per request, and answers it as
+        // unknown on an error, so a malformed section must fail here instead of silently naming nothing.
+        view.wikidata_names()?;
         Ok(())
     }
 }
