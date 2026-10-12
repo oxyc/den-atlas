@@ -2906,7 +2906,7 @@ mod tests {
 
     fn maturity_bounds_state(name: &str) -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-        let ds = crate::queries::write_fixture_maturity_bounds(&dir);
+        let ds = crate::queries::write_fixture_maturity_fan_bounds(&dir);
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
     }
@@ -3027,6 +3027,16 @@ mod tests {
         };
         let policy = "maximumAge=13&unknownRatings=block&region=FI";
 
+        // Loading validates the complete age view exactly once. Building an unrestricted filter context must
+        // not walk it; the first ordinary route below would otherwise add one lookup per corpus row.
+        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0));
+        let legacy_filter = json(
+            body_of(get(&state, "/index/filter/movie/titles.json?sel=subgenre:Heist&limit=10").await).await,
+        );
+        assert_eq!(legacy_filter["titles"].as_array().unwrap().len(), 10);
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0), "no-policy filtering must not scan maturity");
+
         let legacy_neighbours = json(body_of(get(&state, "/index/neighbours/movie/1.json?k=10").await).await);
         assert_eq!(legacy_neighbours["ids"].as_array().unwrap().len(), 10);
         assert!(legacy_neighbours["ids"].as_array().unwrap().iter().all(|id| {
@@ -3041,12 +3051,46 @@ mod tests {
         assert_eq!(neighbour_ids.len(), 10, "eligible tail must refill the requested page");
         assert!(neighbour_ids.iter().all(|id| (710..=729).contains(id)), "leaked neighbour: {neighbours}");
 
+        let legacy_suggest = json(body_of(get(&state, "/index/suggest/movie/1.json?limit=10").await).await);
+        let mixed_ids = |answer: &serde_json::Value| -> Vec<u32> {
+            answer["mixed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|title| title["id"].as_u64().map(|id| id as u32))
+                .collect()
+        };
+        assert_eq!(
+            mixed_ids(&legacy_suggest),
+            (318..=327).collect::<Vec<_>>(),
+            "no-policy direct suggest keeps its mixed curated row"
+        );
+        let restricted_suggest_response =
+            get(&state, &format!("/index/suggest/movie/1.json?skip=10&limit=10&{policy}")).await;
+        let suggest_fi_etag = restricted_suggest_response.headers()[header::ETAG].clone();
+        let restricted_suggest = json(body_of(restricted_suggest_response).await);
+        assert_eq!(
+            mixed_ids(&restricted_suggest),
+            (730..=739).rev().collect::<Vec<_>>(),
+            "the second page must refill in the curated row's reverse order"
+        );
+        let suggest_se_response = get(
+            &state,
+            "/index/suggest/movie/1.json?skip=10&limit=10&maximumAge=13&unknownRatings=block&region=SE",
+        )
+        .await;
+        assert_ne!(suggest_se_response.headers()[header::ETAG], suggest_fi_etag);
+        assert_eq!(mixed_ids(&json(body_of(suggest_se_response).await)), mixed_ids(&restricted_suggest));
+
         for kind in ["like", "fans"] {
             let legacy_path = format!("/index/filter/movie/titles.json?sel={kind}:1&limit=10");
             let legacy = json(body_of(get(&state, &legacy_path).await).await);
             let legacy_ids = title_ids(&legacy);
             assert_eq!(legacy_ids.len(), 10, "no-policy {kind} keeps its full historical page");
             assert!(legacy_ids.iter().all(|id| (300..=709).contains(id)), "legacy {kind}: {legacy}");
+            if kind == "fans" {
+                assert_eq!(legacy_ids, (320..=329).collect::<Vec<_>>(), "no-policy typed curated row");
+            }
 
             let fi_path = format!("{legacy_path}&skip=10&{policy}");
             let fi_response = get(&state, &fi_path).await;
@@ -3059,6 +3103,13 @@ mod tests {
                 fi_ids.iter().all(|id| !(300..=709).contains(id) && *id != 1),
                 "blocked or unknown {kind} member leaked: {fi}"
             );
+            if kind == "fans" {
+                assert_eq!(
+                    fi_ids,
+                    mixed_ids(&restricted_suggest),
+                    "filter fans must use the direct curated row"
+                );
+            }
 
             let se_path = format!("{legacy_path}&skip=10&maximumAge=13&unknownRatings=block&region=SE");
             let se_response = get(&state, &se_path).await;
@@ -3071,7 +3122,6 @@ mod tests {
             );
         }
 
-        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
         for query in [
             "",
             "maximumAge=13&unknownRatings=block&region=FI",
@@ -3084,6 +3134,21 @@ mod tests {
                 "like and fans memos must both be policy/region scoped for {query:?}"
             );
         }
+        for mix in [false, true] {
+            for query in [
+                "",
+                "maximumAge=13&unknownRatings=block&region=FI",
+                "maximumAge=13&unknownRatings=block&region=SE",
+            ] {
+                let policy = crate::maturity::Policy::from_query(query).unwrap();
+                assert_eq!(indexes.has_policy_memos((Movie, 1), mix, policy), (true, true));
+            }
+        }
+        assert_eq!(
+            indexes.minimum_age_accesses().0,
+            1,
+            "candidate lookup must never revalidate the age column"
+        );
     }
 
     /// Exercise the mapped store, label index, policy lookup, pagination, JSON boundary and HTTP handler —

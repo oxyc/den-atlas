@@ -20,6 +20,8 @@ use den_store::{Store, StoreError, StoreTable};
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A mapped store, and the table proving it was verified.
@@ -38,6 +40,13 @@ pub struct MappedStore {
     path: PathBuf,
     map: Mmap,
     table: StoreTable,
+    /// The validated public maturity column, indexed by store row. `minimum_ages()` validates every byte,
+    /// so retaining this owned view makes candidate eligibility O(1) instead of rescanning the column.
+    minimum_ages: Box<[Option<u8>]>,
+    #[cfg(test)]
+    minimum_age_view_builds: AtomicUsize,
+    #[cfg(test)]
+    minimum_age_lookups: AtomicUsize,
 }
 
 impl std::fmt::Debug for MappedStore {
@@ -74,7 +83,21 @@ impl MappedStore {
         if map.len() != verified {
             return Err(format!("{}: changed size while it was being opened", path.display()));
         }
-        Ok(Self { path: path.to_owned(), map, table })
+        let minimum_ages = {
+            let view = table.view(&map);
+            let ages = view.minimum_ages().map_err(|e| format!("{}: {e}", path.display()))?;
+            (0..table.rows()).map(|row| ages.get(den_store::Row(row))).collect()
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            map,
+            table,
+            minimum_ages,
+            #[cfg(test)]
+            minimum_age_view_builds: AtomicUsize::new(1),
+            #[cfg(test)]
+            minimum_age_lookups: AtomicUsize::new(0),
+        })
     }
 
     /// The file this was opened from, for messages.
@@ -102,10 +125,22 @@ impl MappedStore {
 
     /// The public-authority minimum age for one TMDB title, or unknown when the title or rating is absent.
     pub fn minimum_age(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<u8> {
+        #[cfg(test)]
+        self.minimum_age_lookups.fetch_add(1, Ordering::Relaxed);
         let media = u8::from(media_type == den_index::MediaType::Tv);
         let view = self.view();
         let row = view.row_of(media, tmdb_id).ok().flatten()?;
-        view.minimum_ages().expect("MappedStore::check validates minimum_age at load").get(row)
+        self.minimum_ages.get(row.0).copied().flatten()
+    }
+
+    #[cfg(test)]
+    pub fn minimum_age_view_builds(&self) -> usize {
+        self.minimum_age_view_builds.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn minimum_age_lookups(&self) -> usize {
+        self.minimum_age_lookups.load(Ordering::Relaxed)
     }
 
     /// Read every section the serving path needs, once, so a store that is missing one fails at LOAD
@@ -139,9 +174,8 @@ impl MappedStore {
         // `/index/title` names a title the store has no row for from these, per request, and answers it as
         // unknown on an error, so a malformed section must fail here instead of silently naming nothing.
         view.wikidata_names()?;
-        // Kid filtering is a serving invariant, not an optional enhancement. A v4 store without the
-        // required column, or with an out-of-range encoded age, must fail before it can answer traffic.
-        view.minimum_ages()?;
+        // Kid filtering is a serving invariant, not an optional enhancement. `open` already validated and
+        // retained the entire column, before this broader serving check builds.
         Ok(())
     }
 }
@@ -1033,6 +1067,48 @@ pub(crate) mod fixture {
 mod tests {
     use super::*;
     use crate::store::spec_fixture as fixture;
+
+    /// The shipped corpus is about 48k rows. One eligibility lookup per candidate must remain logarithmic in
+    /// keys plus O(1) in ages: rebuilding den-store's validated age view here would scan 1.6 billion bytes.
+    #[test]
+    fn minimum_age_view_is_built_once_at_corpus_scale() {
+        use den_index::MediaType::Movie;
+
+        const ROWS: u32 = 40_001;
+        let dir = std::env::temp_dir().join(format!("den-atlas-age-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let titles: Vec<crate::store::fixture::Title<'_>> = (1..=ROWS)
+            .map(|tmdb_id| crate::store::fixture::Title {
+                media: 0,
+                tmdb_id,
+                primary_genre: "Drama",
+                minimum_age: Some((tmdb_id % 19) as u8),
+                ..crate::store::fixture::Title::default()
+            })
+            .collect();
+        let path = dir.join("corpus.store");
+        crate::store::fixture::write(&path, "age-scale", 3, &titles, &[]);
+        let store = MappedStore::open(&path).expect("the corpus-scale store maps");
+        assert_eq!(store.minimum_age_view_builds(), 1);
+
+        let started = std::time::Instant::now();
+        for tmdb_id in 1..=ROWS {
+            assert_eq!(store.minimum_age(Movie, tmdb_id), Some((tmdb_id % 19) as u8));
+        }
+        assert_eq!(
+            store.minimum_age_view_builds(),
+            1,
+            "candidate access must not rebuild the validated view"
+        );
+        assert_eq!(store.minimum_age_lookups(), ROWS as usize);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{ROWS} indexed maturity lookups took {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     /// The real store, when a dataset happens to be on this machine. Opt-in via `DEN_STORE`, because the
     /// fixture proves the format and only a real store proves the scale: 131 MB, 89 sections, 47,618 rows,

@@ -149,6 +149,11 @@ impl Indexes {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn minimum_age_accesses(&self) -> (usize, usize) {
+        (self.store.store.minimum_age_view_builds(), self.store.store.minimum_age_lookups())
+    }
+
     /// The public-authority minimum age for a title, or unknown when the store has no defensible match.
     pub fn minimum_age(&self, key: Key) -> Option<u8> {
         self.store.store.minimum_age(key.0, key.1)
@@ -176,10 +181,10 @@ impl Indexes {
         maturity: crate::maturity::Policy,
     ) -> Arc<[Key]> {
         memoised(&self.affinity, ((media_type, tmdb_id), mix, maturity), SIMILAR_MEMO, || {
+            if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix, maturity) {
+                return row.into();
+            }
             if !maturity.restricted() {
-                if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix) {
-                    return row.into();
-                }
                 let params = den_index::SimilarParams::default();
                 let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
                     den_index::you_might_also_like(
@@ -223,7 +228,13 @@ impl Indexes {
     /// fan-pick sections), and the affinity row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`),
     /// which have rows of their own, the first screenful of its More Like This, and in a row that does not mix
     /// types the other type. With fewer than `FAN_PICKS_MIN` left the row is empty.
-    fn fan_pick_row(&self, tmdb_id: u32, media_type: den_index::MediaType, mix: bool) -> Option<Vec<Key>> {
+    fn fan_pick_row(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        mix: bool,
+        maturity: crate::maturity::Policy,
+    ) -> Option<Vec<Key>> {
         if !FAN_PICKS {
             return None;
         }
@@ -236,15 +247,11 @@ impl Indexes {
         }
         let keys = view.per_row::<u64>("keys").ok()?;
         let kept_out = crate::versions::kept_out(self, (media_type, tmdb_id));
+        let (one, mixed) = self.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
         let shown: std::collections::HashSet<Key> = if mix {
-            self.more_like_this_mixed(tmdb_id, media_type)
-                .iter()
-                .take(FAN_PICKS_SKIP_SIMILAR)
-                .copied()
-                .collect()
+            mixed.iter().take(FAN_PICKS_SKIP_SIMILAR).copied().collect()
         } else {
-            let ids = self.more_like_this(tmdb_id, media_type);
-            ids.iter().take(FAN_PICKS_SKIP_SIMILAR).map(|&id| (media_type, id)).collect()
+            one.iter().take(FAN_PICKS_SKIP_SIMILAR).map(|&id| (media_type, id)).collect()
         };
         let key_of = |row: usize| {
             keys.get(row).map(|&packed| {
@@ -275,6 +282,7 @@ impl Indexes {
             .chain(tail.into_iter().map(|(_, _, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
             .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
+            .filter(|&key| maturity.allows(self.minimum_age(key)))
             .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
@@ -1345,11 +1353,12 @@ pub fn write_fixture_maturity(dir: &std::path::Path) -> Dataset {
     write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)], false)
 }
 
-/// A maturity fixture whose better-ranked ineligible candidates exceed both the 50-neighbour cap and the
-/// similarity pool. Eligible titles behind them must only be visible when policy enters candidate discovery.
+/// The bounded maturity fixture with a curated row whose ineligible prefix exceeds `MAX_ROW`; its eligible
+/// tail is reverse ordered so a test can distinguish preserved curation from structural similarity.
 #[cfg(test)]
-pub fn write_fixture_maturity_bounds(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)], true)
+pub fn write_fixture_maturity_fan_bounds(dir: &std::path::Path) -> Dataset {
+    let picks = (300..=709).chain((710..=749).rev()).map(|id| (0, id)).collect();
+    write_fixture_as(dir, "One", true, true, &[((0, 1), picks)], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)], true)
 }
 
 /// A fixture title as the store writer keys it: (media, tmdb id), media 0 a film and 1 a series.
@@ -1511,7 +1520,7 @@ fn write_fixture_as(
             minimum_age: (tmdb_id % 2 == 0).then_some(18),
             ..Title::default()
         }));
-        titles.extend((710..=729).map(|tmdb_id| Title {
+        titles.extend((710..=749).map(|tmdb_id| Title {
             media: 0,
             tmdb_id,
             primary_genre: "Drama",
