@@ -971,7 +971,7 @@ impl IndexQuestion {
                 };
                 let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
                 let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
-                let eligible = |id, kind| maturity.allows_with(|| indexes.minimum_age((kind, id)));
+                let eligible = |id, kind| indexes.eligible(maturity, (kind, id));
                 let titles = if *mood {
                     plot.titles_with_mood_where(
                         label,
@@ -1014,7 +1014,7 @@ impl IndexQuestion {
                     Some(mut title) => {
                         title["indexed"] = serde_json::json!(true);
                         if let Some(versions) =
-                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id))
+                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id), maturity)
                         {
                             title["otherVersions"] = versions;
                         }
@@ -1025,6 +1025,8 @@ impl IndexQuestion {
                 // This is the store's already-published public-authority value only. `null` is explicit and
                 // remains distinct from all-ages 0; no private/runtime certification can enter this route.
                 title["minimumAge"] = serde_json::json!(indexes.minimum_age((*media_type, *tmdb_id)));
+                title["maturityRatings"] =
+                    serde_json::json!(indexes.maturity_ratings((*media_type, *tmdb_id)));
                 title
             }
             Self::Franchise { media_type, tmdb_id } => {
@@ -1041,7 +1043,7 @@ impl IndexQuestion {
                     .min(MAX_NEIGHBOUR_K);
                 let ids: Vec<u32> = plot
                     .nearest_where(*tmdb_id, *media_type, MAX_NEIGHBOUR_K, |id, kind| {
-                        maturity.allows_with(|| indexes.minimum_age((kind, id)))
+                        indexes.eligible(maturity, (kind, id))
                     })
                     .iter()
                     .take(k)
@@ -1082,7 +1084,9 @@ fn row_constraints(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings" | "region"))
+        .filter(|(key, _)| {
+            !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings" | "region" | "kidAudience")
+        })
         // The taste is not an axis. Every tilt parameter carries one prefix so a household's
         // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
         .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
@@ -1345,10 +1349,7 @@ async fn search_answer(
     let vector = embed_query(state, &text).await?;
     let (neighbours, stats) = indexes.plot.scan_semantic_vector(
         &vector,
-        |id, kind| {
-            media_type.is_none_or(|want| want == kind)
-                && maturity.allows_with(|| indexes.minimum_age((kind, id)))
-        },
+        |id, kind| media_type.is_none_or(|want| want == kind) && indexes.eligible(maturity, (kind, id)),
         SEMANTIC_K,
     );
     let titles: Vec<serde_json::Value> = neighbours
@@ -1452,7 +1453,7 @@ async fn query_answer(
 }
 
 /// Every parameter `/index/query.json` reads.
-const QUERY_PARAMS: [&str; 12] = [
+const QUERY_PARAMS: [&str; 13] = [
     "q",
     "type",
     "skip",
@@ -1465,6 +1466,7 @@ const QUERY_PARAMS: [&str; 12] = [
     "maximumAge",
     "unknownRatings",
     "region",
+    "kidAudience",
 ];
 
 /// What a query's parameters asked for and the answer does not reflect, as the filter routes report it:
@@ -1879,6 +1881,9 @@ async fn handle_recommend_get(
             if let Some(region) = maturity.region {
                 body["region"] = serde_json::json!(region.as_str());
             }
+            if let Some(kid_audience) = maturity.kid_audience {
+                body["kidAudience"] = serde_json::json!(kid_audience.as_str());
+            }
             if fresh {
                 body["fresh"] = serde_json::json!(true);
             }
@@ -2178,6 +2183,7 @@ async fn handle_index(
                     !part.starts_with("maximumAge=")
                         && !part.starts_with("unknownRatings=")
                         && !part.starts_with("region=")
+                        && !part.starts_with("kidAudience=")
                 })
                 .collect::<Vec<_>>()
                 .join("&");
@@ -2340,27 +2346,28 @@ fn filter_catalog_maturity(
     state: &AppState,
     maturity: crate::maturity::Policy,
 ) -> String {
-    let Some(dataset) = state.dataset.as_ref() else {
-        if maturity.unknown_ratings == crate::maturity::UnknownRatings::Allow {
-            return body.to_owned();
-        }
-        return r#"{"metas":[]}"#.to_owned();
-    };
     if !maturity.restricted() {
         return body.to_owned();
     }
+    let Some(dataset) = state.dataset.as_ref() else {
+        // A missing store has neither a defensible age nor affirmative audience-intent evidence.
+        // Restricted discovery therefore fails closed, including an audience-only Kid request.
+        return r#"{"metas":[]}"#.to_owned();
+    };
     let media_type = if type_ == "series" { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
-    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else { return body.to_owned() };
-    if let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) {
-        metas.retain(|meta| {
-            let age = meta
-                .get("moviedb_id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-                .and_then(|id| dataset.mapped.minimum_age(media_type, id));
-            maturity.allows(age)
-        });
-    }
+    let empty = || r#"{"metas":[]}"#.to_owned();
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else { return empty() };
+    let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) else {
+        return empty();
+    };
+    metas.retain(|meta| {
+        let id =
+            meta.get("moviedb_id").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok());
+        maturity.allows_title_with(
+            || id.and_then(|id| dataset.mapped.minimum_age(media_type, id)),
+            |band| id.is_some_and(|id| dataset.mapped.kid_audience_relevant(media_type, id, band)),
+        )
+    });
     parsed.to_string()
 }
 
@@ -2397,7 +2404,10 @@ async fn handle_title_search(
         den_index::MediaType::Movie
     };
     let body = titles::metas_json_with(&index, &query, media_type, |id| {
-        maturity.allows_with(|| store.and_then(|store| store.minimum_age(kind, id)))
+        maturity.allows_title_with(
+            || store.and_then(|store| store.minimum_age(kind, id)),
+            |band| store.is_some_and(|store| store.kid_audience_relevant(kind, id, band)),
+        )
     });
     let searched = started.elapsed();
     let resp = serve_json_for_policy(method, headers, body, DATASET_ANSWER, None, maturity).await;
@@ -2955,10 +2965,82 @@ mod tests {
         let known = get(&state, "/index/title/movie/2.json").await;
         let known: serde_json::Value = serde_json::from_str(&body_of(known).await).unwrap();
         assert_eq!(known["minimumAge"], 7);
+        assert_eq!(
+            known["maturityRatings"],
+            serde_json::json!([{
+                "authority": "KAVI", "authorityId": "kavi", "rating": "K-7",
+                "normalizedAge": 7, "assessed": "2026-09-01", "runtimeMinutes": 130,
+                "format": "theatrical"
+            }])
+        );
         let unknown = get(&state, "/index/title/series/4.json").await;
         let unknown: serde_json::Value = serde_json::from_str(&body_of(unknown).await).unwrap();
         assert!(unknown.get("minimumAge").is_some());
         assert!(unknown["minimumAge"].is_null());
+        assert_eq!(unknown["maturityRatings"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn kid_discovery_requires_audience_intent_but_direct_details_do_not() {
+        let state = maturity_index_state("den-atlas-kid-audience");
+        let child =
+            get(&state, "/index/rows/movie/subgenre/Heist.json?maximumAge=13&kidAudience=child&limit=10")
+                .await;
+        let child: serde_json::Value = serde_json::from_str(&body_of(child).await).unwrap();
+        assert_eq!(child["ids"], serde_json::json!([3]));
+
+        let older = get(
+            &state,
+            "/index/rows/movie/subgenre/Heist.json?maximumAge=13&kidAudience=child-or-teen&limit=10",
+        )
+        .await;
+        let older: serde_json::Value = serde_json::from_str(&body_of(older).await).unwrap();
+        assert_eq!(older["ids"], serde_json::json!([2, 3]));
+
+        let detail = get(&state, "/index/title/movie/2.json?maximumAge=13&kidAudience=child").await;
+        let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
+        assert_eq!(detail["id"], 2);
+        assert_eq!(detail["minimumAge"], 7);
+
+        let detail = get(&state, "/index/title/movie/1.json?maximumAge=13&kidAudience=child").await;
+        let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
+        assert_eq!(detail["id"], 1, "the directly requested title remains available");
+        assert_eq!(
+            detail["otherVersions"],
+            serde_json::json!([{ "type": "movie", "id": 3, "kind": "remake" }]),
+            "embedded discovery links apply the Kid policy"
+        );
+    }
+
+    #[test]
+    fn cached_catalogs_apply_the_same_age_and_audience_gates() {
+        let state = maturity_index_state("den-atlas-kid-catalog");
+        let body = serde_json::json!({
+            "metas": [
+                { "moviedb_id": 1 },
+                { "moviedb_id": 2 },
+                { "moviedb_id": 3 },
+                { "moviedb_id": 4 }
+            ]
+        })
+        .to_string();
+        let policy = crate::maturity::Policy::from_query("maximumAge=13&kidAudience=child").unwrap();
+        let filtered: serde_json::Value =
+            serde_json::from_str(&filter_catalog_maturity(&body, "movie", &state, policy)).unwrap();
+        assert_eq!(filtered["metas"], serde_json::json!([{ "moviedb_id": 3 }]));
+
+        let policy = crate::maturity::Policy::from_query("kidAudience=child-or-teen").unwrap();
+        let filtered: serde_json::Value =
+            serde_json::from_str(&filter_catalog_maturity(&body, "movie", &state, policy)).unwrap();
+        assert_eq!(filtered["metas"], serde_json::json!([{ "moviedb_id": 2 }, { "moviedb_id": 3 }]));
+
+        for malformed in ["not json", r#"{"unexpected":[]}"#, r#"{"metas":{}}"#] {
+            assert_eq!(
+                filter_catalog_maturity(malformed, "movie", &state, policy),
+                r#"{"metas":[]}"#,
+                "restricted catalogs fail closed for {malformed}"
+            );
+        }
     }
 
     /// Every member-bearing GET route enforces the policy before its page is cut. The seed is deliberately
@@ -3275,18 +3357,20 @@ mod tests {
         assert_eq!(
             named,
             serde_json::json!({ "type": "movie", "id": 3, "indexed": false, "title": "Delta", "year": 2001,
-                                "originalTitle": "Délta", "source": "wikidata", "minimumAge": null })
+                                "originalTitle": "Délta", "source": "wikidata", "minimumAge": null,
+                                "maturityRatings": [] })
         );
         let bare = json(body_of(get(&state, "/index/title/series/11.json").await).await);
         assert_eq!(
             bare,
             serde_json::json!({ "type": "series", "id": 11, "indexed": false, "title": "Epsilon",
-                                "source": "wikidata", "minimumAge": null })
+                                "source": "wikidata", "minimumAge": null, "maturityRatings": [] })
         );
         let other_type = json(body_of(get(&state, "/index/title/series/3.json").await).await);
         assert_eq!(
             other_type,
-            serde_json::json!({ "type": "series", "id": 3, "indexed": false, "minimumAge": null })
+            serde_json::json!({ "type": "series", "id": 3, "indexed": false, "minimumAge": null,
+                                "maturityRatings": [] })
         );
         let carded = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
         assert_eq!(carded["indexed"], true);
@@ -4319,7 +4403,8 @@ mod tests {
         let unknown = json(body_of(get(&state, "/index/title/movie/999999.json").await).await);
         assert_eq!(
             unknown,
-            serde_json::json!({ "type": "movie", "id": 999999, "indexed": false, "minimumAge": null })
+            serde_json::json!({ "type": "movie", "id": 999999, "indexed": false, "minimumAge": null,
+                                "maturityRatings": [] })
         );
         assert_eq!(get(&state, "/index/title/anime/1.json").await.status(), 404);
         assert_eq!(get(&state, "/index/title/movie/x.json").await.status(), 404);

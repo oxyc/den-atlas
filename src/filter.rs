@@ -1823,7 +1823,7 @@ impl<'a> Context<'a> {
         let maturity = if policy.restricted() {
             let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
             for (row, &key) in filter.keys.iter().enumerate() {
-                if policy.allows_with(|| indexes.minimum_age(key)) {
+                if indexes.eligible(policy, key) {
                     set(&mut maturity, row);
                 }
             }
@@ -3549,6 +3549,7 @@ mod tests {
             maximum_age: Some(12),
             unknown_ratings: crate::maturity::UnknownRatings::Block,
             region: None,
+            kid_audience: None,
         };
         let context = Context::new_with_policy(&indexes, Scope::All, None, policy);
         let counts = context.counts(&request_all(Route::Counts, "")).0;
@@ -3565,6 +3566,7 @@ mod tests {
                 maximum_age: Some(12),
                 unknown_ratings: crate::maturity::UnknownRatings::Allow,
                 region: None,
+                kid_audience: None,
             },
         );
         assert_eq!(allow_unknown.counts(&request_all(Route::Counts, "")).0["total"], 2);
