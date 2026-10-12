@@ -135,11 +135,24 @@ impl TitleIndex {
         limit: usize,
         min_coverage: f64,
     ) -> Vec<Hit<'_>> {
+        self.search_with_filter(query, media_type, limit, min_coverage, |_, _| true)
+    }
+
+    /// `search_with`, admitting titles before its bounded result is formed.
+    pub fn search_with_filter(
+        &self,
+        query: &str,
+        media_type: Option<MediaType>,
+        limit: usize,
+        min_coverage: f64,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<Hit<'_>> {
         let q = fold(query);
         if q.chars().count() < 2 || limit == 0 {
             return Vec::new();
         }
-        let wanted = |i: usize| media_type.is_none_or(|m| self.kinds[i] == m);
+        let wanted =
+            |i: usize| media_type.is_none_or(|m| self.kinds[i] == m) && include(self.ids[i], self.kinds[i]);
         let mut query_keys = trigram_keys(&q);
         query_keys.sort_unstable();
         query_keys.dedup();

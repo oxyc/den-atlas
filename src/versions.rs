@@ -300,14 +300,16 @@ pub fn summary_json(
 /// `/index/versions/<type>/<id>.json`: the seed's other versions as cards, each with its `kind`, in the order
 /// `of_title` serves them. A franchise's members also carry `group`: the franchise's id, its `label` for the
 /// row, and the member's era. A version with no card is `{type, id, kind}`, as a franchise member is.
-pub fn route_json(
+pub fn route_json_with_policy(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
     seed: Key,
+    maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
     let mut labels: HashMap<u32, String> = HashMap::new();
     let versions: Vec<serde_json::Value> = of_title(indexes, export, seed)
         .into_iter()
+        .filter(|version| maturity.allows(indexes.minimum_age(version.key)))
         .map(|version| {
             let mut title = indexes
                 .cards

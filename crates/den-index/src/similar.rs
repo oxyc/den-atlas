@@ -1427,7 +1427,8 @@ pub fn more_like_this_with(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
-    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
+    let scans =
+        [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep));
     ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p)
 }
 
@@ -1446,7 +1447,8 @@ pub fn inspect_more_like_this(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Inspection {
-    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types));
+    let scans =
+        [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep));
     let mut inspected = ranked_inspecting(
         &scans, plot, premise, tmdb_id, media_type, candidate, authorship, facets, extras, p,
     );
@@ -1466,7 +1468,7 @@ pub fn inspect_more_like_this(
             ..*p
         };
         let scans =
-            [premise, plot].map(|index| scan(index, tmdb_id, media_type, open.pool_k, open.mix_types));
+            [premise, plot].map(|index| scan(index, tmdb_id, media_type, open.pool_k, open.mix_types, None));
         let counterfactual = ranked_inspecting(
             &scans,
             plot,
@@ -1502,7 +1504,7 @@ pub fn more_like_this_both(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> (Vec<Scored>, Vec<Scored>) {
-    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, true));
+    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, true, extras.keep));
     let (one, mixed) = (SimilarParams { mix_types: false, ..*p }, SimilarParams { mix_types: true, ..*p });
     let rank =
         |p: &SimilarParams| ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p);
@@ -1517,14 +1519,16 @@ fn scan(
     media_type: MediaType,
     pool_k: usize,
     by_type: bool,
+    keep: Option<&dyn Fn(Key) -> bool>,
 ) -> Option<Vec<TypeNeighbours>> {
     let index = index?;
+    let include = |id, kind| keep.is_none_or(|keep| keep((kind, id)));
     Some(if by_type {
-        index.nearest_by_type(tmdb_id, media_type, pool_k)
+        index.nearest_by_type_where(tmdb_id, media_type, pool_k, include)
     } else {
         vec![TypeNeighbours {
             media_type,
-            nearest: index.nearest(tmdb_id, media_type, pool_k),
+            nearest: index.nearest_where(tmdb_id, media_type, pool_k, include),
             stats: ScanStats::default(),
         }]
     })

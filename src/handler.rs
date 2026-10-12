@@ -971,15 +971,26 @@ impl IndexQuestion {
                 };
                 let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
                 let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
+                let eligible = |id, kind| maturity.allows(indexes.minimum_age((kind, id)));
                 let titles = if *mood {
-                    plot.titles_with_mood(label, Some(*media_type), floor, 0, indexes.population)
+                    plot.titles_with_mood_where(
+                        label,
+                        Some(*media_type),
+                        floor,
+                        0,
+                        indexes.population,
+                        eligible,
+                    )
                 } else {
-                    plot.titles_with_subgenre(label, Some(*media_type), floor, 0, indexes.population)
+                    plot.titles_with_subgenre_where(
+                        label,
+                        Some(*media_type),
+                        floor,
+                        0,
+                        indexes.population,
+                        eligible,
+                    )
                 };
-                let titles: Vec<_> = titles
-                    .into_iter()
-                    .filter(|&(id, kind)| maturity.allows(indexes.minimum_age((kind, id))))
-                    .collect();
                 let total = titles.len();
                 let family = if *mood { "mood" } else { "subgenre" };
                 let constraints = [(family.to_owned(), label.clone())];
@@ -1017,10 +1028,10 @@ impl IndexQuestion {
                 title
             }
             Self::Franchise { media_type, tmdb_id } => {
-                crate::franchises::route_json(indexes, (*media_type, *tmdb_id))
+                crate::franchises::route_json_with_policy(indexes, (*media_type, *tmdb_id), maturity)
             }
             Self::Versions { media_type, tmdb_id } => {
-                crate::versions::route_json(indexes, export, (*media_type, *tmdb_id))
+                crate::versions::route_json_with_policy(indexes, export, (*media_type, *tmdb_id), maturity)
             }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
@@ -1104,16 +1115,12 @@ pub(crate) fn similar_json_with_policy(
     query: &str,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
-    let (row, mixed) = indexes.more_like_this_rows(tmdb_id, media_type);
+    let (row, mixed) = indexes.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
     let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let row: Vec<u32> =
-        row.iter().copied().filter(|&id| maturity.allows(indexes.minimum_age((media_type, id)))).collect();
-    let mixed: Vec<(den_index::MediaType, u32)> =
-        mixed.iter().copied().filter(|&key| maturity.allows(indexes.minimum_age(key))).collect();
     let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
     let mixed_page: Vec<(u32, den_index::MediaType)> =
         mixed.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
@@ -1137,20 +1144,15 @@ pub(crate) fn suggest_json(
     query: &str,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
-    let row = indexes.you_might_also_like(tmdb_id, media_type, true);
+    let row = indexes.you_might_also_like_with_policy(tmdb_id, media_type, true, maturity);
     let seed = (media_type, tmdb_id);
     let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let page: Vec<(den_index::MediaType, u32)> = row
-        .iter()
-        .copied()
-        .filter(|&key| key != seed && maturity.allows(indexes.minimum_age(key)))
-        .skip(skip)
-        .take(limit)
-        .collect();
+    let page: Vec<(den_index::MediaType, u32)> =
+        row.iter().copied().filter(|&key| key != seed).skip(skip).take(limit).collect();
     let titles: Vec<serde_json::Value> = page
         .iter()
         .filter_map(|&key| {
@@ -1164,7 +1166,7 @@ pub(crate) fn suggest_json(
         "titles": titles,
         "total": row
             .iter()
-            .filter(|&&key| key != seed && maturity.allows(indexes.minimum_age(key)))
+            .filter(|&&key| key != seed)
             .count(),
     })
 }
@@ -2950,6 +2952,72 @@ mod tests {
         assert!(unknown["minimumAge"].is_null());
     }
 
+    /// Every member-bearing GET route enforces the policy before its page is cut. The seed is deliberately
+    /// adult, the series unrated, and the two middle movies eligible, so neither kind of ineligible member can
+    /// leak and a two-item page must still fill from the eligible tail.
+    #[tokio::test]
+    async fn maturity_policy_covers_member_routes_and_precedes_discovery_bounds() {
+        let state = maturity_index_state("den-atlas-maturity-member-routes");
+        let policy = "maximumAge=13&unknownRatings=block&region=FI";
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |values: &serde_json::Value, field: &str| -> Vec<u32> {
+            values[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_u64().or_else(|| value["id"].as_u64()))
+                .map(|id| id as u32)
+                .collect()
+        };
+
+        let franchise =
+            json(body_of(get(&state, &format!("/index/franchise/movie/1.json?{policy}")).await).await);
+        assert_eq!(ids(&franchise, "members"), [101, 2]);
+        assert_eq!(franchise["total"], 2);
+        let versions =
+            json(body_of(get(&state, &format!("/index/versions/movie/1.json?{policy}")).await).await);
+        assert_eq!(ids(&versions, "versions"), [3, 103]);
+        assert_eq!(versions["total"], 2);
+
+        let search =
+            json(body_of(get(&state, &format!("/index/query.json?q=heist&limit=2&{policy}")).await).await);
+        assert_eq!(ids(&search, "hits"), [2, 3], "eligible titles refill the bounded search lane");
+        assert_eq!(search["total"], 4);
+
+        for path in ["/index/similar/movie/1.json", "/index/suggest/movie/1.json"] {
+            let answer = json(body_of(get(&state, &format!("{path}?limit=2&{policy}")).await).await);
+            let returned = ids(&answer, "mixed");
+            assert!(
+                returned.iter().all(|id| [2, 3, 101, 102, 103, 104].contains(id)),
+                "{path} leaked: {answer}"
+            );
+            let total = if path.contains("similar") { "mixedTotal" } else { "total" };
+            assert!(answer[total].as_u64().unwrap_or_default() >= 2, "the fixture must exercise {path}");
+            assert_eq!(returned.len(), answer[total].as_u64().unwrap_or_default().min(2) as usize);
+        }
+
+        let legacy = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
+        assert_eq!(ids(&legacy, "members"), [101, 2, 1], "no policy keeps the historical membership");
+    }
+
+    /// Exercise the mapped store, label index, policy lookup, pagination, JSON boundary and HTTP handler —
+    /// the actual discovery path, rather than timing a synthetic `Option<u8>` loop.
+    #[tokio::test]
+    async fn maturity_row_discovery_stays_within_a_route_level_bound() {
+        let state = maturity_index_state("den-atlas-maturity-route-performance");
+        let path = "/index/rows/movie/subgenre/Heist.json?maximumAge=13&unknownRatings=block&limit=2";
+        let started = std::time::Instant::now();
+        for _ in 0..500 {
+            let response = get(&state, path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "500 mapped-store discovery requests took {:?}",
+            started.elapsed()
+        );
+    }
+
     fn franchise_state(name: &str, playground: bool) -> Option<Arc<AppState>> {
         let fixture = crate::store::spec_fixture()?;
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
@@ -2977,16 +3045,19 @@ mod tests {
         assert_eq!(
             named,
             serde_json::json!({ "type": "movie", "id": 3, "indexed": false, "title": "Delta", "year": 2001,
-                                "originalTitle": "Délta", "source": "wikidata" })
+                                "originalTitle": "Délta", "source": "wikidata", "minimumAge": null })
         );
         let bare = json(body_of(get(&state, "/index/title/series/11.json").await).await);
         assert_eq!(
             bare,
             serde_json::json!({ "type": "series", "id": 11, "indexed": false, "title": "Epsilon",
-                                "source": "wikidata" })
+                                "source": "wikidata", "minimumAge": null })
         );
         let other_type = json(body_of(get(&state, "/index/title/series/3.json").await).await);
-        assert_eq!(other_type, serde_json::json!({ "type": "series", "id": 3, "indexed": false }));
+        assert_eq!(
+            other_type,
+            serde_json::json!({ "type": "series", "id": 3, "indexed": false, "minimumAge": null })
+        );
         let carded = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
         assert_eq!(carded["indexed"], true);
         assert!(carded.get("source").is_none(), "a store row is its own card: {carded}");

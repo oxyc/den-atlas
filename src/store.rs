@@ -316,6 +316,10 @@ pub(crate) mod fixture {
         /// Its fan picks as (media, tmdb id) in rank order; `None` for a title not asked. The three fan-pick
         /// sections are written when any title was asked.
         pub fan_picks: Option<Vec<(u8, u32)>>,
+        /// Test-only curated franchise membership: (era, stable member order). All such rows form one group.
+        pub curated_franchise: Option<(u32, u32)>,
+        /// Test-only other-version links: (media, TMDB id, kind; 0 shared source, 1 remake).
+        pub versions: Vec<(u8, u32, u8)>,
     }
 
     /// One row of the entity table: a person, a franchise, a place.
@@ -898,6 +902,57 @@ pub(crate) mod fixture {
                 "fan_picks_a",
                 &titles.iter().map(|t| u8::from(t.fan_picks.is_some())).collect::<Vec<u8>>(),
             );
+        }
+
+        let row_of = |media: u8, id: u32| -> u32 {
+            let key = (u64::from(media) << 32) | u64::from(id);
+            u32::try_from(keys.iter().position(|&held| held == key).expect("a linked fixture title"))
+                .expect("fixture row")
+        };
+        if titles.iter().any(|t| !t.versions.is_empty()) {
+            let version_rows: Vec<Vec<u32>> = titles
+                .iter()
+                .map(|title| title.versions.iter().map(|&(media, id, _)| row_of(media, id)).collect())
+                .collect();
+            let version_kinds: Vec<u8> =
+                titles.iter().flat_map(|title| title.versions.iter().map(|&(_, _, kind)| kind)).collect();
+            b.list("versions_v", "versions_o", &version_rows);
+            b.u8s("versions_k", &version_kinds);
+        }
+        if titles.iter().any(|t| t.curated_franchise.is_some()) {
+            let members: Vec<(u32, u32, u32)> = titles
+                .iter()
+                .enumerate()
+                .filter_map(|(row, title)| {
+                    title.curated_franchise.map(|(era, order)| (row as u32, era, order))
+                })
+                .collect();
+            b.u32s(
+                "fr_primary",
+                &titles
+                    .iter()
+                    .map(|title| title.curated_franchise.map_or(den_store::NONE_U32, |_| 0))
+                    .collect::<Vec<_>>(),
+            );
+            let id = b.intern("fixture-franchise");
+            let name = b.intern("Fixture franchise");
+            let source = b.intern("den-dataset-public");
+            let era_id = b.intern("fixture-era");
+            let era_name = b.intern("Fixture era");
+            b.u32s("fr_id", &[id]);
+            b.u32s("fr_name", &[name]);
+            b.u8s("fr_conf", &[100]);
+            b.u32s("fr_source", &[source]);
+            b.u32s("fr_umb_id", &vec![den_store::NONE_U32; rows]);
+            b.u32s("fr_umb_name", &vec![den_store::NONE_U32; rows]);
+            b.u32s("fr_era_id", &[era_id]);
+            b.u32s("fr_era_name", &[era_name]);
+            b.u32s("fr_era_order", &[0]);
+            b.u32s("fr_era_o", &[0, 1]);
+            b.u32s("fr_mem_row", &members.iter().map(|m| m.0).collect::<Vec<_>>());
+            b.u32s("fr_mem_era", &members.iter().map(|m| m.1).collect::<Vec<_>>());
+            b.u32s("fr_mem_order", &members.iter().map(|m| m.2).collect::<Vec<_>>());
+            b.u32s("fr_mem_o", &[0, members.len() as u32]);
         }
 
         // The rail's own columns. The fixture declares no critique axis and no noul, so the pooled scorer

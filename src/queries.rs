@@ -171,6 +171,36 @@ impl Indexes {
         })
     }
 
+    /// A policy-scoped suggestion row. Restricted requests cannot reuse the dataset-only memo: eligibility
+    /// is a retrieval predicate, so blocked titles never occupy the scorer's bounded candidate pool.
+    pub fn you_might_also_like_with_policy(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        mix: bool,
+        maturity: crate::maturity::Policy,
+    ) -> Vec<Key> {
+        if !maturity.restricted() {
+            return self.you_might_also_like(tmdb_id, media_type, mix).to_vec();
+        }
+        let keep = |key| maturity.allows(self.minimum_age(key));
+        let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
+        let seed = self.suggestion_profile((media_type, tmdb_id));
+        let mut row: Vec<Key> = self
+            .more_like_this_with(
+                tmdb_id,
+                media_type,
+                &params,
+                den_index::Extras { keep: Some(&keep), ..den_index::Extras::default() },
+            )
+            .into_iter()
+            .map(|scored| scored.key())
+            .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
+            .collect();
+        row.truncate(den_index::MAX_ROW);
+        row
+    }
+
     /// The seed's fan picks, in the model's order, then the titles the fan-picks graph ties to it
     /// (`fan_tail`). `None` when the store has no answer for the seed (it was not asked, or the store has no
     /// fan-pick sections), and the affinity row serves instead. Left out: the seed's franchise and other versions (`versions::kept_out`),
@@ -452,6 +482,45 @@ impl Indexes {
         memo.insert((seed, false), Arc::clone(&one));
         memo.insert((seed, true), Arc::clone(&mixed));
         (one.iter().map(|&(_, id)| id).collect(), mixed)
+    }
+
+    /// `more_like_this_rows` with request eligibility applied during vector retrieval and before ranking.
+    pub fn more_like_this_rows_with_policy(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        maturity: crate::maturity::Policy,
+    ) -> (Vec<u32>, Vec<Key>) {
+        if !maturity.restricted() {
+            let (one, mixed) = self.more_like_this_rows(tmdb_id, media_type);
+            return (one.to_vec(), mixed.to_vec());
+        }
+        let production = den_index::SimilarParams::default();
+        let seed = (media_type, tmdb_id);
+        let kept_out = crate::versions::kept_out(self, seed);
+        let reserved = |candidate| kept_out.contains(&candidate);
+        let keep = |key| maturity.allows(self.minimum_age(key));
+        let extras = den_index::Extras {
+            keep: Some(&keep),
+            primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
+            ..den_index::Extras::default()
+        };
+        let (one, mixed) = self.with_seed(tmdb_id, media_type, &production, |authorship, facets| {
+            den_index::more_like_this_both(
+                Some(&self.plot),
+                self.premise.as_ref(),
+                tmdb_id,
+                media_type,
+                authorship,
+                Some(facets),
+                extras,
+                &production,
+            )
+        });
+        (
+            one.into_iter().map(|scored| scored.key().1).collect(),
+            mixed.into_iter().map(|scored| scored.key()).collect(),
+        )
     }
 
     /// `work` given what the rail reads about the seed beyond the vectors: its facets, tuned to `params`, and
@@ -1384,6 +1453,60 @@ fn write_fixture_as(
             .find(|title| (title.media, title.tmdb_id) == (media, tmdb_id))
             .expect("a fixture maturity title")
             .minimum_age = Some(minimum_age);
+    }
+    if !maturity.is_empty() {
+        let eligible_neighbour = titles
+            .iter_mut()
+            .find(|title| (title.media, title.tmdb_id) == (0, 3))
+            .expect("the maturity fixture eligible neighbour");
+        eligible_neighbour.primary_genre = "Drama";
+        eligible_neighbour.plot = vec![95, 5, 0];
+        eligible_neighbour.premise = vec![95, 5, 0];
+        eligible_neighbour.facets =
+            vec![("ending", "bittersweet", 90), ("tone", "bleak", 90), ("pacing", "slow-burn", 90)];
+        for (id, order) in [(1, 0), (2, 1), (101, 2)] {
+            titles
+                .iter_mut()
+                .find(|title| title.tmdb_id == id)
+                .expect("a maturity fixture franchise title")
+                .curated_franchise = Some((0, order));
+        }
+        for id in [101, 102, 103, 104] {
+            titles
+                .iter_mut()
+                .find(|title| title.tmdb_id == id)
+                .expect("a maturity fixture tail title")
+                .minimum_age = Some(7);
+        }
+        let eligible_neighbour = titles
+            .iter_mut()
+            .find(|title| title.tmdb_id == 102)
+            .expect("a maturity fixture eligible semantic tail");
+        eligible_neighbour.primary_genre = "Drama";
+        eligible_neighbour.subgenres = vec![("Heist", 59)];
+        eligible_neighbour.plot = vec![94, 6, 0];
+        eligible_neighbour.premise = vec![94, 6, 0];
+        eligible_neighbour.facets =
+            vec![("ending", "bittersweet", 90), ("tone", "bleak", 90), ("pacing", "slow-burn", 90)];
+        eligible_neighbour.card = Some(("One younger", None, Some(2000)));
+        eligible_neighbour.votes = 50;
+        let eligible_tail = titles
+            .iter_mut()
+            .find(|title| title.tmdb_id == 104)
+            .expect("a second maturity fixture eligible semantic tail");
+        eligible_tail.primary_genre = "Drama";
+        eligible_tail.subgenres = vec![("Heist", 58)];
+        eligible_tail.plot = vec![93, 7, 0];
+        eligible_tail.premise = vec![93, 7, 0];
+        eligible_tail.facets =
+            vec![("ending", "bittersweet", 90), ("tone", "bleak", 90), ("pacing", "slow-burn", 90)];
+        eligible_tail.card = Some(("One youngest", None, Some(2001)));
+        eligible_tail.votes = 50;
+        titles
+            .iter_mut()
+            .find(|title| (title.media, title.tmdb_id) == (0, 1))
+            .expect("the maturity fixture version seed")
+            .versions = vec![(0, 3, 1), (1, 4, 0), (1, 103, 0)];
     }
     // Thirty more films, so a seed's More Like This screenful cannot hold every other title and some fan
     // picks fall outside it.

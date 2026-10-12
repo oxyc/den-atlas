@@ -590,6 +590,18 @@ impl Index {
         self.ranked(&self.subgenres, label, media_type, min_confidence, skip, limit)
     }
 
+    pub fn titles_with_subgenre_where(
+        &self,
+        label: &str,
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+        skip: usize,
+        limit: usize,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<(u32, MediaType)> {
+        self.ranked_where(&self.subgenres, label, media_type, min_confidence, skip, limit, include)
+    }
+
     /// Titles carrying a mood label; as `titles_with_subgenre`.
     pub fn titles_with_mood(
         &self,
@@ -600,6 +612,18 @@ impl Index {
         limit: usize,
     ) -> Vec<(u32, MediaType)> {
         self.ranked(&self.moods, label, media_type, min_confidence, skip, limit)
+    }
+
+    pub fn titles_with_mood_where(
+        &self,
+        label: &str,
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+        skip: usize,
+        limit: usize,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<(u32, MediaType)> {
+        self.ranked_where(&self.moods, label, media_type, min_confidence, skip, limit, include)
     }
 
     pub fn count_with_subgenre(
@@ -629,11 +653,27 @@ impl Index {
     /// The `k` titles of the same type nearest to an indexed title, best first, excluding the title itself.
     /// Empty when the title isn't indexed. Ties go to the earlier row, so the answer never varies.
     pub fn nearest(&self, tmdb_id: u32, media_type: MediaType, k: usize) -> Vec<Neighbor> {
+        self.nearest_where(tmdb_id, media_type, k, |_, _| true)
+    }
+
+    /// `nearest`, admitting titles before the bounded top-k is formed.
+    pub fn nearest_where(
+        &self,
+        tmdb_id: u32,
+        media_type: MediaType,
+        k: usize,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<Neighbor> {
         let Some(&query_row) = self.rows.get(&(media_type, tmdb_id)) else { return Vec::new() };
         let query = self.row_vector(query_row as usize);
         self.top_k(
             k,
-            |row| row != query_row as usize && self.records[row].media_type == Some(media_type),
+            |row| {
+                let record = &self.records[row];
+                row != query_row as usize
+                    && record.media_type == Some(media_type)
+                    && include(record.tmdb_id, media_type)
+            },
             query,
         )
     }
@@ -643,6 +683,17 @@ impl Index {
     /// title of that type's cosine to it — what a cross-type cosine is read against (`similar.rs`). Empty
     /// when the title isn't indexed.
     pub fn nearest_by_type(&self, tmdb_id: u32, media_type: MediaType, k: usize) -> Vec<TypeNeighbours> {
+        self.nearest_by_type_where(tmdb_id, media_type, k, |_, _| true)
+    }
+
+    /// `nearest_by_type`, admitting titles before each type's bounded top-k is formed.
+    pub fn nearest_by_type_where(
+        &self,
+        tmdb_id: u32,
+        media_type: MediaType,
+        k: usize,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<TypeNeighbours> {
         let Some(&query_row) = self.rows.get(&(media_type, tmdb_id)) else { return Vec::new() };
         let query = self.row_vector(query_row as usize);
         let other = match media_type {
@@ -653,7 +704,12 @@ impl Index {
             .into_iter()
             .map(|kind| {
                 let scored = self.scores(
-                    |row| row != query_row as usize && self.records[row].media_type == Some(kind),
+                    |row| {
+                        let record = &self.records[row];
+                        row != query_row as usize
+                            && record.media_type == Some(kind)
+                            && include(record.tmdb_id, kind)
+                    },
                     query,
                 );
                 let raw = ScanStats::of(&scored);
@@ -894,6 +950,20 @@ impl Index {
         skip: usize,
         limit: usize,
     ) -> Vec<(u32, MediaType)> {
+        self.ranked_where(buckets, label, media_type, min_confidence, skip, limit, |_, _| true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ranked_where(
+        &self,
+        buckets: &HashMap<u32, Vec<Entry>>,
+        label: &str,
+        media_type: Option<MediaType>,
+        min_confidence: f64,
+        skip: usize,
+        limit: usize,
+        include: impl Fn(u32, MediaType) -> bool,
+    ) -> Vec<(u32, MediaType)> {
         let Some(bucket) =
             self.names.iter().position(|n| &**n == label).and_then(|id| buckets.get(&(id as u32)))
         else {
@@ -906,7 +976,9 @@ impl Index {
             .filter_map(|e| {
                 let record = &self.records[e.row as usize];
                 let kind = record.media_type?;
-                (media_type.is_none() || media_type == Some(kind)).then_some((record.tmdb_id, kind))
+                (media_type.is_none() || media_type == Some(kind))
+                    .then_some((record.tmdb_id, kind))
+                    .filter(|&(id, kind)| include(id, kind))
             })
             .skip(skip)
             .take(limit)

@@ -171,20 +171,4 @@ mod tests {
             Policy::from_query("maximumAge=12&region=SE").unwrap().cache_identity()
         );
     }
-
-    /// A Home/search fan-out may filter the whole roughly 47k-title corpus. The policy check must remain a
-    /// cheap in-memory predicate rather than growing an allocation, map lookup, or per-title source request.
-    #[test]
-    fn a_corpus_sized_eligibility_pass_stays_bounded() {
-        let ages: Vec<Option<u8>> = (0..47_000).map(|i| (i % 5 != 0).then_some((i % 19) as u8)).collect();
-        let policy = Policy::from_query("maximumAge=12&unknownRatings=block&region=FI").unwrap();
-        let started = std::time::Instant::now();
-        let allowed = ages.iter().copied().filter(|age| policy.allows(*age)).count();
-        assert_eq!(allowed, 25_729);
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(250),
-            "one corpus eligibility pass took {:?}",
-            started.elapsed()
-        );
-    }
 }

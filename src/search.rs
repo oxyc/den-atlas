@@ -917,18 +917,23 @@ pub fn answer_with_policy(
     }
     // Every lane drops what was ruled out BEFORE it truncates, or a lane of the 500 most-voted comedies is
     // mostly American and "comedies not american" is left with what the vectors happen to find.
-    let allowed = |key: Key| !rules_out(indexes, parsed, &ruled_out, key);
+    let allowed =
+        |key: Key| !rules_out(indexes, parsed, &ruled_out, key) && maturity.allows(indexes.minimum_age(key));
     let mut found: HashMap<Key, Found> = HashMap::new();
 
     // Titles, by the name TMDB exports and the name atlas displays.
     if let Some(export) = export {
-        for hit in export.search_with(&parsed.text, None, TITLE_LANE, MIN_COVERAGE) {
+        for hit in export.search_with_filter(&parsed.text, None, TITLE_LANE, MIN_COVERAGE, |id, kind| {
+            allowed((title_type(kind), id))
+        }) {
             found.entry((title_type(hit.media_type), hit.tmdb_id)).or_default().export =
                 Some((hit.title.to_owned(), hit.popularity));
         }
     }
     if let Some(display) = &indexes.display {
-        for hit in display.search_with(&parsed.text, None, TITLE_LANE, MIN_COVERAGE) {
+        for hit in display.search_with_filter(&parsed.text, None, TITLE_LANE, MIN_COVERAGE, |id, kind| {
+            allowed((title_type(kind), id))
+        }) {
             found
                 .entry((title_type(hit.media_type), hit.tmdb_id))
                 .or_default()
@@ -996,9 +1001,13 @@ pub fn answer_with_policy(
     // Labels and plot facets the query names.
     for (name, mood) in &parsed.labels {
         let titles = if *mood {
-            indexes.plot.titles_with_mood(name, None, LABEL_FLOOR, 0, LANE)
+            indexes
+                .plot
+                .titles_with_mood_where(name, None, LABEL_FLOOR, 0, LANE, |id, kind| allowed((kind, id)))
         } else {
-            indexes.plot.titles_with_subgenre(name, None, LABEL_FLOOR, 0, LANE)
+            indexes
+                .plot
+                .titles_with_subgenre_where(name, None, LABEL_FLOOR, 0, LANE, |id, kind| allowed((kind, id)))
         };
         for (id, kind) in titles {
             found.entry((kind, id)).or_default();
@@ -1072,7 +1081,7 @@ pub fn answer_with_policy(
         indexes.cards.as_ref().is_some_and(|cards| cards.contains_key(key))
             || found.get(key).is_some_and(|f| f.export.is_some())
     };
-    scored.retain(|s| s.score > 0.0 && drawable(&s.key) && maturity.allows(indexes.minimum_age(s.key)));
+    scored.retain(|s| s.score > 0.0 && drawable(&s.key));
     let votes =
         |(kind, id): Key| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
     scored.sort_by(|a, b| {
