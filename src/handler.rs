@@ -1842,8 +1842,8 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
     // Ranked once per scope and day, every slide atlas will give (`MAX_SLIDES`), and kept: each page, and each
     // shared-cache edge that has not seen it yet, is a slice of that, and every page is from the same ranking.
     let mut key = if fresh { format!("{scope}|{date}|fresh") } else { format!("{scope}|{date}") };
-    if let Some(maximum_age) = maturity.maximum_age {
-        key.push_str(&format!("|maximumAge={maximum_age}|unknown={:?}", maturity.unknown_ratings));
+    if maturity.restricted() {
+        key.push_str(&format!("|maximumAge={:?}|unknown={:?}", maturity.maximum_age, maturity.unknown_ratings));
     }
     let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
     let (answer, timing) = match kept {
@@ -1851,8 +1851,10 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
         None => {
             body["now"] = serde_json::json!(start);
             body["limit"] = serde_json::json!(crate::recommend::MAX_SLIDES);
-            if let Some(maximum_age) = maturity.maximum_age {
-                body["maximumAge"] = serde_json::json!(maximum_age);
+            if maturity.restricted() {
+                if let Some(maximum_age) = maturity.maximum_age {
+                    body["maximumAge"] = serde_json::json!(maximum_age);
+                }
                 body["unknownRatings"] = serde_json::json!(match maturity.unknown_ratings {
                     crate::maturity::UnknownRatings::Allow => "allow",
                     crate::maturity::UnknownRatings::Block => "block",
@@ -2106,7 +2108,7 @@ async fn filter_answer(
     // The path is part of the key too: `counts` without `.json` answers, but as a second spelling.
     let segment = rest.rsplit('/').next().unwrap_or(rest);
     let canonical = request.canonical && segment.ends_with(".json");
-    let location = (!canonical && maturity.maximum_age.is_none())
+    let location = (!canonical && !maturity.restricted())
         .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
     let (body, degraded) = tokio::task::spawn_blocking(move || {
         let context = crate::filter::Context::new_with_policy(&indexes, scope, export, maturity);
@@ -2323,12 +2325,12 @@ fn filter_catalog_maturity(
     maturity: crate::maturity::Policy,
 ) -> String {
     let Some(dataset) = state.dataset.as_ref() else {
-        if maturity.maximum_age.is_none() || maturity.unknown_ratings == crate::maturity::UnknownRatings::Allow {
+        if maturity.unknown_ratings == crate::maturity::UnknownRatings::Allow {
             return body.to_owned();
         }
         return r#"{"metas":[]}"#.to_owned();
     };
-    if maturity.maximum_age.is_none() {
+    if !maturity.restricted() {
         return body.to_owned();
     }
     let media_type = if type_ == "series" {

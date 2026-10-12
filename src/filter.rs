@@ -1831,7 +1831,7 @@ impl<'a> Context<'a> {
             scope: scope.into(),
             view: indexes.store.view(),
             maturity,
-            restricted: policy.maximum_age.is_some(),
+            restricted: policy.restricted(),
         }
     }
 

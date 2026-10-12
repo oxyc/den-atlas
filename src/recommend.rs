@@ -171,7 +171,7 @@ pub struct Request {
     pub maximum_age: Option<u8>,
     /// Unknown ages fail closed whenever a ceiling is present unless the caller explicitly allows them.
     #[serde(default, rename = "unknownRatings")]
-    pub unknown_ratings: crate::maturity::UnknownRatings,
+    pub unknown_ratings: Option<crate::maturity::UnknownRatings>,
     /// Only new titles (oxyc/den#161, `newness`): the pool holds titles out within `NEW_BEHIND`, titles due on a
     /// known day or month within `NEW_AHEAD`, and older series with a season in that window. Off by default, so
     /// the pool with it and without it can be compared before it becomes the default.
@@ -198,7 +198,11 @@ impl Request {
     fn maturity(&self) -> crate::maturity::Policy {
         crate::maturity::Policy {
             maximum_age: self.maximum_age,
-            unknown_ratings: self.unknown_ratings,
+            unknown_ratings: self.unknown_ratings.unwrap_or(if self.maximum_age.is_some() {
+                crate::maturity::UnknownRatings::Block
+            } else {
+                crate::maturity::UnknownRatings::Allow
+            }),
         }
     }
 

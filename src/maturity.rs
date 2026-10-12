@@ -9,8 +9,8 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum UnknownRatings {
-    Allow,
     #[default]
+    Allow,
     Block,
 }
 
@@ -26,8 +26,9 @@ impl Policy {
             .map(|value| value.parse::<u8>().map_err(|_| "maximumAge must be an integer from 0 to 18"))
             .transpose()?;
         let unknown_ratings = match crate::handler::query_param(query, "unknownRatings").as_deref() {
-            None | Some("block") => UnknownRatings::Block,
-            Some("allow") => UnknownRatings::Allow,
+            None if maximum_age.is_some() => UnknownRatings::Block,
+            None | Some("allow") => UnknownRatings::Allow,
+            Some("block") => UnknownRatings::Block,
             Some(_) => return Err("unknownRatings must be allow or block".to_owned()),
         };
         let policy = Self { maximum_age, unknown_ratings };
@@ -39,18 +40,18 @@ impl Policy {
         if self.maximum_age.is_some_and(|age| age > 18) {
             return Err("maximumAge must be an integer from 0 to 18".to_owned());
         }
-        if self.maximum_age.is_none() && self.unknown_ratings == UnknownRatings::Allow {
-            return Err("unknownRatings requires maximumAge".to_owned());
-        }
         Ok(())
     }
 
     pub fn allows(self, minimum_age: Option<u8>) -> bool {
-        let Some(maximum_age) = self.maximum_age else { return true };
         match minimum_age {
-            Some(minimum_age) => minimum_age <= maximum_age,
+            Some(minimum_age) => self.maximum_age.is_none_or(|maximum_age| minimum_age <= maximum_age),
             None => self.unknown_ratings == UnknownRatings::Allow,
         }
+    }
+
+    pub fn restricted(self) -> bool {
+        self.maximum_age.is_some() || self.unknown_ratings == UnknownRatings::Block
     }
 }
 
@@ -66,13 +67,15 @@ mod tests {
         assert!(!policy.allows(None));
         assert!(Policy::from_query("maximumAge=12&unknownRatings=allow").unwrap().allows(None));
         assert!(Policy::from_query("").unwrap().allows(None));
+        let unrated_only = Policy::from_query("unknownRatings=block").unwrap();
+        assert!(unrated_only.allows(Some(18)));
+        assert!(!unrated_only.allows(None));
     }
 
     #[test]
     fn refuses_ambiguous_or_out_of_range_policy() {
         assert!(Policy::from_query("maximumAge=19").is_err());
         assert!(Policy::from_query("maximumAge=pg13").is_err());
-        assert!(Policy::from_query("unknownRatings=allow").is_err());
         assert!(Policy::from_query("maximumAge=7&unknownRatings=maybe").is_err());
     }
 }
