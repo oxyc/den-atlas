@@ -676,6 +676,7 @@ fn media_letter(media_type: MediaType) -> char {
 /// on page 3 can lead page 1 — the ceiling a client-side tilt over an already-loaded page cannot pass. It
 /// never filters and never changes `total`: the tilted order is a permutation of the untilted one, memoised
 /// beside it.
+#[cfg(test)]
 pub fn row(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
@@ -684,6 +685,29 @@ pub fn row(
     tilt: Option<&Tilt>,
     skip: usize,
     limit: usize,
+) -> serde_json::Value {
+    row_with_policy(
+        indexes,
+        export,
+        media_type,
+        constraints,
+        tilt,
+        skip,
+        limit,
+        crate::maturity::Policy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn row_with_policy(
+    indexes: &Indexes,
+    export: Option<&den_titlesearch::TitleIndex>,
+    media_type: MediaType,
+    constraints: &[(String, String)],
+    tilt: Option<&Tilt>,
+    skip: usize,
+    limit: usize,
+    maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
     let coverage = crate::schema::row_coverage(indexes, media_type, constraints);
     let Some(cards) = indexes.cards.as_ref() else {
@@ -738,6 +762,12 @@ pub fn row(
         }
         None => (order, likely),
     };
+    // Maturity is policy, not part of the shared row-order memo. Filter the complete ordered tiers before
+    // pagination so a blocked title cannot consume a slot or leak into `total`.
+    let order: Vec<Key> =
+        order.iter().filter(|&&key| maturity.allows(indexes.minimum_age(key))).copied().collect();
+    let likely: Vec<Key> =
+        likely.iter().filter(|&&key| maturity.allows(indexes.minimum_age(key))).copied().collect();
     let total = order.len() + likely.len();
     let titles: Vec<serde_json::Value> = order
         .iter()

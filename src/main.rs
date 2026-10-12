@@ -20,6 +20,7 @@ mod handler;
 mod http;
 mod justwatch;
 mod manifest;
+mod maturity;
 mod metrics;
 mod motn;
 mod playground;

@@ -1796,15 +1796,33 @@ pub struct Context<'a> {
     characters: Option<Arc<CharacterIndex>>,
     scope: Scope,
     view: den_store::Store<'a>,
+    maturity: Bits,
+    restricted: bool,
 }
 
 impl<'a> Context<'a> {
+    #[cfg(test)]
     pub fn new(
         indexes: &'a Indexes,
         scope: impl Into<Scope>,
         export: Option<Arc<TitleIndex>>,
     ) -> Context<'a> {
+        Self::new_with_policy(indexes, scope, export, crate::maturity::Policy::default())
+    }
+
+    pub fn new_with_policy(
+        indexes: &'a Indexes,
+        scope: impl Into<Scope>,
+        export: Option<Arc<TitleIndex>>,
+        policy: crate::maturity::Policy,
+    ) -> Context<'a> {
         let filter = indexes.filter();
+        let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
+        for (row, &key) in filter.keys.iter().enumerate() {
+            if policy.allows(indexes.minimum_age(key)) {
+                set(&mut maturity, row);
+            }
+        }
         Context {
             filter,
             indexes,
@@ -1812,6 +1830,8 @@ impl<'a> Context<'a> {
             characters: indexes.characters.as_ref().and_then(|c| c.index()),
             scope: scope.into(),
             view: indexes.store.view(),
+            maturity,
+            restricted: policy.restricted(),
         }
     }
 
@@ -2118,6 +2138,7 @@ impl<'a> Context<'a> {
         drop: &dyn Fn(&Spec, &Item) -> bool,
     ) -> Matched {
         let mut sure = self.filter.types[self.t()].clone();
+        sure.iter_mut().zip(&self.maturity).for_each(|(matched, allowed)| *matched &= allowed);
         let mut any = sure.clone();
         for (spec, item) in applied {
             if drop(spec, item) {
@@ -2152,7 +2173,7 @@ impl<'a> Context<'a> {
 
     /// The titles of the route's type (of both, under `all`): what `total` and every coverage is out of.
     fn population(&self) -> usize {
-        popcount(&self.filter.types[self.t()])
+        and_count(&self.filter.types[self.t()], &self.maturity)
     }
 
     /// How much of the route type each applied kind is known for.
@@ -2164,7 +2185,12 @@ impl<'a> Context<'a> {
                 continue;
             }
             let (_, known) = self.value_bits(spec, &item.ids[0]);
-            let count = and_count(&known, &self.filter.types[self.t()]);
+            let type_and_age: Bits = self.filter.types[self.t()]
+                .iter()
+                .zip(&self.maturity)
+                .map(|(type_, age)| type_ & age)
+                .collect();
+            let count = and_count(&known, &type_and_age);
             out.insert(spec.name.to_owned(), json!({ "count": count, "denominator": population }));
         }
         Value::Object(out)
@@ -2354,7 +2380,7 @@ impl<'a> Context<'a> {
 
     /// The kinds object and total for a selection; the empty selection's is worked out once per type.
     fn kinds(&self, applied: &[(&'static Spec, &Item)]) -> (Value, Counted) {
-        if applied.is_empty() {
+        if applied.is_empty() && !self.restricted {
             return self.derived.empty[self.t()].get_or_init(|| self.work_kinds(&[])).clone();
         }
         self.work_kinds(applied)
@@ -3483,6 +3509,43 @@ mod tests {
             decades["values"].as_array().unwrap().iter().map(|v| v["id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), 3, "the films' 1980 and 1990 and the series' 2010: {decades}");
         assert!(ids.contains(&"2010"));
+    }
+
+    #[test]
+    fn maturity_masks_counts_and_titles_before_paging() {
+        let title = |id, minimum_age| crate::store::fixture::Title {
+            media: 0,
+            tmdb_id: id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(2000))),
+            votes: 100 - id,
+            minimum_age,
+            ..crate::store::fixture::Title::default()
+        };
+        let indexes = store_of("maturity", &[title(1, Some(7)), title(2, Some(13)), title(3, None)], &[]);
+        let policy = crate::maturity::Policy {
+            maximum_age: Some(12),
+            unknown_ratings: crate::maturity::UnknownRatings::Block,
+        };
+        let context = Context::new_with_policy(&indexes, Scope::All, None, policy);
+        let counts = context.counts(&request_all(Route::Counts, "")).0;
+        assert_eq!(counts["total"], 1);
+        let titles = context.titles(&request_all(Route::Titles, "limit=10")).0;
+        assert_eq!(typed(&titles), vec![pair("movie", 1)]);
+        assert_eq!(titles["total"], 1);
+
+        let allow_unknown = Context::new_with_policy(
+            &indexes,
+            Scope::All,
+            None,
+            crate::maturity::Policy {
+                maximum_age: Some(12),
+                unknown_ratings: crate::maturity::UnknownRatings::Allow,
+            },
+        );
+        assert_eq!(allow_unknown.counts(&request_all(Route::Counts, "")).0["total"], 2);
     }
 
     /// The indexes of a store holding these titles.

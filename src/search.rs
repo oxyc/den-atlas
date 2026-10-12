@@ -859,6 +859,7 @@ struct Scored {
 }
 
 /// The answer to a parsed query: its reading, a page of hits best first, and how many there are.
+#[cfg(test)]
 pub fn answer(
     indexes: &Indexes,
     export: Option<&TitleIndex>,
@@ -867,6 +868,29 @@ pub fn answer(
     vector: Option<&[i8]>,
     skip: usize,
     limit: usize,
+) -> serde_json::Value {
+    answer_with_policy(
+        indexes,
+        export,
+        parsed,
+        media_type,
+        vector,
+        skip,
+        limit,
+        crate::maturity::Policy::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn answer_with_policy(
+    indexes: &Indexes,
+    export: Option<&TitleIndex>,
+    parsed: &Parsed,
+    media_type: Option<MediaType>,
+    vector: Option<&[i8]>,
+    skip: usize,
+    limit: usize,
+    maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
     // A `type=` PARAMETER wins outright; the word "show" or "movie" in the query is only a default for when
     // none was given. ANDing the two let them annihilate — `?q=the show&type=movie` answered with nothing at
@@ -1048,7 +1072,7 @@ pub fn answer(
         indexes.cards.as_ref().is_some_and(|cards| cards.contains_key(key))
             || found.get(key).is_some_and(|f| f.export.is_some())
     };
-    scored.retain(|s| s.score > 0.0 && drawable(&s.key));
+    scored.retain(|s| s.score > 0.0 && drawable(&s.key) && maturity.allows(indexes.minimum_age(s.key)));
     let votes =
         |(kind, id): Key| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
     scored.sort_by(|a, b| {
