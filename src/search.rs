@@ -881,6 +881,7 @@ pub fn answer(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn answer_with_policy(
     indexes: &Indexes,
     export: Option<&TitleIndex>,

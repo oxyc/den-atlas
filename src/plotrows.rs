@@ -698,6 +698,7 @@ pub fn row(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn row_with_policy(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
