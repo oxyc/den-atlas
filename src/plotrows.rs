@@ -765,9 +765,9 @@ pub fn row_with_policy(
     // Maturity is policy, not part of the shared row-order memo. Filter the complete ordered tiers before
     // pagination so a blocked title cannot consume a slot or leak into `total`.
     let order: Vec<Key> =
-        order.iter().filter(|&&key| maturity.allows(indexes.minimum_age(key))).copied().collect();
+        order.iter().filter(|&&key| maturity.allows_with(|| indexes.minimum_age(key))).copied().collect();
     let likely: Vec<Key> =
-        likely.iter().filter(|&&key| maturity.allows(indexes.minimum_age(key))).copied().collect();
+        likely.iter().filter(|&&key| maturity.allows_with(|| indexes.minimum_age(key))).copied().collect();
     let total = order.len() + likely.len();
     let titles: Vec<serde_json::Value> = order
         .iter()

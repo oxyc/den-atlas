@@ -204,7 +204,7 @@ impl Indexes {
                 row.truncate(den_index::MAX_ROW);
                 return row.into();
             }
-            let keep = |key| maturity.allows(self.minimum_age(key));
+            let keep = |key| maturity.allows_with(|| self.minimum_age(key));
             let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
             let seed = self.suggestion_profile((media_type, tmdb_id));
             let mut row: Vec<Key> = self
@@ -282,7 +282,7 @@ impl Indexes {
             .chain(tail.into_iter().map(|(_, _, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
             .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
-            .filter(|&key| maturity.allows(self.minimum_age(key)))
+            .filter(|&key| maturity.allows_with(|| self.minimum_age(key)))
             .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
@@ -544,7 +544,7 @@ impl Indexes {
         let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
-        let keep = |key| maturity.allows(self.minimum_age(key));
+        let keep = |key| maturity.allows_with(|| self.minimum_age(key));
         let extras = den_index::Extras {
             keep: Some(&keep),
             primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),

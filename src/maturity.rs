@@ -105,6 +105,13 @@ impl Policy {
         }
     }
 
+    /// Test a title lazily, so the unrestricted policy preserves the historical path without even
+    /// consulting the maturity view. Besides avoiding needless work, this keeps instrumentation able to
+    /// prove that adding policy support has no data-access cost for ordinary requests.
+    pub fn allows_with(self, minimum_age: impl FnOnce() -> Option<u8>) -> bool {
+        !self.restricted() || self.allows(minimum_age())
+    }
+
     pub fn restricted(self) -> bool {
         self.maximum_age.is_some() || self.unknown_ratings == UnknownRatings::Block
     }
@@ -146,6 +153,16 @@ mod tests {
         assert!(!unrated_only.allows(None));
         assert_eq!(Policy::from_query("region=fi").unwrap().region.unwrap().as_str(), "FI");
         assert_eq!(serde_json::from_str::<Region>(r#""se""#).unwrap().as_str(), "SE");
+    }
+
+    #[test]
+    fn unrestricted_policy_does_not_evaluate_the_age_lookup() {
+        let mut looked_up = false;
+        assert!(Policy::default().allows_with(|| {
+            looked_up = true;
+            None
+        }));
+        assert!(!looked_up);
     }
 
     #[test]

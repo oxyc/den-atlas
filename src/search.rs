@@ -917,8 +917,9 @@ pub fn answer_with_policy(
     }
     // Every lane drops what was ruled out BEFORE it truncates, or a lane of the 500 most-voted comedies is
     // mostly American and "comedies not american" is left with what the vectors happen to find.
-    let allowed =
-        |key: Key| !rules_out(indexes, parsed, &ruled_out, key) && maturity.allows(indexes.minimum_age(key));
+    let allowed = |key: Key| {
+        !rules_out(indexes, parsed, &ruled_out, key) && maturity.allows_with(|| indexes.minimum_age(key))
+    };
     let mut found: HashMap<Key, Found> = HashMap::new();
 
     // Titles, by the name TMDB exports and the name atlas displays.

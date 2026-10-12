@@ -1247,7 +1247,7 @@ pub fn answer(
         push(key, known.title(key, Some(&offered.hint), None), rank, None);
     }
     // Policy is applied to the complete candidate pool before attention, fit and diversity ranking.
-    pool.retain(|candidate| maturity.allows(indexes.minimum_age(candidate.key)));
+    pool.retain(|candidate| maturity.allows_with(|| indexes.minimum_age(candidate.key)));
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
     let on = on_service(request, lists);
@@ -1255,7 +1255,7 @@ pub fn answer(
         only.is_none_or(|t| t == c.key.0)
             && on.as_ref().is_none_or(|on| on.contains(&c.key))
             && !owned.contains(&c.key)
-            && maturity.allows(indexes.minimum_age(c.key))
+            && maturity.allows_with(|| indexes.minimum_age(c.key))
             && !hidden(c, &request.hide)
     };
     // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.

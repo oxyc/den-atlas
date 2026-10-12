@@ -971,7 +971,7 @@ impl IndexQuestion {
                 };
                 let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
                 let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
-                let eligible = |id, kind| maturity.allows(indexes.minimum_age((kind, id)));
+                let eligible = |id, kind| maturity.allows_with(|| indexes.minimum_age((kind, id)));
                 let titles = if *mood {
                     plot.titles_with_mood_where(
                         label,
@@ -1041,7 +1041,7 @@ impl IndexQuestion {
                     .min(MAX_NEIGHBOUR_K);
                 let ids: Vec<u32> = plot
                     .nearest_where(*tmdb_id, *media_type, MAX_NEIGHBOUR_K, |id, kind| {
-                        maturity.allows(indexes.minimum_age((kind, id)))
+                        maturity.allows_with(|| indexes.minimum_age((kind, id)))
                     })
                     .iter()
                     .take(k)
@@ -1346,7 +1346,8 @@ async fn search_answer(
     let (neighbours, stats) = indexes.plot.scan_semantic_vector(
         &vector,
         |id, kind| {
-            media_type.is_none_or(|want| want == kind) && maturity.allows(indexes.minimum_age((kind, id)))
+            media_type.is_none_or(|want| want == kind)
+                && maturity.allows_with(|| indexes.minimum_age((kind, id)))
         },
         SEMANTIC_K,
     );
@@ -2396,7 +2397,7 @@ async fn handle_title_search(
         den_index::MediaType::Movie
     };
     let body = titles::metas_json_with(&index, &query, media_type, |id| {
-        maturity.allows(store.and_then(|store| store.minimum_age(kind, id)))
+        maturity.allows_with(|| store.and_then(|store| store.minimum_age(kind, id)))
     });
     let searched = started.elapsed();
     let resp = serve_json_for_policy(method, headers, body, DATASET_ANSWER, None, maturity).await;
@@ -3006,6 +3007,84 @@ mod tests {
 
         let legacy = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         assert_eq!(ids(&legacy, "members"), [101, 2, 1], "no policy keeps the historical membership");
+    }
+
+    /// Policy plumbing must be free for ordinary traffic: even routes whose restricted form filters every
+    /// candidate must not consult the age view when the effective policy allows every age. Exercise the
+    /// actual handlers (including semantic embedding and recommendation), rather than calling predicates in
+    /// isolation, so a newly added route-level lookup trips the shared store counter.
+    #[tokio::test]
+    async fn unrestricted_routes_never_consult_the_minimum_age_view() {
+        use den_titlesearch::{MediaType as TitleMediaType, TitleIndex, TitleRecord};
+
+        let dir = std::env::temp_dir()
+            .join(format!("den-atlas-unrestricted-maturity-routes-{}", std::process::id()));
+        let ds = crate::queries::write_fixture_maturity_fan_bounds(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let titles = TitleIndex::build(vec![TitleRecord {
+            tmdb_id: 1,
+            media_type: TitleMediaType::Movie,
+            title: "One".into(),
+            popularity: 100.0,
+        }]);
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            titles: Some(Arc::new(crate::titles::TitleSearch::with_index(titles))),
+            ..AppState::for_test(Some(ds))
+        });
+        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0));
+
+        let routes = [
+            "/index/neighbours/movie/1.json?k=10",
+            "/index/search.json?q=campy+fun",
+            "/index/query.json?q=heist&limit=10",
+            "/index/rows/movie/subgenre/Heist.json?limit=10",
+            "/index/row/movie.json?subgenre=Heist&limit=10",
+            "/index/suggest/movie/1.json?limit=10",
+            "/index/filter/movie/titles.json?sel=subgenre:Heist&limit=10",
+            "/index/filter/movie/titles.json?sel=like:1&limit=10",
+            "/index/filter/movie/titles.json?sel=fans:1&limit=10",
+            "/index/franchise/movie/1.json",
+            "/index/versions/movie/1.json",
+            "/catalog/movie/den-titles/search=one.json",
+        ];
+        for route in routes {
+            let response = get(&state, route).await;
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+        }
+        let recommendation = r#"{"surface":"movies","now":"2026-09-12T00:00:00Z",
+            "library":[{"type":"movie","id":1,"weight":1}],
+            "candidates":[{"type":"movie","id":2,"rank":0,"of":10}]}"#;
+        assert_eq!(post(&state, "/recommend", recommendation).await.status(), StatusCode::OK);
+
+        // Explicit `allow` and a region-only policy are unrestricted too. Their result identity semantics
+        // remain distinct where required, but neither may turn a no-filter request into an age scan.
+        for suffix in ["unknownRatings=allow", "region=FI"] {
+            for route in [
+                "/index/neighbours/movie/1.json?k=10",
+                "/index/query.json?q=heist&limit=10",
+                "/index/similar/movie/1.json?limit=10",
+                "/index/suggest/movie/1.json?limit=10",
+                "/index/filter/movie/titles.json?sel=like:1&limit=10",
+                "/index/filter/movie/titles.json?sel=fans:1&limit=10",
+                "/index/franchise/movie/1.json",
+                "/index/versions/movie/1.json",
+            ] {
+                let separator = if route.contains('?') { '&' } else { '?' };
+                let response = get(&state, &format!("{route}{separator}{suffix}")).await;
+                assert_eq!(response.status(), StatusCode::OK, "{route} {suffix}");
+                let unrestricted = body_of(response).await;
+                let legacy = body_of(get(&state, route).await).await;
+                assert_eq!(unrestricted, legacy, "{route} {suffix} changed the legacy answer");
+            }
+        }
+        assert_eq!(
+            indexes.minimum_age_accesses(),
+            (1, 0),
+            "unrestricted routes must not consult a title age"
+        );
     }
 
     /// More than 400 better-ranked adult/unknown films precede the eligible tail. Neighbours must cross its

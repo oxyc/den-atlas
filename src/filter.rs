@@ -1823,7 +1823,7 @@ impl<'a> Context<'a> {
         let maturity = if policy.restricted() {
             let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
             for (row, &key) in filter.keys.iter().enumerate() {
-                if policy.allows(indexes.minimum_age(key)) {
+                if policy.allows_with(|| indexes.minimum_age(key)) {
                     set(&mut maturity, row);
                 }
             }
