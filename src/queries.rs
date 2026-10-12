@@ -6,7 +6,7 @@
 //!
 //! # One artifact
 //!
-//! Everything below is read out of the mmap'd store (den-spec `wire/store-v3.md`) and nothing else. There
+//! Everything below is read out of the mmap'd store (den-spec `wire/store-v4.md`) and nothing else. There
 //! used to be seven inputs — `labels-t02.json`, `vectors-bge-m3.bin`, `labels-premise.json`,
 //! `vectors-premise.bin`, `metadata-*.json`, `facets.bin`, a facts sidecar and a plot-facets sidecar —
 //! each with its own reader, its own parse and its own idea of how many titles the corpus has. They
@@ -135,6 +135,11 @@ const FAN_HUB_DAMPING: f64 = 0.25;
 const FAN_MIN_PATHS: usize = 2;
 
 impl Indexes {
+    /// The public-authority minimum age for a title, or unknown when the store has no defensible match.
+    pub fn minimum_age(&self, key: Key) -> Option<u8> {
+        self.store.store.minimum_age(key.0, key.1)
+    }
+
     /// You Might Also Like for one seed. The fan picks where the store has them for it (`fan_pick_row`);
     /// otherwise structural affinity leads when store-v3 carries it, and the ordinary row is appended so
     /// partial/old stores still answer and a sparse affinity pass never shortens a rail.

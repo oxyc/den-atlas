@@ -166,6 +166,12 @@ pub struct Request {
     pub candidates: Vec<Offered>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Kid discovery ceiling. Absent means an unrestricted profile.
+    #[serde(default, rename = "maximumAge")]
+    pub maximum_age: Option<u8>,
+    /// Unknown ages fail closed whenever a ceiling is present unless the caller explicitly allows them.
+    #[serde(default, rename = "unknownRatings")]
+    pub unknown_ratings: crate::maturity::UnknownRatings,
     /// Only new titles (oxyc/den#161, `newness`): the pool holds titles out within `NEW_BEHIND`, titles due on a
     /// known day or month within `NEW_AHEAD`, and older series with a season in that window. Off by default, so
     /// the pool with it and without it can be compared before it becomes the default.
@@ -185,7 +191,15 @@ impl Request {
                 return Err(format!("at most {max} {what}"));
             }
         }
+        self.maturity().check()?;
         Ok(())
+    }
+
+    fn maturity(&self) -> crate::maturity::Policy {
+        crate::maturity::Policy {
+            maximum_age: self.maximum_age,
+            unknown_ratings: self.unknown_ratings,
+        }
     }
 
     fn only(&self) -> Option<MediaType> {
@@ -1155,6 +1169,7 @@ pub fn answer(
 ) -> serde_json::Value {
     let known = Knowledge { indexes };
     let only = request.only();
+    let maturity = request.maturity();
     let slides = request.limit.unwrap_or(SLIDES).clamp(1, MAX_SLIDES);
 
     let weighed: Vec<(Key, &LibraryEntry)> = request
@@ -1222,6 +1237,8 @@ pub fn answer(
         };
         push(key, known.title(key, Some(&offered.hint), None), rank, None);
     }
+    // Policy is applied to the complete candidate pool before attention, fit and diversity ranking.
+    pool.retain(|candidate| maturity.allows(indexes.minimum_age(candidate.key)));
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
     let on = on_service(request, lists);
@@ -1229,6 +1246,7 @@ pub fn answer(
         only.is_none_or(|t| t == c.key.0)
             && on.as_ref().is_none_or(|on| on.contains(&c.key))
             && !owned.contains(&c.key)
+            && maturity.allows(indexes.minimum_age(c.key))
             && !hidden(c, &request.hide)
     };
     // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.

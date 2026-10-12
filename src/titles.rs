@@ -160,10 +160,23 @@ fn inflate_into(scanner: ExportScanner, gz: &[u8]) -> std::io::Result<ExportScan
 /// A search catalog body of `{id,type,name,moviedb_id}` metas. The TMDB id is what the Den apps map a row
 /// through, and they draw posters from TMDB themselves, so atlas serves none; the name is the export's
 /// original title, at most a day old.
+#[cfg(test)]
 pub fn metas_json(index: &TitleIndex, query: &str, media_type: MediaType) -> String {
+    metas_json_with(index, query, media_type, |_| true)
+}
+
+/// As `metas_json`, filtering the full ranked hit stream before the result limit is applied.
+pub fn metas_json_with(
+    index: &TitleIndex,
+    query: &str,
+    media_type: MediaType,
+    allow: impl Fn(u32) -> bool,
+) -> String {
     let metas: Vec<serde_json::Value> = index
-        .search(query, Some(media_type), RESULT_LIMIT)
+        .search(query, Some(media_type), index.len())
         .iter()
+        .filter(|hit| allow(hit.tmdb_id))
+        .take(RESULT_LIMIT)
         .map(|hit| {
             serde_json::json!({
                 "id": format!("tmdb:{}", hit.tmdb_id),

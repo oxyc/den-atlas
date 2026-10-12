@@ -29,6 +29,7 @@ mod railab;
 mod raileval;
 mod ratings;
 mod recommend;
+mod maturity;
 mod schema;
 mod search;
 mod series;

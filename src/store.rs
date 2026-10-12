@@ -1,6 +1,6 @@
 //! The store on disk: the one impure step, and the shapes the serving path reads out of it.
 //!
-//! The format and its decoder are not here. `den-spec wire/store-v3.md` is the contract and
+//! The format and its decoder are not here. `den-spec wire/store-v4.md` is the contract and
 //! `den_store` is the reader, in den-core, because that crate must also compile for the browser and for
 //! tvOS where `memmap2` does not. What belongs here is the part that touches the filesystem: map the
 //! file, verify it once, and keep the mapping alive for the life of the process.
@@ -100,6 +100,16 @@ impl MappedStore {
         self.map.len()
     }
 
+    /// The public-authority minimum age for one TMDB title, or unknown when the title or rating is absent.
+    pub fn minimum_age(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<u8> {
+        let media = u8::from(media_type == den_index::MediaType::Tv);
+        let view = self.view();
+        let row = view.row_of(media, tmdb_id).ok().flatten()?;
+        view.minimum_ages()
+            .expect("MappedStore::check validates minimum_age at load")
+            .get(row)
+    }
+
     /// Read every section the serving path needs, once, so a store that is missing one fails at LOAD
     /// rather than on the first request that happens to want it.
     ///
@@ -131,6 +141,9 @@ impl MappedStore {
         // `/index/title` names a title the store has no row for from these, per request, and answers it as
         // unknown on an error, so a malformed section must fail here instead of silently naming nothing.
         view.wikidata_names()?;
+        // Kid filtering is a serving invariant, not an optional enhancement. A v4 store without the
+        // required column, or with an out-of-range encoded age, must fail before it can answer traffic.
+        view.minimum_ages()?;
         Ok(())
     }
 }
@@ -184,7 +197,7 @@ impl LoadedStore {
 /// way a test can say so is to fail.
 #[cfg(test)]
 pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
-    spec_vectors("store-v3.store")
+    spec_vectors("store-v4.store")
 }
 
 /// A file under den-spec's `vectors/`, with `spec_fixture`'s rule for when it is absent. `store-v1.store`
@@ -226,7 +239,7 @@ pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
 /// copy agrees with itself. What keeps it honest is that it is checked by the reader we ship: every store
 /// it writes goes through `den_store::Store::open`, which verifies the magic, the version, the endianness
 /// marker, the content hash over every byte and each section's extent, and then through `MappedStore::check`.
-/// A layout mistake here fails the tests rather than passing them. The store-v3 CONTRACT is still tested
+/// A layout mistake here fails the tests rather than passing them. The store-v4 CONTRACT is still tested
 /// against the real writer's output, by `maps_and_checks_the_spec_fixture` below.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -261,6 +274,8 @@ pub(crate) mod fixture {
         /// (title, poster path, year). Absent ⇒ no card, which is how a row with no drawable name is held.
         pub card: Option<(&'a str, Option<&'a str>, Option<i16>)>,
         pub votes: u32,
+        /// The conservative public-authority minimum age; absent is encoded as `NONE_AGE`.
+        pub minimum_age: Option<u8>,
         pub imdb: Option<&'a str>,
         /// (days since 1970-01-01, precision: 0 day / 1 month / 2 year).
         pub released: Option<(i32, u8)>,
@@ -631,6 +646,10 @@ pub(crate) mod fixture {
                 .collect(),
         );
         b.u32s("votes", &titles.iter().map(|t| t.votes).collect::<Vec<u32>>());
+        b.u8s(
+            "minimum_age",
+            &titles.iter().map(|t| t.minimum_age.unwrap_or(den_store::NONE_AGE)).collect::<Vec<u8>>(),
+        );
 
         // The facts.
         let imdb: Vec<u32> = titles.iter().map(|t| b.optional(t.imdb)).collect();
@@ -989,7 +1008,7 @@ mod tests {
     #[test]
     fn maps_and_checks_the_spec_fixture() {
         let Some(path) = fixture() else {
-            eprintln!("SKIP: den-spec/vectors/store-v3.store not found");
+            eprintln!("SKIP: den-spec/vectors/store-v4.store not found");
             return;
         };
         let store = MappedStore::open(&path).expect("the fixture maps");
@@ -997,6 +1016,10 @@ mod tests {
         assert_eq!(store.rows(), 3);
         let agg = den_index::RailAggregates::build(&store.view()).expect("aggregates");
         store.check(&agg).expect("the fixture has every section serving needs");
+        let ages = store.view().minimum_ages().expect("minimum ages");
+        assert_eq!(ages.get(den_store::Row(0)), Some(13));
+        assert_eq!(ages.get(den_store::Row(1)), None);
+        assert_eq!(ages.get(den_store::Row(2)), Some(7));
     }
 
     // The rail's column reads (`den_index::SeedFacets`), against den-spec's three-title fixture. These
