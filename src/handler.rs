@@ -1040,9 +1040,10 @@ impl IndexQuestion {
                     .unwrap_or(NEIGHBOUR_K)
                     .min(MAX_NEIGHBOUR_K);
                 let ids: Vec<u32> = plot
-                    .nearest(*tmdb_id, *media_type, MAX_NEIGHBOUR_K)
+                    .nearest_where(*tmdb_id, *media_type, MAX_NEIGHBOUR_K, |id, kind| {
+                        maturity.allows(indexes.minimum_age((kind, id)))
+                    })
                     .iter()
-                    .filter(|n| maturity.allows(indexes.minimum_age((n.media_type, n.tmdb_id))))
                     .take(k)
                     .map(|n| n.tmdb_id)
                     .collect();
@@ -2903,6 +2904,13 @@ mod tests {
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
     }
 
+    fn maturity_bounds_state(name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let ds = crate::queries::write_fixture_maturity_bounds(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
     /// Region is explicit policy identity, never inferred from server/install state. Canonical spellings share an
     /// ETag, different regions do not, and a request with no policy keeps the historical body-only ETag exactly.
     #[tokio::test]
@@ -2998,6 +3006,84 @@ mod tests {
 
         let legacy = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
         assert_eq!(ids(&legacy, "members"), [101, 2, 1], "no policy keeps the historical membership");
+    }
+
+    /// More than 400 better-ranked adult/unknown films precede the eligible tail. Neighbours must cross its
+    /// cap of 50, and filter `like`/`fans` must cross the similarity pool, rather than spend either bound first.
+    /// Warming the legacy and other-region rows also proves those independently memoised answers stay isolated.
+    #[tokio::test]
+    async fn maturity_enters_neighbour_and_filter_candidate_discovery_before_bounds() {
+        use den_index::MediaType::Movie;
+
+        let state = maturity_bounds_state("den-atlas-maturity-candidate-bounds");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let title_ids = |answer: &serde_json::Value| -> Vec<u32> {
+            answer["titles"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|title| title["id"].as_u64().map(|id| id as u32))
+                .collect()
+        };
+        let policy = "maximumAge=13&unknownRatings=block&region=FI";
+
+        let legacy_neighbours = json(body_of(get(&state, "/index/neighbours/movie/1.json?k=10").await).await);
+        assert_eq!(legacy_neighbours["ids"].as_array().unwrap().len(), 10);
+        assert!(legacy_neighbours["ids"].as_array().unwrap().iter().all(|id| {
+            let id = id.as_u64().unwrap() as u32;
+            (300..=709).contains(&id)
+        }));
+
+        let neighbours =
+            json(body_of(get(&state, &format!("/index/neighbours/movie/1.json?k=10&{policy}")).await).await);
+        let neighbour_ids: Vec<u32> =
+            neighbours["ids"].as_array().unwrap().iter().map(|id| id.as_u64().unwrap() as u32).collect();
+        assert_eq!(neighbour_ids.len(), 10, "eligible tail must refill the requested page");
+        assert!(neighbour_ids.iter().all(|id| (710..=729).contains(id)), "leaked neighbour: {neighbours}");
+
+        for kind in ["like", "fans"] {
+            let legacy_path = format!("/index/filter/movie/titles.json?sel={kind}:1&limit=10");
+            let legacy = json(body_of(get(&state, &legacy_path).await).await);
+            let legacy_ids = title_ids(&legacy);
+            assert_eq!(legacy_ids.len(), 10, "no-policy {kind} keeps its full historical page");
+            assert!(legacy_ids.iter().all(|id| (300..=709).contains(id)), "legacy {kind}: {legacy}");
+
+            let fi_path = format!("{legacy_path}&skip=10&{policy}");
+            let fi_response = get(&state, &fi_path).await;
+            assert_eq!(fi_response.status(), StatusCode::OK, "{fi_path}");
+            let fi_etag = fi_response.headers()[header::ETAG].clone();
+            let fi = json(body_of(fi_response).await);
+            let fi_ids = title_ids(&fi);
+            assert_eq!(fi_ids.len(), 10, "eligible {kind} tail must refill the requested page: {fi}");
+            assert!(
+                fi_ids.iter().all(|id| !(300..=709).contains(id) && *id != 1),
+                "blocked or unknown {kind} member leaked: {fi}"
+            );
+
+            let se_path = format!("{legacy_path}&skip=10&maximumAge=13&unknownRatings=block&region=SE");
+            let se_response = get(&state, &se_path).await;
+            assert_eq!(se_response.status(), StatusCode::OK, "{se_path}");
+            assert_ne!(se_response.headers()[header::ETAG], fi_etag, "region is cache identity");
+            assert_eq!(
+                title_ids(&json(body_of(se_response).await)),
+                fi_ids,
+                "region does not alter global ages"
+            );
+        }
+
+        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
+        for query in [
+            "",
+            "maximumAge=13&unknownRatings=block&region=FI",
+            "maximumAge=13&unknownRatings=block&region=SE",
+        ] {
+            let policy = crate::maturity::Policy::from_query(query).unwrap();
+            assert_eq!(
+                indexes.has_policy_memos((Movie, 1), false, policy),
+                (true, true),
+                "like and fans memos must both be policy/region scoped for {query:?}"
+            );
+        }
     }
 
     /// Exercise the mapped store, label index, policy lookup, pagination, JSON boundary and HTTP handler —

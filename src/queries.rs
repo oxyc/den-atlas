@@ -97,7 +97,7 @@ pub struct Indexes {
 
 type Key = (den_index::MediaType, u32);
 /// A More Like This row in the memo: the title, and whether the row mixes films and series.
-type SimilarKey = (Key, bool);
+type SimilarKey = (Key, bool, crate::maturity::Policy);
 
 /// More Like This answers and row orders kept at most: bounded, and simply started over when full. Both are small
 /// (a row order is at most a few thousand titles, an answer at most `den_index::MAX_ROW` ids).
@@ -135,6 +135,20 @@ const FAN_HUB_DAMPING: f64 = 0.25;
 const FAN_MIN_PATHS: usize = 2;
 
 impl Indexes {
+    /// Test visibility for the policy dimensions of the two independently bounded discovery memos.
+    #[cfg(test)]
+    pub(crate) fn has_policy_memos(
+        &self,
+        seed: Key,
+        mix: bool,
+        policy: crate::maturity::Policy,
+    ) -> (bool, bool) {
+        (
+            lock(&self.similar).contains_key(&(seed, mix, policy)),
+            lock(&self.affinity).contains_key(&(seed, mix, policy)),
+        )
+    }
+
     /// The public-authority minimum age for a title, or unknown when the store has no defensible match.
     pub fn minimum_age(&self, key: Key) -> Option<u8> {
         self.store.store.minimum_age(key.0, key.1)
@@ -149,26 +163,7 @@ impl Indexes {
         media_type: den_index::MediaType,
         mix: bool,
     ) -> Arc<[Key]> {
-        memoised(&self.affinity, ((media_type, tmdb_id), mix), SIMILAR_MEMO, || {
-            if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix) {
-                return row.into();
-            }
-            let params = den_index::SimilarParams::default();
-            let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
-                den_index::you_might_also_like(Some(facets), (media_type, tmdb_id), mix, den_index::MAX_ROW)
-            });
-            let fallback: Vec<Key> = if mix {
-                self.more_like_this_mixed(tmdb_id, media_type).to_vec()
-            } else {
-                self.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
-            };
-            let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
-            row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
-            let seed = self.suggestion_profile((media_type, tmdb_id));
-            row.retain(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)));
-            row.truncate(den_index::MAX_ROW);
-            row.into()
-        })
+        self.you_might_also_like_with_policy(tmdb_id, media_type, mix, crate::maturity::Policy::default())
     }
 
     /// A policy-scoped suggestion row. Restricted requests cannot reuse the dataset-only memo: eligibility
@@ -179,26 +174,48 @@ impl Indexes {
         media_type: den_index::MediaType,
         mix: bool,
         maturity: crate::maturity::Policy,
-    ) -> Vec<Key> {
-        if !maturity.restricted() {
-            return self.you_might_also_like(tmdb_id, media_type, mix).to_vec();
-        }
-        let keep = |key| maturity.allows(self.minimum_age(key));
-        let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
-        let seed = self.suggestion_profile((media_type, tmdb_id));
-        let mut row: Vec<Key> = self
-            .more_like_this_with(
-                tmdb_id,
-                media_type,
-                &params,
-                den_index::Extras { keep: Some(&keep), ..den_index::Extras::default() },
-            )
-            .into_iter()
-            .map(|scored| scored.key())
-            .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
-            .collect();
-        row.truncate(den_index::MAX_ROW);
-        row
+    ) -> Arc<[Key]> {
+        memoised(&self.affinity, ((media_type, tmdb_id), mix, maturity), SIMILAR_MEMO, || {
+            if !maturity.restricted() {
+                if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix) {
+                    return row.into();
+                }
+                let params = den_index::SimilarParams::default();
+                let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
+                    den_index::you_might_also_like(
+                        Some(facets),
+                        (media_type, tmdb_id),
+                        mix,
+                        den_index::MAX_ROW,
+                    )
+                });
+                let (one, mixed) = self.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
+                let fallback: Vec<Key> =
+                    if mix { mixed } else { one.into_iter().map(|id| (media_type, id)).collect() };
+                let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
+                row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
+                let seed = self.suggestion_profile((media_type, tmdb_id));
+                row.retain(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)));
+                row.truncate(den_index::MAX_ROW);
+                return row.into();
+            }
+            let keep = |key| maturity.allows(self.minimum_age(key));
+            let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
+            let seed = self.suggestion_profile((media_type, tmdb_id));
+            let mut row: Vec<Key> = self
+                .more_like_this_with(
+                    tmdb_id,
+                    media_type,
+                    &params,
+                    den_index::Extras { keep: Some(&keep), ..den_index::Extras::default() },
+                )
+                .into_iter()
+                .map(|scored| scored.key())
+                .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
+                .collect();
+            row.truncate(den_index::MAX_ROW);
+            row.into()
+        })
     }
 
     /// The seed's fan picks, in the model's order, then the titles the fan-picks graph ties to it
@@ -343,11 +360,16 @@ impl Indexes {
     /// The seed's own type alone, as ids — the row `/index/similar`'s `ids` and `/index/suggest`'s have always
     /// carried, which every client reads. `more_like_this_mixed` is the row with the other type in it.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
-        let row = memoised(&self.similar, ((media_type, tmdb_id), false), SIMILAR_MEMO, || {
-            let one_type =
-                den_index::SimilarParams { mix_types: false, ..den_index::SimilarParams::default() };
-            self.more_like_this_scored(tmdb_id, media_type, &one_type).iter().map(|s| s.key()).collect()
-        });
+        let row = memoised(
+            &self.similar,
+            ((media_type, tmdb_id), false, crate::maturity::Policy::default()),
+            SIMILAR_MEMO,
+            || {
+                let one_type =
+                    den_index::SimilarParams { mix_types: false, ..den_index::SimilarParams::default() };
+                self.more_like_this_scored(tmdb_id, media_type, &one_type).iter().map(|s| s.key()).collect()
+            },
+        );
         row.iter().map(|&(_, id)| id).collect()
     }
 
@@ -356,10 +378,15 @@ impl Indexes {
     /// `more_like_this`'s first ones, in its order; the rerank orders each row by its own top ten
     /// (`den_index::JevMode`), so a seed with Jev's scores can order them differently.
     pub fn more_like_this_mixed(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
-        memoised(&self.similar, ((media_type, tmdb_id), true), SIMILAR_MEMO, || {
-            let production = den_index::SimilarParams::default();
-            self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
-        })
+        memoised(
+            &self.similar,
+            ((media_type, tmdb_id), true, crate::maturity::Policy::default()),
+            SIMILAR_MEMO,
+            || {
+                let production = den_index::SimilarParams::default();
+                self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
+            },
+        )
     }
 
     /// More Like This ranked with `params`, every title's signals kept, and never memoised — the tuning
@@ -448,7 +475,8 @@ impl Indexes {
         let seed = (media_type, tmdb_id);
         let held = {
             let memo = lock(&self.similar);
-            memo.contains_key(&(seed, false)) || memo.contains_key(&(seed, true))
+            let policy = crate::maturity::Policy::default();
+            memo.contains_key(&(seed, false, policy)) || memo.contains_key(&(seed, true, policy))
         };
         if held {
             let one = self.more_like_this(tmdb_id, media_type);
@@ -479,8 +507,9 @@ impl Indexes {
         if memo.len() + 2 > SIMILAR_MEMO {
             memo.clear();
         }
-        memo.insert((seed, false), Arc::clone(&one));
-        memo.insert((seed, true), Arc::clone(&mixed));
+        let policy = crate::maturity::Policy::default();
+        memo.insert((seed, false, policy), Arc::clone(&one));
+        memo.insert((seed, true, policy), Arc::clone(&mixed));
         (one.iter().map(|&(_, id)| id).collect(), mixed)
     }
 
@@ -491,12 +520,20 @@ impl Indexes {
         media_type: den_index::MediaType,
         maturity: crate::maturity::Policy,
     ) -> (Vec<u32>, Vec<Key>) {
-        if !maturity.restricted() {
+        if maturity == crate::maturity::Policy::default() {
             let (one, mixed) = self.more_like_this_rows(tmdb_id, media_type);
             return (one.to_vec(), mixed.to_vec());
         }
-        let production = den_index::SimilarParams::default();
         let seed = (media_type, tmdb_id);
+        {
+            let memo = lock(&self.similar);
+            if let (Some(one), Some(mixed)) =
+                (memo.get(&(seed, false, maturity)), memo.get(&(seed, true, maturity)))
+            {
+                return (one.iter().map(|&(_, id)| id).collect(), mixed.to_vec());
+            }
+        }
+        let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
         let keep = |key| maturity.allows(self.minimum_age(key));
@@ -517,10 +554,16 @@ impl Indexes {
                 &production,
             )
         });
-        (
-            one.into_iter().map(|scored| scored.key().1).collect(),
-            mixed.into_iter().map(|scored| scored.key()).collect(),
-        )
+        let one: Arc<[Key]> = one.into_iter().map(|scored| scored.key()).collect();
+        let mixed: Arc<[Key]> = mixed.into_iter().map(|scored| scored.key()).collect();
+        let answer = (one.iter().map(|&(_, id)| id).collect(), mixed.to_vec());
+        let mut memo = lock(&self.similar);
+        if memo.len() + 2 > SIMILAR_MEMO {
+            memo.clear();
+        }
+        memo.insert((seed, false, maturity), one);
+        memo.insert((seed, true, maturity), mixed);
+        answer
     }
 
     /// `work` given what the rail reads about the seed beyond the vectors: its facets, tuned to `params`, and
@@ -1293,13 +1336,20 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
 /// them living in a separate blob.
 #[cfg(test)]
 pub fn write_fixture(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, true, &[], &[])
+    write_fixture_as(dir, "One", true, true, &[], &[], false)
 }
 
 /// The normal route fixture with public maturity ages on three drawable movies and one explicit unknown.
 #[cfg(test)]
 pub fn write_fixture_maturity(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)])
+    write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)], false)
+}
+
+/// A maturity fixture whose better-ranked ineligible candidates exceed both the 50-neighbour cap and the
+/// similarity pool. Eligible titles behind them must only be visible when policy enters candidate discovery.
+#[cfg(test)]
+pub fn write_fixture_maturity_bounds(dir: &std::path::Path) -> Dataset {
+    write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)], true)
 }
 
 /// A fixture title as the store writer keys it: (media, tmdb id), media 0 a film and 1 a series.
@@ -1309,21 +1359,21 @@ type FixtureKey = (u8, u32);
 /// The same fixture with fan picks: each `(media, id)` named is asked, with its picks.
 #[cfg(test)]
 pub fn write_fixture_fan_picks(dir: &std::path::Path, picks: &[(FixtureKey, Vec<FixtureKey>)]) -> Dataset {
-    write_fixture_as(dir, "One", true, true, picks, &[])
+    write_fixture_as(dir, "One", true, true, picks, &[], false)
 }
 
 /// The same fixture with every `votes` count zeroed, for the tests about a corpus no source can order:
 /// what the store will look like once the producer stops writing the column.
 #[cfg(test)]
 pub fn write_fixture_voteless(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, false, &[], &[])
+    write_fixture_as(dir, "One", true, false, &[], &[], false)
 }
 
 /// The same fixture with a different display title for movie 1, for the tests about a word that is both a
 /// facet and a title ("brazil").
 #[cfg(test)]
 pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
-    write_fixture_as(dir, movie_one, true, true, &[], &[])
+    write_fixture_as(dir, movie_one, true, true, &[], &[], false)
 }
 
 /// The same fixture with no premise vectors, for the tests about a dataset whose store carries only the
@@ -1331,7 +1381,7 @@ pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
 /// section of the store now, so the store is what has to lack it.
 #[cfg(test)]
 pub fn write_fixture_plot_only(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", false, true, &[], &[])
+    write_fixture_as(dir, "One", false, true, &[], &[], false)
 }
 
 #[cfg(test)]
@@ -1342,6 +1392,7 @@ fn write_fixture_as(
     votes: bool,
     fan_picks: &[(FixtureKey, Vec<FixtureKey>)],
     maturity: &[(u8, u32, u8)],
+    maturity_bounds: bool,
 ) -> Dataset {
     use crate::store::fixture::{Entity, Title};
     // Days since 1970-01-01, the store's unit for a release date.
@@ -1442,6 +1493,40 @@ fn write_fixture_as(
         premise: vector([0, 0, 0], premise),
         ..Title::default()
     }));
+    if maturity_bounds {
+        // 410 exact neighbours rank before the eligible tail: more than the public neighbours cap (50) and
+        // den-index's similarity pool (400). Half are explicitly adult and half genuinely unknown.
+        titles.extend((300..=709).map(|tmdb_id| Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            subgenres: vec![("Heist", 90)],
+            moods: vec![("Tense", 80)],
+            plot: vector([100, 0, 0], true),
+            premise: vector([100, 0, 0], premise),
+            facets: vec![("ending", "bittersweet", 70), ("tone", "bleak", 90), ("pacing", "slow-burn", 90)],
+            card: Some(("Blocked candidate", None, Some(2000))),
+            votes: 100,
+            countries: vec!["KR"],
+            minimum_age: (tmdb_id % 2 == 0).then_some(18),
+            ..Title::default()
+        }));
+        titles.extend((710..=729).map(|tmdb_id| Title {
+            media: 0,
+            tmdb_id,
+            primary_genre: "Drama",
+            subgenres: vec![("Heist", 89)],
+            moods: vec![("Tense", 79)],
+            plot: vector([99, 1, 0], true),
+            premise: vector([99, 1, 0], premise),
+            facets: vec![("ending", "bittersweet", 70), ("tone", "bleak", 89), ("pacing", "slow-burn", 89)],
+            card: Some(("Eligible candidate", None, Some(2000))),
+            votes: 100,
+            countries: vec!["KR"],
+            minimum_age: Some(7),
+            ..Title::default()
+        }));
+    }
     if !votes {
         for title in &mut titles {
             title.votes = 0;

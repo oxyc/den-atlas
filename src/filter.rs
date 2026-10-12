@@ -1797,6 +1797,7 @@ pub struct Context<'a> {
     scope: Scope,
     view: den_store::Store<'a>,
     maturity: Bits,
+    policy: crate::maturity::Policy,
     restricted: bool,
 }
 
@@ -1831,6 +1832,7 @@ impl<'a> Context<'a> {
             scope: scope.into(),
             view: indexes.store.view(),
             maturity,
+            policy,
             restricted: policy.restricted(),
         }
     }
@@ -1875,15 +1877,18 @@ impl<'a> Context<'a> {
         let keys: Vec<Key> = match (data, self.scope) {
             (Data::Fans, scope) => self
                 .indexes
-                .you_might_also_like(tmdb_id, media_type, scope == Scope::All)
+                .you_might_also_like_with_policy(tmdb_id, media_type, scope == Scope::All, self.policy)
                 .iter()
                 .copied()
                 .filter(|&key| key != (media_type, tmdb_id))
                 .collect(),
             (_, Scope::Type(_)) => {
-                self.indexes.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
+                let (one, _) = self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy);
+                one.into_iter().map(|id| (media_type, id)).collect()
             }
-            (_, Scope::All) => self.indexes.more_like_this_mixed(tmdb_id, media_type).to_vec(),
+            (_, Scope::All) => {
+                self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy).1
+            }
         };
         keys.into_iter()
             .filter_map(|(media_type, id)| {
