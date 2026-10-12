@@ -10,7 +10,7 @@ publish = false
 # The store reader — den-spec wire/store-v3. Pure and dependency-light (`zerocopy` alone) and it owns no
 # mapping, so it compiles for wasm32 like the rest of this crate. Same revision as den-atlas reads with:
 # a binary format contract wants one version per build, not two.
-den-store = { git = "https://github.com/oxyc/den-core.git", rev = "1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5" }
+den-store = { git = "https://github.com/oxyc/den-core.git", rev = "00bcda387b5b75647fef5590083722a49ac14edf" }
 # `ln` for the scorer. `f64::ln` calls the platform's libm — macOS's, musl's, the one compiled into a wasm
 # module — which may round differently, so the same row could score differently on the server and in a
 # browser. This is one pure-Rust implementation on every target; without `arch` it takes the same code
