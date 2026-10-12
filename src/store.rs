@@ -1,6 +1,6 @@
 //! The store on disk: the one impure step, and the shapes the serving path reads out of it.
 //!
-//! The format and its decoder are not here. `den-spec wire/store-v4.md` is the contract and
+//! The format and its decoder are not here. `den-spec wire/store-v5.md` is the current contract and
 //! `den_store` is the reader, in den-core, because that crate must also compile for the browser and for
 //! tvOS where `memmap2` does not. What belongs here is the part that touches the filesystem: map the
 //! file, verify it once, and keep the mapping alive for the life of the process.
@@ -18,6 +18,7 @@
 
 use den_store::{Store, StoreError, StoreTable};
 use memmap2::Mmap;
+use serde::Serialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -43,10 +44,31 @@ pub struct MappedStore {
     /// The validated public maturity column, indexed by store row. `minimum_ages()` validates every byte,
     /// so retaining this owned view makes candidate eligibility O(1) instead of rescanning the column.
     minimum_ages: Box<[Option<u8>]>,
+    /// Audience-intent decisions at the contract's 0.5 floor: (made for children, made for teens).
+    /// Missing or malformed evidence stays false, so Kid discovery fails closed without degrading Owner use.
+    kid_audience: Box<[(bool, bool)]>,
+    /// Validated official observations, owned once at load so a detail request never rescans all observations.
+    maturity_ratings: Box<[Vec<PublicMaturityRating>]>,
     #[cfg(test)]
     minimum_age_view_builds: AtomicUsize,
     #[cfg(test)]
     minimum_age_lookups: AtomicUsize,
+}
+
+/// One redistributable official classification observation returned by `/index/title`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicMaturityRating {
+    pub authority: String,
+    pub authority_id: String,
+    pub rating: String,
+    pub normalized_age: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 impl std::fmt::Debug for MappedStore {
@@ -83,16 +105,37 @@ impl MappedStore {
         if map.len() != verified {
             return Err(format!("{}: changed size while it was being opened", path.display()));
         }
-        let minimum_ages = {
+        let (minimum_ages, kid_audience, maturity_ratings) = {
             let view = table.view(&map);
             let ages = view.minimum_ages().map_err(|e| format!("{}: {e}", path.display()))?;
-            (0..table.rows()).map(|row| ages.get(den_store::Row(row))).collect()
+            let minimum_ages = (0..table.rows()).map(|row| ages.get(den_store::Row(row))).collect();
+            let kid_audience = kid_audience_rows(&view, table.rows());
+            let ratings = view.maturity_ratings().map_err(|e| format!("{}: {e}", path.display()))?;
+            let maturity_ratings = (0..table.rows())
+                .map(|row| {
+                    ratings
+                        .get(den_store::Row(row))
+                        .map(|rating| PublicMaturityRating {
+                            authority: rating.authority.to_owned(),
+                            authority_id: rating.authority_id.to_owned(),
+                            rating: rating.rating.to_owned(),
+                            normalized_age: rating.normalized_age,
+                            assessed: rating.assessed.map(str::to_owned),
+                            runtime_minutes: rating.runtime_minutes,
+                            format: rating.format.map(str::to_owned),
+                        })
+                        .collect()
+                })
+                .collect();
+            (minimum_ages, kid_audience, maturity_ratings)
         };
         Ok(Self {
             path: path.to_owned(),
             map,
             table,
             minimum_ages,
+            kid_audience,
+            maturity_ratings,
             #[cfg(test)]
             minimum_age_view_builds: AtomicUsize::new(1),
             #[cfg(test)]
@@ -131,6 +174,34 @@ impl MappedStore {
         let view = self.view();
         let row = view.row_of(media, tmdb_id).ok().flatten()?;
         self.minimum_ages.get(row.0).copied().flatten()
+    }
+
+    /// Whether the store has affirmative audience-intent evidence for this Kid catalogue band.
+    pub fn kid_audience_relevant(
+        &self,
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+        band: crate::maturity::KidAudience,
+    ) -> bool {
+        let media = u8::from(media_type == den_index::MediaType::Tv);
+        let row = self.view().row_of(media, tmdb_id).ok().flatten();
+        let (child, teen) = row.and_then(|row| self.kid_audience.get(row.0)).copied().unwrap_or_default();
+        child || (band == crate::maturity::KidAudience::ChildOrTeen && teen)
+    }
+
+    pub fn maturity_ratings(
+        &self,
+        media_type: den_index::MediaType,
+        tmdb_id: u32,
+    ) -> &[PublicMaturityRating] {
+        let media = u8::from(media_type == den_index::MediaType::Tv);
+        self.view()
+            .row_of(media, tmdb_id)
+            .ok()
+            .flatten()
+            .and_then(|row| self.maturity_ratings.get(row.0))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     #[cfg(test)]
@@ -178,6 +249,30 @@ impl MappedStore {
         // retained the entire column, before this broader serving check builds.
         Ok(())
     }
+}
+
+fn kid_audience_rows(view: &Store<'_>, rows: usize) -> Box<[(bool, bool)]> {
+    let empty = || vec![(false, false); rows].into_boxed_slice();
+    let (Ok(cells), Ok(names), Ok(strings)) =
+        (view.column::<u8>("audience"), view.column::<u32>("audience_names"), view.strings())
+    else {
+        return empty();
+    };
+    let width = names.len();
+    if width == 0 || cells.len() != rows.saturating_mul(width) {
+        return empty();
+    }
+    let child = names.iter().position(|&id| strings.get(id) == Some("made_for_children"));
+    let teen = names.iter().position(|&id| strings.get(id) == Some("made_for_teens"));
+    (0..rows)
+        .map(|row| {
+            let scores = &cells[row * width..(row + 1) * width];
+            (
+                child.and_then(|at| scores.get(at)).is_some_and(|&score| score >= 50),
+                teen.and_then(|at| scores.get(at)).is_some_and(|&score| score >= 50),
+            )
+        })
+        .collect()
 }
 
 /// The mapping, for the indexes that read their vectors from it in place (`den_index::StoreBytes`).
@@ -229,7 +324,7 @@ impl LoadedStore {
 /// way a test can say so is to fail.
 #[cfg(test)]
 pub(crate) fn spec_fixture() -> Option<std::path::PathBuf> {
-    spec_vectors("store-v4.store")
+    spec_vectors("store-v5.store")
 }
 
 /// A file under den-spec's `vectors/`, with `spec_fixture`'s rule for when it is absent. `store-v1.store`
@@ -271,7 +366,7 @@ pub(crate) fn spec_vectors(name: &str) -> Option<std::path::PathBuf> {
 /// copy agrees with itself. What keeps it honest is that it is checked by the reader we ship: every store
 /// it writes goes through `den_store::Store::open`, which verifies the magic, the version, the endianness
 /// marker, the content hash over every byte and each section's extent, and then through `MappedStore::check`.
-/// A layout mistake here fails the tests rather than passing them. The store-v4 CONTRACT is still tested
+/// A layout mistake here fails the tests rather than passing them. The store-v5 CONTRACT is still tested
 /// against the real writer's output, by `maps_and_checks_the_spec_fixture` below.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -308,6 +403,7 @@ pub(crate) mod fixture {
         pub votes: u32,
         /// The conservative public-authority minimum age; absent is encoded as `NONE_AGE`.
         pub minimum_age: Option<u8>,
+        pub maturity_ratings: Vec<MaturityRating<'a>>,
         pub imdb: Option<&'a str>,
         /// (days since 1970-01-01, precision: 0 day / 1 month / 2 year).
         pub released: Option<(i32, u8)>,
@@ -354,6 +450,17 @@ pub(crate) mod fixture {
         pub curated_franchise: Option<(u32, u32)>,
         /// Test-only other-version links: (media, TMDB id, kind; 0 shared source, 1 remake).
         pub versions: Vec<(u8, u32, u8)>,
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct MaturityRating<'a> {
+        pub authority: &'a str,
+        pub authority_id: &'a str,
+        pub rating: &'a str,
+        pub normalized_age: Option<u8>,
+        pub assessed: Option<&'a str>,
+        pub runtime_minutes: Option<u16>,
+        pub format: Option<&'a str>,
     }
 
     /// One row of the entity table: a person, a franchise, a place.
@@ -442,6 +549,10 @@ pub(crate) mod fixture {
 
         fn u32s(&mut self, name: &'static str, values: &[u32]) {
             self.section(name, 4, values.iter().flat_map(|v| v.to_le_bytes()).collect());
+        }
+
+        fn u16s(&mut self, name: &'static str, values: &[u16]) {
+            self.section(name, 2, values.iter().flat_map(|v| v.to_le_bytes()).collect());
         }
 
         fn u64s(&mut self, name: &'static str, values: &[u64]) {
@@ -685,6 +796,60 @@ pub(crate) mod fixture {
         b.u8s(
             "minimum_age",
             &titles.iter().map(|t| t.minimum_age.unwrap_or(den_store::NONE_AGE)).collect::<Vec<u8>>(),
+        );
+        let observations: Vec<Vec<MaturityRating<'_>>> = titles
+            .iter()
+            .map(|title| {
+                if !title.maturity_ratings.is_empty() {
+                    title.maturity_ratings.clone()
+                } else {
+                    title
+                        .minimum_age
+                        .map(|age| {
+                            vec![MaturityRating {
+                                authority: "fixture-authority",
+                                authority_id: "fixture-id",
+                                rating: "fixture-rating",
+                                normalized_age: Some(age),
+                                assessed: None,
+                                runtime_minutes: None,
+                                format: None,
+                            }]
+                        })
+                        .unwrap_or_default()
+                }
+            })
+            .collect();
+        b.offsets("mat_o", observations.iter().map(Vec::len));
+        let authority =
+            observations.iter().flatten().map(|rating| b.intern(rating.authority)).collect::<Vec<_>>();
+        let authority_id =
+            observations.iter().flatten().map(|rating| b.intern(rating.authority_id)).collect::<Vec<_>>();
+        let raw = observations.iter().flatten().map(|rating| b.intern(rating.rating)).collect::<Vec<_>>();
+        let assessed =
+            observations.iter().flatten().map(|rating| b.optional(rating.assessed)).collect::<Vec<_>>();
+        let formats =
+            observations.iter().flatten().map(|rating| b.optional(rating.format)).collect::<Vec<_>>();
+        b.u32s("mat_auth", &authority);
+        b.u32s("mat_authid", &authority_id);
+        b.u32s("mat_raw", &raw);
+        b.u32s("mat_assess", &assessed);
+        b.u32s("mat_format", &formats);
+        b.u8s(
+            "mat_age",
+            &observations
+                .iter()
+                .flatten()
+                .map(|rating| rating.normalized_age.unwrap_or(den_store::NONE_AGE))
+                .collect::<Vec<_>>(),
+        );
+        b.u16s(
+            "mat_runtime",
+            &observations
+                .iter()
+                .flatten()
+                .map(|rating| rating.runtime_minutes.unwrap_or(0))
+                .collect::<Vec<_>>(),
         );
 
         // The facts.
@@ -1137,7 +1302,7 @@ mod tests {
     #[test]
     fn maps_and_checks_the_spec_fixture() {
         let Some(path) = fixture() else {
-            eprintln!("SKIP: den-spec/vectors/store-v4.store not found");
+            eprintln!("SKIP: den-spec/vectors/store-v5.store not found");
             return;
         };
         let store = MappedStore::open(&path).expect("the fixture maps");
@@ -1149,6 +1314,23 @@ mod tests {
         assert_eq!(ages.get(den_store::Row(0)), Some(13));
         assert_eq!(ages.get(den_store::Row(1)), None);
         assert_eq!(ages.get(den_store::Row(2)), Some(7));
+        assert_eq!(
+            store.maturity_ratings(den_index::MediaType::Movie, 1),
+            &[PublicMaturityRating {
+                authority: "MCC Québec".to_owned(),
+                authority_id: "qc:1".to_owned(),
+                rating: "13+".to_owned(),
+                normalized_age: Some(13),
+                assessed: Some("2025-03-02".to_owned()),
+                runtime_minutes: Some(101),
+                format: Some("cinema".to_owned()),
+            }]
+        );
+        assert_eq!(
+            store.maturity_ratings(den_index::MediaType::Movie, 2)[0].normalized_age,
+            None,
+            "an official label remains visible even when it cannot be normalized"
+        );
     }
 
     // The rail's column reads (`den_index::SeedFacets`), against den-spec's three-title fixture. These

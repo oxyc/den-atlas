@@ -255,7 +255,7 @@ dependencies = [
 [[package]]
 name = "den-store"
 version = "0.1.0"
-source = "git+https://github.com/oxyc/den-core.git?rev=1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5#1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5"
+source = "git+https://github.com/oxyc/den-core.git?rev=12bcc15a3bc704dc4c32f49abed95615d36f39f1#12bcc15a3bc704dc4c32f49abed95615d36f39f1"
 dependencies = [
  "zerocopy",
 ]

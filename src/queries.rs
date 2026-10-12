@@ -159,6 +159,17 @@ impl Indexes {
         self.store.store.minimum_age(key.0, key.1)
     }
 
+    pub fn eligible(&self, policy: crate::maturity::Policy, key: Key) -> bool {
+        policy.allows_title_with(
+            || self.minimum_age(key),
+            |band| self.store.store.kid_audience_relevant(key.0, key.1, band),
+        )
+    }
+
+    pub fn maturity_ratings(&self, key: Key) -> &[crate::store::PublicMaturityRating] {
+        self.store.store.maturity_ratings(key.0, key.1)
+    }
+
     /// You Might Also Like for one seed. The fan picks where the store has them for it (`fan_pick_row`);
     /// otherwise structural affinity leads when store-v3 carries it, and the ordinary row is appended so
     /// partial/old stores still answer and a sparse affinity pass never shortens a rail.
@@ -204,7 +215,7 @@ impl Indexes {
                 row.truncate(den_index::MAX_ROW);
                 return row.into();
             }
-            let keep = |key| maturity.allows_with(|| self.minimum_age(key));
+            let keep = |key| self.eligible(maturity, key);
             let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
             let seed = self.suggestion_profile((media_type, tmdb_id));
             let mut row: Vec<Key> = self
@@ -282,7 +293,7 @@ impl Indexes {
             .chain(tail.into_iter().map(|(_, _, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
             .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
-            .filter(|&key| maturity.allows_with(|| self.minimum_age(key)))
+            .filter(|&key| self.eligible(maturity, key))
             .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
@@ -544,7 +555,7 @@ impl Indexes {
         let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
-        let keep = |key| maturity.allows_with(|| self.minimum_age(key));
+        let keep = |key| self.eligible(maturity, key);
         let extras = den_index::Extras {
             keep: Some(&keep),
             primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
@@ -1403,7 +1414,7 @@ fn write_fixture_as(
     maturity: &[(u8, u32, u8)],
     maturity_bounds: bool,
 ) -> Dataset {
-    use crate::store::fixture::{Entity, Title};
+    use crate::store::fixture::{Entity, MaturityRating, Title};
     // Days since 1970-01-01, the store's unit for a release date.
     const D1985: i32 = 5479;
     const D1995: i32 = 9131;
@@ -1549,6 +1560,20 @@ fn write_fixture_as(
             .minimum_age = Some(minimum_age);
     }
     if !maturity.is_empty() {
+        let teen_title = titles
+            .iter_mut()
+            .find(|title| (title.media, title.tmdb_id) == (0, 2))
+            .expect("the maturity fixture teen title");
+        teen_title.audience = vec![("made_for_teens", 90)];
+        teen_title.maturity_ratings = vec![MaturityRating {
+            authority: "KAVI",
+            authority_id: "kavi",
+            rating: "K-7",
+            normalized_age: Some(7),
+            assessed: Some("2026-09-01"),
+            runtime_minutes: Some(130),
+            format: Some("theatrical"),
+        }];
         let eligible_neighbour = titles
             .iter_mut()
             .find(|title| (title.media, title.tmdb_id) == (0, 3))

@@ -16,6 +16,36 @@ pub enum UnknownRatings {
     Block,
 }
 
+/// Which intended-audience evidence a Kid catalogue accepts.
+///
+/// This is deliberately explicit instead of inferred from a numeric ceiling: age safety and catalogue
+/// relevance are separate product decisions, and a restricted adult/Visitor request must not silently become
+/// a Kid catalogue.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub enum KidAudience {
+    #[serde(rename = "child")]
+    Child,
+    #[serde(rename = "child-or-teen")]
+    ChildOrTeen,
+}
+
+impl KidAudience {
+    fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "child" => Ok(Self::Child),
+            "child-or-teen" => Ok(Self::ChildOrTeen),
+            _ => Err("kidAudience must be child or child-or-teen"),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Child => "child",
+            Self::ChildOrTeen => "child-or-teen",
+        }
+    }
+}
+
 /// An explicitly supplied ISO 3166-1 alpha-2 viewer region.
 ///
 /// The public store currently carries one conservative global age, so region does not change eligibility yet.
@@ -70,6 +100,7 @@ pub struct Policy {
     pub maximum_age: Option<u8>,
     pub unknown_ratings: UnknownRatings,
     pub region: Option<Region>,
+    pub kid_audience: Option<KidAudience>,
 }
 
 impl Policy {
@@ -86,7 +117,10 @@ impl Policy {
         let region = crate::handler::query_param(query, "region")
             .map(|value| Region::parse(&value).map_err(str::to_owned))
             .transpose()?;
-        let policy = Self { maximum_age, unknown_ratings, region };
+        let kid_audience = crate::handler::query_param(query, "kidAudience")
+            .map(|value| KidAudience::parse(&value).map_err(str::to_owned))
+            .transpose()?;
+        let policy = Self { maximum_age, unknown_ratings, region, kid_audience };
         policy.check()?;
         Ok(policy)
     }
@@ -109,11 +143,24 @@ impl Policy {
     /// consulting the maturity view. Besides avoiding needless work, this keeps instrumentation able to
     /// prove that adding policy support has no data-access cost for ordinary requests.
     pub fn allows_with(self, minimum_age: impl FnOnce() -> Option<u8>) -> bool {
-        !self.restricted() || self.allows(minimum_age())
+        !self.age_restricted() || self.allows(minimum_age())
+    }
+
+    /// Apply age safety and Kid catalogue relevance independently and lazily.
+    pub fn allows_title_with(
+        self,
+        minimum_age: impl FnOnce() -> Option<u8>,
+        audience_relevant: impl FnOnce(KidAudience) -> bool,
+    ) -> bool {
+        self.allows_with(minimum_age) && self.kid_audience.is_none_or(audience_relevant)
+    }
+
+    pub fn age_restricted(self) -> bool {
+        self.maximum_age.is_some() || self.unknown_ratings == UnknownRatings::Block
     }
 
     pub fn restricted(self) -> bool {
-        self.maximum_age.is_some() || self.unknown_ratings == UnknownRatings::Block
+        self.age_restricted() || self.kid_audience.is_some()
     }
 
     /// Canonical cache/ETag identity for every explicitly meaningful maturity input.
@@ -125,13 +172,14 @@ impl Policy {
             return None;
         }
         Some(format!(
-            "maturity:v1;maximumAge={};unknownRatings={};region={}",
+            "maturity:v2;maximumAge={};unknownRatings={};region={};kidAudience={}",
             self.maximum_age.map_or_else(|| "-".to_owned(), |age| age.to_string()),
             match self.unknown_ratings {
                 UnknownRatings::Allow => "allow",
                 UnknownRatings::Block => "block",
             },
             self.region.map_or_else(|| "-".to_owned(), |region| region.as_str().to_owned()),
+            self.kid_audience.map_or("-", KidAudience::as_str),
         ))
     }
 }
@@ -153,6 +201,10 @@ mod tests {
         assert!(!unrated_only.allows(None));
         assert_eq!(Policy::from_query("region=fi").unwrap().region.unwrap().as_str(), "FI");
         assert_eq!(serde_json::from_str::<Region>(r#""se""#).unwrap().as_str(), "SE");
+        assert_eq!(
+            Policy::from_query("kidAudience=child-or-teen").unwrap().kid_audience,
+            Some(KidAudience::ChildOrTeen)
+        );
     }
 
     #[test]
@@ -172,6 +224,7 @@ mod tests {
         assert!(Policy::from_query("maximumAge=7&unknownRatings=maybe").is_err());
         assert!(Policy::from_query("region=FIN").is_err());
         assert!(Policy::from_query("region=1x").is_err());
+        assert!(Policy::from_query("kidAudience=family").is_err());
         assert!(serde_json::from_str::<Region>(r#""north""#).is_err());
     }
 
@@ -186,6 +239,10 @@ mod tests {
         assert_ne!(
             Policy::from_query("maximumAge=12&region=FI").unwrap().cache_identity(),
             Policy::from_query("maximumAge=12&region=SE").unwrap().cache_identity()
+        );
+        assert_ne!(
+            Policy::from_query("maximumAge=12").unwrap().cache_identity(),
+            Policy::from_query("maximumAge=12&kidAudience=child-or-teen").unwrap().cache_identity()
         );
     }
 }
