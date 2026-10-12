@@ -105,9 +105,7 @@ impl MappedStore {
         let media = u8::from(media_type == den_index::MediaType::Tv);
         let view = self.view();
         let row = view.row_of(media, tmdb_id).ok().flatten()?;
-        view.minimum_ages()
-            .expect("MappedStore::check validates minimum_age at load")
-            .get(row)
+        view.minimum_ages().expect("MappedStore::check validates minimum_age at load").get(row)
     }
 
     /// Read every section the serving path needs, once, so a store that is missing one fails at LOAD

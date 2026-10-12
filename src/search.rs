@@ -1072,9 +1072,7 @@ pub fn answer_with_policy(
         indexes.cards.as_ref().is_some_and(|cards| cards.contains_key(key))
             || found.get(key).is_some_and(|f| f.export.is_some())
     };
-    scored.retain(|s| {
-        s.score > 0.0 && drawable(&s.key) && maturity.allows(indexes.minimum_age(s.key))
-    });
+    scored.retain(|s| s.score > 0.0 && drawable(&s.key) && maturity.allows(indexes.minimum_age(s.key)));
     let votes =
         |(kind, id): Key| indexes.facets.as_ref().and_then(|f| f.title(id, kind)).map_or(0, |t| t.votes);
     scored.sort_by(|a, b| {

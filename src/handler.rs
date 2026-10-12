@@ -794,7 +794,8 @@ async fn handle_catalog(
                 timing.push_str(", cache;desc=stale");
             }
             let filtered = filter_catalog_maturity(&r.body, type_, state, maturity);
-            let mut resp = serve_json(method, headers, crate::catalog::page_of(&filtered, skip), cc, None).await;
+            let mut resp =
+                serve_json(method, headers, crate::catalog::page_of(&filtered, skip), cc, None).await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
             // state /health calls `stale_catalog`, so the row carries the same slug.
             if !r.fresh {
@@ -1058,9 +1059,7 @@ fn row_constraints(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| {
-            !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings")
-        })
+        .filter(|(key, _)| !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings"))
         // The taste is not an axis. Every tilt parameter carries one prefix so a household's
         // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
         .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
@@ -1100,16 +1099,10 @@ pub(crate) fn similar_json_with_policy(
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let row: Vec<u32> = row
-        .iter()
-        .copied()
-        .filter(|&id| maturity.allows(indexes.minimum_age((media_type, id))))
-        .collect();
-    let mixed: Vec<(den_index::MediaType, u32)> = mixed
-        .iter()
-        .copied()
-        .filter(|&key| maturity.allows(indexes.minimum_age(key)))
-        .collect();
+    let row: Vec<u32> =
+        row.iter().copied().filter(|&id| maturity.allows(indexes.minimum_age((media_type, id)))).collect();
+    let mixed: Vec<(den_index::MediaType, u32)> =
+        mixed.iter().copied().filter(|&key| maturity.allows(indexes.minimum_age(key))).collect();
     let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
     let mixed_page: Vec<(u32, den_index::MediaType)> =
         mixed.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
@@ -1140,13 +1133,13 @@ pub(crate) fn suggest_json(
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let page: Vec<(den_index::MediaType, u32)> =
-        row.iter()
-            .copied()
-            .filter(|&key| key != seed && maturity.allows(indexes.minimum_age(key)))
-            .skip(skip)
-            .take(limit)
-            .collect();
+    let page: Vec<(den_index::MediaType, u32)> = row
+        .iter()
+        .copied()
+        .filter(|&key| key != seed && maturity.allows(indexes.minimum_age(key)))
+        .skip(skip)
+        .take(limit)
+        .collect();
     let titles: Vec<serde_json::Value> = page
         .iter()
         .filter_map(|&key| {
@@ -1339,8 +1332,7 @@ async fn search_answer(
     let (neighbours, stats) = indexes.plot.scan_semantic_vector(
         &vector,
         |id, kind| {
-            media_type.is_none_or(|want| want == kind)
-                && maturity.allows(indexes.minimum_age((kind, id)))
+            media_type.is_none_or(|want| want == kind) && maturity.allows(indexes.minimum_age((kind, id)))
         },
         SEMANTIC_K,
     );
@@ -1843,7 +1835,10 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
     // shared-cache edge that has not seen it yet, is a slice of that, and every page is from the same ranking.
     let mut key = if fresh { format!("{scope}|{date}|fresh") } else { format!("{scope}|{date}") };
     if maturity.restricted() {
-        key.push_str(&format!("|maximumAge={:?}|unknown={:?}", maturity.maximum_age, maturity.unknown_ratings));
+        key.push_str(&format!(
+            "|maximumAge={:?}|unknown={:?}",
+            maturity.maximum_age, maturity.unknown_ratings
+        ));
     }
     let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
     let (answer, timing) = match kept {
@@ -2162,9 +2157,7 @@ async fn handle_index(
         IndexQuestion::Filter { scope, route } => {
             let filter_query = query
                 .split('&')
-                .filter(|part| {
-                    !part.starts_with("maximumAge=") && !part.starts_with("unknownRatings=")
-                })
+                .filter(|part| !part.starts_with("maximumAge=") && !part.starts_with("unknownRatings="))
                 .collect::<Vec<_>>()
                 .join("&");
             match crate::filter::Request::parse(*route, *scope, &filter_query) {
@@ -2283,7 +2276,8 @@ async fn handle_index(
                 return json_response(r#"{"error":"search_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             }
         },
-        IndexQuestion::Query => match query_answer(state, Arc::clone(&indexes), query, early, maturity).await {
+        IndexQuestion::Query => match query_answer(state, Arc::clone(&indexes), query, early, maturity).await
+        {
             Ok((body, timing, missed)) => {
                 unembedded(missed);
                 phases = format!("{timing}, ");
@@ -2301,7 +2295,7 @@ async fn handle_index(
             match tokio::task::spawn_blocking(move || {
                 question.answer(&indexes, titles.as_deref(), &query, maturity)
             })
-                .await
+            .await
             {
                 Ok(body) => body,
                 Err(e) => {
@@ -2333,11 +2327,7 @@ fn filter_catalog_maturity(
     if !maturity.restricted() {
         return body.to_owned();
     }
-    let media_type = if type_ == "series" {
-        den_index::MediaType::Tv
-    } else {
-        den_index::MediaType::Movie
-    };
+    let media_type = if type_ == "series" { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
     let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else { return body.to_owned() };
     if let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) {
         metas.retain(|meta| {
@@ -2800,10 +2790,9 @@ mod tests {
         assert_eq!(hit.headers()["cache-control"], DATASET_ANSWER);
         let hit = body_of(hit).await;
         assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
-        let kid = body_of(
-            get(&state, "/catalog/movie/den-titles/search=the%20matrx.json?maximumAge=12").await,
-        )
-        .await;
+        let kid =
+            body_of(get(&state, "/catalog/movie/den-titles/search=the%20matrx.json?maximumAge=12").await)
+                .await;
         assert_eq!(kid, r#"{"metas":[]}"#, "unknown ages fail closed");
         let allowed = body_of(
             get(
@@ -2815,9 +2804,7 @@ mod tests {
         .await;
         assert!(allowed.contains(r#""id":"tmdb:603""#), "{allowed}");
         assert_eq!(
-            get(&state, "/catalog/movie/den-titles/search=matrix.json?maximumAge=19")
-                .await
-                .status(),
+            get(&state, "/catalog/movie/den-titles/search=matrix.json?maximumAge=19").await.status(),
             StatusCode::BAD_REQUEST
         );
         let other_type =

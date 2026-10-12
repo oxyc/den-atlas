@@ -228,7 +228,7 @@ dependencies = [
  "blake2",
  "bytes",
  "den-index",
- "den-store",
+ "den-store 0.1.0 (git+https://github.com/oxyc/den-core.git?rev=1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5)",
  "den-sync",
  "den-titlesearch",
  "flate2",
@@ -246,7 +246,7 @@ dependencies = [
 name = "den-index"
 version = "0.1.0"
 dependencies = [
- "den-store",
+ "den-store 0.1.0 (git+https://github.com/oxyc/den-core.git?rev=00bcda387b5b75647fef5590083722a49ac14edf)",
  "libm",
  "serde",
  "serde_json",
@@ -256,6 +256,14 @@ dependencies = [
 name = "den-store"
 version = "0.1.0"
 source = "git+https://github.com/oxyc/den-core.git?rev=00bcda387b5b75647fef5590083722a49ac14edf#00bcda387b5b75647fef5590083722a49ac14edf"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
+name = "den-store"
+version = "0.1.0"
+source = "git+https://github.com/oxyc/den-core.git?rev=1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5#1cf57a1d58a9399aa87ca8d2f3cab41ce96b2ef5"
 dependencies = [
  "zerocopy",
 ]
