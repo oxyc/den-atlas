@@ -1014,7 +1014,7 @@ impl IndexQuestion {
                     Some(mut title) => {
                         title["indexed"] = serde_json::json!(true);
                         if let Some(versions) =
-                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id))
+                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id), maturity)
                         {
                             title["otherVersions"] = versions;
                         }
@@ -2355,19 +2355,19 @@ fn filter_catalog_maturity(
         return r#"{"metas":[]}"#.to_owned();
     };
     let media_type = if type_ == "series" { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
-    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else { return body.to_owned() };
-    if let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) {
-        metas.retain(|meta| {
-            let id = meta
-                .get("moviedb_id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok());
-            maturity.allows_title_with(
-                || id.and_then(|id| dataset.mapped.minimum_age(media_type, id)),
-                |band| id.is_some_and(|id| dataset.mapped.kid_audience_relevant(media_type, id, band)),
-            )
-        });
-    }
+    let empty = || r#"{"metas":[]}"#.to_owned();
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(body) else { return empty() };
+    let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) else {
+        return empty();
+    };
+    metas.retain(|meta| {
+        let id =
+            meta.get("moviedb_id").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok());
+        maturity.allows_title_with(
+            || id.and_then(|id| dataset.mapped.minimum_age(media_type, id)),
+            |band| id.is_some_and(|id| dataset.mapped.kid_audience_relevant(media_type, id, band)),
+        )
+    });
     parsed.to_string()
 }
 
@@ -3001,6 +3001,15 @@ mod tests {
         let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
         assert_eq!(detail["id"], 2);
         assert_eq!(detail["minimumAge"], 7);
+
+        let detail = get(&state, "/index/title/movie/1.json?maximumAge=13&kidAudience=child").await;
+        let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
+        assert_eq!(detail["id"], 1, "the directly requested title remains available");
+        assert_eq!(
+            detail["otherVersions"],
+            serde_json::json!([{ "type": "movie", "id": 3, "kind": "remake" }]),
+            "embedded discovery links apply the Kid policy"
+        );
     }
 
     #[test]
@@ -3024,6 +3033,14 @@ mod tests {
         let filtered: serde_json::Value =
             serde_json::from_str(&filter_catalog_maturity(&body, "movie", &state, policy)).unwrap();
         assert_eq!(filtered["metas"], serde_json::json!([{ "moviedb_id": 2 }, { "moviedb_id": 3 }]));
+
+        for malformed in ["not json", r#"{"unexpected":[]}"#, r#"{"metas":{}}"#] {
+            assert_eq!(
+                filter_catalog_maturity(malformed, "movie", &state, policy),
+                r#"{"metas":[]}"#,
+                "restricted catalogs fail closed for {malformed}"
+            );
+        }
     }
 
     /// Every member-bearing GET route enforces the policy before its page is cut. The seed is deliberately

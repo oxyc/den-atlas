@@ -287,8 +287,12 @@ pub fn summary_json(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
     seed: Key,
+    maturity: crate::maturity::Policy,
 ) -> Option<serde_json::Value> {
-    let found = of_title(indexes, export, seed);
+    let found: Vec<_> = of_title(indexes, export, seed)
+        .into_iter()
+        .filter(|version| indexes.eligible(maturity, version.key))
+        .collect();
     (!found.is_empty()).then(|| {
         serde_json::json!(found
             .iter()
