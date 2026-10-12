@@ -1224,7 +1224,13 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
 /// them living in a separate blob.
 #[cfg(test)]
 pub fn write_fixture(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, true, &[])
+    write_fixture_as(dir, "One", true, true, &[], &[])
+}
+
+/// The normal route fixture with public maturity ages on three drawable movies and one explicit unknown.
+#[cfg(test)]
+pub fn write_fixture_maturity(dir: &std::path::Path) -> Dataset {
+    write_fixture_as(dir, "One", true, true, &[], &[(0, 1, 18), (0, 2, 7), (0, 3, 13)])
 }
 
 /// A fixture title as the store writer keys it: (media, tmdb id), media 0 a film and 1 a series.
@@ -1234,21 +1240,21 @@ type FixtureKey = (u8, u32);
 /// The same fixture with fan picks: each `(media, id)` named is asked, with its picks.
 #[cfg(test)]
 pub fn write_fixture_fan_picks(dir: &std::path::Path, picks: &[(FixtureKey, Vec<FixtureKey>)]) -> Dataset {
-    write_fixture_as(dir, "One", true, true, picks)
+    write_fixture_as(dir, "One", true, true, picks, &[])
 }
 
 /// The same fixture with every `votes` count zeroed, for the tests about a corpus no source can order:
 /// what the store will look like once the producer stops writing the column.
 #[cfg(test)]
 pub fn write_fixture_voteless(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", true, false, &[])
+    write_fixture_as(dir, "One", true, false, &[], &[])
 }
 
 /// The same fixture with a different display title for movie 1, for the tests about a word that is both a
 /// facet and a title ("brazil").
 #[cfg(test)]
 pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
-    write_fixture_as(dir, movie_one, true, true, &[])
+    write_fixture_as(dir, movie_one, true, true, &[], &[])
 }
 
 /// The same fixture with no premise vectors, for the tests about a dataset whose store carries only the
@@ -1256,7 +1262,7 @@ pub fn write_fixture_titled(dir: &std::path::Path, movie_one: &str) -> Dataset {
 /// section of the store now, so the store is what has to lack it.
 #[cfg(test)]
 pub fn write_fixture_plot_only(dir: &std::path::Path) -> Dataset {
-    write_fixture_as(dir, "One", false, true, &[])
+    write_fixture_as(dir, "One", false, true, &[], &[])
 }
 
 #[cfg(test)]
@@ -1266,6 +1272,7 @@ fn write_fixture_as(
     premise: bool,
     votes: bool,
     fan_picks: &[(FixtureKey, Vec<FixtureKey>)],
+    maturity: &[(u8, u32, u8)],
 ) -> Dataset {
     use crate::store::fixture::{Entity, Title};
     // Days since 1970-01-01, the store's unit for a release date.
@@ -1370,6 +1377,13 @@ fn write_fixture_as(
         for title in &mut titles {
             title.votes = 0;
         }
+    }
+    for &(media, tmdb_id, minimum_age) in maturity {
+        titles
+            .iter_mut()
+            .find(|title| (title.media, title.tmdb_id) == (media, tmdb_id))
+            .expect("a fixture maturity title")
+            .minimum_age = Some(minimum_age);
     }
     // Thirty more films, so a seed's More Like This screenful cannot hold every other title and some fan
     // picks fall outside it.

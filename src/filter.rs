@@ -3528,6 +3528,7 @@ mod tests {
         let policy = crate::maturity::Policy {
             maximum_age: Some(12),
             unknown_ratings: crate::maturity::UnknownRatings::Block,
+            region: None,
         };
         let context = Context::new_with_policy(&indexes, Scope::All, None, policy);
         let counts = context.counts(&request_all(Route::Counts, "")).0;
@@ -3543,6 +3544,7 @@ mod tests {
             crate::maturity::Policy {
                 maximum_age: Some(12),
                 unknown_ratings: crate::maturity::UnknownRatings::Allow,
+                region: None,
             },
         );
         assert_eq!(allow_unknown.counts(&request_all(Route::Counts, "")).0["total"], 2);

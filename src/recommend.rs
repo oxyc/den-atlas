@@ -172,6 +172,10 @@ pub struct Request {
     /// Unknown ages fail closed whenever a ceiling is present unless the caller explicitly allows them.
     #[serde(default, rename = "unknownRatings")]
     pub unknown_ratings: Option<crate::maturity::UnknownRatings>,
+    /// Explicit viewer region for maturity-policy identity. The public baseline is globally conservative today;
+    /// retaining this boundary prevents a future regional mapping from sharing cached work across countries.
+    #[serde(default)]
+    pub region: Option<crate::maturity::Region>,
     /// Only new titles (oxyc/den#161, `newness`): the pool holds titles out within `NEW_BEHIND`, titles due on a
     /// known day or month within `NEW_AHEAD`, and older series with a season in that window. Off by default, so
     /// the pool with it and without it can be compared before it becomes the default.
@@ -203,6 +207,7 @@ impl Request {
             } else {
                 crate::maturity::UnknownRatings::Allow
             }),
+            region: self.region,
         }
     }
 
