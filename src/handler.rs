@@ -223,7 +223,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let ds = state.dataset.as_ref();
 
     if let Some(scope) = route.strip_prefix("/recommend/").and_then(|rest| rest.strip_suffix(".json")) {
-        return handle_recommend_get(&state, config, scope, &query).await;
+        return handle_recommend_get(&method, &headers, &state, config, scope, &query).await;
     }
     if route == "/metrics" {
         if !crate::metrics::authorized(&headers, state.metrics_token.as_deref()) {
@@ -794,8 +794,15 @@ async fn handle_catalog(
                 timing.push_str(", cache;desc=stale");
             }
             let filtered = filter_catalog_maturity(&r.body, type_, state, maturity);
-            let mut resp =
-                serve_json(method, headers, crate::catalog::page_of(&filtered, skip), cc, None).await;
+            let mut resp = serve_json_for_policy(
+                method,
+                headers,
+                crate::catalog::page_of(&filtered, skip),
+                cc,
+                None,
+                maturity,
+            )
+            .await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
             // state /health calls `stale_catalog`, so the row carries the same slug.
             if !r.fresh {
@@ -964,15 +971,26 @@ impl IndexQuestion {
                 };
                 let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
                 let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
+                let eligible = |id, kind| maturity.allows_with(|| indexes.minimum_age((kind, id)));
                 let titles = if *mood {
-                    plot.titles_with_mood(label, Some(*media_type), floor, 0, indexes.population)
+                    plot.titles_with_mood_where(
+                        label,
+                        Some(*media_type),
+                        floor,
+                        0,
+                        indexes.population,
+                        eligible,
+                    )
                 } else {
-                    plot.titles_with_subgenre(label, Some(*media_type), floor, 0, indexes.population)
+                    plot.titles_with_subgenre_where(
+                        label,
+                        Some(*media_type),
+                        floor,
+                        0,
+                        indexes.population,
+                        eligible,
+                    )
                 };
-                let titles: Vec<_> = titles
-                    .into_iter()
-                    .filter(|&(id, kind)| maturity.allows(indexes.minimum_age((kind, id))))
-                    .collect();
                 let total = titles.len();
                 let family = if *mood { "mood" } else { "subgenre" };
                 let constraints = [(family.to_owned(), label.clone())];
@@ -992,7 +1010,7 @@ impl IndexQuestion {
             // on it, which is not the same as it not existing. Wikidata's name for it rides along where the store
             // carries one (`unindexed_title_json`).
             Self::Title { media_type, tmdb_id } => {
-                match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
+                let mut title = match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
                     Some(mut title) => {
                         title["indexed"] = serde_json::json!(true);
                         if let Some(versions) =
@@ -1003,13 +1021,17 @@ impl IndexQuestion {
                         title
                     }
                     None => unindexed_title_json(indexes, *media_type, *tmdb_id),
-                }
+                };
+                // This is the store's already-published public-authority value only. `null` is explicit and
+                // remains distinct from all-ages 0; no private/runtime certification can enter this route.
+                title["minimumAge"] = serde_json::json!(indexes.minimum_age((*media_type, *tmdb_id)));
+                title
             }
             Self::Franchise { media_type, tmdb_id } => {
-                crate::franchises::route_json(indexes, (*media_type, *tmdb_id))
+                crate::franchises::route_json_with_policy(indexes, (*media_type, *tmdb_id), maturity)
             }
             Self::Versions { media_type, tmdb_id } => {
-                crate::versions::route_json(indexes, export, (*media_type, *tmdb_id))
+                crate::versions::route_json_with_policy(indexes, export, (*media_type, *tmdb_id), maturity)
             }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
@@ -1018,9 +1040,10 @@ impl IndexQuestion {
                     .unwrap_or(NEIGHBOUR_K)
                     .min(MAX_NEIGHBOUR_K);
                 let ids: Vec<u32> = plot
-                    .nearest(*tmdb_id, *media_type, MAX_NEIGHBOUR_K)
+                    .nearest_where(*tmdb_id, *media_type, MAX_NEIGHBOUR_K, |id, kind| {
+                        maturity.allows_with(|| indexes.minimum_age((kind, id)))
+                    })
                     .iter()
-                    .filter(|n| maturity.allows(indexes.minimum_age((n.media_type, n.tmdb_id))))
                     .take(k)
                     .map(|n| n.tmdb_id)
                     .collect();
@@ -1059,7 +1082,7 @@ fn row_constraints(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .filter(|(key, _)| !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings"))
+        .filter(|(key, _)| !matches!(*key, "skip" | "limit" | "maximumAge" | "unknownRatings" | "region"))
         // The taste is not an axis. Every tilt parameter carries one prefix so a household's
         // `tilt.liked` can never be read as a constraint, whatever axes the store grows.
         .filter(|(key, _)| !key.starts_with(crate::plotrows::TILT_PREFIX))
@@ -1093,16 +1116,12 @@ pub(crate) fn similar_json_with_policy(
     query: &str,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
-    let (row, mixed) = indexes.more_like_this_rows(tmdb_id, media_type);
+    let (row, mixed) = indexes.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
     let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let row: Vec<u32> =
-        row.iter().copied().filter(|&id| maturity.allows(indexes.minimum_age((media_type, id)))).collect();
-    let mixed: Vec<(den_index::MediaType, u32)> =
-        mixed.iter().copied().filter(|&key| maturity.allows(indexes.minimum_age(key))).collect();
     let page: Vec<u32> = row.iter().copied().skip(skip).take(limit).collect();
     let mixed_page: Vec<(u32, den_index::MediaType)> =
         mixed.iter().skip(skip).take(limit).map(|&(media, id)| (id, media)).collect();
@@ -1126,20 +1145,15 @@ pub(crate) fn suggest_json(
     query: &str,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
-    let row = indexes.you_might_also_like(tmdb_id, media_type, true);
+    let row = indexes.you_might_also_like_with_policy(tmdb_id, media_type, true, maturity);
     let seed = (media_type, tmdb_id);
     let skip = query_param(query, "skip").and_then(|v| v.parse().ok()).unwrap_or(0);
     let limit = query_param(query, "limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(SIMILAR_PAGE)
         .min(den_index::MAX_ROW);
-    let page: Vec<(den_index::MediaType, u32)> = row
-        .iter()
-        .copied()
-        .filter(|&key| key != seed && maturity.allows(indexes.minimum_age(key)))
-        .skip(skip)
-        .take(limit)
-        .collect();
+    let page: Vec<(den_index::MediaType, u32)> =
+        row.iter().copied().filter(|&key| key != seed).skip(skip).take(limit).collect();
     let titles: Vec<serde_json::Value> = page
         .iter()
         .filter_map(|&key| {
@@ -1153,7 +1167,7 @@ pub(crate) fn suggest_json(
         "titles": titles,
         "total": row
             .iter()
-            .filter(|&&key| key != seed && maturity.allows(indexes.minimum_age(key)))
+            .filter(|&&key| key != seed)
             .count(),
     })
 }
@@ -1332,7 +1346,8 @@ async fn search_answer(
     let (neighbours, stats) = indexes.plot.scan_semantic_vector(
         &vector,
         |id, kind| {
-            media_type.is_none_or(|want| want == kind) && maturity.allows(indexes.minimum_age((kind, id)))
+            media_type.is_none_or(|want| want == kind)
+                && maturity.allows_with(|| indexes.minimum_age((kind, id)))
         },
         SEMANTIC_K,
     );
@@ -1437,7 +1452,7 @@ async fn query_answer(
 }
 
 /// Every parameter `/index/query.json` reads.
-const QUERY_PARAMS: [&str; 11] = [
+const QUERY_PARAMS: [&str; 12] = [
     "q",
     "type",
     "skip",
@@ -1449,6 +1464,7 @@ const QUERY_PARAMS: [&str; 11] = [
     "broadcaster",
     "maximumAge",
     "unknownRatings",
+    "region",
 ];
 
 /// What a query's parameters asked for and the answer does not reflect, as the filter routes report it:
@@ -1801,7 +1817,14 @@ const BILLBOARD_PAGE: usize = 100;
 /// atlas's own lists as of that day: a page of slides and where the next starts (`next`, absent at the end). Kept by
 /// a shared cache until the day is over, and served stale for a day after while it is asked again; `day` is in the
 /// address so each day is its own answer. Off (404) unless `INDEX_QUERIES` is set, like the POST.
-async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str, query: &str) -> Response {
+async fn handle_recommend_get(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    state: &Arc<AppState>,
+    config: Config,
+    scope: &str,
+    query: &str,
+) -> Response {
     let started = Instant::now();
     let Some(queries) = state.index.as_ref() else {
         return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
@@ -1834,11 +1857,9 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
     // Ranked once per scope and day, every slide atlas will give (`MAX_SLIDES`), and kept: each page, and each
     // shared-cache edge that has not seen it yet, is a slice of that, and every page is from the same ranking.
     let mut key = if fresh { format!("{scope}|{date}|fresh") } else { format!("{scope}|{date}") };
-    if maturity.restricted() {
-        key.push_str(&format!(
-            "|maximumAge={:?}|unknown={:?}",
-            maturity.maximum_age, maturity.unknown_ratings
-        ));
+    if let Some(identity) = maturity.cache_identity() {
+        key.push('|');
+        key.push_str(&identity);
     }
     let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
     let (answer, timing) = match kept {
@@ -1854,6 +1875,9 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
                     crate::maturity::UnknownRatings::Allow => "allow",
                     crate::maturity::UnknownRatings::Block => "block",
                 });
+            }
+            if let Some(region) = maturity.region {
+                body["region"] = serde_json::json!(region.as_str());
             }
             if fresh {
                 body["fresh"] = serde_json::json!(true);
@@ -1889,16 +1913,9 @@ async fn handle_recommend_get(state: &Arc<AppState>, config: Config, scope: &str
     // Until the day is over in a shared cache (at least a minute, for an answer asked at 23:59:59), then served stale
     // for a day while it is asked again: a day's first visitor after midnight is answered from yesterday's at once.
     let left = ((day + 1.0 - today) * 86_400.0).max(60.0) as u64;
-    let mut resp = with_timing(
-        json_response(body.to_string(), StatusCode::OK),
-        &format!("{timing}, total;dur={}", ms(started.elapsed())),
-    );
-    if let Ok(policy) = header::HeaderValue::from_str(&format!(
-        "public, max-age=300, s-maxage={left}, stale-while-revalidate=86400"
-    )) {
-        resp.headers_mut().insert(header::CACHE_CONTROL, policy);
-    }
-    resp
+    let cache_control = format!("public, max-age=300, s-maxage={left}, stale-while-revalidate=86400");
+    let resp = serve_json_for_policy(method, headers, body.to_string(), &cache_control, None, maturity).await;
+    with_timing(resp, &format!("{timing}, total;dur={}", ms(started.elapsed())))
 }
 
 /// Billboards `GET /recommend` has ranked, by scope and day. A handful of scopes a day; cleared whole past this.
@@ -2103,7 +2120,7 @@ async fn filter_answer(
     // The path is part of the key too: `counts` without `.json` answers, but as a second spelling.
     let segment = rest.rsplit('/').next().unwrap_or(rest);
     let canonical = request.canonical && segment.ends_with(".json");
-    let location = (!canonical && !maturity.restricted())
+    let location = (!canonical && maturity.cache_identity().is_none())
         .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
     let (body, degraded) = tokio::task::spawn_blocking(move || {
         let context = crate::filter::Context::new_with_policy(&indexes, scope, export, maturity);
@@ -2157,7 +2174,11 @@ async fn handle_index(
         IndexQuestion::Filter { scope, route } => {
             let filter_query = query
                 .split('&')
-                .filter(|part| !part.starts_with("maximumAge=") && !part.starts_with("unknownRatings="))
+                .filter(|part| {
+                    !part.starts_with("maximumAge=")
+                        && !part.starts_with("unknownRatings=")
+                        && !part.starts_with("region=")
+                })
                 .collect::<Vec<_>>()
                 .join("&");
             match crate::filter::Request::parse(*route, *scope, &filter_query) {
@@ -2204,7 +2225,8 @@ async fn handle_index(
         let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
         return match answer {
             Ok((body, cache_control, location, degraded)) => {
-                let mut resp = serve_json(method, headers, body, cache_control, None).await;
+                let mut resp =
+                    serve_json_for_policy(method, headers, body, cache_control, None, maturity).await;
                 if let Some(location) = location.and_then(|l| header::HeaderValue::from_str(&l).ok()) {
                     resp.headers_mut().insert(header::CONTENT_LOCATION, location);
                 }
@@ -2306,7 +2328,7 @@ async fn handle_index(
         }
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
-    let resp = serve_json(method, headers, body, cache_control, None).await;
+    let resp = serve_json_for_policy(method, headers, body, cache_control, None, maturity).await;
     with_timing(resp, &format!("{load}{phases}total;dur={}", ms(started.elapsed())))
 }
 
@@ -2375,10 +2397,10 @@ async fn handle_title_search(
         den_index::MediaType::Movie
     };
     let body = titles::metas_json_with(&index, &query, media_type, |id| {
-        maturity.allows(store.and_then(|store| store.minimum_age(kind, id)))
+        maturity.allows_with(|| store.and_then(|store| store.minimum_age(kind, id)))
     });
     let searched = started.elapsed();
-    let resp = serve_json(method, headers, body, DATASET_ANSWER, None).await;
+    let resp = serve_json_for_policy(method, headers, body, DATASET_ANSWER, None, maturity).await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
@@ -2409,11 +2431,38 @@ async fn serve_json(
     cache_control: &str,
     last_modified: Option<String>,
 ) -> Response {
+    serve_json_with_identity(method, headers, body, cache_control, last_modified, None).await
+}
+
+/// A JSON answer whose ETag is scoped by canonical request identity as well as response bytes. This matters
+/// even when two policies happen to produce the same page today: a validator learned under one Kid policy or
+/// explicit region must never validate another policy's response after the underlying mapping grows.
+async fn serve_json_for_policy(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    body: String,
+    cache_control: &str,
+    last_modified: Option<String>,
+    maturity: crate::maturity::Policy,
+) -> Response {
+    let identity = maturity.cache_identity();
+    serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref()).await
+}
+
+async fn serve_json_with_identity(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    body: String,
+    cache_control: &str,
+    last_modified: Option<String>,
+    identity: Option<&str>,
+) -> Response {
+    let etag_base = identity.map_or_else(|| fnv1a(&body), |identity| fnv1a(&format!("{identity}\n{body}")));
     serve(
         method,
         headers,
         Servable {
-            etag_base: fnv1a(&body),
+            etag_base,
             content_type: "application/json".to_owned(),
             cache_control: cache_control.to_owned(),
             last_modified,
@@ -2803,6 +2852,15 @@ mod tests {
         )
         .await;
         assert!(allowed.contains(r#""id":"tmdb:603""#), "{allowed}");
+        let fi =
+            get(&state, "/catalog/movie/den-titles/search=the%20matrx.json?maximumAge=12&region=FI").await;
+        let se =
+            get(&state, "/catalog/movie/den-titles/search=the%20matrx.json?maximumAge=12&region=SE").await;
+        assert_ne!(
+            fi.headers()[header::ETAG],
+            se.headers()[header::ETAG],
+            "equal empty pages still keep explicit region out of the validator identity"
+        );
         assert_eq!(
             get(&state, "/catalog/movie/den-titles/search=matrix.json?maximumAge=19").await.status(),
             StatusCode::BAD_REQUEST
@@ -2840,6 +2898,356 @@ mod tests {
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
     }
 
+    fn maturity_index_state(name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let ds = crate::queries::write_fixture_maturity(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
+    fn maturity_bounds_state(name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let ds = crate::queries::write_fixture_maturity_fan_bounds(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
+    /// Region is explicit policy identity, never inferred from server/install state. Canonical spellings share an
+    /// ETag, different regions do not, and a request with no policy keeps the historical body-only ETag exactly.
+    #[tokio::test]
+    async fn maturity_policy_and_region_scope_etags_without_changing_the_legacy_answer() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+
+        let state = maturity_index_state("den-atlas-maturity-etags");
+        let path = "/index/taxonomy.json";
+        let legacy = get(&state, path).await;
+        let legacy_etag = legacy.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let legacy_body = body_of(legacy).await;
+        assert_eq!(legacy_etag, format!("\"{}\"", fnv1a(&legacy_body)));
+
+        let fi_lower = get(&state, &format!("{path}?maximumAge=12&region=fi")).await;
+        let fi_lower_etag = fi_lower.headers()[header::ETAG].clone();
+        assert_eq!(body_of(fi_lower).await, legacy_body);
+        let fi_canonical = get(&state, &format!("{path}?region=FI&unknownRatings=block&maximumAge=12")).await;
+        assert_eq!(fi_canonical.headers()[header::ETAG], fi_lower_etag);
+        let se = get(&state, &format!("{path}?maximumAge=12&region=SE")).await;
+        assert_ne!(se.headers()[header::ETAG], fi_lower_etag);
+        let cross_region = HttpRequest::builder()
+            .uri(format!("{path}?maximumAge=12&region=SE"))
+            .header(header::IF_NONE_MATCH, fi_lower_etag)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(handle(State(Arc::clone(&state)), cross_region).await.status(), StatusCode::OK);
+        assert_eq!(get(&state, &format!("{path}?region=fin")).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Eligibility is applied to the full ordered row before either limit or pagination. The fixture's first
+    /// ranked title is age 18; a ceiling of 13 must replenish the page with the next two eligible titles.
+    #[tokio::test]
+    async fn maturity_filter_replenishes_before_row_pagination_and_exposes_public_minimum_age() {
+        let state = maturity_index_state("den-atlas-maturity-page");
+        let row = get(&state, "/index/rows/movie/subgenre/Heist.json?maximumAge=13&region=FI&limit=2").await;
+        let row: serde_json::Value = serde_json::from_str(&body_of(row).await).unwrap();
+        assert_eq!(row["ids"], serde_json::json!([2, 3]));
+        assert_eq!(row["total"], 2);
+
+        let known = get(&state, "/index/title/movie/2.json").await;
+        let known: serde_json::Value = serde_json::from_str(&body_of(known).await).unwrap();
+        assert_eq!(known["minimumAge"], 7);
+        let unknown = get(&state, "/index/title/series/4.json").await;
+        let unknown: serde_json::Value = serde_json::from_str(&body_of(unknown).await).unwrap();
+        assert!(unknown.get("minimumAge").is_some());
+        assert!(unknown["minimumAge"].is_null());
+    }
+
+    /// Every member-bearing GET route enforces the policy before its page is cut. The seed is deliberately
+    /// adult, the series unrated, and the two middle movies eligible, so neither kind of ineligible member can
+    /// leak and a two-item page must still fill from the eligible tail.
+    #[tokio::test]
+    async fn maturity_policy_covers_member_routes_and_precedes_discovery_bounds() {
+        let state = maturity_index_state("den-atlas-maturity-member-routes");
+        let policy = "maximumAge=13&unknownRatings=block&region=FI";
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let ids = |values: &serde_json::Value, field: &str| -> Vec<u32> {
+            values[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_u64().or_else(|| value["id"].as_u64()))
+                .map(|id| id as u32)
+                .collect()
+        };
+
+        let franchise =
+            json(body_of(get(&state, &format!("/index/franchise/movie/1.json?{policy}")).await).await);
+        assert_eq!(ids(&franchise, "members"), [101, 2]);
+        assert_eq!(franchise["total"], 2);
+        let versions =
+            json(body_of(get(&state, &format!("/index/versions/movie/1.json?{policy}")).await).await);
+        assert_eq!(ids(&versions, "versions"), [3, 103]);
+        assert_eq!(versions["total"], 2);
+
+        let search =
+            json(body_of(get(&state, &format!("/index/query.json?q=heist&limit=2&{policy}")).await).await);
+        assert_eq!(ids(&search, "hits"), [2, 3], "eligible titles refill the bounded search lane");
+        assert_eq!(search["total"], 4);
+
+        for path in ["/index/similar/movie/1.json", "/index/suggest/movie/1.json"] {
+            let answer = json(body_of(get(&state, &format!("{path}?limit=2&{policy}")).await).await);
+            let returned = ids(&answer, "mixed");
+            assert!(
+                returned.iter().all(|id| [2, 3, 101, 102, 103, 104].contains(id)),
+                "{path} leaked: {answer}"
+            );
+            let total = if path.contains("similar") { "mixedTotal" } else { "total" };
+            assert!(answer[total].as_u64().unwrap_or_default() >= 2, "the fixture must exercise {path}");
+            assert_eq!(returned.len(), answer[total].as_u64().unwrap_or_default().min(2) as usize);
+        }
+
+        let legacy = json(body_of(get(&state, "/index/franchise/movie/1.json").await).await);
+        assert_eq!(ids(&legacy, "members"), [101, 2, 1], "no policy keeps the historical membership");
+    }
+
+    /// Policy plumbing must be free for ordinary traffic: even routes whose restricted form filters every
+    /// candidate must not consult the age view when the effective policy allows every age. Exercise the
+    /// actual handlers (including semantic embedding and recommendation), rather than calling predicates in
+    /// isolation, so a newly added route-level lookup trips the shared store counter.
+    #[tokio::test]
+    async fn unrestricted_routes_never_consult_the_minimum_age_view() {
+        use den_titlesearch::{MediaType as TitleMediaType, TitleIndex, TitleRecord};
+
+        let dir = std::env::temp_dir()
+            .join(format!("den-atlas-unrestricted-maturity-routes-{}", std::process::id()));
+        let ds = crate::queries::write_fixture_maturity_fan_bounds(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&ds));
+        let titles = TitleIndex::build(vec![TitleRecord {
+            tmdb_id: 1,
+            media_type: TitleMediaType::Movie,
+            title: "One".into(),
+            popularity: 100.0,
+        }]);
+        let state = Arc::new(AppState {
+            index: Some(index),
+            embed: Some(fake_embed("[0,100,0]").await.0),
+            titles: Some(Arc::new(crate::titles::TitleSearch::with_index(titles))),
+            ..AppState::for_test(Some(ds))
+        });
+        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0));
+
+        let routes = [
+            "/index/neighbours/movie/1.json?k=10",
+            "/index/search.json?q=campy+fun",
+            "/index/query.json?q=heist&limit=10",
+            "/index/rows/movie/subgenre/Heist.json?limit=10",
+            "/index/row/movie.json?subgenre=Heist&limit=10",
+            "/index/suggest/movie/1.json?limit=10",
+            "/index/filter/movie/titles.json?sel=subgenre:Heist&limit=10",
+            "/index/filter/movie/titles.json?sel=like:1&limit=10",
+            "/index/filter/movie/titles.json?sel=fans:1&limit=10",
+            "/index/franchise/movie/1.json",
+            "/index/versions/movie/1.json",
+            "/catalog/movie/den-titles/search=one.json",
+        ];
+        for route in routes {
+            let response = get(&state, route).await;
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+        }
+        let recommendation = r#"{"surface":"movies","now":"2026-09-12T00:00:00Z",
+            "library":[{"type":"movie","id":1,"weight":1}],
+            "candidates":[{"type":"movie","id":2,"rank":0,"of":10}]}"#;
+        assert_eq!(post(&state, "/recommend", recommendation).await.status(), StatusCode::OK);
+
+        // Explicit `allow` and a region-only policy are unrestricted too. Their result identity semantics
+        // remain distinct where required, but neither may turn a no-filter request into an age scan.
+        for suffix in ["unknownRatings=allow", "region=FI"] {
+            for route in [
+                "/index/neighbours/movie/1.json?k=10",
+                "/index/query.json?q=heist&limit=10",
+                "/index/similar/movie/1.json?limit=10",
+                "/index/suggest/movie/1.json?limit=10",
+                "/index/filter/movie/titles.json?sel=like:1&limit=10",
+                "/index/filter/movie/titles.json?sel=fans:1&limit=10",
+                "/index/franchise/movie/1.json",
+                "/index/versions/movie/1.json",
+            ] {
+                let separator = if route.contains('?') { '&' } else { '?' };
+                let response = get(&state, &format!("{route}{separator}{suffix}")).await;
+                assert_eq!(response.status(), StatusCode::OK, "{route} {suffix}");
+                let unrestricted = body_of(response).await;
+                let legacy = body_of(get(&state, route).await).await;
+                assert_eq!(unrestricted, legacy, "{route} {suffix} changed the legacy answer");
+            }
+        }
+        assert_eq!(
+            indexes.minimum_age_accesses(),
+            (1, 0),
+            "unrestricted routes must not consult a title age"
+        );
+    }
+
+    /// More than 400 better-ranked adult/unknown films precede the eligible tail. Neighbours must cross its
+    /// cap of 50, and filter `like`/`fans` must cross the similarity pool, rather than spend either bound first.
+    /// Warming the legacy and other-region rows also proves those independently memoised answers stay isolated.
+    #[tokio::test]
+    async fn maturity_enters_neighbour_and_filter_candidate_discovery_before_bounds() {
+        use den_index::MediaType::Movie;
+
+        let state = maturity_bounds_state("den-atlas-maturity-candidate-bounds");
+        let json = |body: String| serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        let title_ids = |answer: &serde_json::Value| -> Vec<u32> {
+            answer["titles"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|title| title["id"].as_u64().map(|id| id as u32))
+                .collect()
+        };
+        let policy = "maximumAge=13&unknownRatings=block&region=FI";
+
+        // Loading validates the complete age view exactly once. Building an unrestricted filter context must
+        // not walk it; the first ordinary route below would otherwise add one lookup per corpus row.
+        let (indexes, _) = state.index.as_ref().unwrap().get(|| {}).await.unwrap();
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0));
+        let legacy_filter = json(
+            body_of(get(&state, "/index/filter/movie/titles.json?sel=subgenre:Heist&limit=10").await).await,
+        );
+        assert_eq!(legacy_filter["titles"].as_array().unwrap().len(), 10);
+        assert_eq!(indexes.minimum_age_accesses(), (1, 0), "no-policy filtering must not scan maturity");
+
+        let legacy_neighbours = json(body_of(get(&state, "/index/neighbours/movie/1.json?k=10").await).await);
+        assert_eq!(legacy_neighbours["ids"].as_array().unwrap().len(), 10);
+        assert!(legacy_neighbours["ids"].as_array().unwrap().iter().all(|id| {
+            let id = id.as_u64().unwrap() as u32;
+            (300..=709).contains(&id)
+        }));
+
+        let neighbours =
+            json(body_of(get(&state, &format!("/index/neighbours/movie/1.json?k=10&{policy}")).await).await);
+        let neighbour_ids: Vec<u32> =
+            neighbours["ids"].as_array().unwrap().iter().map(|id| id.as_u64().unwrap() as u32).collect();
+        assert_eq!(neighbour_ids.len(), 10, "eligible tail must refill the requested page");
+        assert!(neighbour_ids.iter().all(|id| (710..=729).contains(id)), "leaked neighbour: {neighbours}");
+
+        let legacy_suggest = json(body_of(get(&state, "/index/suggest/movie/1.json?limit=10").await).await);
+        let mixed_ids = |answer: &serde_json::Value| -> Vec<u32> {
+            answer["mixed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|title| title["id"].as_u64().map(|id| id as u32))
+                .collect()
+        };
+        assert_eq!(
+            mixed_ids(&legacy_suggest),
+            (318..=327).collect::<Vec<_>>(),
+            "no-policy direct suggest keeps its mixed curated row"
+        );
+        let restricted_suggest_response =
+            get(&state, &format!("/index/suggest/movie/1.json?skip=10&limit=10&{policy}")).await;
+        let suggest_fi_etag = restricted_suggest_response.headers()[header::ETAG].clone();
+        let restricted_suggest = json(body_of(restricted_suggest_response).await);
+        assert_eq!(
+            mixed_ids(&restricted_suggest),
+            (730..=739).rev().collect::<Vec<_>>(),
+            "the second page must refill in the curated row's reverse order"
+        );
+        let suggest_se_response = get(
+            &state,
+            "/index/suggest/movie/1.json?skip=10&limit=10&maximumAge=13&unknownRatings=block&region=SE",
+        )
+        .await;
+        assert_ne!(suggest_se_response.headers()[header::ETAG], suggest_fi_etag);
+        assert_eq!(mixed_ids(&json(body_of(suggest_se_response).await)), mixed_ids(&restricted_suggest));
+
+        for kind in ["like", "fans"] {
+            let legacy_path = format!("/index/filter/movie/titles.json?sel={kind}:1&limit=10");
+            let legacy = json(body_of(get(&state, &legacy_path).await).await);
+            let legacy_ids = title_ids(&legacy);
+            assert_eq!(legacy_ids.len(), 10, "no-policy {kind} keeps its full historical page");
+            assert!(legacy_ids.iter().all(|id| (300..=709).contains(id)), "legacy {kind}: {legacy}");
+            if kind == "fans" {
+                assert_eq!(legacy_ids, (320..=329).collect::<Vec<_>>(), "no-policy typed curated row");
+            }
+
+            let fi_path = format!("{legacy_path}&skip=10&{policy}");
+            let fi_response = get(&state, &fi_path).await;
+            assert_eq!(fi_response.status(), StatusCode::OK, "{fi_path}");
+            let fi_etag = fi_response.headers()[header::ETAG].clone();
+            let fi = json(body_of(fi_response).await);
+            let fi_ids = title_ids(&fi);
+            assert_eq!(fi_ids.len(), 10, "eligible {kind} tail must refill the requested page: {fi}");
+            assert!(
+                fi_ids.iter().all(|id| !(300..=709).contains(id) && *id != 1),
+                "blocked or unknown {kind} member leaked: {fi}"
+            );
+            if kind == "fans" {
+                assert_eq!(
+                    fi_ids,
+                    mixed_ids(&restricted_suggest),
+                    "filter fans must use the direct curated row"
+                );
+            }
+
+            let se_path = format!("{legacy_path}&skip=10&maximumAge=13&unknownRatings=block&region=SE");
+            let se_response = get(&state, &se_path).await;
+            assert_eq!(se_response.status(), StatusCode::OK, "{se_path}");
+            assert_ne!(se_response.headers()[header::ETAG], fi_etag, "region is cache identity");
+            assert_eq!(
+                title_ids(&json(body_of(se_response).await)),
+                fi_ids,
+                "region does not alter global ages"
+            );
+        }
+
+        for query in [
+            "",
+            "maximumAge=13&unknownRatings=block&region=FI",
+            "maximumAge=13&unknownRatings=block&region=SE",
+        ] {
+            let policy = crate::maturity::Policy::from_query(query).unwrap();
+            assert_eq!(
+                indexes.has_policy_memos((Movie, 1), false, policy),
+                (true, true),
+                "like and fans memos must both be policy/region scoped for {query:?}"
+            );
+        }
+        for mix in [false, true] {
+            for query in [
+                "",
+                "maximumAge=13&unknownRatings=block&region=FI",
+                "maximumAge=13&unknownRatings=block&region=SE",
+            ] {
+                let policy = crate::maturity::Policy::from_query(query).unwrap();
+                assert_eq!(indexes.has_policy_memos((Movie, 1), mix, policy), (true, true));
+            }
+        }
+        assert_eq!(
+            indexes.minimum_age_accesses().0,
+            1,
+            "candidate lookup must never revalidate the age column"
+        );
+    }
+
+    /// Exercise the mapped store, label index, policy lookup, pagination, JSON boundary and HTTP handler —
+    /// the actual discovery path, rather than timing a synthetic `Option<u8>` loop.
+    #[tokio::test]
+    async fn maturity_row_discovery_stays_within_a_route_level_bound() {
+        let state = maturity_index_state("den-atlas-maturity-route-performance");
+        let path = "/index/rows/movie/subgenre/Heist.json?maximumAge=13&unknownRatings=block&limit=2";
+        let started = std::time::Instant::now();
+        for _ in 0..500 {
+            let response = get(&state, path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "500 mapped-store discovery requests took {:?}",
+            started.elapsed()
+        );
+    }
+
     fn franchise_state(name: &str, playground: bool) -> Option<Arc<AppState>> {
         let fixture = crate::store::spec_fixture()?;
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
@@ -2867,16 +3275,19 @@ mod tests {
         assert_eq!(
             named,
             serde_json::json!({ "type": "movie", "id": 3, "indexed": false, "title": "Delta", "year": 2001,
-                                "originalTitle": "Délta", "source": "wikidata" })
+                                "originalTitle": "Délta", "source": "wikidata", "minimumAge": null })
         );
         let bare = json(body_of(get(&state, "/index/title/series/11.json").await).await);
         assert_eq!(
             bare,
             serde_json::json!({ "type": "series", "id": 11, "indexed": false, "title": "Epsilon",
-                                "source": "wikidata" })
+                                "source": "wikidata", "minimumAge": null })
         );
         let other_type = json(body_of(get(&state, "/index/title/series/3.json").await).await);
-        assert_eq!(other_type, serde_json::json!({ "type": "series", "id": 3, "indexed": false }));
+        assert_eq!(
+            other_type,
+            serde_json::json!({ "type": "series", "id": 3, "indexed": false, "minimumAge": null })
+        );
         let carded = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
         assert_eq!(carded["indexed"], true);
         assert!(carded.get("source").is_none(), "a store row is its own card: {carded}");
@@ -3906,7 +4317,10 @@ mod tests {
         assert_eq!(no_franchise["total"], 0);
 
         let unknown = json(body_of(get(&state, "/index/title/movie/999999.json").await).await);
-        assert_eq!(unknown, serde_json::json!({ "type": "movie", "id": 999999, "indexed": false }));
+        assert_eq!(
+            unknown,
+            serde_json::json!({ "type": "movie", "id": 999999, "indexed": false, "minimumAge": null })
+        );
         assert_eq!(get(&state, "/index/title/anime/1.json").await.status(), 404);
         assert_eq!(get(&state, "/index/title/movie/x.json").await.status(), 404);
     }
@@ -4433,6 +4847,37 @@ mod tests {
         assert_eq!(get(&state, "/recommend/service/x.json").await.status(), 404);
         assert_eq!(get(&state, "/recommend/home.json?day=soon").await.status(), 400);
         assert_eq!(get(&Arc::new(AppState::for_test(None)), "/recommend/home.json").await.status(), 404);
+    }
+
+    /// The in-process day memo is upstream of the HTTP ETag, so it needs the same canonical policy/region scope.
+    /// Distinct preloaded answers make accidental cross-region reuse visible even though today's public age is global.
+    #[tokio::test]
+    async fn billboard_memo_and_etag_are_scoped_by_policy_and_explicit_region() {
+        let state = index_state("den-atlas-recommend-region-key");
+        let policy = |region| {
+            crate::maturity::Policy::from_query(&format!("maximumAge=12&region={region}"))
+                .unwrap()
+                .cache_identity()
+                .unwrap()
+        };
+        let day = "1994-11-07";
+        billboards().lock().unwrap().insert(
+            format!("movies|{day}|{}", policy("FI")),
+            Arc::new(serde_json::json!({"version": 1, "slides": [{"type": "movie", "id": 2}]})),
+        );
+        billboards().lock().unwrap().insert(
+            format!("movies|{day}|{}", policy("SE")),
+            Arc::new(serde_json::json!({"version": 1, "slides": [{"type": "movie", "id": 3}]})),
+        );
+
+        let fi = get(&state, &format!("/recommend/movies.json?day={day}&maximumAge=12&region=fi")).await;
+        let fi_etag = fi.headers()[header::ETAG].clone();
+        let fi_body: serde_json::Value = serde_json::from_str(&body_of(fi).await).unwrap();
+        assert_eq!(fi_body["slides"][0]["id"], 2);
+        let se = get(&state, &format!("/recommend/movies.json?day={day}&maximumAge=12&region=SE")).await;
+        assert_ne!(se.headers()[header::ETAG], fi_etag);
+        let se_body: serde_json::Value = serde_json::from_str(&body_of(se).await).unwrap();
+        assert_eq!(se_body["slides"][0]["id"], 3);
     }
 
     #[test]

@@ -193,7 +193,11 @@ pub fn title_facts(indexes: &crate::queries::Indexes, key: Key) -> TitleFacts {
 /// `/index/franchise/<type>/<id>.json`: the seed's primary franchise, grouped seed-era first, newest first
 /// inside every era (`Franchises::members_for`). A known title without a curated primary returns `null` and
 /// an empty row, which lets old stores and ungrouped titles use the same client fallback.
-pub fn route_json(indexes: &crate::queries::Indexes, seed: Key) -> serde_json::Value {
+pub fn route_json_with_policy(
+    indexes: &crate::queries::Indexes,
+    seed: Key,
+    maturity: crate::maturity::Policy,
+) -> serde_json::Value {
     let Some(membership) = indexes.franchises.membership(seed) else {
         return serde_json::json!({
             "franchise": null,
@@ -209,6 +213,7 @@ pub fn route_json(indexes: &crate::queries::Indexes, seed: Key) -> serde_json::V
     let members = indexes.franchises.members_for(seed, |key| title_facts(indexes, key)).unwrap_or_default();
     let titles: Vec<serde_json::Value> = members
         .iter()
+        .filter(|member| maturity.allows_with(|| indexes.minimum_age(member.key)))
         .filter_map(|member| {
             let era = franchise.eras.get(member.era as usize)?;
             let mut title = indexes

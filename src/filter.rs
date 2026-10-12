@@ -1796,7 +1796,10 @@ pub struct Context<'a> {
     characters: Option<Arc<CharacterIndex>>,
     scope: Scope,
     view: den_store::Store<'a>,
-    maturity: Bits,
+    /// The eligible store rows for a restrictive policy. `None` is the historical unrestricted universe,
+    /// so ordinary traffic neither scans the maturity column nor allocates another corpus-sized bitset.
+    maturity: Option<Bits>,
+    policy: crate::maturity::Policy,
     restricted: bool,
 }
 
@@ -1817,12 +1820,17 @@ impl<'a> Context<'a> {
         policy: crate::maturity::Policy,
     ) -> Context<'a> {
         let filter = indexes.filter();
-        let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
-        for (row, &key) in filter.keys.iter().enumerate() {
-            if policy.allows(indexes.minimum_age(key)) {
-                set(&mut maturity, row);
+        let maturity = if policy.restricted() {
+            let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
+            for (row, &key) in filter.keys.iter().enumerate() {
+                if policy.allows_with(|| indexes.minimum_age(key)) {
+                    set(&mut maturity, row);
+                }
             }
-        }
+            Some(maturity)
+        } else {
+            None
+        };
         Context {
             filter,
             indexes,
@@ -1831,6 +1839,7 @@ impl<'a> Context<'a> {
             scope: scope.into(),
             view: indexes.store.view(),
             maturity,
+            policy,
             restricted: policy.restricted(),
         }
     }
@@ -1875,15 +1884,18 @@ impl<'a> Context<'a> {
         let keys: Vec<Key> = match (data, self.scope) {
             (Data::Fans, scope) => self
                 .indexes
-                .you_might_also_like(tmdb_id, media_type, scope == Scope::All)
+                .you_might_also_like_with_policy(tmdb_id, media_type, scope == Scope::All, self.policy)
                 .iter()
                 .copied()
                 .filter(|&key| key != (media_type, tmdb_id))
                 .collect(),
             (_, Scope::Type(_)) => {
-                self.indexes.more_like_this(tmdb_id, media_type).iter().map(|&id| (media_type, id)).collect()
+                let (one, _) = self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy);
+                one.into_iter().map(|id| (media_type, id)).collect()
             }
-            (_, Scope::All) => self.indexes.more_like_this_mixed(tmdb_id, media_type).to_vec(),
+            (_, Scope::All) => {
+                self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy).1
+            }
         };
         keys.into_iter()
             .filter_map(|(media_type, id)| {
@@ -2138,7 +2150,9 @@ impl<'a> Context<'a> {
         drop: &dyn Fn(&Spec, &Item) -> bool,
     ) -> Matched {
         let mut sure = self.filter.types[self.t()].clone();
-        sure.iter_mut().zip(&self.maturity).for_each(|(matched, allowed)| *matched &= allowed);
+        if let Some(maturity) = &self.maturity {
+            sure.iter_mut().zip(maturity).for_each(|(matched, allowed)| *matched &= allowed);
+        }
         let mut any = sure.clone();
         for (spec, item) in applied {
             if drop(spec, item) {
@@ -2173,7 +2187,10 @@ impl<'a> Context<'a> {
 
     /// The titles of the route's type (of both, under `all`): what `total` and every coverage is out of.
     fn population(&self) -> usize {
-        and_count(&self.filter.types[self.t()], &self.maturity)
+        self.maturity.as_ref().map_or_else(
+            || popcount(&self.filter.types[self.t()]),
+            |maturity| and_count(&self.filter.types[self.t()], maturity),
+        )
     }
 
     /// How much of the route type each applied kind is known for.
@@ -2185,12 +2202,15 @@ impl<'a> Context<'a> {
                 continue;
             }
             let (_, known) = self.value_bits(spec, &item.ids[0]);
-            let type_and_age: Bits = self.filter.types[self.t()]
-                .iter()
-                .zip(&self.maturity)
-                .map(|(type_, age)| type_ & age)
-                .collect();
-            let count = and_count(&known, &type_and_age);
+            let count = match &self.maturity {
+                Some(maturity) => self.filter.types[self.t()]
+                    .iter()
+                    .zip(maturity)
+                    .zip(&known)
+                    .map(|((type_, age), known)| (type_ & age & known).count_ones() as usize)
+                    .sum(),
+                None => and_count(&known, &self.filter.types[self.t()]),
+            };
             out.insert(spec.name.to_owned(), json!({ "count": count, "denominator": population }));
         }
         Value::Object(out)
@@ -3528,6 +3548,7 @@ mod tests {
         let policy = crate::maturity::Policy {
             maximum_age: Some(12),
             unknown_ratings: crate::maturity::UnknownRatings::Block,
+            region: None,
         };
         let context = Context::new_with_policy(&indexes, Scope::All, None, policy);
         let counts = context.counts(&request_all(Route::Counts, "")).0;
@@ -3543,6 +3564,7 @@ mod tests {
             crate::maturity::Policy {
                 maximum_age: Some(12),
                 unknown_ratings: crate::maturity::UnknownRatings::Allow,
+                region: None,
             },
         );
         assert_eq!(allow_unknown.counts(&request_all(Route::Counts, "")).0["total"], 2);
