@@ -2876,15 +2876,6 @@ mod tests {
         answer["titles"].as_array().unwrap().iter().map(|t| t["id"].as_u64().unwrap()).collect()
     }
 
-    /// The title record's warnings are the `warning` filter's values for that title, at the same floor.
-    #[test]
-    fn a_titles_warnings_are_what_the_warning_filter_holds_it_to() {
-        let indexes = fixture("title-warnings");
-        assert_eq!(indexes.warnings((Movie, 1)), vec!["violence".to_owned()]);
-        assert!(indexes.warnings((Movie, 2)).is_empty(), "under the floor");
-        assert!(indexes.warnings((Movie, 999_999)).is_empty(), "not in the store");
-    }
-
     /// Movies 1–3 of the fixture: 1 is Korean and Danish from 1985, genres 80 and 18, Tense and a Heist,
     /// violent, 95 minutes; 2 is Korean from 1995, a Heist, 130 minutes; 3 is Spanish from 1985, a Heist
     /// and Campy/Cult, 160 minutes.

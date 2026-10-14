@@ -47,6 +47,10 @@ pub struct MappedStore {
     /// Audience-intent decisions at the contract's 0.5 floor: (made for children, made for teens).
     /// Missing or malformed evidence stays false, so Kid discovery fails closed without degrading Owner use.
     kid_audience: Box<[(bool, bool)]>,
+    /// Whether a Kid may never see the title unless an owner approves it: it depicts one of `KID_VETO_WARNINGS`
+    /// and is not made for children (den-spec profiles-v1 §5). Made for teens does not lift it: that is American
+    /// Pie and Superbad as much as Divergent.
+    kid_veto: Box<[bool]>,
     /// Validated official observations, owned once at load so a detail request never rescans all observations.
     maturity_ratings: Box<[Vec<PublicMaturityRating>]>,
     #[cfg(test)]
@@ -105,11 +109,12 @@ impl MappedStore {
         if map.len() != verified {
             return Err(format!("{}: changed size while it was being opened", path.display()));
         }
-        let (minimum_ages, kid_audience, maturity_ratings) = {
+        let (minimum_ages, kid_audience, kid_veto, maturity_ratings) = {
             let view = table.view(&map);
             let ages = view.minimum_ages().map_err(|e| format!("{}: {e}", path.display()))?;
             let minimum_ages = (0..table.rows()).map(|row| ages.get(den_store::Row(row))).collect();
             let kid_audience = kid_audience_rows(&view, table.rows());
+            let kid_veto = kid_veto_rows(&view, &kid_audience);
             let ratings = view.maturity_ratings().map_err(|e| format!("{}: {e}", path.display()))?;
             let maturity_ratings = (0..table.rows())
                 .map(|row| {
@@ -127,7 +132,7 @@ impl MappedStore {
                         .collect()
                 })
                 .collect();
-            (minimum_ages, kid_audience, maturity_ratings)
+            (minimum_ages, kid_audience, kid_veto, maturity_ratings)
         };
         Ok(Self {
             path: path.to_owned(),
@@ -135,6 +140,7 @@ impl MappedStore {
             table,
             minimum_ages,
             kid_audience,
+            kid_veto,
             maturity_ratings,
             #[cfg(test)]
             minimum_age_view_builds: AtomicUsize::new(1),
@@ -176,7 +182,8 @@ impl MappedStore {
         self.minimum_ages.get(row.0).copied().flatten()
     }
 
-    /// Whether the store has affirmative audience-intent evidence for this Kid catalogue band.
+    /// Whether the store has affirmative audience-intent evidence for this Kid catalogue band, and the title is
+    /// not one a Kid is vetoed from (`kid_vetoed`).
     pub fn kid_audience_relevant(
         &self,
         media_type: den_index::MediaType,
@@ -184,32 +191,17 @@ impl MappedStore {
         band: crate::maturity::KidAudience,
     ) -> bool {
         let media = u8::from(media_type == den_index::MediaType::Tv);
-        let row = self.view().row_of(media, tmdb_id).ok().flatten();
-        let (child, teen) = row.and_then(|row| self.kid_audience.get(row.0)).copied().unwrap_or_default();
-        child || (band == crate::maturity::KidAudience::ChildOrTeen && teen)
+        let Some(row) = self.view().row_of(media, tmdb_id).ok().flatten() else { return false };
+        let (child, teen) = self.kid_audience.get(row.0).copied().unwrap_or_default();
+        !self.kid_veto.get(row.0).copied().unwrap_or(false)
+            && (child || (band == crate::maturity::KidAudience::ChildOrTeen && teen))
     }
 
-    /// What the title depicts at the `warning` filter's 0.5 floor (`sexual_content`, `drug_use`, ...), read from
-    /// its one row of the dense `depicts` table. Empty where the store has no evidence.
-    pub fn warnings(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Vec<String> {
-        let view = self.view();
+    /// Whether a Kid may not open this title whatever its age (`kid_veto`).
+    pub fn kid_vetoed(&self, media_type: den_index::MediaType, tmdb_id: u32) -> bool {
         let media = u8::from(media_type == den_index::MediaType::Tv);
-        let (Ok(Some(row)), Ok(cells), Ok(names), Ok(strings)) = (
-            view.row_of(media, tmdb_id),
-            view.column::<u8>("depicts"),
-            view.column::<u32>("depicts_names"),
-            view.strings(),
-        ) else {
-            return Vec::new();
-        };
-        let width = names.len();
-        let Some(scores) = cells.get(row.0 * width..(row.0 + 1) * width) else { return Vec::new() };
-        names
-            .iter()
-            .zip(scores)
-            .filter(|&(_, &score)| score >= 50)
-            .filter_map(|(&name, _)| strings.get(name).map(str::to_owned))
-            .collect()
+        let row = self.view().row_of(media, tmdb_id).ok().flatten();
+        row.and_then(|row| self.kid_veto.get(row.0)).copied().unwrap_or(false)
     }
 
     pub fn maturity_ratings(
@@ -294,6 +286,38 @@ fn kid_audience_rows(view: &Store<'_>, rows: usize) -> Box<[(bool, bool)]> {
                 child.and_then(|at| scores.get(at)).is_some_and(|&score| score >= 50),
                 teen.and_then(|at| scores.get(at)).is_some_and(|&score| score >= 50),
             )
+        })
+        .collect()
+}
+
+/// What a Kid may not see unless the title is made for children. `animal_harm` is left out on purpose: it marks a
+/// great many children's films.
+const KID_VETO_WARNINGS: &[&str] = &["sexual_content", "graphic_violence", "drug_use", "self_harm"];
+
+/// Per row, whether the dense `depicts` table holds a `KID_VETO_WARNINGS` axis at the `warning` filter's 0.5 floor
+/// on a title not made for children. A store without the table vetoes nothing, as before the veto existed.
+fn kid_veto_rows(view: &Store<'_>, audience: &[(bool, bool)]) -> Box<[bool]> {
+    let rows = audience.len();
+    let none = || vec![false; rows].into_boxed_slice();
+    let (Ok(cells), Ok(names), Ok(strings)) =
+        (view.column::<u8>("depicts"), view.column::<u32>("depicts_names"), view.strings())
+    else {
+        return none();
+    };
+    let width = names.len();
+    if width == 0 || cells.len() != rows.saturating_mul(width) {
+        return none();
+    }
+    let vetoing: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|&(_, &id)| strings.get(id).is_some_and(|name| KID_VETO_WARNINGS.contains(&name)))
+        .map(|(at, _)| at)
+        .collect();
+    (0..rows)
+        .map(|row| {
+            let scores = &cells[row * width..(row + 1) * width];
+            !audience[row].0 && vetoing.iter().any(|&at| scores[at] >= 50)
         })
         .collect()
 }

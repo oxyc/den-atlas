@@ -171,9 +171,9 @@ impl Indexes {
         self.store.store.kid_audience_relevant(key.0, key.1, band)
     }
 
-    /// What the title depicts at the warning floor, which can veto a Kid's direct read (`Policy::allows_direct`).
-    pub fn warnings(&self, key: Key) -> Vec<String> {
-        self.store.store.warnings(key.0, key.1)
+    /// Whether a Kid may not open the title whatever its age (`Policy::allows_direct`).
+    pub fn kid_vetoed(&self, key: Key) -> bool {
+        self.store.store.kid_vetoed(key.0, key.1)
     }
 
     pub fn maturity_ratings(&self, key: Key) -> &[crate::store::PublicMaturityRating] {
@@ -1575,6 +1575,8 @@ fn write_fixture_as(
             .find(|title| (title.media, title.tmdb_id) == (0, 2))
             .expect("the maturity fixture teen title");
         teen_title.audience = vec![("made_for_teens", 90)];
+        // The Blue Lagoon's shape: made for teens, one lenient age (7 below), depicting sexual content.
+        teen_title.depicts = vec![("violence", 20), ("sexual_content", 80)];
         teen_title.maturity_ratings = vec![MaturityRating {
             authority: "KAVI",
             authority_id: "kavi",

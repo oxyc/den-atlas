@@ -1061,7 +1061,7 @@ impl IndexQuestion {
                 title["eligible"] = serde_json::json!(maturity.allows_direct(
                     indexes.minimum_age(key),
                     |band| indexes.kid_audience_relevant(key, band),
-                    || indexes.warnings(key),
+                    || indexes.kid_vetoed(key),
                 ));
                 title
             }
@@ -3031,13 +3031,20 @@ mod tests {
         )
         .await;
         let older: serde_json::Value = serde_json::from_str(&body_of(older).await).unwrap();
-        assert_eq!(older["ids"], serde_json::json!([2, 3]));
+        assert_eq!(older["ids"], serde_json::json!([3]), "made for teens does not lift the veto on 2");
 
         let detail = get(&state, "/index/title/movie/2.json?maximumAge=13&kidAudience=child").await;
         let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
         assert_eq!(detail["id"], 2);
         assert_eq!(detail["minimumAge"], 7);
-        assert_eq!(detail["eligible"], true, "age-eligible though not made for children: no catalogue gate");
+        assert_eq!(detail["eligible"], false, "age 7, but vetoed: sexual content, not made for children");
+        let owner = get(&state, "/index/title/movie/2.json?maximumAge=13").await;
+        let owner: serde_json::Value = serde_json::from_str(&body_of(owner).await).unwrap();
+        assert_eq!(owner["eligible"], true, "the veto is a Kid rule only");
+
+        let detail = get(&state, "/index/title/movie/3.json?maximumAge=13&kidAudience=child").await;
+        let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
+        assert_eq!(detail["eligible"], true, "age 13, made for children");
 
         let detail = get(&state, "/index/title/movie/1.json?maximumAge=13&kidAudience=child").await;
         let detail: serde_json::Value = serde_json::from_str(&body_of(detail).await).unwrap();
@@ -3070,7 +3077,7 @@ mod tests {
         let policy = crate::maturity::Policy::from_query("kidAudience=child-or-teen").unwrap();
         let filtered: serde_json::Value =
             serde_json::from_str(&filter_catalog_maturity(&body, "movie", &state, policy)).unwrap();
-        assert_eq!(filtered["metas"], serde_json::json!([{ "moviedb_id": 2 }, { "moviedb_id": 3 }]));
+        assert_eq!(filtered["metas"], serde_json::json!([{ "moviedb_id": 3 }]), "2 is vetoed for every Kid");
 
         for malformed in ["not json", r#"{"unexpected":[]}"#, r#"{"metas":{}}"#] {
             assert_eq!(
