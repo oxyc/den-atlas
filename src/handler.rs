@@ -134,12 +134,40 @@ fn request_id(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 /// The request path as the log may show it. A leading per-install config segment becomes `<config>`
-/// — it is a user's region and service choice, which a log has no need to keep — and the query string
-/// is never read, so nothing in it can reach the log. Redacted by the same `Config::parse` the router
-/// uses, so exactly the segments treated as a config are the ones hidden. A search catalog's query is
-/// what someone typed, so it becomes `<query>`.
+/// — it is a user's region and service choice, which a log has no need to keep. Redacted by the same
+/// `Config::parse` the router uses, so exactly the segments treated as a config are the ones hidden. A
+/// search catalog's query is what someone typed, so it becomes `<query>`. Of the query string only
+/// `LOGGED_PARAMS` are kept: they decide what a profile is shown, which is what a log is read for when
+/// a Kid sees the wrong titles. Every other parameter is dropped unread.
 fn loggable_path(uri: &axum::http::Uri) -> String {
-    let path = uri.path();
+    let path = loggable_route(uri.path());
+    let kept: Vec<String> = uri
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| {
+            let (key, value) = kv.split_once('=').unwrap_or((kv, ""));
+            LOGGED_PARAMS.contains(&key).then(|| format!("{key}={}", log_safe(value)))
+        })
+        .collect();
+    if kept.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
+/// Query parameters a request line shows: the profile policy and paging, none of which carries
+/// anything a person typed.
+const LOGGED_PARAMS: &[&str] = &["maximumAge", "unknownRatings", "kidAudience", "region", "skip", "limit"];
+
+/// A query value as a log line may carry it. It comes off the network, so only `[A-Za-z0-9_-]`
+/// survives and at most 16 of those: nothing in it can break the line apart or forge a second one.
+fn log_safe(value: &str) -> String {
+    value.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(16).collect()
+}
+
+fn loggable_route(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     let (first, rest) = trimmed.split_once('/').map_or((trimmed, None), |(f, r)| (f, Some(r)));
     let shown = if Config::parse(first).is_none() {
@@ -5182,6 +5210,22 @@ mod tests {
         assert_eq!(loggable_path(&uri), "/<config>/catalog/movie/x/search=<query>&skip=5.json");
         let uri: axum::http::Uri = "/catalog/movie/jw-nfx.json".parse().unwrap();
         assert_eq!(loggable_path(&uri), "/catalog/movie/jw-nfx.json");
+    }
+
+    #[test]
+    fn the_log_keeps_the_profile_policy_and_nothing_else_from_the_query() {
+        let uri: axum::http::Uri =
+            "/index/rows/movie/subgenre/Heist.json?q=secret&maximumAge=12&unknownRatings=block&kidAudience=child&region=FI&limit=10&day=3"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            loggable_path(&uri),
+            "/index/rows/movie/subgenre/Heist.json?maximumAge=12&unknownRatings=block&kidAudience=child&region=FI&limit=10"
+        );
+        let uri: axum::http::Uri = "/catalog/movie/x.json?region=FI%0Aforged".parse().unwrap();
+        assert_eq!(loggable_path(&uri), "/catalog/movie/x.json?region=FI0Aforged");
+        let uri: axum::http::Uri = "/catalog/movie/x.json?datasetVersion=abc".parse().unwrap();
+        assert_eq!(loggable_path(&uri), "/catalog/movie/x.json");
     }
 
     /// `/health` answers 200 whatever is wrong, by the addon convention. `/ready` is the one a monitor
