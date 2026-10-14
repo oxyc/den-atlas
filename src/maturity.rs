@@ -146,13 +146,16 @@ impl Policy {
         !self.age_restricted() || self.allows(minimum_age())
     }
 
-    /// Apply age safety and Kid catalogue relevance independently and lazily.
+    /// Apply age safety and Kid catalogue relevance lazily. For a Kid the title must be made for its band, and that
+    /// same evidence admits an unknown age (den-spec profiles-v1 §5); a known age is still held to the ceiling.
     pub fn allows_title_with(
         self,
         minimum_age: impl FnOnce() -> Option<u8>,
         audience_relevant: impl FnOnce(KidAudience) -> bool,
     ) -> bool {
-        self.allows_with(minimum_age) && self.kid_audience.is_none_or(audience_relevant)
+        let Some(band) = self.kid_audience else { return self.allows_with(minimum_age) };
+        audience_relevant(band)
+            && (!self.age_restricted() || minimum_age().is_none_or(|age| self.allows(Some(age))))
     }
 
     pub fn age_restricted(self) -> bool {
@@ -205,6 +208,18 @@ mod tests {
             Policy::from_query("kidAudience=child-or-teen").unwrap().kid_audience,
             Some(KidAudience::ChildOrTeen)
         );
+    }
+
+    #[test]
+    fn a_kid_admits_an_unrated_title_made_for_its_band_and_nothing_else() {
+        let kid = Policy::from_query("maximumAge=7&unknownRatings=block&kidAudience=child").unwrap();
+        assert!(kid.allows_title_with(|| None, |_| true), "unrated, made for children");
+        assert!(!kid.allows_title_with(|| None, |_| false), "unrated, not made for children");
+        assert!(!kid.allows_title_with(|| Some(12), |_| true), "a known age above the ceiling still blocks");
+        assert!(kid.allows_title_with(|| Some(7), |_| true));
+        // Not a Kid: an unknown age is decided by unknownRatings alone.
+        let ceiling = Policy::from_query("maximumAge=7&unknownRatings=block").unwrap();
+        assert!(!ceiling.allows_title_with(|| None, |_| true));
     }
 
     #[test]

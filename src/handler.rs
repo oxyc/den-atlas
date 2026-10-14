@@ -1055,6 +1055,11 @@ impl IndexQuestion {
                 title["minimumAge"] = serde_json::json!(indexes.minimum_age((*media_type, *tmdb_id)));
                 title["maturityRatings"] =
                     serde_json::json!(indexes.maturity_ratings((*media_type, *tmdb_id)));
+                // Audience intent and content warnings, the Kid inputs of the shared age rule (den-spec profiles-v1
+                // §5): a client's direct-read check passes them to den-core as `madeForAudience` and `warnings`.
+                let (children, teens) = indexes.kid_audience((*media_type, *tmdb_id));
+                title["madeFor"] = serde_json::json!({ "children": children, "teens": teens });
+                title["warnings"] = serde_json::json!(indexes.warnings((*media_type, *tmdb_id)));
                 title
             }
             Self::Franchise { media_type, tmdb_id } => {
@@ -2566,6 +2571,11 @@ pub(crate) fn percent_decode(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A title record with no audience evidence.
+    fn not_made_for() -> serde_json::Value {
+        serde_json::json!({ "children": false, "teens": false })
+    }
+
     #[test]
     fn a_hundred_unindexed_library_titles_fill_in_four_bounded_requests() {
         let memo = crate::cache::EmbedMemo::new(std::time::Duration::MAX, 1_000);
@@ -3386,19 +3396,20 @@ mod tests {
             named,
             serde_json::json!({ "type": "movie", "id": 3, "indexed": false, "title": "Delta", "year": 2001,
                                 "originalTitle": "Délta", "source": "wikidata", "minimumAge": null,
-                                "maturityRatings": [] })
+                                "maturityRatings": [], "madeFor": not_made_for(), "warnings": [] })
         );
         let bare = json(body_of(get(&state, "/index/title/series/11.json").await).await);
         assert_eq!(
             bare,
             serde_json::json!({ "type": "series", "id": 11, "indexed": false, "title": "Epsilon",
-                                "source": "wikidata", "minimumAge": null, "maturityRatings": [] })
+                                "source": "wikidata", "minimumAge": null, "maturityRatings": [],
+                                "madeFor": not_made_for(), "warnings": [] })
         );
         let other_type = json(body_of(get(&state, "/index/title/series/3.json").await).await);
         assert_eq!(
             other_type,
             serde_json::json!({ "type": "series", "id": 3, "indexed": false, "minimumAge": null,
-                                "maturityRatings": [] })
+                                "maturityRatings": [], "madeFor": not_made_for(), "warnings": [] })
         );
         let carded = json(body_of(get(&state, "/index/title/movie/1.json").await).await);
         assert_eq!(carded["indexed"], true);
@@ -4432,7 +4443,7 @@ mod tests {
         assert_eq!(
             unknown,
             serde_json::json!({ "type": "movie", "id": 999999, "indexed": false, "minimumAge": null,
-                                "maturityRatings": [] })
+                                "maturityRatings": [], "madeFor": not_made_for(), "warnings": [] })
         );
         assert_eq!(get(&state, "/index/title/anime/1.json").await.status(), 404);
         assert_eq!(get(&state, "/index/title/movie/x.json").await.status(), 404);

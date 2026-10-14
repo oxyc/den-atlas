@@ -166,6 +166,17 @@ impl Indexes {
         )
     }
 
+    /// (made for children, made for teens): the audience evidence a client's direct-read check passes to den-core.
+    pub fn kid_audience(&self, key: Key) -> (bool, bool) {
+        self.store.store.kid_audience(key.0, key.1)
+    }
+
+    /// What the title depicts at the warning floor: a client's direct-read check passes it to den-core, which
+    /// vetoes a Kid's title with a serious warning that is not made for its audience.
+    pub fn warnings(&self, key: Key) -> Vec<String> {
+        self.store.store.warnings(key.0, key.1)
+    }
+
     pub fn maturity_ratings(&self, key: Key) -> &[crate::store::PublicMaturityRating] {
         self.store.store.maturity_ratings(key.0, key.1)
     }
