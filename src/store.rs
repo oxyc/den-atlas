@@ -189,6 +189,29 @@ impl MappedStore {
         child || (band == crate::maturity::KidAudience::ChildOrTeen && teen)
     }
 
+    /// What the title depicts at the `warning` filter's 0.5 floor (`sexual_content`, `drug_use`, ...), read from
+    /// its one row of the dense `depicts` table. Empty where the store has no evidence.
+    pub fn warnings(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Vec<String> {
+        let view = self.view();
+        let media = u8::from(media_type == den_index::MediaType::Tv);
+        let (Ok(Some(row)), Ok(cells), Ok(names), Ok(strings)) = (
+            view.row_of(media, tmdb_id),
+            view.column::<u8>("depicts"),
+            view.column::<u32>("depicts_names"),
+            view.strings(),
+        ) else {
+            return Vec::new();
+        };
+        let width = names.len();
+        let Some(scores) = cells.get(row.0 * width..(row.0 + 1) * width) else { return Vec::new() };
+        names
+            .iter()
+            .zip(scores)
+            .filter(|&(_, &score)| score >= 50)
+            .filter_map(|(&name, _)| strings.get(name).map(str::to_owned))
+            .collect()
+    }
+
     pub fn maturity_ratings(
         &self,
         media_type: den_index::MediaType,

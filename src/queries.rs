@@ -166,6 +166,16 @@ impl Indexes {
         )
     }
 
+    /// Whether the store has audience-intent evidence that this title is made for a Kid of `band`.
+    pub fn kid_audience_relevant(&self, key: Key, band: crate::maturity::KidAudience) -> bool {
+        self.store.store.kid_audience_relevant(key.0, key.1, band)
+    }
+
+    /// What the title depicts at the warning floor, which can veto a Kid's direct read (`Policy::allows_direct`).
+    pub fn warnings(&self, key: Key) -> Vec<String> {
+        self.store.store.warnings(key.0, key.1)
+    }
+
     pub fn maturity_ratings(&self, key: Key) -> &[crate::store::PublicMaturityRating] {
         self.store.store.maturity_ratings(key.0, key.1)
     }
