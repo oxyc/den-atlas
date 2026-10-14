@@ -146,35 +146,42 @@ impl Policy {
         !self.age_restricted() || self.allows(minimum_age())
     }
 
-    /// Apply age safety and Kid catalogue relevance lazily. For a Kid the title must be made for its band, and that
-    /// same evidence admits an unknown age (den-spec profiles-v1 §5); a known age is still held to the ceiling.
+    /// Apply age safety and Kid catalogue relevance lazily. For a Kid the title must be made for its band; an unknown
+    /// age is admitted only for a title made for children (den-spec profiles-v1 §5). Made for teens is 13 to 17, too
+    /// wide to stand in for a missing age (an unrated TV-MA teen drama), so such a title needs a known age.
     pub fn allows_title_with(
         self,
         minimum_age: impl FnOnce() -> Option<u8>,
-        audience_relevant: impl FnOnce(KidAudience) -> bool,
+        made_for: impl Fn(KidAudience) -> bool,
     ) -> bool {
         let Some(band) = self.kid_audience else { return self.allows_with(minimum_age) };
-        audience_relevant(band)
-            && (!self.age_restricted() || minimum_age().is_none_or(|age| self.allows(Some(age))))
+        made_for(band) && self.kid_age_allows(minimum_age(), &made_for)
     }
 
     /// Whether a title may be opened directly — detail, play, sources, download — under this policy. There is no
-    /// catalogue gate here: a Kid may open an age-eligible title not made for it. Being made for the Kid's band
-    /// admits an unknown age; the store's Kid veto (a serious warning on a title not made for children) refuses
-    /// whatever the age, so a single lenient public rating of an adult work cannot open it (profiles-v1 §5).
+    /// catalogue gate here: a Kid may open an age-eligible title not made for it. Made for children admits an
+    /// unknown age; the store's Kid veto (a serious warning on a title not made for children) refuses whatever the
+    /// age, so a single lenient public rating of an adult work cannot open it (profiles-v1 §5).
     pub fn allows_direct(
         self,
         minimum_age: Option<u8>,
-        made_for: impl FnOnce(KidAudience) -> bool,
+        made_for: impl Fn(KidAudience) -> bool,
         vetoed: impl FnOnce() -> bool,
     ) -> bool {
-        let Some(band) = self.kid_audience else { return self.allows_with(|| minimum_age) };
-        if vetoed() {
-            return false;
+        if self.kid_audience.is_none() {
+            return self.allows_with(|| minimum_age);
         }
-        let made_for = made_for(band);
+        !vetoed() && self.kid_age_allows(minimum_age, &made_for)
+    }
+
+    /// A Kid's age rule: a known age is held to the ceiling, an unknown one admitted when the title is made for
+    /// children or the policy allows unknown ratings.
+    fn kid_age_allows(self, minimum_age: Option<u8>, made_for: &impl Fn(KidAudience) -> bool) -> bool {
         !self.age_restricted()
-            || minimum_age.map_or(made_for || self.allows(None), |age| self.allows(Some(age)))
+            || match minimum_age {
+                Some(age) => self.allows(Some(age)),
+                None => self.allows(None) || made_for(KidAudience::Child),
+            }
     }
 
     pub fn age_restricted(self) -> bool {
@@ -239,6 +246,16 @@ mod tests {
         // Not a Kid: an unknown age is decided by unknownRatings alone.
         let ceiling = Policy::from_query("maximumAge=7&unknownRatings=block").unwrap();
         assert!(!ceiling.allows_title_with(|| None, |_| true));
+    }
+
+    #[test]
+    fn made_for_teens_needs_a_known_age() {
+        let kid = Policy::from_query("maximumAge=12&unknownRatings=block&kidAudience=child-or-teen").unwrap();
+        let teens_only = |band: KidAudience| band == KidAudience::ChildOrTeen;
+        // Wayne: unrated, made for teens. In the band, but no age to hold it to.
+        assert!(!kid.allows_title_with(|| None, teens_only));
+        assert!(!kid.allows_direct(None, teens_only, || false));
+        assert!(kid.allows_title_with(|| Some(12), teens_only), "a rated teen title within the ceiling");
     }
 
     #[test]
