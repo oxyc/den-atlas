@@ -95,6 +95,10 @@ impl<'de> Deserialize<'de> for Region {
     }
 }
 
+/// What a Kid may not open unless the title is made for its band. `animal_harm` is left out on purpose: it marks
+/// a great many children's films.
+const KID_VETO_WARNINGS: &[&str] = &["sexual_content", "graphic_violence", "drug_use", "self_harm"];
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Policy {
     pub maximum_age: Option<u8>,
@@ -156,6 +160,25 @@ impl Policy {
         let Some(band) = self.kid_audience else { return self.allows_with(minimum_age) };
         audience_relevant(band)
             && (!self.age_restricted() || minimum_age().is_none_or(|age| self.allows(Some(age))))
+    }
+
+    /// Whether a title may be opened directly — detail, play, sources, download — under this policy. There is no
+    /// catalogue gate here: a Kid may open an age-eligible title not made for it. Being made for the Kid's band
+    /// admits an unknown age; depicting one of `KID_VETO_WARNINGS` without being made for it refuses whatever the
+    /// age, so a single lenient public rating of an adult work cannot open it (profiles-v1 §5).
+    pub fn allows_direct(
+        self,
+        minimum_age: Option<u8>,
+        made_for: impl FnOnce(KidAudience) -> bool,
+        warnings: impl FnOnce() -> Vec<String>,
+    ) -> bool {
+        let Some(band) = self.kid_audience else { return self.allows_with(|| minimum_age) };
+        let made_for = made_for(band);
+        if !made_for && warnings().iter().any(|warning| KID_VETO_WARNINGS.contains(&warning.as_str())) {
+            return false;
+        }
+        !self.age_restricted()
+            || minimum_age.map_or(made_for || self.allows(None), |age| self.allows(Some(age)))
     }
 
     pub fn age_restricted(self) -> bool {
@@ -220,6 +243,26 @@ mod tests {
         // Not a Kid: an unknown age is decided by unknownRatings alone.
         let ceiling = Policy::from_query("maximumAge=7&unknownRatings=block").unwrap();
         assert!(!ceiling.allows_title_with(|| None, |_| true));
+    }
+
+    #[test]
+    fn a_kid_opens_directly_what_its_age_admits_unless_a_serious_warning_vetoes_it() {
+        let kid = Policy::from_query("maximumAge=12&unknownRatings=block&kidAudience=child-or-teen").unwrap();
+        let warned = || vec!["sexual_content".to_owned()];
+        let calm = Vec::new;
+        // The Blue Lagoon: one lenient rating of 8, not made for children, depicts sexual content.
+        assert!(!kid.allows_direct(Some(8), |_| false, warned));
+        assert!(kid.allows_direct(Some(8), |_| false, calm), "no catalogue gate on a direct read");
+        assert!(kid.allows_direct(Some(0), |_| true, || vec!["drug_use".to_owned()]), "made for it: no veto");
+        assert!(kid.allows_direct(Some(0), |_| false, || vec!["animal_harm".to_owned()]));
+        assert!(kid.allows_direct(None, |_| true, calm), "unrated, made for its band");
+        assert!(!kid.allows_direct(None, |_| false, calm), "unrated, not made for it");
+        assert!(!kid.allows_direct(Some(13), |_| true, calm), "a known age still decides");
+        // Not a Kid: the age policy alone, no veto.
+        let ceiling = Policy::from_query("maximumAge=12&unknownRatings=block").unwrap();
+        assert!(ceiling.allows_direct(Some(8), |_| false, warned));
+        assert!(!ceiling.allows_direct(None, |_| true, calm));
+        assert!(Policy::default().allows_direct(None, |_| false, warned));
     }
 
     #[test]

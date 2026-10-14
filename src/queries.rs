@@ -166,13 +166,12 @@ impl Indexes {
         )
     }
 
-    /// (made for children, made for teens): the audience evidence a client's direct-read check passes to den-core.
-    pub fn kid_audience(&self, key: Key) -> (bool, bool) {
-        self.store.store.kid_audience(key.0, key.1)
+    /// Whether the store has audience-intent evidence that this title is made for a Kid of `band`.
+    pub fn kid_audience_relevant(&self, key: Key, band: crate::maturity::KidAudience) -> bool {
+        self.store.store.kid_audience_relevant(key.0, key.1, band)
     }
 
-    /// What the title depicts at the warning floor: a client's direct-read check passes it to den-core, which
-    /// vetoes a Kid's title with a serious warning that is not made for its audience.
+    /// What the title depicts at the warning floor, which can veto a Kid's direct read (`Policy::allows_direct`).
     pub fn warnings(&self, key: Key) -> Vec<String> {
         self.store.store.warnings(key.0, key.1)
     }
