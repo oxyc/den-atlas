@@ -2496,7 +2496,8 @@ async fn serve_json_for_policy(
 ) -> Response {
     let identity = maturity.cache_identity();
     let mut response =
-        serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref()).await;
+        serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref())
+            .await;
     if let Some(identity) = identity.and_then(|value| header::HeaderValue::from_str(&value).ok()) {
         response.headers_mut().insert(POLICY, identity);
     }
