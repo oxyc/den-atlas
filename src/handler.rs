@@ -24,6 +24,9 @@ const CONFIGURE_PAGE: &str = include_str!("configure.html");
 /// The Den app reads it the same way from every addon, so a stale row can be flagged on the row itself
 /// instead of the app having to poll /health and guess which rows that affects.
 const DEGRADED: &str = "x-den-degraded";
+/// The canonical policy that shaped a restricted answer. A relay or shared cache must not be able to hand a Kid
+/// an unrestricted (or differently restricted) representation while leaving the JSON looking otherwise valid.
+const POLICY: &str = "x-den-policy";
 
 /// A duration in Server-Timing's unit: milliseconds, to a tenth.
 fn ms(d: std::time::Duration) -> String {
@@ -67,7 +70,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     resp.headers_mut().insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         // Retry-After and ETag too, or a browser can neither wait as asked nor revalidate.
-        header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After, ETag"),
+        header::HeaderValue::from_static("Server-Timing, X-Den-Degraded, X-Den-Policy, Retry-After, ETag"),
     );
     resp.headers_mut().insert("timing-allow-origin", header::HeaderValue::from_static("*"));
     // What a shared cache may keep is named, so the deploy that changes it can drop it by name: den's
@@ -2492,7 +2495,13 @@ async fn serve_json_for_policy(
     maturity: crate::maturity::Policy,
 ) -> Response {
     let identity = maturity.cache_identity();
-    serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref()).await
+    let mut response =
+        serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref())
+            .await;
+    if let Some(identity) = identity.and_then(|value| header::HeaderValue::from_str(&value).ok()) {
+        response.headers_mut().insert(POLICY, identity);
+    }
+    response
 }
 
 async fn serve_json_with_identity(
@@ -2974,6 +2983,10 @@ mod tests {
 
         let fi_lower = get(&state, &format!("{path}?maximumAge=12&region=fi")).await;
         let fi_lower_etag = fi_lower.headers()[header::ETAG].clone();
+        assert_eq!(
+            fi_lower.headers()[POLICY],
+            "maturity:v2;maximumAge=12;unknownRatings=block;region=FI;kidAudience=-"
+        );
         assert_eq!(body_of(fi_lower).await, legacy_body);
         let fi_canonical = get(&state, &format!("{path}?region=FI&unknownRatings=block&maximumAge=12")).await;
         assert_eq!(fi_canonical.headers()[header::ETAG], fi_lower_etag);
