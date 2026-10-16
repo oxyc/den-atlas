@@ -38,6 +38,12 @@ pub struct Meta {
     /// transformed plot matrix may not, because its transform explicitly names the raw space it accepts.
     #[serde(rename = "embeddingSpace", default)]
     pub embedding_space: Option<String>,
+    /// Canonical engine identity recorded by the corpus producer. Integrated embedding is fail-closed when either
+    /// field is absent: model+dims alone cannot distinguish vector generations or server-side truncation.
+    #[serde(rename = "embedderVectorEpoch", default)]
+    pub embedder_vector_epoch: Option<u32>,
+    #[serde(rename = "embedderMaxTokens", default)]
+    pub embedder_max_tokens: Option<u32>,
     /// Plot rows already have the measured length direction removed. The decoded direction is kept so raw
     /// den-embed query vectors can undergo the same operation before scanning the plot matrix. Premise rows
     /// remain in `embeddingSpace` and never read this.

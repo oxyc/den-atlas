@@ -7,7 +7,7 @@ use crate::http::{serve, Servable};
 use crate::manifest::manifest_json;
 use crate::titles;
 use crate::util::{fnv1a, json_response, unavailable_response, RELOAD_WAIT};
-use crate::AppState;
+use crate::{AppState, EmbedProxy};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
@@ -275,19 +275,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         note_health(&state);
         // Standard Den addon health shape (ADDON-02): 200 for liveness, but report `degraded` so the
         // app's Plugins screen (and any monitor) can see a problem.
-        return json_response(
-            health_body(
-                ds.is_some(),
-                state.catalog.fresh(),
-                state.catalog.schema_suspect(),
-                state.index.as_ref().is_some_and(|index| index.facts_unusable()),
-                state.index.as_ref().is_some_and(|index| index.store_unusable()),
-                state.index.as_ref().is_some_and(|index| index.rows_unusable()),
-                state.index.as_ref().is_some_and(|index| index.votes_unusable()),
-                state.index.as_ref().is_some_and(|index| index.votes_pending()),
-            ),
-            StatusCode::OK,
-        );
+        return json_response(state_health_body(&state), StatusCode::OK);
     }
     // `/ready` — the alertable one. `/health` answers 200 whatever is wrong, by the addon convention
     // (ADDON-02), which is right for a liveness probe and useless for waking someone. This returns 503 when a
@@ -296,27 +284,9 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     // stale catalog is a monitor that gets muted before the outage it was meant to catch.
     if route == "/ready" {
         note_health(&state);
-        let now = health_state(
-            ds.is_some(),
-            state.catalog.fresh(),
-            state.catalog.schema_suspect(),
-            state.index.as_ref().is_some_and(|index| index.facts_unusable()),
-            state.index.as_ref().is_some_and(|index| index.store_unusable()),
-            state.index.as_ref().is_some_and(|index| index.rows_unusable()),
-            state.index.as_ref().is_some_and(|index| index.votes_unusable()),
-            state.index.as_ref().is_some_and(|index| index.votes_pending()),
-        );
+        let now = state_health(&state);
         let serious = now.is_some_and(|(reason, _)| loses_a_feature(reason));
-        let body = health_body(
-            ds.is_some(),
-            state.catalog.fresh(),
-            state.catalog.schema_suspect(),
-            state.index.as_ref().is_some_and(|index| index.facts_unusable()),
-            state.index.as_ref().is_some_and(|index| index.store_unusable()),
-            state.index.as_ref().is_some_and(|index| index.rows_unusable()),
-            state.index.as_ref().is_some_and(|index| index.votes_unusable()),
-            state.index.as_ref().is_some_and(|index| index.votes_pending()),
-        );
+        let body = state_health_body(&state);
         let status = if serious { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
         return json_response(body, status);
     }
@@ -339,7 +309,11 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 serve_json(
                     &method,
                     &headers,
-                    build_descriptor(ds, state.embed.is_some(), state.index.is_some()),
+                    build_descriptor(
+                        ds,
+                        state.embed.as_ref().is_some_and(EmbedProxy::available),
+                        state.index.is_some(),
+                    ),
                     "public, max-age=300, stale-while-revalidate=3600, stale-if-error=86400",
                     None,
                 )
@@ -622,6 +596,7 @@ pub(crate) fn loses_a_feature(reason: &str) -> bool {
             | "rows_unusable"
             | "votes_unusable"
             | "votes_pending"
+            | "embed_unavailable"
     )
 }
 
@@ -703,6 +678,7 @@ pub(crate) fn health_state(
 /// The `/health` JSON body (ADDON-02). Always paired with 200 + `no-store` — liveness never fails; the
 /// body carries the real state. Pure, so the decision is unit-testable without an HTTP round-trip.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn health_body(
     dataset_loaded: bool,
     catalog_fresh: bool,
@@ -730,6 +706,38 @@ fn health_body(
     }
 }
 
+fn embed_health(state: &AppState) -> Option<(&'static str, &'static str)> {
+    state.embed.as_ref().filter(|embed| embed.unready()).map(|_| {
+        (
+            "embed_unavailable",
+            "the configured embedding engine has not passed its corpus identity and inference canary",
+        )
+    })
+}
+
+fn state_health(state: &AppState) -> Option<(&'static str, &'static str)> {
+    health_state(
+        state.dataset.is_some(),
+        state.catalog.fresh(),
+        state.catalog.schema_suspect(),
+        state.index.as_ref().is_some_and(|index| index.facts_unusable()),
+        state.index.as_ref().is_some_and(|index| index.store_unusable()),
+        state.index.as_ref().is_some_and(|index| index.rows_unusable()),
+        state.index.as_ref().is_some_and(|index| index.votes_unusable()),
+        state.index.as_ref().is_some_and(|index| index.votes_pending()),
+    )
+    .or_else(|| embed_health(state))
+}
+
+fn state_health_body(state: &AppState) -> String {
+    match state_health(state) {
+        None => r#"{"status":"ok"}"#.to_owned(),
+        Some((reason, detail)) => {
+            format!(r#"{{"status":"degraded","reason":"{reason}","detail":"{detail}"}}"#)
+        }
+    }
+}
+
 /// Log `/health`'s answer when it changes, and only then: one line when the addon goes degraded (with
 /// the reason), one when it recovers. The state is what an operator needs; a line per request would
 /// repeat it thousands of times. Checked where the answer can move — after a catalog refresh — and
@@ -739,17 +747,13 @@ pub(crate) fn note_catalog_health(state: &AppState) {
     note_health(state);
 }
 
+#[cfg(feature = "embedded-model")]
+pub(crate) fn note_embed_health(state: &AppState) {
+    note_health(state);
+}
+
 fn note_health(state: &AppState) {
-    let now = health_state(
-        state.dataset.is_some(),
-        state.catalog.fresh(),
-        state.catalog.schema_suspect(),
-        state.index.as_ref().is_some_and(|index| index.facts_unusable()),
-        state.index.as_ref().is_some_and(|index| index.store_unusable()),
-        state.index.as_ref().is_some_and(|index| index.rows_unusable()),
-        state.index.as_ref().is_some_and(|index| index.votes_unusable()),
-        state.index.as_ref().is_some_and(|index| index.votes_pending()),
-    );
+    let now = state_health(state);
     let slug = now.map_or("ok", |(reason, _)| reason);
     let mut last = crate::util::lock(&state.health);
     if *last == slug {
@@ -1456,10 +1460,14 @@ async fn query_answer(
         (Some(words), Some(early)) if words == parsed.text() => {
             early.await.map_err(|e| e.to_string()).and_then(|embedded| embedded).map_err(unembedded).ok()
         }
-        (Some(words), _) if state.embed.is_some() => embed_query(state, words).await.map_err(unembedded).ok(),
+        (Some(words), _) if state.embed.as_ref().is_some_and(EmbedProxy::available) => {
+            embed_query(state, words).await.map_err(unembedded).ok()
+        }
         _ => None,
     };
-    let unembedded = vector.is_none() && state.embed.is_some() && parsed.embed_text().is_some();
+    let unembedded = vector.is_none()
+        && state.embed.as_ref().is_some_and(EmbedProxy::available)
+        && parsed.embed_text().is_some();
     let embedded_in = embedding.elapsed();
     let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());
@@ -2041,7 +2049,7 @@ async fn rank(
     let requests = crate::recommend::library_embedding_requests(&indexes, &request);
     let (mut library_embeddings, missing) =
         library_embedding_plan(&state.library_embed_memo, &space, dims, requests);
-    if state.embed.is_some() && !missing.is_empty() {
+    if state.embed.as_ref().is_some_and(EmbedProxy::available) && !missing.is_empty() {
         let texts: Vec<_> = missing.iter().map(|(_, _, text)| text.clone()).collect();
         match embed_batch_upstream(state, &texts).await {
             Ok(vectors) if vectors.len() == missing.len() => {
@@ -2791,6 +2799,7 @@ mod tests {
                     base: format!("http://{addr}"),
                 },
                 inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+                readiness: Arc::new(std::sync::Mutex::new(crate::EmbedReadiness::Ready)),
             }),
             ..AppState::for_test(None)
         });
@@ -3884,6 +3893,7 @@ mod tests {
                 base: format!("http://{addr}"),
             },
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
+            readiness: Arc::new(std::sync::Mutex::new(crate::EmbedReadiness::Ready)),
         };
         (proxy, asked)
     }
@@ -3989,6 +3999,7 @@ mod tests {
                 base: "http://127.0.0.1:9".to_owned(),
             },
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
+            readiness: Arc::new(std::sync::Mutex::new(crate::EmbedReadiness::Ready)),
         };
         let state =
             Arc::new(AppState { index: Some(index), embed: Some(down), ..AppState::for_test(Some(ds)) });
