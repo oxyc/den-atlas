@@ -162,7 +162,8 @@ impl Indexes {
         self.store.store.minimum_age(key.0, key.1)
     }
 
-    /// The public baseline plus box-local authority data applicable to the explicitly requested region.
+    /// The public baseline plus box-local authority data applicable to this viewer. Applicability is independent
+    /// of jurisdiction: for example, a Finnish authority's observation may still protect a US viewer.
     pub fn effective_minimum_age(&self, policy: crate::maturity::Policy, key: Key) -> Option<u8> {
         self.minimum_age(key).into_iter().chain(self.maturity.minimum_age(key, policy.region)).max()
     }

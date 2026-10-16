@@ -105,6 +105,31 @@ pub fn render(state: &AppState) -> String {
         let titles = u64::try_from(ds.store_rows).unwrap_or(u64::MAX);
         gauge(&mut b, "atlas_dataset_titles", "Titles in the served dataset.", "", titles);
     }
+    let maturity_coverage = state.maturity_providers.coverage();
+    if !maturity_coverage.is_empty() {
+        b.push_str(
+            "# HELP atlas_maturity_provider_titles Runtime maturity-provider title coverage by authority, media type, and status.\n\
+             # TYPE atlas_maturity_provider_titles gauge\n",
+        );
+    }
+    for coverage in maturity_coverage {
+        let media_type = if coverage.media_type == den_index::MediaType::Tv { "series" } else { "movie" };
+        let labels = |status: &str| {
+            format!(
+                "{{authority=\"{}\",media_type=\"{media_type}\",status=\"{status}\"}}",
+                label(coverage.authority)
+            )
+        };
+        for (status, value) in
+            [("catalog", coverage.catalog), ("checked", coverage.checked), ("matched", coverage.matched)]
+        {
+            b.push_str(&format!(
+                "atlas_maturity_provider_titles{} {}\n",
+                labels(status),
+                u64::try_from(value).unwrap_or(u64::MAX)
+            ));
+        }
+    }
     gauge(
         &mut b,
         "atlas_catalog_fresh",

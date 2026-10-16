@@ -2557,8 +2557,8 @@ async fn serve_json_for_policy(
 ) -> Response {
     let identity = maturity.cache_identity();
     // Runtime providers can change without a dataset publish (and therefore without the release cache purge).
-    // An answer in an enabled provider's region is kept briefly by the caller only, never in a shared cache
-    // for a month. Other regions retain their normal cache policy.
+    // An answer to which a live provider applies is kept briefly by the caller only, never in a shared cache
+    // for a month. Applicability is separate from the authority's jurisdiction.
     let cache_control =
         if providers.applies_to(maturity.region) { "private, max-age=300" } else { cache_control };
     let mut response =
