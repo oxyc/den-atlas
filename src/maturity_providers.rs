@@ -681,7 +681,10 @@ fn read_cache(path: &Path) -> Result<CacheFile, String> {
 
 fn read_cache_recovering(path: &Path) -> CacheFile {
     match read_cache(path) {
-        Ok(cache) => cache,
+        Ok(cache) => {
+            harden_cache_permissions(path);
+            cache
+        }
         Err(error) => {
             let quarantine = path.with_extension(format!("json.corrupt-{}", now_secs()));
             match std::fs::rename(path, &quarantine) {
@@ -701,6 +704,20 @@ fn read_cache_recovering(path: &Path) -> CacheFile {
         }
     }
 }
+
+#[cfg(unix)]
+fn harden_cache_permissions(path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else { return };
+    if metadata.permissions().mode() & 0o777 == 0o600 {
+        return;
+    }
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("maturity providers: could not make {} private ({error})", path.display());
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_cache_permissions(_path: &Path) {}
 
 fn write_atomically(path: &Path, body: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -987,6 +1004,27 @@ mod tests {
         let path = dir.join(FILE);
         std::fs::write(&path, br#"{"schema":3,"providers":{}}"#).unwrap();
         assert!(read_cache(&path).unwrap_err().contains("unsupported schema 3"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_cache_is_made_private_without_rewriting_it() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-maturity-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        std::fs::write(&path, serde_json::to_vec(&CacheFile::default()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(read_cache_recovering(&path).schema, SCHEMA);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "chmod must not rewrite cache contents"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
