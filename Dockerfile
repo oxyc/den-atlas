@@ -2,7 +2,7 @@
 # `scratch` → a ~few-MB, dependency-free image. The server speaks plain HTTP, and its outbound HTTPS
 # (JustWatch) uses rustls with bundled roots, so scratch needs no CA bundle. CI builds this with an empty
 # data/ (blobs gitignored) → the published image is the SERVER ONLY; mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
-FROM rust:1-alpine AS build
+FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -20,7 +20,7 @@ RUN cargo build --release --locked
 # The release version reaches only the final image configuration (and this marker), never the Rust build above,
 # so a release commit that changes only VERSION reuses the cached compile. A missing or malformed value fails
 # here, before an image can be pushed.
-FROM rust:1-alpine AS release-metadata
+FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS release-metadata
 ARG DEN_VERSION
 RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
     || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
@@ -29,7 +29,7 @@ RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 # Optional migration targets. Neither is the Dockerfile's final/default target, so the published Atlas image
 # remains the same static-musl server. Select `--target den-atlas-embedded` or `--target den-embed` explicitly.
 # ORT's archive needs Debian trixie's newer libstdc++; this cannot reuse the normal Alpine/musl builder.
-FROM rust:1-trixie AS embedded-build
+FROM rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS embedded-build
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -39,10 +39,9 @@ COPY crates ./crates
 COPY embed/Cargo.toml ./embed/Cargo.toml
 COPY embed/src ./embed/src
 COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
-RUN cargo build --release --locked -p den-atlas --features embedded-model \
-    && cargo build --release --locked -p den-embed
+RUN cargo build --release --locked -p den-atlas -p den-embed --features den-atlas/embedded-model
 
-FROM debian:trixie-slim AS embed-model
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS embed-model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /models
@@ -55,7 +54,7 @@ RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
     && echo "${MODEL_SHA256}  model_int8.onnx" | sha256sum -c - \
     && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
-FROM debian:trixie-slim AS embedded-base
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS embedded-base
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home nonroot
@@ -64,8 +63,9 @@ COPY --from=embed-model /models /models
 FROM embedded-base AS den-embed
 ARG DEN_VERSION
 ARG GIT_REVISION
-ENV PORT=8080 MODEL_DIR=/models MAX_CHARS=8000 MALLOC_ARENA_MAX=2 DEN_VERSION=$DEN_VERSION
-LABEL org.opencontainers.image.version=$DEN_VERSION org.opencontainers.image.revision=$GIT_REVISION
+ENV PORT=8080 MODEL_DIR=/models MAX_CHARS=8000 MAX_TOKENS=1024 MALLOC_ARENA_MAX=2 DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION org.opencontainers.image.revision=$GIT_REVISION \
+      org.opencontainers.image.source="https://github.com/oxyc/den-atlas"
 COPY --from=release-metadata /den-version /den-version
 COPY --from=embedded-build /app/target/release/den-embed /den-embed
 EXPOSE 8080
@@ -76,8 +76,9 @@ FROM embedded-base AS den-atlas-embedded
 ARG DEN_VERSION
 ARG GIT_REVISION
 ENV PORT=8080 DATA_DIR=/app/data EMBED_LOCAL=1 EMBED_MODEL_DIR=/models \
-    EMBED_IDLE_UNLOAD_SECS=600 MALLOC_ARENA_MAX=2 DEN_VERSION=$DEN_VERSION
-LABEL org.opencontainers.image.version=$DEN_VERSION org.opencontainers.image.revision=$GIT_REVISION
+    EMBED_MAX_TOKENS=1024 EMBED_IDLE_UNLOAD_SECS=600 MALLOC_ARENA_MAX=2 DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION org.opencontainers.image.revision=$GIT_REVISION \
+      org.opencontainers.image.source="https://github.com/oxyc/den-atlas"
 COPY --from=release-metadata /den-version /den-version
 COPY --from=embedded-build /app/target/release/den-atlas /den-atlas
 COPY data /app/data
@@ -92,7 +93,8 @@ ENV DATA_DIR=/app/data \
     PORT=8080 \
     DEN_VERSION=$DEN_VERSION
 LABEL org.opencontainers.image.version=$DEN_VERSION \
-      org.opencontainers.image.revision=$GIT_REVISION
+      org.opencontainers.image.revision=$GIT_REVISION \
+      org.opencontainers.image.source="https://github.com/oxyc/den-atlas"
 COPY --from=release-metadata /den-version /den-version
 COPY --from=build /app/target/release/den-atlas /den-atlas
 # The dataset blobs (gitignored; fetched via scripts/fetch-dataset.sh). Empty in CI → mount at runtime.

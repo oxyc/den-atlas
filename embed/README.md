@@ -116,6 +116,7 @@ captured from the Python service predate the ONNX Runtime 1.28 move and no longe
 ## Deploy
 
 Until the migration gates pass, the existing standalone image remains deployed and reached by Atlas over
-the internal network. New compatibility and integrated images are built from the workspace Dockerfile's
-`den-embed` and `den-atlas-embedded` targets. Publishing, canarying, and retiring the legacy image are
-deliberately separate rollout steps; see the migration document.
+the internal network. Atlas releases publish the workspace targets as `ghcr.io/oxyc/den-atlas-embed`
+(`MAX_TOKENS=1024` for corpus compatibility) and `ghcr.io/oxyc/den-atlas-integrated`; no production deploy
+consumes either yet. Canarying a corpus and retiring the legacy image remain separate rollout steps; see the
+migration document.

@@ -1,11 +1,11 @@
-# Main CI builds and scans an immutable candidate image. A vX.Y.Z tag promotes the exact digest recorded by that
-# successful main run: it verifies, signs and tags that image, and neither compiles nor tests the commit again.
+# Main CI builds and scans three immutable candidate images. A vX.Y.Z tag promotes the exact digests recorded by
+# that successful main run: it verifies, signs and tags them, and neither compiles nor tests the commit again.
 # CI has no dataset blobs (gitignored), so the published image is the SERVER ONLY — mount data at runtime:
 #   docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas:latest
 #
 # Every Monday, and on a manual run, the NEWEST v* tag is rebuilt instead: released code only, never main,
-# with the base images re-pulled and no build cache, so a toolchain or musl security fix reaches the box
-# between releases — through den-update's probe and rollback, like any release.
+# with pinned bases re-pulled, package indexes refreshed and no build cache, so an OS package security fix
+# reaches the images between releases — through den-update's probe and rollback, like any release.
 name: docker-publish
 
 on:
@@ -17,6 +17,8 @@ on:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-atlas
+  EMBED_IMAGE: ghcr.io/${{ github.repository_owner }}/den-atlas-embed
+  INTEGRATED_IMAGE: ghcr.io/${{ github.repository_owner }}/den-atlas-integrated
 
 # One publish at a time, never cancelled: a patch rebuild and a release must not race each other to :latest.
 concurrency:
@@ -76,6 +78,8 @@ jobs:
       packages: read
     outputs:
       digest: ${{ steps.image.outputs.digest }}
+      embed_digest: ${{ steps.optional.outputs.embed_digest }}
+      integrated_digest: ${{ steps.optional.outputs.integrated_digest }}
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -122,6 +126,13 @@ jobs:
           name: release-candidate-${{ steps.commit.outputs.sha }}
           run-id: ${{ steps.ci.outputs.run_id }}
           github-token: ${{ github.token }}
+      - name: Download the scanned optional digest record
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: optional-release-candidate-${{ steps.commit.outputs.sha }}
+          path: optional
+          run-id: ${{ steps.ci.outputs.run_id }}
+          github-token: ${{ github.token }}
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -140,6 +151,20 @@ jobs:
           live=$(docker buildx imagetools inspect "$IMAGE:candidate-$SHA" --format '{{json .Manifest}}' | jq -r .digest)
           test "$live" = "$digest" || { echo "::error::candidate tag no longer matches the digest recorded by main CI"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Verify optional candidate identities
+        id: optional
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          embed=$(jq -er '.embed | select(test("^sha256:[0-9a-f]{64}$"))' optional/optional-candidate-digests.json)
+          integrated=$(jq -er '.integrated | select(test("^sha256:[0-9a-f]{64}$"))' optional/optional-candidate-digests.json)
+          live_embed=$(docker buildx imagetools inspect "$EMBED_IMAGE:candidate-$SHA" --format '{{json .Manifest}}' | jq -r .digest)
+          live_integrated=$(docker buildx imagetools inspect "$INTEGRATED_IMAGE:candidate-$SHA" --format '{{json .Manifest}}' | jq -r .digest)
+          test "$live_embed" = "$embed" || { echo "::error::compatibility candidate no longer matches main CI"; exit 1; }
+          test "$live_integrated" = "$integrated" || { echo "::error::integrated candidate no longer matches main CI"; exit 1; }
+          echo "embed_digest=$embed" >> "$GITHUB_OUTPUT"
+          echo "integrated_digest=$integrated" >> "$GITHUB_OUTPUT"
       - name: Prove the manifest version matches the release tag
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
@@ -169,6 +194,8 @@ jobs:
       security-events: write  # Trivy's report goes to code scanning
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      embed_digest: ${{ steps.optional.outputs.embed_digest }}
+      integrated_digest: ${{ steps.optional.outputs.integrated_digest }}
       sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,8 +207,8 @@ jobs:
         env:
           EXPECTED: ${{ needs.source.outputs.version }}
         run: |
-          if [ ! -f VERSION ]; then
-            echo "::error::newest tag predates the candidate pipeline; cut one release from current main before running a patch rebuild"
+          if [ ! -f VERSION ] || [ ! -f docker-bake.hcl ]; then
+            echo "::error::newest tag predates the current three-image candidate pipeline; cut one release from current main before running a patch rebuild"
             exit 1
           fi
           test "$(cat VERSION)" = "$EXPECTED" || { echo "::error::tag says $EXPECTED but VERSION says $(cat VERSION)"; exit 1; }
@@ -206,8 +233,8 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          # Re-pull every FROM: a base image served from the build cache is how a release inherits an old
-          # toolchain and musl. A patch rebuild exists to re-fetch the bases; one reused layer defeats it.
+          # Re-pull every pinned FROM and refresh packages below it. Dependabot changes base/toolchain digests;
+          # this rebuild picks up package fixes between those reviewed source changes.
           pull: true
           no-cache: true
           tags: ${{ env.IMAGE }}:${{ needs.source.outputs.version }}-patch.${{ needs.source.outputs.stamp }}
@@ -217,6 +244,35 @@ jobs:
           # SLSA provenance and an SBOM, attached to the image index and so covered by its signature.
           provenance: mode=max
           sbom: true
+      - name: Rebuild optional images without cache
+        id: optional-build
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e # v7.5.0
+        with:
+          source: .
+          files: docker-bake.hcl
+          targets: optional
+          push: true
+          pull: true
+          no-cache: true
+          provenance: mode=max
+          sbom: true
+          vars: |
+            TAG=${{ needs.source.outputs.version }}-patch.${{ needs.source.outputs.stamp }}
+            DEN_VERSION=${{ needs.source.outputs.version }}
+            GIT_REVISION=${{ steps.commit.outputs.sha }}
+            ATLAS_IMAGE=${{ env.IMAGE }}
+            EMBED_IMAGE=${{ env.EMBED_IMAGE }}
+            INTEGRATED_IMAGE=${{ env.INTEGRATED_IMAGE }}
+      - name: Record rebuilt optional identities
+        id: optional
+        env:
+          METADATA: ${{ steps.optional-build.outputs.metadata }}
+        run: |
+          set -euo pipefail
+          embed=$(jq -er '.compat["containerimage.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$METADATA")
+          integrated=$(jq -er '.integrated["containerimage.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$METADATA")
+          echo "embed_digest=$embed" >> "$GITHUB_OUTPUT"
+          echo "integrated_digest=$integrated" >> "$GITHUB_OUTPUT"
       - name: Prove the rebuilt image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -233,6 +289,34 @@ jobs:
           done
           got=$(jq -r .version <<<"$body")
           test "$got" = "$VERSION" || { echo "::error::image /manifest.json version is $got, tag is $VERSION"; exit 1; }
+      - name: Prove rebuilt optional images
+        env:
+          EMBED_DIGEST: ${{ steps.optional.outputs.embed_digest }}
+          INTEGRATED_DIGEST: ${{ steps.optional.outputs.integrated_digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$EMBED_IMAGE@$EMBED_DIGEST" >/dev/null
+          id=$(docker run --rm -d -p 127.0.0.1:18081:8080 "$EMBED_IMAGE@$EMBED_DIGEST")
+          trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
+          body=""
+          for _ in $(seq 1 20); do
+            body=$(curl -fsS http://127.0.0.1:18081/health 2>/dev/null) && break
+            sleep 1
+          done
+          jq -e '.status == "ok" and .model == "bge-m3" and .dims == 1024 and
+                 .vector_epoch == 1 and .max_tokens == 1024' <<<"$body"
+          docker rm -f "$id" >/dev/null
+          trap - EXIT
+
+          docker pull "$INTEGRATED_IMAGE@$INTEGRATED_DIGEST" >/dev/null
+          id=$(docker run --rm -d -p 127.0.0.1:18082:8080 "$INTEGRATED_IMAGE@$INTEGRATED_DIGEST")
+          trap 'docker rm -f "$id" >/dev/null 2>&1 || true' EXIT
+          body=""
+          for _ in $(seq 1 20); do
+            body=$(curl -fsS http://127.0.0.1:18082/health 2>/dev/null) && break
+            sleep 1
+          done
+          jq -e '.status == "degraded" and .reason == "dataset_unavailable"' <<<"$body"
       # One scan, of fixable HIGH and CRITICAL findings, which the report and the gate below both read.
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -244,6 +328,26 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "0"
+      - name: Scan compatibility image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.EMBED_IMAGE }}@${{ steps.optional.outputs.embed_digest }}
+          version: v0.74.0
+          format: json
+          output: trivy-embed.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+      - name: Scan integrated image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.INTEGRATED_IMAGE }}@${{ steps.optional.outputs.integrated_digest }}
+          version: v0.74.0
+          format: json
+          output: trivy-integrated.json
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
       # Gate: a CRITICAL with a fixed version available fails here, before anything is signed or :latest
       # moves. A patch rebuild gates on OS packages only — the part a rebuild can fix; a vulnerable crate needs
       # a release. A finding that does not apply goes in .trivyignore with a reason.
@@ -252,6 +356,10 @@ jobs:
           set -euo pipefail
           jq '.Results |= map(select(.Class == "os-pkgs"))' trivy.json > gate.json
           trivy convert --severity CRITICAL --exit-code 1 --format table gate.json
+          for image in embed integrated; do
+            jq '.Results |= map(select(.Class == "os-pkgs"))' "trivy-$image.json" > "gate-$image.json"
+            trivy convert --severity CRITICAL --exit-code 1 --format table "gate-$image.json"
+          done
       # Report: those findings go to the repository's code scanning. Advisory — it never fails the job.
       - name: Report for code scanning
         continue-on-error: true
@@ -287,12 +395,19 @@ jobs:
       - name: Sign the exact digest
         env:
           DIGEST: ${{ needs.candidate.outputs.digest || needs.patch-build.outputs.digest }}
-        run: cosign sign --yes "$IMAGE@$DIGEST"
+          EMBED_DIGEST: ${{ needs.candidate.outputs.embed_digest || needs.patch-build.outputs.embed_digest }}
+          INTEGRATED_DIGEST: ${{ needs.candidate.outputs.integrated_digest || needs.patch-build.outputs.integrated_digest }}
+        run: |
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign sign --yes "$EMBED_IMAGE@$EMBED_DIGEST"
+          cosign sign --yes "$INTEGRATED_IMAGE@$INTEGRATED_DIGEST"
       # :latest is what den-update deploys, so it moves last, to exactly the digest that was scanned and
       # signed. imagetools re-tags a single index as-is; the check proves the digest survived the move.
       - name: Publish release tags and move latest last
         env:
           DIGEST: ${{ needs.candidate.outputs.digest || needs.patch-build.outputs.digest }}
+          EMBED_DIGEST: ${{ needs.candidate.outputs.embed_digest || needs.patch-build.outputs.embed_digest }}
+          INTEGRATED_DIGEST: ${{ needs.candidate.outputs.integrated_digest || needs.patch-build.outputs.integrated_digest }}
           SHA: ${{ needs.candidate.outputs.sha || needs.patch-build.outputs.sha }}
           VERSION: ${{ needs.source.outputs.version }}
           PATCH: ${{ needs.source.outputs.patch }}
@@ -303,7 +418,18 @@ jobs:
             minor=${VERSION%.*}; major=${VERSION%%.*}; short=${SHA:0:7}
             docker buildx imagetools create --tag "$IMAGE:$VERSION" --tag "$IMAGE:$minor" --tag "$IMAGE:$major" \
               --tag "$IMAGE:sha-$short" "$IMAGE@$DIGEST"
+            docker buildx imagetools create --tag "$EMBED_IMAGE:$VERSION" --tag "$EMBED_IMAGE:$minor" \
+              --tag "$EMBED_IMAGE:$major" --tag "$EMBED_IMAGE:sha-$short" "$EMBED_IMAGE@$EMBED_DIGEST"
+            docker buildx imagetools create --tag "$INTEGRATED_IMAGE:$VERSION" --tag "$INTEGRATED_IMAGE:$minor" \
+              --tag "$INTEGRATED_IMAGE:$major" --tag "$INTEGRATED_IMAGE:sha-$short" \
+              "$INTEGRATED_IMAGE@$INTEGRATED_DIGEST"
           fi
           docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          docker buildx imagetools create --tag "$EMBED_IMAGE:latest" "$EMBED_IMAGE@$EMBED_DIGEST"
+          docker buildx imagetools create --tag "$INTEGRATED_IMAGE:latest" "$INTEGRATED_IMAGE@$INTEGRATED_DIGEST"
           moved=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          moved_embed=$(docker buildx imagetools inspect "$EMBED_IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          moved_integrated=$(docker buildx imagetools inspect "$INTEGRATED_IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
           test "$moved" = "$DIGEST" || { echo "::error::latest resolved to $moved, not the signed $DIGEST"; exit 1; }
+          test "$moved_embed" = "$EMBED_DIGEST" || { echo "::error::compatibility latest does not match its signed digest"; exit 1; }
+          test "$moved_integrated" = "$INTEGRATED_DIGEST" || { echo "::error::integrated latest does not match its signed digest"; exit 1; }

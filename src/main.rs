@@ -283,8 +283,9 @@ impl EmbedProxy {
                     .map_err(|_| "embedded model timed out".to_owned())?
                     .map_err(|error| error.to_string())?;
                 let (parts, body) = response.into_parts();
-                let body =
-                    axum::body::to_bytes(body, 16 * 1024 * 1024).await.map_err(|error| error.to_string())?;
+                let body = axum::body::to_bytes(body, MAX_LOCAL_EMBED_RESPONSE_BYTES)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 Ok(EmbedAnswer { status: parts.status, headers: parts.headers, body })
             }
         }
@@ -315,6 +316,10 @@ impl EmbedProxy {
 /// Concurrent embeds allowed through to den-embed. A search query is interactive, so a short queue
 /// with a deadline beats an unbounded one.
 pub const MAX_EMBED_INFLIGHT: usize = 4;
+// At the engine's absolute MAX_BATCH=4096, a response of 1024 zero-valued dimensions is about 8 MiB.
+// Leave framing/headroom, but do not let an in-process compatibility response allocate an arbitrary body.
+#[cfg(feature = "embedded-model")]
+const MAX_LOCAL_EMBED_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const EMBED_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 

@@ -522,17 +522,21 @@ rollback.
   production path; see [`docs/EMBED-MIGRATION.md`](docs/EMBED-MIGRATION.md) for the unactivated local path.
 
 **Release images.** Main CI builds `ghcr.io/oxyc/den-atlas:candidate-<sha>` for every main commit while its
-tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. Run
+tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. It also
+builds, probes and scans the explicitly unused `ghcr.io/oxyc/den-atlas-embed` compatibility service and
+`ghcr.io/oxyc/den-atlas-integrated` image from the same bake. Run
 `scripts/release.sh X.Y.Z`: it changes only `VERSION` (never `Cargo.toml`, so the cached Rust build is
 reused; the image carries the version as `DEN_VERSION`), pushes that commit, waits for its exact main CI and
-only then creates `vX.Y.Z`. The tag's `docker-publish` run verifies that exact digest, signs it, adds the
-`:X.Y.Z`, `:X.Y`, `:X` and `:sha-` tags and moves `:latest`; it does not rebuild or retest.
+only then creates `vX.Y.Z`. The tag's `docker-publish` run verifies and signs all three exact digests, adds
+their `:X.Y.Z`, `:X.Y`, `:X` and `:sha-` tags and moves each package's `:latest`; it does not rebuild or
+retest. No deploy consumes either optional package.
 
-`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) with the
-base images re-pulled and no build cache, and publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`, so a
-toolchain or musl fix reaches the box between releases through `den-update`'s probe and rollback like any
-release. It fails if the newest tag predates the candidate pipeline (no `VERSION` file); cut one release
-first. Trivy scans each image before `:latest` moves: a CRITICAL with a fix available fails the run (on the
+`docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) from its
+digest-pinned bases with refreshed OS packages and no build cache, and publishes it as
+`:X.Y.Z-patch.<date>.<run>` and `:latest`, so package fixes reach the box between releases through
+`den-update`'s probe and rollback like any release. Dependabot updates the pinned toolchain/base digests. The
+workflow fails if the newest tag predates the candidate pipeline (no `VERSION` file); cut one release first.
+Trivy scans each image before `:latest` moves: a CRITICAL with a fix available fails the run (on the
 weekly rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL findings go
 to code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every image carries
 SLSA provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
