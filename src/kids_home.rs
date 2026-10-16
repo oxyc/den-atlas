@@ -8,7 +8,8 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 enum Source {
-    Query { query: &'static str },
+    Query { query: &'static str, minimum_score: f32 },
+    Franchise { r#type: &'static str, id: u32 },
     Filter { r#type: &'static str, selection: &'static [&'static str] },
 }
 
@@ -26,59 +27,79 @@ const ROWS: &[Row] = &[
         id: "dogs",
         title: "Dogs",
         group: "themes",
-        source: Source::Query { query: "family film about a dog" },
+        source: Source::Query { query: "family film about a dog", minimum_score: 0.405 },
     },
     Row {
         id: "cats",
         title: "Cats",
         group: "themes",
-        source: Source::Query { query: "family film about a cat" },
+        source: Source::Query { query: "family film about a cat", minimum_score: 0.4001 },
     },
     Row {
         id: "horses",
         title: "Horses",
         group: "themes",
-        source: Source::Query { query: "family film about horses" },
+        source: Source::Query { query: "family film about horses", minimum_score: 0.4063 },
     },
     Row {
         id: "dinosaurs",
         title: "Dinosaurs",
         group: "themes",
-        source: Source::Query { query: "family film about dinosaurs" },
+        source: Source::Query { query: "family film about dinosaurs", minimum_score: 0.4063 },
     },
     Row {
         id: "under-the-sea",
         title: "Under the Sea",
         group: "themes",
-        source: Source::Query { query: "family film about the sea" },
+        source: Source::Query { query: "family film about the sea", minimum_score: 0.401 },
     },
     Row {
         id: "fairy-tales",
         title: "Princesses and Fairy Tales",
         group: "themes",
-        source: Source::Query { query: "princesses and fairy tales" },
+        source: Source::Query { query: "princesses and fairy tales", minimum_score: 0.09 },
     },
-    Row { id: "moomins", title: "Moomins", group: "worlds", source: Source::Query { query: "Moomins" } },
+    Row {
+        id: "moomins",
+        title: "Moomins",
+        group: "worlds",
+        source: Source::Query { query: "Moomins", minimum_score: 0.69 },
+    },
     Row {
         id: "paddington",
         title: "Paddington",
         group: "worlds",
-        source: Source::Query { query: "Paddington" },
+        source: Source::Query { query: "Paddington", minimum_score: 0.93 },
     },
     Row {
         id: "winnie-the-pooh",
         title: "Winnie the Pooh",
         group: "worlds",
-        source: Source::Query { query: "Winnie the Pooh" },
+        source: Source::Franchise { r#type: "movie", id: 250480 },
     },
-    Row { id: "barbie", title: "Barbie", group: "worlds", source: Source::Query { query: "Barbie" } },
-    Row { id: "pokemon", title: "Pokémon", group: "worlds", source: Source::Query { query: "Pokémon" } },
-    Row { id: "cars", title: "Cars", group: "worlds", source: Source::Query { query: "Cars" } },
+    Row {
+        id: "barbie",
+        title: "Barbie",
+        group: "worlds",
+        source: Source::Franchise { r#type: "movie", id: 21705 },
+    },
+    Row {
+        id: "pokemon",
+        title: "Pokémon",
+        group: "worlds",
+        source: Source::Franchise { r#type: "series", id: 60572 },
+    },
+    Row {
+        id: "cars",
+        title: "Cars",
+        group: "worlds",
+        source: Source::Franchise { r#type: "movie", id: 920 },
+    },
     Row {
         id: "thomas-and-friends",
         title: "Thomas & Friends",
         group: "worlds",
-        source: Source::Query { query: "Thomas and Friends" },
+        source: Source::Query { query: "Thomas and Friends", minimum_score: 0.79 },
     },
     Row {
         id: "pixar",
