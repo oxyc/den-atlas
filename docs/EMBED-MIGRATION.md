@@ -22,7 +22,7 @@ docker build -t den-atlas .
 docker build --target den-embed \
   --build-arg DEN_VERSION=$(cat VERSION) -t den-embed .
 
-# Atlas plus the same engine and pinned model; this target is not published or deployed yet
+# Atlas plus the same engine and pinned model; this target is published but not deployed
 docker build --target den-atlas-embedded \
   --build-arg DEN_VERSION=$(cat VERSION) -t den-atlas:embedded .
 ```
@@ -31,17 +31,18 @@ Local-engine settings use the compatibility names with `EMBED_` prepended, for e
 `EMBED_MODEL_DIR`, `EMBED_MAX_TOKENS`, `EMBED_CACHE_MAX_ENTRIES`, and
 `EMBED_IDLE_UNLOAD_SECS`. `EMBED_PORT` is ignored because no second listener is opened.
 
-den-dataset should keep calling the batch HTTP API while migrating its image reference. Building the
-compatibility target above guarantees its corpus and Atlas queries execute the same Rust code and pinned
-model. Do not archive the standalone repository or change dataset's image until this target is published
-and its corpus parity gate passes.
+den-dataset should keep calling the batch HTTP API while migrating its image reference. After the first
+release containing this pipeline, its exact compatibility image is
+`ghcr.io/oxyc/den-atlas-embed:<Atlas VERSION>` (prefer the release's immutable digest in CI). That image
+guarantees corpus and Atlas queries execute the same Rust code, 1024-token cap, vector epoch and pinned model.
+Do not archive the standalone repository until a corpus built with this image passes its parity gate.
 
 ## Rollout blockers
 
 Before setting `EMBED_LOCAL=1` in production:
 
-1. Publish and scan both optional Debian targets. The model/ORT build needs glibc and cannot use Atlas's
-   current Alpine/scratch image.
+1. Both optional Debian targets are built, probed, scanned, signed and published by the Atlas release. The
+   model/ORT build needs glibc and cannot use Atlas's current Alpine/scratch image.
 2. Run the existing golden-vector parity check on the production amd64 CPU. Query and corpus jobs must use
    the same `MAX_TOKENS` (currently 1024 for the corpus); changing it requires a new vector epoch/corpus.
 3. Raise and measure Atlas's memory limit. The current 256 MiB Atlas limit cannot also hold the model; prior
@@ -54,9 +55,8 @@ Before setting `EMBED_LOCAL=1` in production:
    different; existing manifests intentionally fail closed.
 6. Point den-dataset at the Atlas-owned compatibility image and complete a corpus build before retiring the
    standalone den-embed release workflow/repository.
-7. Pin the optional image's Debian packages/base digest and choose a smaller explicit maximum for responses
-   collected across the in-process HTTP boundary. Both are release-hardening follow-ups; neither changes the
-   default-off engine selection or the engine-owned inference bound.
+7. The Rust and Debian bases are digest-pinned and Dependabot owns their refresh. In-process compatibility
+   responses have a 10 MiB collection bound, large enough for the engine's maximum batch shape.
 
 Keeping these as rollout gates avoids adding a second abstraction or configuration service. The public
 Atlas routes, response bodies, error codes, headers, concurrency bound, timeout, and default deployment stay
