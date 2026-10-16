@@ -523,13 +523,14 @@ rollback.
 
 **Release images.** Main CI builds `ghcr.io/oxyc/den-atlas:candidate-<sha>` for every main commit while its
 tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. It also
-builds, probes and scans the explicitly unused `ghcr.io/oxyc/den-atlas-embed` compatibility service and
+builds, probes and scans `ghcr.io/oxyc/den-atlas-embed`, the compatibility service consumed under the
+cross-repository gates in [`docs/EMBED-MIGRATION.md`](docs/EMBED-MIGRATION.md), and the currently unused
 `ghcr.io/oxyc/den-atlas-integrated` image from the same bake. Run
 `scripts/release.sh X.Y.Z`: it changes only `VERSION` (never `Cargo.toml`, so the cached Rust build is
 reused; the image carries the version as `DEN_VERSION`), pushes that commit, waits for its exact main CI and
 only then creates `vX.Y.Z`. The tag's `docker-publish` run verifies and signs all three exact digests, adds
 their `:X.Y.Z`, `:X.Y`, `:X` and `:sha-` tags and moves each package's `:latest`; it does not rebuild or
-retest. No deploy consumes either optional package.
+retest. Publishing either optional package does not enable Atlas's in-process engine.
 
 `docker-publish` also runs every Monday: the weekly run rebuilds the newest `v*` tag (never `main`) from its
 digest-pinned bases with refreshed OS packages and no build cache, and publishes it as

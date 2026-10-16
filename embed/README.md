@@ -115,8 +115,9 @@ captured from the Python service predate the ONNX Runtime 1.28 move and no longe
 
 ## Deploy
 
-Until the migration gates pass, the existing standalone image remains deployed and reached by Atlas over
-the internal network. Atlas releases publish the workspace targets as `ghcr.io/oxyc/den-atlas-embed`
-(`MAX_TOKENS=1024` for corpus compatibility) and `ghcr.io/oxyc/den-atlas-integrated`; no production deploy
-consumes either yet. Canarying a corpus and retiring the legacy image remain separate rollout steps; see the
-migration document.
+Atlas releases publish the workspace targets as `ghcr.io/oxyc/den-atlas-embed` (`MAX_TOKENS=1024` for
+corpus compatibility) and `ghcr.io/oxyc/den-atlas-integrated`. The den-dataset byte-exact canary passed for
+the release 0.96.11 compatibility digest on its allowed native x86_64 workflow runner, so that image belongs
+to the current corpus space and needs no corpus rebuild. The den repository controls the separate service
+deployment; do not archive the standalone repository until that switch is live and verified. The integrated
+image remains unactivated. See the migration document.
