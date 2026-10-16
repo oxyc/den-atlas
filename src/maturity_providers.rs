@@ -452,8 +452,17 @@ impl Kavi {
                 .timeout(Duration::from_secs(15))
                 .build()
                 .map_err(|e| e.to_string())?,
-            base: reqwest::Url::parse("https://luokittelu.kavi.fi/agelimit/").map_err(|e| e.to_string())?,
+            // No trailing slash: `path_segments_mut().push()` would otherwise preserve its empty final segment
+            // and produce `/agelimit//Title`, which KAVI correctly rejects with 404.
+            base: reqwest::Url::parse("https://luokittelu.kavi.fi/agelimit").map_err(|e| e.to_string())?,
         })
+    }
+
+    fn search_url(&self, candidate: &str) -> Result<reqwest::Url, String> {
+        let mut url = self.base.clone();
+        url.path_segments_mut().map_err(|()| "KAVI base URL cannot take a path".to_owned())?.push(candidate);
+        url.query_pairs_mut().append_pair("type", "series").append_pair("count", "100");
+        Ok(url)
     }
 }
 
@@ -516,11 +525,7 @@ impl Backend for Kavi {
             if !budget.take().await {
                 return Ok(Lookup::Deferred);
             }
-            let mut url = self.base.clone();
-            url.path_segments_mut()
-                .map_err(|()| "KAVI base URL cannot take a path".to_owned())?
-                .push(candidate);
-            url.query_pairs_mut().append_pair("type", "series").append_pair("count", "100");
+            let url = self.search_url(candidate)?;
             let response = self
                 .client
                 .get(url.clone())
@@ -613,6 +618,15 @@ mod tests {
         assert_eq!(row.id, 58417);
         assert_eq!(row.agelimit, Some(7));
         assert_eq!(row.warnings, ["anxiety"]);
+    }
+
+    #[test]
+    fn kavi_search_url_has_one_path_separator_and_encodes_the_title() {
+        let url = Kavi::new().unwrap().search_url("Clerks: The Animated Series").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://luokittelu.kavi.fi/agelimit/Clerks:%20The%20Animated%20Series?type=series&count=100"
+        );
     }
 
     #[test]
