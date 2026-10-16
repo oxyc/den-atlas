@@ -19,6 +19,7 @@ mod franchises;
 mod handler;
 mod http;
 mod justwatch;
+mod kids_home;
 mod manifest;
 mod maturity;
 mod metrics;

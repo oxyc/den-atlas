@@ -901,6 +901,9 @@ enum IndexQuestion {
     Facets,
     /// Search in one request (`search.rs`). Answered in `handle_index`, because it waits on den-embed.
     Query,
+    /// The checked-in Kid Home row catalogue. Its sources are ordinary pageable index routes, so the caller's
+    /// maturity policy is applied by the same authority as every other discovery answer.
+    KidsHome,
     /// A row of the plot facets named in the query (`?ending=bittersweet&tone=bleak`).
     Plot {
         media_type: den_index::MediaType,
@@ -970,6 +973,7 @@ impl IndexQuestion {
                 Some(Self::Filter { scope: crate::filter::Scope::parse(type_)?, route })
             }
             ["query"] => Some(Self::Query),
+            ["kids-home"] => Some(Self::KidsHome),
             ["plot" | "row", type_] => Some(Self::Plot { media_type: index_media_type(type_)? }),
             _ => None,
         }
@@ -996,6 +1000,7 @@ impl IndexQuestion {
                 "moods": plot.mood_labels(),
             }),
             Self::Schema => return indexes.schema_json().to_owned(),
+            Self::KidsHome => crate::kids_home::json(),
             Self::Rows { media_type, mood, label } => {
                 let number = |key: &str, default: usize| {
                     query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
