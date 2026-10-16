@@ -10,17 +10,6 @@ publish = false
 name = "den-embed"
 path = "src/main.rs"
 
-[profile.release]
-# Small, fast binary: fat LTO + one codegen unit + strip symbols. The image size
-# is dominated by the 555 MB ONNX model, but a lean binary keeps the non-model
-# layers tiny and helps cold-start.
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-# Unwinding, not abort: a panic on the blocking pool then surfaces as a JoinError — the logged 500 —
-# instead of taking every in-flight request down with the process.
-
 [dependencies]
 # ONNX Runtime — the SAME native engine the Python service used via fastembed, so
 # the same model_int8.onnx on the same CPU provider yields identical tensors.

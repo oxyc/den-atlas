@@ -581,23 +581,17 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
         );
     };
     let upstream = Instant::now();
-    let mut upstream_req =
-        proxy.client.post(format!("{}/embed", proxy.base)).header(header::CONTENT_TYPE, "application/json");
-    if let Some(rid) = &rid {
-        upstream_req = upstream_req.header("x-request-id", rid.as_str());
-    }
-    let resp = match upstream_req.body(body).send().await {
+    let resp = match proxy.call("/embed", body, rid.as_deref()).await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = resp.status;
             // den-embed's own wait hint, when it gives one, reaches the client.
-            let retry_after = resp.headers().get(header::RETRY_AFTER).cloned();
-            let bytes = resp.bytes().await.unwrap_or_default();
+            let retry_after = resp.headers.get(header::RETRY_AFTER).cloned();
             let mut out = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 // A POST proxy of per-query vectors — never let a heuristic/intermediary cache these.
                 .header(header::CACHE_CONTROL, "no-store")
-                .body(Body::from(bytes))
+                .body(Body::from(resp.body))
                 .unwrap();
             if let Some(value) = retry_after {
                 out.headers_mut().insert(header::RETRY_AFTER, value);
@@ -1328,17 +1322,14 @@ async fn embed_upstream(state: &AppState, text: &str) -> Result<Vec<i8>, String>
         .await
         .map_err(|_| "den-embed is busy")?
         .map_err(|_| "den-embed permits are closed")?;
-    let resp = proxy
-        .client
-        .post(format!("{}/embed", proxy.base))
-        .json(&serde_json::json!({ "text": text }))
-        .send()
-        .await
-        .map_err(|e| format!("den-embed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("den-embed answered HTTP {}", resp.status()));
+    let body = serde_json::to_vec(&serde_json::json!({ "text": text })).map_err(|e| e.to_string())?;
+    let resp = proxy.call("/embed", body.into(), None).await.map_err(|e| format!("den-embed: {e}"))?;
+    if !resp.status.is_success() {
+        return Err(format!("den-embed answered HTTP {}", resp.status));
     }
-    resp.json::<Embedded>().await.map(|e| e.vector).map_err(|e| format!("den-embed body: {e}"))
+    serde_json::from_slice::<Embedded>(&resp.body)
+        .map(|embedded| embedded.vector)
+        .map_err(|e| format!("den-embed body: {e}"))
 }
 
 /// One bounded den-embed batch. Library coverage is one model batch rather than 32 requests competing for the
@@ -1353,17 +1344,15 @@ async fn embed_batch_upstream(state: &AppState, texts: &[String]) -> Result<Vec<
         .await
         .map_err(|_| "den-embed is busy")?
         .map_err(|_| "den-embed permits are closed")?;
-    let resp = proxy
-        .client
-        .post(format!("{}/embed/batch", proxy.base))
-        .json(&serde_json::json!({ "texts": texts }))
-        .send()
-        .await
-        .map_err(|e| format!("den-embed batch: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("den-embed batch answered HTTP {}", resp.status()));
+    let body = serde_json::to_vec(&serde_json::json!({ "texts": texts })).map_err(|e| e.to_string())?;
+    let resp =
+        proxy.call("/embed/batch", body.into(), None).await.map_err(|e| format!("den-embed batch: {e}"))?;
+    if !resp.status.is_success() {
+        return Err(format!("den-embed batch answered HTTP {}", resp.status));
     }
-    resp.json::<Embedded>().await.map(|e| e.vectors).map_err(|e| format!("den-embed batch body: {e}"))
+    serde_json::from_slice::<Embedded>(&resp.body)
+        .map(|embedded| embedded.vectors)
+        .map_err(|e| format!("den-embed batch body: {e}"))
 }
 
 /// Wake den-embed as the indexes load on a query, which with the indexes loaded at start (`load_at_start`) is
@@ -2797,8 +2786,10 @@ mod tests {
         });
         let state = Arc::new(AppState {
             embed: Some(crate::EmbedProxy {
-                client: reqwest::Client::new(),
-                base: format!("http://{addr}"),
+                transport: crate::EmbedTransport::Remote {
+                    client: reqwest::Client::new(),
+                    base: format!("http://{addr}"),
+                },
                 inflight: Arc::new(tokio::sync::Semaphore::new(1)),
             }),
             ..AppState::for_test(None)
@@ -3888,8 +3879,10 @@ mod tests {
             }
         });
         let proxy = crate::EmbedProxy {
-            client: reqwest::Client::new(),
-            base: format!("http://{addr}"),
+            transport: crate::EmbedTransport::Remote {
+                client: reqwest::Client::new(),
+                base: format!("http://{addr}"),
+            },
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
         };
         (proxy, asked)
@@ -3991,8 +3984,10 @@ mod tests {
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         // Nothing listens on the discard port, so every embed fails at once.
         let down = crate::EmbedProxy {
-            client: reqwest::Client::new(),
-            base: "http://127.0.0.1:9".to_owned(),
+            transport: crate::EmbedTransport::Remote {
+                client: reqwest::Client::new(),
+                base: "http://127.0.0.1:9".to_owned(),
+            },
             inflight: Arc::new(tokio::sync::Semaphore::new(4)),
         };
         let state =

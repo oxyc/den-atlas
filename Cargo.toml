@@ -46,9 +46,17 @@ unicode-normalization = "0.1"
 # Runtime authority results are rebuilt off the request path and swapped as one immutable view. Readers never
 # contend with refresh, persistence, or a metrics scrape.
 arc-swap = "1"
+# Opt-in during migration. The default image and deployment still use EMBED_URL; an integrated Atlas build can
+# link the exact engine that also ships as the workspace's compatibility den-embed binary.
+den-embed = { path = "embed", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+
+[features]
+default = []
+embedded-model = ["dep:den-embed", "dep:tower"]
 
 [workspace]
-members = ["crates/den-index", "crates/den-titlesearch"]
+members = ["crates/den-index", "crates/den-titlesearch", "embed"]
 
 # `start_paused` — the cold-burst test simulates ~45s of queued upstream work, which has to cost no
 # wall clock to be worth running. Tests only; the shipped binary's tokio features are unchanged.
