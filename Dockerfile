@@ -10,7 +10,8 @@ COPY src ./src
 COPY crates ./crates
 # The package is optional for the normal Atlas binary, but it is a workspace member and Cargo must be able
 # to read its manifest while resolving the locked workspace. It is not linked into this default build.
-COPY embed ./embed
+COPY embed/Cargo.toml ./embed/Cargo.toml
+COPY embed/src ./embed/src
 # Compiled in (`raileval.rs`): the playground scores its knobs against the judged set, both files.
 COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
 # rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
@@ -35,7 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
-COPY embed ./embed
+COPY embed/Cargo.toml ./embed/Cargo.toml
+COPY embed/src ./embed/src
 COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
 RUN cargo build --release --locked -p den-atlas --features embedded-model \
     && cargo build --release --locked -p den-embed

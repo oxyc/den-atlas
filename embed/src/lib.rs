@@ -4,7 +4,7 @@
 //! a tiny idle footprint. The Python process, even with the model unloaded, held
 //! ~100 MB (interpreter + numpy + fastapi + onnxruntime arenas that gc can't
 //! return). This drops the interpreter entirely; with the model AND tokenizer
-//! idle-unloaded it falls back to tens of MB (measured figures in CLAUDE.md),
+//! idle-unloaded it falls back to tens of MB,
 //! reloading on the next request.
 //!
 //! Parity is the contract. Corpus vectors and query vectors are only comparable
@@ -182,7 +182,7 @@ impl Config {
     }
 
     fn from_get(get: &impl Fn(&str) -> Option<String>) -> Self {
-        // Model files are baked into the image (see Dockerfile). Default to the
+        // Model files are baked into the optional images (see the workspace Dockerfile). Default to the
         // fixed bake paths; overridable for local dev.
         let model_dir = get("MODEL_DIR").unwrap_or_else(|| "/models".into());
         let onnx_path = get("ONNX_PATH").unwrap_or_else(|| format!("{model_dir}/model_int8.onnx"));

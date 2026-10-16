@@ -13,7 +13,7 @@ Query vectors and corpus vectors are only comparable because both come out of **
 tokenizer, the same model file, the same ONNX Runtime, the same pooling and the same quantization.
 Change any of them on one side and the other side has to be re-embedded through the new path. "The
 same model" is not enough — an ONNX Runtime upgrade alone moved the int8 output far enough to reorder
-results (CLAUDE.md has the measurements), and a different serving path such as Workers AI's
+results, and a different serving path such as Workers AI's
 `@cf/baai/bge-m3` would too. `vector_epoch` in `/health` names the generation of vectors this build
 produces; den-dataset records it with a corpus and refuses to mix generations.
 
@@ -23,7 +23,7 @@ produces; den-dataset records it with a corpus and refuses to mix generations.
 2. The text is cut to `MAX_CHARS` characters, then the tokenizer truncates it to `MAX_TOKENS`
    tokens. Both cuts are silent.
 3. `tokenizer.json` and `onnx/model_int8.onnx` from `Xenova/bge-m3`, pinned to a commit and
-   checksum-verified in the Dockerfile, run on the ONNX Runtime CPU provider.
+   checksum-verified in the workspace Dockerfile, run on the ONNX Runtime CPU provider.
 4. CLS pooling: token 0 of `last_hidden_state`.
 5. L2-normalize in f64, then `clamp(round_half_to_even(x * 127), -127, 127)`.
 
@@ -36,7 +36,7 @@ With `IDLE_UNLOAD_SECS` above 0 (the box sets 600) the model is not loaded at bo
 request that needs it loads it, and a background task drops it after that many seconds without an
 inference, then hands the freed memory back to the OS. `/health`, `/metrics` and `OPTIONS` do not
 count as activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at
-boot and stays. Measured footprints for each state are in CLAUDE.md.
+boot and stays. The measured rollout bounds are recorded in the migration document.
 
 ## Routes
 
@@ -86,7 +86,7 @@ boot and stays. Measured footprints for each state are in CLAUDE.md.
 
 A number outside its range is clamped and a malformed one falls back to the default, each with a log
 line. The ranges are memory and latency bounds, sized against a 1536 MiB container and den-atlas's
-10 s timeout on this call; CLAUDE.md explains each one. `.env.example` lists the same variables.
+10 s timeout on this call.
 
 ## Run
 
@@ -98,7 +98,7 @@ curl -X POST http://127.0.0.1:8080/embed/batch \
   -d '{"texts":["a bank robbery","","a quiet romance"]}'
 ```
 
-Take the model files from the revision the Dockerfile pins, so local vectors match the image's.
+Take the model files from the revision the workspace Dockerfile pins, so local vectors match the image's.
 
 ```sh
 cargo test
@@ -115,28 +115,7 @@ captured from the Python service predate the ONNX Runtime 1.28 move and no longe
 
 ## Deploy
 
-Until the migration gates pass, the existing standalone image runs as a rootful-podman Quadlet container
-in the `den` stack — see the den repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as
-`http://den-embed:8080` on `den.network`, capped at 1536 MiB, running as uid 65532 with the model
-baked into the image. Main CI builds, probes and scans an immutable candidate image for every commit.
-Run `scripts/release.sh X.Y.Z` to write `VERSION` and create `vX.Y.Z` once that exact main CI has
-passed; the tag workflow verifies, signs and promotes the same digest without rebuilding. `den-update`
-picks up the new `:latest` within a day, proving it by embedding a string before pinning its digest.
-The release version lives in `VERSION` and reaches the service as `DEN_VERSION`; `Cargo.toml`'s version
-is not bumped, so a release does not recompile the dependencies.
-
-**Legacy release images.** The standalone repository's `docker-publish` also runs every Monday: it rebuilds the newest `v*` tag (never
-`main`) with the base images re-pulled, no build cache and a fresh `apt-get upgrade`, and publishes it as
-`:X.Y.Z-patch.<date>.<run>` and `:latest`, so a Debian security fix reaches the box between releases
-through the same probe and rollback. The model is pinned by revision and checksum, so a rebuild bakes the
-same bytes. Trivy scans each image before `:latest` moves: a CRITICAL with a fix available fails the run
-(on the weekly rebuild only in OS packages, the part a rebuild can fix), and fixable HIGH and CRITICAL
-findings go to code scanning. A finding that does not apply goes in `.trivyignore` with a reason. Every
-image carries SLSA provenance and an SBOM and is signed keylessly with cosign; verify a digest with:
-
-```sh
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/oxyc/den-embed/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/oxyc/den-embed@sha256:<digest>
-```
+Until the migration gates pass, the existing standalone image remains deployed and reached by Atlas over
+the internal network. New compatibility and integrated images are built from the workspace Dockerfile's
+`den-embed` and `den-atlas-embedded` targets. Publishing, canarying, and retiring the legacy image are
+deliberately separate rollout steps; see the migration document.
