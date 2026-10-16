@@ -1,8 +1,11 @@
-# den-embed
+# den-embed engine
 
 The embedding service behind Den's semantic search: **BAAI/bge-m3**, int8, 1024 dims, served over
 HTTP by a small Rust binary (axum + ONNX Runtime via `ort` + HuggingFace `tokenizers`). den-atlas
 calls it to embed search queries; den-dataset runs the same image to embed the corpus.
+
+This package is now owned by the den-atlas workspace. Its library is the canonical engine; the binary
+keeps the old HTTP service intact while deployment migrates. See [`../docs/EMBED-MIGRATION.md`](../docs/EMBED-MIGRATION.md).
 
 ## The alignment rule
 
@@ -88,7 +91,7 @@ line. The ranges are memory and latency bounds, sized against a 1536 MiB contain
 ## Run
 
 ```sh
-MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release
+MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release -p den-embed
 curl 'http://127.0.0.1:8080/embed?text=a%20heist%20thriller%20about%20a%20bank%20robbery'
 curl -X POST http://127.0.0.1:8080/embed/batch \
   -H 'content-type: application/json' \
@@ -112,8 +115,8 @@ captured from the Python service predate the ONNX Runtime 1.28 move and no longe
 
 ## Deploy
 
-On the homelab box it runs as a rootful-podman Quadlet container in the `den` stack — see the den
-repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as
+Until the migration gates pass, the existing standalone image runs as a rootful-podman Quadlet container
+in the `den` stack — see the den repo's `deploy/README.md`. It is internal-only: no published port, reached by den-atlas as
 `http://den-embed:8080` on `den.network`, capped at 1536 MiB, running as uid 65532 with the model
 baked into the image. Main CI builds, probes and scans an immutable candidate image for every commit.
 Run `scripts/release.sh X.Y.Z` to write `VERSION` and create `vX.Y.Z` once that exact main CI has
@@ -122,7 +125,7 @@ picks up the new `:latest` within a day, proving it by embedding a string before
 The release version lives in `VERSION` and reaches the service as `DEN_VERSION`; `Cargo.toml`'s version
 is not bumped, so a release does not recompile the dependencies.
 
-**Release images.** `docker-publish` also runs every Monday: it rebuilds the newest `v*` tag (never
+**Legacy release images.** The standalone repository's `docker-publish` also runs every Monday: it rebuilds the newest `v*` tag (never
 `main`) with the base images re-pulled, no build cache and a fresh `apt-get upgrade`, and publishes it as
 `:X.Y.Z-patch.<date>.<run>` and `:latest`, so a Debian security fix reaches the box between releases
 through the same probe and rollback. The model is pinned by revision and checksum, so a rebuild bakes the

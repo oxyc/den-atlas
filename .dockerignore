@@ -1,6 +1,5 @@
-# The build copies only Cargo.toml, Cargo.lock, src/, crates/, judged/rail.json, judged/rail-cross.json and
-# data/; everything below
-# is context it never reads.
+# The builds copy only the workspace sources, selected judged fixtures, and data/. Everything below is
+# context they never read.
 target
 .git
 .github

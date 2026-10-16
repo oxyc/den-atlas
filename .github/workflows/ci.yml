@@ -51,6 +51,11 @@ jobs:
         env:
           DEN_SPEC_DIR: ${{ github.workspace }}/den-spec-checkout
 
+      # The normal binary deliberately keeps using the external service. Compile the opt-in migration
+      # path too, so it cannot silently rot before its separate image is ready to canary.
+      - name: Integrated embedding path compiles
+        run: cargo check --locked -p den-atlas --features embedded-model
+
       # Denied, not reported. The lint set here is small and the codebase is clean, so a new warning
       # is a real signal rather than background noise to scroll past.
       - name: Clippy

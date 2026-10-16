@@ -166,10 +166,11 @@ last-good copy was served), `embed;dur=<ms>` for the den-embed call, and `total;
 is stale or a fallback carries `X-Den-Degraded: <reason>` with /health's reason slug — a catalog row
 served after a failed JustWatch refresh says `stale_catalog`. Normal answers carry no `X-Den-Degraded`.
 
-`POST /embed` forwards the query to the internal [den-embed](https://github.com/oxyc/den-embed) service and
-returns its int8 vector (`{"vector":…,"dims":1024,"model":"bge-m3"}`), so a query embeds through the SAME
-bge-m3 + quantizer that built the corpus and the two are comparable. den-embed stays internal — only Atlas
-is exposed.
+`POST /embed` returns an int8 vector (`{"vector":…,"dims":1024,"model":"bge-m3"}`). By default Atlas
+forwards to the internal den-embed service. The same engine now lives in this workspace under `embed/`, so
+an opt-in build can run it in-process without changing the HTTP contract. The compatibility `den-embed`
+binary uses that exact library too, which lets den-dataset keep using the same path while deployment moves.
+Only Atlas is exposed.
 
 Title search (`TITLE_SEARCH`) builds an in-memory index of the 100k most popular movies and series in
 TMDB's daily ID exports — downloaded once a day, gunzipped straight into the scanner, nothing written to
@@ -184,7 +185,8 @@ Index queries (`INDEX_QUERIES`) answer from the dataset's plot and premise index
 index does. They return TMDB ids only; clients hydrate titles themselves. The indexes load as atlas starts
 and stay for the life of the process; a query that arrives before the load has finished waits for it. The
 descriptor carries `"queries":true` when they're on.
-Semantic search and the facet lane's theme ranking embed the query through den-embed (`EMBED_URL`). Unified
+Semantic search and the facet lane's theme ranking embed the query through the configured embedding engine
+(`EMBED_URL`, or the opt-in local engine). Unified
 query search scans both plot and premise vectors when the latter exist, normalises each scan against its own
 distribution, and lets the stronger one spend the single semantic weight; a missing premise index preserves
 plot-only behaviour. The facet lane reads the store's country, language, year and vote columns — it used to
@@ -442,7 +444,9 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_PROVIDERS` | all | provider subset for an install with no `<region>_<codes>` segment |
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. TMDB's kept numbers and credits live here too (`tmdb-votes.tsv`, `tmdb-credits.tsv`, `tmdb-sweep.tsv`), and nowhere else. Unset ⇒ memory only |
-| `EMBED_URL` | unset | den-embed base URL for `POST /embed`; unset ⇒ `/embed` answers `503` |
+| `EMBED_URL` | unset | den-embed base URL for `POST /embed`; it wins over `EMBED_LOCAL` during migration |
+| `EMBED_LOCAL` | off | with an `embedded-model` build, `1` runs the workspace's engine in Atlas; without either engine `/embed` answers `503` |
+| `EMBED_MODEL_DIR` | `/models` | model directory for the local engine; its other settings are the den-embed variables prefixed with `EMBED_` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load as atlas starts and stay loaded |
 | `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |
 | `TMDB_DAILY_MAX` | `1500` | questions atlas asks the proxy in a UTC day, two seconds apart. A full vote sweep is ~4,800, so it spreads over a few days; den-edge's own ceiling (`TMDB_DAILY_MAX` there) is shared with the web app's guests and must leave room for this |
@@ -462,6 +466,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 ```sh
 scripts/fetch-dataset.sh   # prep ./data from the den-dataset `data-latest` release (labels + vectors + gzip + meta)
 cargo run                  # http://localhost:8080  (add /manifest.json in Den → Plugins)
+cargo run --features embedded-model  # opt-in local-engine build; still needs EMBED_LOCAL=1 and model files
 cargo test                 # the caching layer (ETag / Range / gzip / 304), routes, catalog, shutdown
 cargo fmt --all --check    # CI gates on this — see below if the command is missing
 scripts/release.sh 0.94.0  # bumps VERSION, waits for its main CI, tags, and WAITS for the promotion
@@ -513,7 +518,8 @@ rollback.
   by the `atlas-dataset-sync` timer, which restarts atlas only when the release actually changed.
 - Image updates go through `den-update`: a new `:latest` is proved against `/health` and `/manifest.json`
   in a throwaway container before its digest is pinned, and a failed proof rolls back.
-- `EMBED_URL=http://den-embed:8080` over the shared Podman network enables `POST /embed`.
+- `EMBED_URL=http://den-embed:8080` over the shared Podman network enables `POST /embed`. This remains the
+  production path; see [`docs/EMBED-MIGRATION.md`](docs/EMBED-MIGRATION.md) for the unactivated local path.
 
 **Release images.** Main CI builds `ghcr.io/oxyc/den-atlas:candidate-<sha>` for every main commit while its
 tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. Run
