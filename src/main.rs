@@ -22,6 +22,7 @@ mod justwatch;
 mod kids_home;
 mod manifest;
 mod maturity;
+mod maturity_providers;
 mod metrics;
 mod motn;
 mod playground;
@@ -82,6 +83,9 @@ pub struct AppState {
     /// Index queries over the dataset (env `INDEX_QUERIES`, and a loaded dataset). `None` — off — 404s the
     /// `/index/…` routes.
     pub index: Option<Arc<queries::IndexQueries>>,
+    /// Box-local, refreshable maturity authorities (`MATURITY_PROVIDERS`). Their normalized cache lives only
+    /// in `CACHE_DIR`; it is never part of the public dataset or a downloadable atlas artifact.
+    pub maturity_providers: Arc<maturity_providers::Providers>,
     /// Movie of the Night's lists (env `MOTN_KEY`): each service's Top 10 and additions, per country. Without a key
     /// it keeps nothing, and rows and billboards read JustWatch alone.
     pub motn: Arc<motn::Motn>,
@@ -156,6 +160,7 @@ impl AppState {
             library_embed_memo: cache::EmbedMemo::new(Duration::MAX, cache::LIBRARY_EMBED_MEMO_ENTRIES),
             titles: None,
             index: None,
+            maturity_providers: maturity_providers::Providers::disabled(),
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
             metrics_token: None,
             log_requests: false,
@@ -367,11 +372,31 @@ async fn main() {
             built.map_err(|e| eprintln!("title search disabled (reqwest build failed: {e})")).ok()
         })
         .map(Arc::new);
+    let (maturity_daily_max, maturity_pace) = maturity_providers::defaults_from_env();
+    let maturity_providers = match (dataset.as_ref(), env_opt("MATURITY_PROVIDERS")) {
+        (Some(ds), Some(enabled)) => maturity_providers::Providers::new(
+            &ds.mapped,
+            cache_dir.as_deref().map(std::path::Path::new),
+            &enabled,
+            maturity_daily_max,
+            maturity_pace,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("maturity providers disabled ({error})");
+            maturity_providers::Providers::disabled()
+        }),
+        _ => maturity_providers::Providers::disabled(),
+    };
+
     // Off unless INDEX_QUERIES is set, and only over a dataset that loaded. The indexes themselves load on
     // the first query.
     let index = std::env::var("INDEX_QUERIES")
         .is_ok_and(|v| !v.is_empty() && v != "0")
-        .then(|| dataset.as_ref().map(queries::IndexQueries::new))
+        .then(|| {
+            dataset.as_ref().map(|dataset| {
+                queries::IndexQueries::new(dataset).with_maturity(Arc::clone(&maturity_providers))
+            })
+        })
         .flatten();
     // TMDB's vote counts, scores and credits for the corpus (`tmdb.rs`, whose top says what they may be used
     // for): the count every browse row is ordered by, the score /recommend rates a title with, and which
@@ -417,6 +442,7 @@ async fn main() {
         ),
         titles: title_search,
         index,
+        maturity_providers: Arc::clone(&maturity_providers),
         motn,
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
@@ -429,6 +455,9 @@ async fn main() {
     }
     if let Some(index) = &state.index {
         tokio::spawn(queries::load_at_start(Arc::clone(index)));
+    }
+    if maturity_providers.enabled() {
+        tokio::spawn(maturity_providers::Providers::refresh_forever(Arc::clone(&maturity_providers)));
     }
     if let Some(tmdb) = &tmdb {
         // The vote counts are awaited, not spawned: a local read. The store carries no vote count of its own, so
@@ -488,7 +517,7 @@ async fn main() {
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} log_identity={} {dataset} country={} \
          providers={} catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} \
-         motn={} playground={}",
+         motn={} maturity_providers={} playground={}",
         release_version(),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -506,6 +535,7 @@ async fn main() {
             None => "off",
         },
         on(state.motn.enabled()),
+        on(state.maturity_providers.enabled()),
         on(state.playground && state.index.is_some()),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;

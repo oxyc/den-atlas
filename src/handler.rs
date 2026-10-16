@@ -832,6 +832,7 @@ async fn handle_catalog(
                 cc,
                 None,
                 maturity,
+                &state.maturity_providers,
             )
             .await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
@@ -1058,16 +1059,20 @@ impl IndexQuestion {
                     }
                     None => unindexed_title_json(indexes, *media_type, *tmdb_id),
                 };
-                // This is the store's already-published public-authority value only. `null` is explicit and
-                // remains distinct from all-ages 0; no private/runtime certification can enter this route.
-                title["minimumAge"] = serde_json::json!(indexes.minimum_age((*media_type, *tmdb_id)));
-                title["maturityRatings"] =
-                    serde_json::json!(indexes.maturity_ratings((*media_type, *tmdb_id)));
+                // Keep the published baseline and box-local provider observations distinguishable. The effective
+                // value is what eligibility used for this explicit region; `null` remains distinct from age 0.
+                let key = (*media_type, *tmdb_id);
+                title["minimumAge"] = serde_json::json!(indexes.effective_minimum_age(maturity, key));
+                title["maturityRatings"] = serde_json::json!(indexes.maturity_ratings(key));
+                let runtime = indexes.runtime_maturity_ratings(maturity, key);
+                if !runtime.is_empty() {
+                    title["publicMinimumAge"] = serde_json::json!(indexes.minimum_age(key));
+                    title["runtimeMaturityRatings"] = serde_json::json!(runtime);
+                }
                 // Whether the request's policy may open this title directly (detail, play, download): every client
                 // asks this one answer rather than re-deriving it (den-spec profiles-v1 §5).
-                let key = (*media_type, *tmdb_id);
                 title["eligible"] = serde_json::json!(maturity.allows_direct(
-                    indexes.minimum_age(key),
+                    indexes.effective_minimum_age(maturity, key),
                     |band| indexes.kid_audience_relevant(key, band),
                     || indexes.kid_vetoed(key),
                 ));
@@ -1963,7 +1968,16 @@ async fn handle_recommend_get(
     // for a day while it is asked again: a day's first visitor after midnight is answered from yesterday's at once.
     let left = ((day + 1.0 - today) * 86_400.0).max(60.0) as u64;
     let cache_control = format!("public, max-age=300, s-maxage={left}, stale-while-revalidate=86400");
-    let resp = serve_json_for_policy(method, headers, body.to_string(), &cache_control, None, maturity).await;
+    let resp = serve_json_for_policy(
+        method,
+        headers,
+        body.to_string(),
+        &cache_control,
+        None,
+        maturity,
+        &state.maturity_providers,
+    )
+    .await;
     with_timing(resp, &format!("{timing}, total;dur={}", ms(started.elapsed())))
 }
 
@@ -2275,8 +2289,16 @@ async fn handle_index(
         let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
         return match answer {
             Ok((body, cache_control, location, degraded)) => {
-                let mut resp =
-                    serve_json_for_policy(method, headers, body, cache_control, None, maturity).await;
+                let mut resp = serve_json_for_policy(
+                    method,
+                    headers,
+                    body,
+                    cache_control,
+                    None,
+                    maturity,
+                    &state.maturity_providers,
+                )
+                .await;
                 if let Some(location) = location.and_then(|l| header::HeaderValue::from_str(&l).ok()) {
                     resp.headers_mut().insert(header::CONTENT_LOCATION, location);
                 }
@@ -2378,7 +2400,16 @@ async fn handle_index(
         }
     };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
-    let resp = serve_json_for_policy(method, headers, body, cache_control, None, maturity).await;
+    let resp = serve_json_for_policy(
+        method,
+        headers,
+        body,
+        cache_control,
+        None,
+        maturity,
+        &state.maturity_providers,
+    )
+    .await;
     with_timing(resp, &format!("{load}{phases}total;dur={}", ms(started.elapsed())))
 }
 
@@ -2408,7 +2439,16 @@ fn filter_catalog_maturity(
         let id =
             meta.get("moviedb_id").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok());
         maturity.allows_title_with(
-            || id.and_then(|id| dataset.mapped.minimum_age(media_type, id)),
+            || {
+                id.and_then(|id| {
+                    dataset
+                        .mapped
+                        .minimum_age(media_type, id)
+                        .into_iter()
+                        .chain(state.maturity_providers.minimum_age((media_type, id), maturity.region))
+                        .max()
+                })
+            },
             |band| id.is_some_and(|id| dataset.mapped.kid_audience_relevant(media_type, id, band)),
         )
     });
@@ -2449,12 +2489,27 @@ async fn handle_title_search(
     };
     let body = titles::metas_json_with(&index, &query, media_type, |id| {
         maturity.allows_title_with(
-            || store.and_then(|store| store.minimum_age(kind, id)),
+            || {
+                store
+                    .and_then(|store| store.minimum_age(kind, id))
+                    .into_iter()
+                    .chain(state.maturity_providers.minimum_age((kind, id), maturity.region))
+                    .max()
+            },
             |band| store.is_some_and(|store| store.kid_audience_relevant(kind, id, band)),
         )
     });
     let searched = started.elapsed();
-    let resp = serve_json_for_policy(method, headers, body, DATASET_ANSWER, None, maturity).await;
+    let resp = serve_json_for_policy(
+        method,
+        headers,
+        body,
+        DATASET_ANSWER,
+        None,
+        maturity,
+        &state.maturity_providers,
+    )
+    .await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
 }
 
@@ -2498,8 +2553,14 @@ async fn serve_json_for_policy(
     cache_control: &str,
     last_modified: Option<String>,
     maturity: crate::maturity::Policy,
+    providers: &crate::maturity_providers::Providers,
 ) -> Response {
     let identity = maturity.cache_identity();
+    // Runtime providers can change without a dataset publish (and therefore without the release cache purge).
+    // An answer in an enabled provider's region is kept briefly by the caller only, never in a shared cache
+    // for a month. Other regions retain their normal cache policy.
+    let cache_control =
+        if providers.applies_to(maturity.region) { "private, max-age=300" } else { cache_control };
     let mut response =
         serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref())
             .await;
