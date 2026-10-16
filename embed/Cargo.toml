@@ -1,0 +1,37 @@
+[package]
+name = "den-embed"
+version = "5.1.2"
+edition = "2021"
+description = "bge-m3 int8 embedding service for den-atlas semantic search (Rust rewrite of the Python service)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "den-embed"
+path = "src/main.rs"
+
+[dependencies]
+# ONNX Runtime — the SAME native engine the Python service used via fastembed, so
+# the same model_int8.onnx on the same CPU provider yields identical tensors.
+# `tls-rustls` is required from rc.13 on: `download-binaries` fetches the ONNX Runtime archive at
+# BUILD time and now insists a TLS provider be named explicitly. rustls/ring rather than native,
+# so the build needs no OpenSSL. It is a build-dependency only — nothing TLS ships in the binary.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
+ndarray = "0.17"
+# HuggingFace tokenizers — the SAME Rust crate fastembed wraps, so loading the
+# same tokenizer.json gives byte-identical token ids.
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# blake2b-128 to reproduce the Python content-cache key exactly (digest_size=16).
+blake2 = "0.11"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[dev-dependencies]
+# `oneshot`, to drive the router in a unit test without binding a socket. Already in the tree via axum.
+tower = { version = "0.5", features = ["util"] }

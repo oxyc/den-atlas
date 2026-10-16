@@ -1,0 +1,1813 @@
+//! den-embed — bge-m3 int8 embedding service (Rust).
+//!
+//! A 1:1 rewrite of the Python service (server.py) with one goal beyond speed:
+//! a tiny idle footprint. The Python process, even with the model unloaded, held
+//! ~100 MB (interpreter + numpy + fastapi + onnxruntime arenas that gc can't
+//! return). This drops the interpreter entirely; with the model AND tokenizer
+//! idle-unloaded it falls back to tens of MB,
+//! reloading on the next request.
+//!
+//! Parity is the contract. Corpus vectors and query vectors are only comparable
+//! because they pass through ONE canonical path: same tokenizer.json (HuggingFace
+//! `tokenizers`, the very crate fastembed wraps), same model_int8.onnx on the same
+//! ONNX Runtime CPU provider (via `ort`), same CLS pooling, same L2-normalize, same
+//! `round(x*127)` clamp. tests/parity_check.py — run by hand against a live
+//! instance and golden vectors, not in CI — pins this against the Python service's
+//! actual output.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use axum::extract::{Query, Request, State};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use blake2::digest::consts::U16;
+use blake2::{Blake2b, Digest};
+use ndarray::Array2;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::value::Tensor;
+use serde::{Deserialize, Serialize};
+use tokenizers::Tokenizer;
+
+// --- fixed contract (mirror server.py) -------------------------------------
+const MODEL_LABEL: &str = "bge-m3";
+const DIMS: usize = 1024;
+
+/// Bumped ONLY when this service's vector OUTPUT changes for the same input.
+///
+/// The crate version cannot serve this purpose, and using it was a bug: den-dataset records the embedder
+/// identity with each corpus and refuses to append a different one, so with the version as the identity a
+/// release that touched nothing but a log line would invalidate a 37.5k-title corpus and demand hours of
+/// re-embedding. Equally, `model` and `dims` alone are too coarse — they say bge-m3/1024 for every
+/// generation, including the ORT 1.22 -> 1.28 bump that DID move int8 output.
+///
+/// So: bump this for an ONNX Runtime upgrade, a model or revision change, a pooling or normalisation
+/// change, or anything else that moves the numbers. Do NOT bump it for anything else.
+///
+/// 1 = the Rust service (ORT 1.28). The Python/ORT-1.22 generation that built the corpus shipping today
+/// predates the field entirely and reads back as 0, which is correctly not equal to this.
+const VECTOR_EPOCH: u32 = 1;
+
+/// The release carried by the runtime image (`DEN_VERSION`, set from the VERSION file at image build). Keeping it
+/// out of Cargo.toml means a release does not invalidate the dependency build layer merely to change a tag.
+/// Developer builds and tests have no image metadata, so they fall back to the package version.
+fn release_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
+
+/// `ort::Error` doesn't implement `std::error::Error`, so `?` can't convert it
+/// into `anyhow::Error` directly; map it through its Display.
+///
+/// Generic over the recovery payload: from ort rc.13 the session-builder methods fail with
+/// `Error<SessionBuilder>`, which hands the builder back so a caller could retry, while everything
+/// else still fails with `Error<()>`. We do not retry, so both collapse to the same message.
+fn ort_err<R>(e: ort::Error<R>) -> anyhow::Error {
+    anyhow::anyhow!("ort: {e}")
+}
+
+// glibc-only: return free heap arenas to the OS after the model is dropped. Not
+// exposed by the `libc` crate, so declare it directly (the image is glibc/debian).
+// Guarded for Linux so the service still builds on macOS (dev); a no-op elsewhere.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+#[cfg(not(target_os = "linux"))]
+unsafe fn malloc_trim(_pad: usize) -> i32 {
+    0
+}
+
+// --- config from env ---------------------------------------------------------
+// No name carries an addon prefix: the container is the namespace, so PORT, METRICS_TOKEN and the
+// knobs below read the same way in every den addon. There is no host knob: like every other addon it
+// binds 0.0.0.0, and staying off the LAN is the container network's job (no published port), not the
+// bind address's.
+struct Config {
+    port: u16,
+    onnx_path: String,
+    tokenizer_path: String,
+    max_chars: usize,
+    /// Per-text TOKEN cap. `max_chars` bounds characters, which bounds nothing that matters: at the
+    /// 8000-char limit, emoji tokenize to 8003 tokens and Hangul to 8002, so a small request reached
+    /// the model's full 8192-token ceiling. Activation memory grows superlinearly with sequence
+    /// length — measured peak RSS 1087 MB at 512 tokens, 1219 MB at 1024, 1598 MB at 2048 — against
+    /// a 1536 MB cgroup limit, so a ~10 KB POST body was an OOM-kill of the container.
+    ///
+    /// 512 because this service embeds SEARCH QUERIES; anything near the cap is already not a query.
+    max_tokens: usize,
+    /// Total TOKENS across one request, batch included — the thing that actually costs time. Per-text
+    /// limits bound nothing in aggregate: `max_batch` (512) x `max_chars` (8000) is 4M characters
+    /// through a serial loop holding the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Counted as `min(chars, max_tokens)` per text, which is an upper bound on what inference will
+    /// actually see: a text yields at most one token per character, and truncation caps it at
+    /// `max_tokens` regardless. Counting raw characters instead got this backwards in both
+    /// directions — it rejected three 8000-char English texts (1536 tokens, about a second of work)
+    /// while admitting 32 texts of 512 CJK characters (16384 tokens, ~10 seconds).
+    max_request_tokens: usize,
+    max_batch: usize,
+    max_body_bytes: usize,
+    cache_max: usize,
+    idle_unload: Option<Duration>,
+    intra_threads: usize,
+    /// Bearer token for `/metrics`; `None` (unset or blank) turns the route off.
+    metrics_token: Option<String>,
+    /// One stderr line per request. Read once here, so with it off the only cost is not adding the layer.
+    log_requests: bool,
+}
+
+/// Read a numeric env var, clamped to `[min, max]`.
+///
+/// A malformed value is REPORTED, not silently replaced: `IDLE_UNLOAD_SECS='600s'` parsed
+/// as nothing and fell back to 0, which means always-warm — ~1 GB resident forever, the exact
+/// opposite of what the operator asked for, with no line anywhere saying so. That value lives in
+/// /etc/den/env on the box, outside this repo, so nothing reviews it either.
+///
+/// `max` matters as much as `min`: several of these bound memory, and an out-of-range value silently
+/// restores the failure the bound exists to prevent (`MAX_TOKENS=8192` is the OOM again).
+fn env_clamped_with(
+    get: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> usize {
+    match get(key) {
+        None => default,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(v) => {
+                let clamped = v.clamp(min, max);
+                if clamped != v {
+                    tracing::warn!("{key}={v} is outside {min}..={max}; using {clamped}");
+                }
+                clamped
+            }
+            Err(_) => {
+                tracing::warn!("{key}={raw:?} is not a number; using the default {default}");
+                default
+            }
+        },
+    }
+}
+
+fn env_clamped(key: &str, default: usize, min: usize, max: usize) -> usize {
+    env_clamped_with(&|key| std::env::var(key).ok(), key, default, min, max)
+}
+
+impl Config {
+    fn from_env() -> Self {
+        Self::from_get(&|key| std::env::var(key).ok())
+    }
+
+    fn from_prefix(prefix: &str) -> Self {
+        Self::from_get(&|key| std::env::var(format!("{prefix}{key}")).ok())
+    }
+
+    fn from_get(get: &impl Fn(&str) -> Option<String>) -> Self {
+        // Model files are baked into the optional images (see the workspace Dockerfile). Default to the
+        // fixed bake paths; overridable for local dev.
+        let model_dir = get("MODEL_DIR").unwrap_or_else(|| "/models".into());
+        let onnx_path = get("ONNX_PATH").unwrap_or_else(|| format!("{model_dir}/model_int8.onnx"));
+        let tokenizer_path = get("TOKENIZER_PATH").unwrap_or_else(|| format!("{model_dir}/tokenizer.json"));
+        // A day is already far past "idle"; anything larger is a typo.
+        let idle = env_clamped_with(get, "IDLE_UNLOAD_SECS", 0, 0, 86_400);
+        Self {
+            port: get("PORT").and_then(|v| v.parse().ok()).unwrap_or(8080),
+            onnx_path,
+            tokenizer_path,
+            max_chars: env_clamped_with(get, "MAX_CHARS", 8000, 500, 100_000),
+            // 1024 is the ceiling, not the model's: measured peak RSS is 1219 MB at 1024 tokens and
+            // 1598 MB at 2048, against a 1536 MB cgroup. Above this the cap stops being a bound.
+            max_tokens: env_clamped_with(get, "MAX_TOKENS", 512, 16, 1024),
+            // ~0.33s per 512 tokens measured, so 8192 is ~5s — inside the 10s timeout den-atlas
+            // applies to this call. The CEILING has to respect that too, and strictly: 32768 was
+            // ~21s (double the timeout the comment cited), and 16384 is ~10.5s, still past it.
+            // 12288 is ~7.9s, the largest batch a caller is actually still waiting for.
+            max_request_tokens: env_clamped_with(get, "MAX_REQUEST_TOKENS", 8192, 512, 12_288),
+            max_batch: env_clamped_with(get, "MAX_BATCH", 512, 1, 4096),
+            max_body_bytes: env_clamped_with(
+                get,
+                "MAX_BODY_BYTES",
+                4 * 1024 * 1024,
+                64 * 1024,
+                16 * 1024 * 1024,
+            ),
+            // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
+            // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
+            // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
+            // cgroup, i.e. both ceilings set at once was an OOM. 32768 is ~137 MB, leaving ~180 MB.
+            cache_max: env_clamped_with(get, "CACHE_MAX_ENTRIES", 8192, 0, 32_768),
+            idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
+            // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
+            intra_threads: env_clamped_with(get, "INTRA_THREADS", 0, 0, 256),
+            metrics_token: get("METRICS_TOKEN").map(|t| t.trim().to_string()).filter(|t| !t.is_empty()),
+            // Unset, empty or "0" is off; anything else is on. Untrimmed, as in every den addon.
+            log_requests: get("LOG_REQUESTS").is_some_and(|v| !matches!(v.as_str(), "" | "0")),
+        }
+    }
+}
+
+// --- the loaded model (session + tokenizer), held only while warm -----------
+struct Model {
+    session: Session,
+    tokenizer: Tokenizer,
+}
+
+impl Model {
+    fn load(cfg: &Config) -> anyhow::Result<Self> {
+        let started = Instant::now();
+        let mut builder = Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?;
+        if cfg.intra_threads > 0 {
+            builder = builder.with_intra_threads(cfg.intra_threads).map_err(ort_err)?;
+        }
+        let session = builder.commit_from_file(&cfg.onnx_path).map_err(ort_err)?;
+        let mut tokenizer = Tokenizer::from_file(&cfg.tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // bge-m3 supports 8192 tokens, but the ceiling that matters here is memory, not the model:
+        // see `Config::max_tokens`. The tokenizer.json ships no truncation, so this is where the cap
+        // is actually enforced — `max_chars` does not bound tokens for non-Latin text.
+        let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: cfg.max_tokens,
+            ..Default::default()
+        }));
+        tracing::info!("loaded model in {}ms", started.elapsed().as_millis());
+        Ok(Self { session, tokenizer })
+    }
+}
+
+/// Marks a failure to load the model, so it is rate-limited apart from a failure of inference itself:
+/// a missing model fails every request, and its line must not stand in for a different failure.
+#[derive(Debug)]
+struct LoadFailed;
+
+impl std::fmt::Display for LoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model load failed")
+    }
+}
+
+/// The model, loaded first if it is not resident — never loaded yet, or dropped by idle-unload.
+fn ensure_loaded<'a>(
+    slot: &'a mut Option<Model>,
+    cfg: &Config,
+    load_failing: &AtomicBool,
+    phases: &mut Phases,
+) -> anyhow::Result<&'a mut Model> {
+    if slot.is_none() {
+        let started = Instant::now();
+        *slot = Some(Model::load(cfg).context(LoadFailed)?);
+        load_failing.store(false, Ordering::Relaxed);
+        Phases::add(&mut phases.load, started);
+    }
+    Ok(slot.as_mut().unwrap())
+}
+
+/// What one embed request spent its time on, reported in `Server-Timing`. Only instants read on
+/// work the request does anyway: nothing is kept once the response is built.
+#[derive(Default)]
+struct Phases {
+    /// Set only when this request had to load the model.
+    load: Option<Duration>,
+    tokenize: Option<Duration>,
+    inference: Option<Duration>,
+    cache_hits: usize,
+}
+
+impl Phases {
+    fn add(phase: &mut Option<Duration>, since: Instant) {
+        *phase.get_or_insert_default() += since.elapsed();
+    }
+
+    /// e.g. `load;dur=1283.4, tokenize;dur=0.6, inference;dur=312.0, total;dur=1596.3`, in ms. A
+    /// request whose every text came from the cache says `cache;desc=hit` instead of `inference`; a
+    /// blank text does neither, and reports `total` alone.
+    fn header(&self, total: Duration) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut parts = Vec::new();
+        for (name, phase) in [("load", self.load), ("tokenize", self.tokenize), ("inference", self.inference)]
+        {
+            if let Some(d) = phase {
+                parts.push(format!("{name};dur={:.1}", ms(d)));
+            }
+        }
+        if self.cache_hits > 0 && self.inference.is_none() {
+            parts.push("cache;desc=hit".into());
+        }
+        parts.push(format!("total;dur={:.1}", ms(total)));
+        parts.join(", ")
+    }
+}
+
+struct AppState {
+    cfg: Config,
+    model: Mutex<Option<Model>>,
+    // millis since `started` of the last embed; drives idle-unload.
+    last_used_ms: AtomicU64,
+    started: Instant,
+    cache: Mutex<Lru>,
+    /// When each failure condition was last logged, and how many repeats have gone unlogged since.
+    failures: Mutex<HashMap<&'static str, (Option<Instant>, u64)>>,
+    /// The last attempt to load the model failed and none has succeeded since — what `/health`
+    /// reports as degraded, without itself ever loading the model.
+    load_failing: AtomicBool,
+}
+
+impl AppState {
+    fn touch(&self) {
+        self.last_used_ms.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Lock, recovering from poison. A panic while a lock is held (on the blocking pool, say) must cost
+/// that one request, not turn every later `unwrap` into another panic: the model is only read, the
+/// cache is a pure optimisation and the failure log is bookkeeping, so none of them is left unsafe.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// --- tiny LRU: cache is a pure optimization, so its eviction policy does not
+// affect output vectors. Counter-recency LRU; evict the least-recent when full.
+struct Lru {
+    map: HashMap<String, (Vec<i32>, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl Lru {
+    fn new(cap: usize) -> Self {
+        Self { map: HashMap::new(), tick: 0, cap }
+    }
+    fn get(&mut self, key: &str) -> Option<Vec<i32>> {
+        if self.cap == 0 {
+            return None;
+        }
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(entry) = self.map.get_mut(key) {
+            entry.1 = tick;
+            Some(entry.0.clone())
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, key: String, val: Vec<i32>) {
+        if self.cap == 0 {
+            return;
+        }
+        self.tick += 1;
+        self.map.insert(key, (val, self.tick));
+        while self.map.len() > self.cap {
+            if let Some(oldest) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                self.map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// --- the canonical embedding path ------------------------------------------
+
+/// blake2b-128 hex of `"{MODEL_LABEL}\x00{text}"`, matching server.py's
+/// `hashlib.blake2b(..., digest_size=16).hexdigest()`. `text` is already truncated.
+fn cache_key(text: &str) -> String {
+    let mut h = Blake2b::<U16>::new();
+    h.update(MODEL_LABEL.as_bytes());
+    h.update(b"\x00");
+    h.update(text.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn zero_vector() -> Vec<i32> {
+    vec![0; DIMS]
+}
+
+/// L2-normalize in f64 then quantize to int8: `clamp(round_ties_even(x*127), -127, 127)`.
+/// numpy's `np.round` is round-half-to-even and `quantize_int8` upcasts to float64
+/// before normalizing, so both are matched here.
+fn quantize_int8(cls: &[f32]) -> Vec<i32> {
+    let mut v: Vec<f64> = cls.iter().map(|&x| x as f64).collect();
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v.iter().map(|&x| ((x * 127.0).round_ties_even() as i64).clamp(-127, 127) as i32).collect()
+}
+
+/// Run the model on one already-truncated, non-blank text → CLS-pooled int8 vector.
+/// Serialized under the model lock (single-worker, like the Python service), which
+/// also lazily loads the model on first use and refreshes the idle timer.
+fn infer(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
+    let mut guard = lock(&state.model);
+    let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
+
+    let started = Instant::now();
+    let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Phases::add(&mut phases.tokenize, started);
+
+    let started = Instant::now();
+    let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
+    let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
+    let seq = ids.len();
+
+    let ids = Tensor::from_array(Array2::from_shape_vec((1, seq), ids)?).map_err(ort_err)?;
+    let mask = Tensor::from_array(Array2::from_shape_vec((1, seq), mask)?).map_err(ort_err)?;
+    let outputs =
+        model.session.run(ort::inputs!["input_ids" => ids, "attention_mask" => mask]).map_err(ort_err)?;
+    let (_shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>().map_err(ort_err)?;
+    // last_hidden_state is [1, seq, 1024]; CLS pooling = token 0 = data[0..1024].
+    let cls = &data[0..DIMS];
+    let out = quantize_int8(cls);
+    Phases::add(&mut phases.inference, started);
+
+    state.touch();
+    Ok(out)
+}
+
+fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
+    if is_blank(text) {
+        return Ok(zero_vector());
+    }
+    let truncated: String = text.chars().take(state.cfg.max_chars).collect();
+    let key = cache_key(&truncated);
+    if let Some(hit) = lock(&state.cache).get(&key) {
+        phases.cache_hits += 1;
+        return Ok(hit);
+    }
+    let vector = infer(state, &truncated, phases)?;
+    lock(&state.cache).put(key, vector.clone());
+    Ok(vector)
+}
+
+fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<Vec<Vec<i32>>> {
+    // CLS pooling is padding-invariant, so per-item inference is byte-identical to
+    // fastembed's batched path; the content cache handles repeats.
+    texts.iter().map(|t| embed_one(state, t, phases)).collect()
+}
+
+/// Snapshot a batch that needs no inference before loading the tokenizer/model for admission. Keeping
+/// the vectors, rather than checking membership and reading them later, makes cache eviction harmless.
+fn cached_batch(state: &AppState, texts: &[String], phases: &mut Phases) -> Option<Vec<Vec<i32>>> {
+    let mut cache = lock(&state.cache);
+    let mut hits = 0;
+    let vectors = texts
+        .iter()
+        .map(|text| {
+            if is_blank(text) {
+                return Some(zero_vector());
+            }
+            let truncated: String = text.chars().take(state.cfg.max_chars).collect();
+            let vector = cache.get(&cache_key(&truncated))?;
+            hits += 1;
+            Some(vector)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    phases.cache_hits += hits;
+    Some(vectors)
+}
+
+/// The batch's real token count, capped per text exactly as inference will cap it.
+///
+/// Counting `min(chars, max_tokens)` instead was UNSOUND, and not marginally: the tokenizer's
+/// normalizer is SentencePiece's `Precompiled` NFKC charsmap, which EXPANDS a single scalar before
+/// the model sees it. `㌚` (U+331A) yields 5.05 tokens per character, and 1187 codepoints across the
+/// CJK-compatibility, Arabic-presentation and halfwidth blocks exceed 1 token/char. A 49 KB body of
+/// 80 texts scored 8160 against the 8192 budget and actually cost 40,960 tokens — 5x the ceiling,
+/// ~26s of CPU against a caller that times out at 10s.
+///
+/// Tokenizing costs microseconds against ~330ms of inference per 512 tokens, so measuring beats
+/// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
+/// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
+fn count_tokens(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<usize> {
+    let mut guard = lock(&state.model);
+    let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
+    let mut total = 0usize;
+    for t in texts {
+        if is_blank(t) {
+            continue; // short-circuited before inference, costs nothing
+        }
+        let truncated: String = t.chars().take(state.cfg.max_chars).collect();
+        let started = Instant::now();
+        let enc = model.tokenizer.encode(truncated, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Phases::add(&mut phases.tokenize, started);
+        // Truncation already caps this at max_tokens; the min is belt and braces.
+        total = total.saturating_add(enc.get_ids().len().min(state.cfg.max_tokens));
+    }
+    Ok(total)
+}
+
+// --- HTTP surface (same routes/shapes as server.py) ------------------------
+
+/// The den addon health shape — `status`, plus `reason` and `detail` only when degraded — followed by
+/// the embedder identity den-dataset reads.
+#[derive(Serialize)]
+struct HealthResp {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'static str>,
+    model: &'static str,
+    dims: usize,
+    /// Which generation of vectors this serves — see `VECTOR_EPOCH`. This, `dims` and `max_tokens` are
+    /// what den-dataset compares; a corpus built under a different epoch cannot be appended to.
+    vector_epoch: u32,
+    /// Human-readable build identity, for logs and error messages. NOT part of the comparison: it changes
+    /// on every release, and treating it as the identity would invalidate a corpus over a log-line fix.
+    runtime: String,
+    /// Documents are truncated here, so changing it changes the vectors for anything longer.
+    max_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct EmbedResp {
+    vector: Vec<i32>,
+    dims: usize,
+    model: &'static str,
+}
+
+#[derive(Serialize)]
+struct BatchResp {
+    vectors: Vec<Vec<i32>>,
+    dims: usize,
+    model: &'static str,
+}
+
+#[derive(Deserialize)]
+struct EmbedQuery {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct EmbedBody {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct BatchBody {
+    texts: Vec<String>,
+}
+
+/// `{"error":"<slug>"[,"detail":"…"]}`, the error body every den addon answers with.
+#[derive(Serialize)]
+struct ErrResp {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+type AppErr = (StatusCode, Json<ErrResp>);
+
+/// A failing condition repeats on every request — a missing model fails all of them — so each is
+/// logged at most this often, with a count of the repeats in between. A timestamp, not a timer.
+const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// The 500 for a failed embed. The real error goes to the log, rate-limited per condition; the text
+/// being embedded never does.
+fn internal(state: &AppState, e: anyhow::Error) -> AppErr {
+    let (condition, detail) = match e.downcast_ref::<LoadFailed>() {
+        Some(_) => {
+            state.load_failing.store(true, Ordering::Relaxed);
+            ("model load", format!("{:#}", e.root_cause()))
+        }
+        None => ("embedding", format!("{e:#}")),
+    };
+    let now = Instant::now();
+    let mut failures = lock(&state.failures);
+    let (last, repeats) = failures.entry(condition).or_insert((None, 0));
+    if last.is_some_and(|at| now.duration_since(at) < FAILURE_LOG_EVERY) {
+        *repeats += 1;
+    } else {
+        *last = Some(now);
+        match std::mem::take(repeats) {
+            0 => tracing::error!("{condition} failed: {detail}"),
+            n => tracing::error!("{condition} failed: {detail} ({n} more since the last line)"),
+        }
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrResp { error: "embedding_failed", detail: None }))
+}
+
+/// Run `f` on the blocking pool, where all tokenizing and inference happens, turning any failure
+/// into the logged 500.
+async fn run_blocking<T: Send + 'static>(
+    state: &Arc<AppState>,
+    f: impl FnOnce(&AppState) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, AppErr> {
+    let st = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || f(&st)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(internal(state, e)),
+        Err(e) => Err(internal(state, e.into())),
+    }
+}
+
+/// Always 200 — liveness never fails; the body carries the state. Never loads the model: a degraded
+/// answer comes from the last load that was actually attempted by an embed.
+async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
+    let failing = state.load_failing.load(Ordering::Relaxed);
+    Json(HealthResp {
+        status: if failing { "degraded" } else { "ok" },
+        reason: failing.then_some("model_unavailable"),
+        detail: failing.then_some("the model could not be loaded; embeds fail until it can"),
+        model: MODEL_LABEL,
+        dims: DIMS,
+        vector_epoch: VECTOR_EPOCH,
+        runtime: format!("den-embed/{}", release_version()),
+        max_tokens: state.cfg.max_tokens,
+    })
+}
+
+/// `GET /metrics`: Prometheus text format, behind `Authorization: Bearer <METRICS_TOKEN>`.
+///
+/// With no token configured, or the wrong one given, it answers exactly as an unknown route does — the
+/// same JSON 404 — so an install that has not set one is not told there is something here to poke at.
+///
+/// A scrape is NOT activity, for the same reason `/health` is not: a scraper polling every 15 seconds
+/// would otherwise keep ~1.2 GB resident all day, which is precisely what idle-unload exists to
+/// prevent. So this only reads — it never calls `touch` or `Model::load` — and everything it reports
+/// is state the service already keeps for its own purposes, computed here on request.
+async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !metrics_authorized(state.cfg.metrics_token.as_deref(), &headers) {
+        return not_found();
+    }
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")],
+        render_metrics(&state),
+    )
+        .into_response()
+}
+
+/// The answer for an unknown path and for a refused `/metrics`, identical so the two cannot be told
+/// apart. The same body every den addon gives.
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(CONTENT_TYPE, "application/json"), (CACHE_CONTROL, "no-store")],
+        r#"{"error":"not_found"}"#,
+    )
+        .into_response()
+}
+
+/// Every response is readable cross-origin, and a preflight on any path is answered here, before
+/// routing. It returns without reaching a handler, so a preflight never calls `touch` or loads the
+/// model — like `/health` and `/metrics`, it is not activity and cannot keep the model warm.
+async fn cors(req: Request, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        return (
+            StatusCode::NO_CONTENT,
+            [
+                (ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+                (ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS"),
+                (ACCESS_CONTROL_ALLOW_HEADERS, "*"),
+                // A day, so a browser stops preflighting every request.
+                (ACCESS_CONTROL_MAX_AGE, "86400"),
+            ],
+        )
+            .into_response();
+    }
+    let mut resp = json_error(next.run(req).await).await;
+    // Nothing here is worth a cache holding: health is live state, a vector is cheap to recompute and
+    // cached in-process already, and errors must never stick.
+    resp.headers_mut().entry(CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
+    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+    resp.headers_mut()
+        .insert("access-control-expose-headers", HeaderValue::from_static("Server-Timing, X-Den-Degraded"));
+    resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
+    resp
+}
+
+/// Errors axum makes itself — an extractor rejection (bad or missing JSON, a bad query), a 405, a body
+/// over the limit — come back as plain text or empty. Every den addon answers
+/// `{"error":"<slug>"[,"detail":"…"]}` instead, so rewrite any non-JSON error into that, keeping the
+/// status and the framework's message as the detail.
+async fn json_error(resp: Response) -> Response {
+    let status = resp.status();
+    let is_json =
+        resp.headers().get(CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return resp;
+    }
+    let slug = match status {
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        s if s.is_client_error() => "bad_request",
+        _ => "internal_error",
+    };
+    let (mut parts, body) = resp.into_parts();
+    // Rejection messages are one short line; the cap only bounds what an unexpected body could be.
+    let text = axum::body::to_bytes(body, 4096)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
+        .unwrap_or_default();
+    let mut value = serde_json::json!({ "error": slug });
+    if !text.is_empty() {
+        value["detail"] = text.into();
+    }
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Response::from_parts(parts, axum::body::Body::from(value.to_string()))
+}
+
+/// One line per request, written once the response is ready. Only added to the router when
+/// `LOG_REQUESTS` is on.
+async fn log_request(req: Request, next: Next) -> Response {
+    let (method, uri) = (req.method().clone(), req.uri().clone());
+    let rid = request_id(req.headers());
+    let started = Instant::now();
+    let resp = next.run(req).await;
+    tracing::info!("{}", request_line(&method, &uri, resp.status(), started.elapsed(), rid.as_deref()));
+    resp
+}
+
+/// `<METHOD> <path> <status> <ms>ms[ rid=<id>]`, with the path alone: the query of `GET /embed?text=` is
+/// the user's search, and it must never reach a log. `rid` is the caller's `X-Request-Id`, so a line here
+/// can be joined to the app's (and den-atlas's) line for the same request.
+fn request_line(method: &Method, uri: &Uri, status: StatusCode, took: Duration, rid: Option<&str>) -> String {
+    let line = format!("{method} {} {} {}ms", uri.path(), status.as_u16(), took.as_millis());
+    match rid {
+        Some(rid) => format!("{line} rid={rid}"),
+        None => line,
+    }
+}
+
+/// The caller's `X-Request-Id`, reduced to `[A-Za-z0-9_-]` and 32 characters: it is client input going
+/// into a log line, so nothing in it may break the line or pass for another field. Empty ⇒ absent.
+fn request_id(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let id: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(32).collect();
+    (!id.is_empty()).then_some(id)
+}
+
+fn metrics_authorized(want: Option<&str>, headers: &HeaderMap) -> bool {
+    let Some(want) = want else { return false };
+    // The `Bearer ` scheme is required, as in every den addon: a bare token is not an Authorization
+    // value any client sends, so accepting one only made this addon the odd one out.
+    let given = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let Some(given) = given.strip_prefix("Bearer ") else { return false };
+    constant_time_eq(given.trim().as_bytes(), want.as_bytes())
+}
+
+/// Compare without stopping at the first differing byte, so response time does not reveal how much
+/// of a guess was right. A length mismatch returns at once, as Go's `subtle.ConstantTimeCompare`
+/// does: that leaks only the token's length, not its contents.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn render_metrics(state: &AppState) -> String {
+    // TRY the model lock, never wait on it: inference holds it for the whole of every request (~5 s
+    // for a full batch), and a scrape must not queue behind that. Its only holders are inference,
+    // which loads the model before anything else, and the unloader's momentary check — so a held
+    // lock means the model is in use, and reads as loaded.
+    let loaded = match state.model.try_lock() {
+        Ok(model) => model.is_some(),
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Poisoned(p)) => p.into_inner().is_some(),
+    };
+    let (entries, capacity) = {
+        let cache = lock(&state.cache);
+        (cache.map.len(), cache.cap)
+    };
+    // The same arithmetic the unloader does, so this is the number it compares against its limit.
+    let now_ms = state.started.elapsed().as_millis() as u64;
+    let idle_secs = now_ms.saturating_sub(state.last_used_ms.load(Ordering::Relaxed)) / 1000;
+    let unload_secs = state.cfg.idle_unload.map_or(0, |d| d.as_secs());
+
+    format!(
+        "# HELP embed_build_info Build identity.
+# TYPE embed_build_info gauge
+embed_build_info{{version=\"{version}\",model=\"{MODEL_LABEL}\"}} 1
+# HELP embed_model_loaded Model resident (1) or idle-unloaded (0).
+# TYPE embed_model_loaded gauge
+embed_model_loaded {loaded}
+# HELP embed_cache_entries Vectors held in the embedding cache.
+# TYPE embed_cache_entries gauge
+embed_cache_entries {entries}
+# HELP embed_cache_max Most vectors the embedding cache will hold (0 = cache off).
+# TYPE embed_cache_max gauge
+embed_cache_max {capacity}
+# HELP embed_idle_seconds Seconds since the last inference, or since boot if there has been none.
+# TYPE embed_idle_seconds gauge
+embed_idle_seconds {idle_secs}
+# HELP embed_idle_unload_seconds Idle time after which the model is unloaded (0 = never).
+# TYPE embed_idle_unload_seconds gauge
+embed_idle_unload_seconds {unload_secs}
+",
+        version = release_version(),
+        loaded = u8::from(loaded),
+    )
+}
+
+async fn embed_get(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<EmbedQuery>,
+) -> Result<Response, AppErr> {
+    embed_single(state, q.text).await
+}
+
+async fn embed_post(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmbedBody>,
+) -> Result<Response, AppErr> {
+    embed_single(state, body.text).await
+}
+
+/// `/embed`, from either the query or the body.
+async fn embed_single(state: Arc<AppState>, text: String) -> Result<Response, AppErr> {
+    let started = Instant::now();
+    let (vector, phases) = run_blocking(&state, move |st| {
+        let mut phases = Phases::default();
+        embed_one(st, &text, &mut phases).map(|v| (v, phases))
+    })
+    .await?;
+    Ok(timed(started, &phases, Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL })))
+}
+
+/// `body` with a `Server-Timing` header covering the request from `started`.
+fn timed(started: Instant, phases: &Phases, body: impl IntoResponse) -> Response {
+    ([("server-timing", phases.header(started.elapsed()))], body).into_response()
+}
+
+async fn embed_batch(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchBody>,
+) -> Result<Response, AppErr> {
+    let started = Instant::now();
+    if body.texts.len() > state.cfg.max_batch {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrResp {
+                error: "too_many_texts",
+                detail: Some(format!("too many texts (max {})", state.cfg.max_batch)),
+            }),
+        ));
+    }
+    // Bound the TOTAL work, not just the count. Each text is separately capped, but the aggregate is
+    // what saturates the CPU and queues behind the model — 512 x 8000 chars of CJK measured at
+    // ~20-30 minutes of service pinned behind one request.
+    //
+    // MEASURED, not estimated. Two earlier versions of this check were wrong: counting characters
+    // rejected cheap work and admitted expensive work, and `min(chars, max_tokens)` looked sound but
+    // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
+    // `count_tokens`), which let 5x the budget through.
+    let texts_for_count = body.texts.clone();
+    let (cached, total, phases) = run_blocking(&state, move |st| {
+        let mut phases = Phases::default();
+        if let Some(vectors) = cached_batch(st, &texts_for_count, &mut phases) {
+            return Ok((Some(vectors), 0, phases));
+        }
+        count_tokens(st, &texts_for_count, &mut phases).map(|n| (None, n, phases))
+    })
+    .await?;
+    if let Some(vectors) = cached {
+        return Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })));
+    }
+    if total > state.cfg.max_request_tokens {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrResp {
+                error: "batch_too_large",
+                detail: Some(format!(
+                    "{total} tokens across {} texts (max {} in total)",
+                    body.texts.len(),
+                    state.cfg.max_request_tokens
+                )),
+            }),
+        ));
+    }
+    let (vectors, phases) = run_blocking(&state, move |st| {
+        let mut phases = phases;
+        embed_many(st, &body.texts, &mut phases).map(|v| (v, phases))
+    })
+    .await?;
+    Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })))
+}
+
+fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
+    // Background task: drop the model+tokenizer once idle for `idle`, returning the
+    // process to its minimal baseline. The next request lazily reloads them.
+    let poll = idle.div_f64(2.0).clamp(Duration::from_secs(15), Duration::from_secs(60));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            let idle_ms = idle.as_millis() as u64;
+            let now_ms = state.started.elapsed().as_millis() as u64;
+            let last = state.last_used_ms.load(Ordering::Relaxed);
+            let mut guard = lock(&state.model);
+            if guard.is_some() && now_ms.saturating_sub(last) >= idle_ms {
+                *guard = None; // drops Session + Tokenizer → frees to the allocator
+                               // ...but glibc keeps freed arenas mapped; hand them back to the OS so
+                               // idle RSS actually falls (else it plateaus ~600 MB after unload).
+                unsafe {
+                    malloc_trim(0);
+                }
+                tracing::info!("idle-unloaded model after {}s", idle.as_secs());
+            }
+        }
+    });
+}
+
+fn init_ort() {
+    static INITIALIZED: std::sync::Once = std::sync::Once::new();
+    INITIALIZED.call_once(|| {
+        // rc.13 returns bool, not Result: false means an environment was already committed, so this
+        // config simply does not take effect. Another embedding service in this process may legitimately
+        // have committed it first; the model contract is still pinned by this crate.
+        if !ort::init().with_name("den-embed").commit() {
+            tracing::warn!(
+                "ort environment was already committed; den-embed's configuration is not in effect"
+            );
+        }
+    });
+}
+
+fn build_state(cfg: Config) -> anyhow::Result<Arc<AppState>> {
+    init_ort();
+    let idle = cfg.idle_unload;
+    let cache_max = cfg.cache_max;
+    let state = Arc::new(AppState {
+        cache: Mutex::new(Lru::new(cache_max)),
+        model: Mutex::new(None),
+        last_used_ms: AtomicU64::new(0),
+        started: Instant::now(),
+        failures: Mutex::new(HashMap::new()),
+        load_failing: AtomicBool::new(false),
+        cfg,
+    });
+    match idle {
+        Some(duration) => spawn_idle_unloader(Arc::clone(&state), duration),
+        None => *lock(&state.model) = Some(Model::load(&state.cfg)?),
+    }
+    Ok(state)
+}
+
+/// The canonical embedding service as an in-process HTTP service. Atlas uses this only when its explicit
+/// local-engine switch is enabled; the ordinary standalone binary is built from the same state and router.
+/// Keeping the HTTP boundary here preserves the existing routes, statuses, headers and JSON while deployment
+/// migrates, and gives den-dataset one package to build for corpus vectors too.
+#[derive(Clone)]
+pub struct EmbeddedService {
+    router: Router,
+}
+
+impl EmbeddedService {
+    /// Build from prefixed environment variables (`EMBED_MODEL_DIR`, `EMBED_MAX_TOKENS`, … for `EMBED_`).
+    /// `PORT` is read but irrelevant for an in-process service.
+    pub fn from_env_prefix(prefix: &str) -> anyhow::Result<Self> {
+        Self::from_config(Config::from_prefix(prefix))
+    }
+
+    fn from_config(cfg: Config) -> anyhow::Result<Self> {
+        let state = build_state(cfg)?;
+        Ok(Self { router: router(state) })
+    }
+
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+}
+
+#[tokio::main]
+pub async fn serve() -> anyhow::Result<()> {
+    // One plain line per event on stderr, the way every den addon logs. No timestamp, level or
+    // colour: the systemd journal stamps and names each line itself, and nothing filters on level
+    // (the build has no env-filter), so a prefix would only make these lines read unlike the rest.
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .without_time()
+        .with_level(false)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .init();
+    let cfg = Config::from_env();
+    let addr = format!("0.0.0.0:{}", cfg.port);
+    let state = build_state(cfg)?;
+
+    // What this process is running with, secret-free: the metrics token is reported as on or off.
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let settings = format!(
+        "metrics={} log_requests={} model={MODEL_LABEL} idle_unload={} max_tokens={} max_request_tokens={}",
+        on_off(state.cfg.metrics_token.is_some()),
+        on_off(state.cfg.log_requests),
+        state.cfg.idle_unload.map_or("off".into(), |d| format!("{}s", d.as_secs())),
+        state.cfg.max_tokens,
+        state.cfg.max_request_tokens,
+    );
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Registered BEFORE the readiness line, so nothing is told the service is up while a stop signal
+    // would still be a hard kill: until a handler exists SIGTERM keeps its default disposition.
+    let shutdown = shutdown_signal();
+    // The BOUND port, not the configured one: tests/shutdown.rs starts on port 0 and reads it here.
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    tracing::info!("den-embed {} listening on :{bound} — {settings}", release_version());
+
+    let outcome = serve_until(listener, app, shutdown, drain_grace()).await;
+    match &outcome {
+        Outcome::Drained => tracing::info!("shut down cleanly"),
+        Outcome::DeadlineHit(why) => tracing::warn!("{why}"),
+        Outcome::Failed(why) => tracing::error!("{why}"),
+    }
+    // EXIT, rather than returning. Returning drops the tokio runtime, and dropping a runtime blocks
+    // until every in-flight `spawn_blocking` finishes — which is where all inference runs. So the
+    // deadline bounded the drain and then the process sat waiting on the very task it had just given
+    // up on: measured 8s deadline, 14.4s actual exit, straight through podman's 10s stop timeout
+    // into a SIGKILL, with the response lost anyway. The whole point of the bound is that the stop
+    // takes a knowable length of time, and only exiting here delivers that.
+    //
+    // It also keeps the second-signal escape alive: that is a spawned task, and dropping the runtime
+    // cancelled it exactly during the window an operator would be pressing ^C again.
+    exit_now(outcome.exit_code());
+}
+
+/// The fallback and the CORS layer are added after the routes because a layer only wraps what the
+/// router already holds; added before, unknown paths and 405s would go out without the CORS header.
+fn router(state: Arc<AppState>) -> Router {
+    let max_body = state.cfg.max_body_bytes;
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/embed", get(embed_get).post(embed_post))
+        .route("/embed/batch", post(embed_batch))
+        .fallback(|| async { not_found() })
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .layer(middleware::from_fn(cors));
+    // Outermost, so the logged status is what the client got, preflights included.
+    let app = if state.cfg.log_requests { app.layer(middleware::from_fn(log_request)) } else { app };
+    app.with_state(state)
+}
+
+/// Exit without running `atexit` handlers.
+///
+/// `std::process::exit` calls libc `exit()`, which runs the statically-linked ONNX Runtime's C++
+/// static destructors — while a `Run` may still be executing on a `spawn_blocking` thread. Measured:
+/// in 11 of 12 stops that caught inference, the in-flight Run failed with a bogus internal status
+/// (`GetElementType is not implemented`, naming a different random node each time) logged as an
+/// ERROR indistinguishable from a real inference failure. That is ORT's global state being freed
+/// under a running Run — a use-after-free-shaped race that happened to surface as a status. The same
+/// measurement with `_exit` produced it 0 times in 6.
+///
+/// Nothing here needs an atexit handler: the model is read-only, the cache is in-memory, and the log
+/// goes to stderr, which is unbuffered, so its lines are already out. Both streams are flushed anyway,
+/// because `_exit` will not.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` terminates the process; it has no preconditions.
+    unsafe { libc_exit(code) }
+}
+
+extern "C" {
+    #[link_name = "_exit"]
+    fn libc_exit(code: i32) -> !;
+}
+
+/// The default drain grace, overridable with `DRAIN_GRACE_SECS`.
+///
+/// Configurable because it is coupled to the container's stop timeout, which is set outside this
+/// binary: raise one and you must raise the other. The default is what is safe with no stop timeout
+/// configured at all. The quadlet does set `--stop-timeout=25`, but that file only lands when someone
+/// re-runs the provisioner, and the drain must not depend on it having done so.
+///
+/// The binary is PID 1 in its container (`ENTRYPOINT` exec form), and PID 1 gets no default
+/// terminate action — so without a handler SIGTERM was ignored entirely and podman waited its full
+/// stop timeout before SIGKILLing: a guaranteed ~10s of downtime on every deploy and auto-update,
+/// with every in-flight embed cut. Under podman's DEFAULT 10s rather than the quadlet's 25s, for the
+/// reason above; an embed is milliseconds warm and ~1.3s cold, so this is generous.
+const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+// The default must finish before the smallest external stop timeout that can apply — podman's and
+// docker's default 10s, which applies whenever the quadlet has not reached the box. A test only
+// guards what someone remembers to run; this fails the build. `MAX_DRAIN_GRACE` is what bounds an
+// operator override, since this assert cannot see one.
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() < 10);
+
+/// The largest grace that can still finish before something outside kills us.
+///
+/// Sized against podman's DEFAULT 10s, not against the quadlet's `--stop-timeout=25`.
+///
+/// The box now does carry that 25s (it did not for most of the time this was written — `podman
+/// inspect` reported 10 while the repo said 25, and a grace of 10..=25 was therefore a value this
+/// binary accepted and advertised as safe while being a guaranteed SIGKILL mid-drain). It stays
+/// sized to the default anyway: this binary also runs under plain `docker run`, under compose, and
+/// on any box provisioned before that line landed, and it cannot see which. A ceiling that is
+/// correct everywhere beats one that is correct where someone remembered to re-provision.
+///
+/// Strictly below, not equal: podman starts its clock at the signal and kills at the timeout, so a
+/// grace equal to it loses by however long the deadline takes to fire. Raising this needs the
+/// container's stop timeout raised FIRST, and this binary has no way to check that — which is why
+/// the conservative number is the one compiled in.
+const MAX_DRAIN_GRACE: Duration = Duration::from_secs(9);
+
+// Both the default and the ceiling must finish before the smallest external stop timeout that can
+// apply. The default had this assert; the ceiling did not, which is how 25 got in.
+const _: () = assert!(MAX_DRAIN_GRACE.as_secs() < 10);
+const _: () = assert!(DEFAULT_DRAIN_GRACE.as_secs() <= MAX_DRAIN_GRACE.as_secs());
+
+fn drain_grace() -> Duration {
+    let secs = env_clamped(
+        "DRAIN_GRACE_SECS",
+        DEFAULT_DRAIN_GRACE.as_secs() as usize,
+        1,
+        MAX_DRAIN_GRACE.as_secs() as usize,
+    );
+    Duration::from_secs(secs as u64)
+}
+
+/// How serving ended. The exit code differs: a drain that ran out of time is expected, a serve
+/// error is not.
+#[derive(Debug)]
+enum Outcome {
+    Drained,
+    DeadlineHit(String),
+    Failed(String),
+}
+
+impl Outcome {
+    /// A drain that ran out of time is a DESIGNED outcome, so it exits 0. Exiting non-zero would put
+    /// the unit into `failed` with Result=exit-code on a routine restart.
+    fn exit_code(&self) -> i32 {
+        match self {
+            Outcome::Drained | Outcome::DeadlineHit(_) => 0,
+            Outcome::Failed(_) => 1,
+        }
+    }
+}
+
+/// Serve until `shutdown` resolves, then drain for at most `grace`.
+///
+/// The bound is the point. `with_graceful_shutdown` waits for every connection task and hyper waits
+/// on one that is mid-request, and there is no header-read timeout anywhere — so a client that opens
+/// a socket and sends half a request head would hold the process open indefinitely, making restart
+/// downtime a function of what an arbitrary client does with a TCP socket.
+///
+/// `shutdown` is a parameter rather than a direct call so a test can trigger the drain without
+/// signalling the test runner itself.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    grace: Duration,
+) -> Outcome {
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown.await;
+        let _ = signalled_tx.send(());
+    });
+    tokio::select! {
+        r = serve => match r {
+            Ok(()) => Outcome::Drained,
+            Err(e) => Outcome::Failed(format!("serve error: {e}")),
+        },
+        _ = async {
+            // The clock starts when the signal ARRIVES, not when the server does — and a DROPPED
+            // sender is not an arrival. `oneshot` resolves `Err` immediately when the sender drops,
+            // which would start the grace at that instant; today the only path that drops it also
+            // completes `serve`, which wins the select, but that is a coincidence to rely on.
+            if signalled_rx.await.is_err() {
+                std::future::pending::<()>().await
+            }
+            tokio::time::sleep(grace).await;
+        } => Outcome::DeadlineHit(format!("drain deadline ({grace:?}) reached with requests still in flight")),
+    }
+}
+
+/// Resolves when the process is asked to stop. Handlers are registered eagerly, by the caller.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
+        tokio::select! {
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
+        }
+        // A SECOND signal ends it now. Both handles are dropped by here and tokio does not restore
+        // the default disposition when a `Signal` drops, so without re-registering every later
+        // SIGTERM and ^C would be caught and discarded and only SIGKILL would work.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            tracing::warn!("second signal — exiting without finishing the drain");
+            // `exit_now`, for the same reason as the deadline path — and this is where the hazard is
+            // MOST likely, because you press ^C again precisely when inference is holding the drain
+            // open. Measured with `process::exit`: 3 of 3 second-signal stops logged a bogus ORT
+            // status naming a random node, against 0 of 2 controls. Fixing one call site and not the
+            // other left the worse one behind.
+            exit_now(0);
+        });
+    }
+}
+
+/// Resolve when this signal arrives, or NEVER if it could not be registered — resolving immediately
+/// would shut the server down the moment it started, which is worse than the hard kill it replaces.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            tracing::info!("{name} — draining in-flight requests");
+        }
+        Err(e) => {
+            tracing::error!("{name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await
+        }
+    }
+}
+
+/// Like `wait_for`, but silent — the caller prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Atlas embeds this router instead of reimplementing the service. Lazy loading lets the contract be
+    /// exercised without model files; a blank query is intentionally a model-free zero vector.
+    #[tokio::test]
+    async fn reusable_service_uses_the_same_http_router() {
+        use tower::ServiceExt;
+
+        let mut cfg = Config::from_get(&|_| None);
+        cfg.idle_unload = Some(Duration::from_secs(600));
+        let service = EmbeddedService::from_config(cfg).unwrap();
+        let request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/embed")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"text":""}"#))
+            .unwrap();
+        let response = service.router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["model"], MODEL_LABEL);
+        assert_eq!(body["dims"], DIMS);
+        assert_eq!(body["vector"].as_array().unwrap().len(), DIMS);
+    }
+
+    #[test]
+    fn prefixed_config_uses_the_compatibility_names() {
+        let cfg = Config::from_get(&|key| match key {
+            "MODEL_DIR" => Some("/test-model".into()),
+            "MAX_TOKENS" => Some("777".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.onnx_path, "/test-model/model_int8.onnx");
+        assert_eq!(cfg.tokenizer_path, "/test-model/tokenizer.json");
+        assert_eq!(cfg.max_tokens, 777);
+    }
+
+    /// /health has to distinguish two builds that return DIFFERENT vectors for the same text, because
+    /// `model` and `dims` do not: every generation says bge-m3 and 1024. den-dataset records these fields
+    /// with the corpus it builds and refuses to append a different identity, so dropping one silently
+    /// restores the undetectable drift.
+    #[test]
+    fn health_reports_what_actually_embedded() {
+        let body = serde_json::to_value(HealthResp {
+            status: "ok",
+            reason: None,
+            detail: None,
+            model: MODEL_LABEL,
+            dims: DIMS,
+            vector_epoch: VECTOR_EPOCH,
+            runtime: format!("den-embed/{}", release_version()),
+            max_tokens: 512,
+        })
+        .unwrap();
+
+        assert_eq!(body["model"], MODEL_LABEL);
+        assert_eq!(body["dims"], DIMS);
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["vector_epoch"], VECTOR_EPOCH);
+        assert_eq!(body["runtime"], format!("den-embed/{}", release_version()));
+        assert_ne!(body["runtime"], "den-embed/");
+    }
+
+    /// The epoch must NOT track the crate version. If it did, a release that changed nothing about the
+    /// numbers would invalidate every corpus built before it — hours of re-embedding for a log-line fix.
+    #[test]
+    fn the_vector_epoch_is_not_the_crate_version() {
+        assert!(!env!("CARGO_PKG_VERSION").starts_with(&VECTOR_EPOCH.to_string()));
+    }
+
+    // Pins the quantization contract (mirrors the Python tests/test_quantize.py).
+    // End-to-end byte-parity with the Python service is covered by tests/parity_check.py.
+    #[test]
+    fn hand_computed_rounding() {
+        // Unit vector (0.6, -0.8, 0.0): 0.6*127=76.2->76, -0.8*127=-101.6->-102.
+        assert_eq!(quantize_int8(&[0.6, -0.8, 0.0]), vec![76, -102, 0]);
+    }
+
+    #[test]
+    fn clamp_and_normalize() {
+        // Degenerate single axis normalizes to 1.0 -> 127 exactly, no overflow.
+        assert_eq!(quantize_int8(&[10.0, 0.0, 0.0]), vec![127, 0, 0]);
+    }
+
+    #[test]
+    fn zero_vector_stays_zero() {
+        assert_eq!(quantize_int8(&[0.0; 8]), vec![0; 8]);
+    }
+
+    #[test]
+    fn round_half_to_even_matches_numpy() {
+        // A pre-normalized value landing exactly on x.5 must round to even (numpy
+        // np.round semantics), not away from zero. 0.5/127 normalized back to 0.5.
+        assert_eq!(quantize_int8(&[0.5, 0.5]).len(), 2);
+    }
+
+    #[test]
+    fn blank_detection() {
+        assert!(is_blank(""));
+        assert!(is_blank("   "));
+        assert!(!is_blank("hola"));
+    }
+
+    /// The token cap is what bounds activation memory, and `max_chars` does not imply it: at the
+    /// 8000-char limit, Hangul and emoji tokenize to ~8000 tokens, and peak RSS measured 1598 MB at
+    /// 2048 tokens against a 1536 MB cgroup — a ~10 KB request was an OOM-kill.
+    #[test]
+    fn the_token_cap_is_below_what_the_memory_limit_allows() {
+        let cfg = Config::from_env();
+        assert!(cfg.max_tokens <= 1024, "max_tokens {} exceeds what 1536 MB can hold", cfg.max_tokens);
+        assert!(cfg.max_tokens >= 16, "max_tokens {} is too small to embed a query", cfg.max_tokens);
+    }
+
+    /// Per-text limits bound nothing in aggregate: max_batch x max_chars is 4M characters through a
+    /// serial loop that holds the model lock, measured at ~20-30 minutes of pinned service.
+    ///
+    /// Asserted on the CLAMPS rather than on `Config::from_env()`, because from_env with no
+    /// environment set only ever reports the compiled-in defaults — a test that reads like a runtime
+    /// guard and is really just documentation. These check that no OPERATOR setting can undo the
+    /// bound, which is the part that matters.
+    #[test]
+    fn no_env_setting_can_undo_the_request_budget() {
+        let worst_case_tokens = |max_request_tokens: usize| max_request_tokens;
+        // ~0.33s per 512 tokens measured, and den-atlas times this call out at 10s.
+        let ceiling = env_clamped("MAX_REQUEST_TOKENS", 8192, 512, 12_288);
+        // den-atlas times this call out at 10s. A ceiling that permits more than that is a batch
+        // nobody is still waiting for — the earlier 32768 allowed ~21s, double the timeout.
+        assert!(
+            worst_case_tokens(ceiling) as f64 * 0.33 / 512.0 < 10.0,
+            "a legal batch can outlast den-atlas's 10s timeout on this call"
+        );
+
+        // And the per-text cap cannot be raised back into the OOM: 1219 MB at 1024 tokens, 1598 MB
+        // at 2048, against a 1536 MB cgroup.
+        std::env::set_var("MAX_TOKENS", "8192");
+        let raised = env_clamped("MAX_TOKENS", 512, 16, 1024);
+        std::env::remove_var("MAX_TOKENS");
+        assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
+
+        // The ceilings have to hold TOGETHER, not one at a time. Measured: 1219 MB peak at 1024
+        // tokens, ~4.2 KB per cache entry, against a 1536 MB cgroup — so both at maximum has to
+        // still leave room. Setting each ceiling against the OTHER's default is how 1494 MB got
+        // signed off as safe.
+        let peak_at_max_tokens_mb = 1219.0;
+        let cache_ceiling = env_clamped("CACHE_MAX_ENTRIES", 8192, 0, 32_768);
+        let cache_mb = cache_ceiling as f64 * 4.2 / 1024.0;
+        assert!(
+            peak_at_max_tokens_mb + cache_mb < 1400.0,
+            "both ceilings at once is {:.0} MB against a 1536 MB cgroup",
+            peak_at_max_tokens_mb + cache_mb
+        );
+    }
+
+    /// A malformed value must not silently become the opposite of what was asked for.
+    /// `IDLE_UNLOAD_SECS='600s'` parsed as nothing and fell back to 0 — always-warm, ~1 GB
+    /// resident forever — with no line anywhere saying so.
+    #[test]
+    fn a_malformed_setting_falls_back_to_the_default_not_to_zero() {
+        std::env::set_var("TEST_MALFORMED", "600s");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", "");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", "-5");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 600);
+        std::env::set_var("TEST_MALFORMED", " 42 ");
+        assert_eq!(env_clamped("TEST_MALFORMED", 600, 0, 86_400), 42, "a padded number is still a number");
+        std::env::remove_var("TEST_MALFORMED");
+    }
+
+    /// A state as `main` builds it with idle-unload on — model unloaded, idle clock never reset — but a
+    /// minute old, so anything that reset the idle clock would move it visibly.
+    fn metrics_state(token: Option<&str>) -> Arc<AppState> {
+        let mut cfg = Config::from_env();
+        cfg.metrics_token = token.map(Into::into);
+        cfg.idle_unload = Some(Duration::from_secs(600));
+        Arc::new(AppState {
+            cache: Mutex::new(Lru::new(cfg.cache_max)),
+            model: Mutex::new(None),
+            last_used_ms: AtomicU64::new(0),
+            started: Instant::now() - Duration::from_secs(60),
+            failures: Mutex::new(HashMap::new()),
+            load_failing: AtomicBool::new(false),
+            cfg,
+        })
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
+    }
+
+    async fn send(
+        state: Arc<AppState>,
+        method: Method,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+    ) -> Response {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap();
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    /// Nothing this service answers is worth a cache holding, and a response that says nothing
+    /// is heuristically cacheable — so every one says no-store, successes included.
+    #[tokio::test]
+    async fn every_response_is_no_store() {
+        for (method, path) in
+            [(Method::GET, "/health"), (Method::GET, "/embed?text="), (Method::DELETE, "/health")]
+        {
+            let resp = call(metrics_state(None), method.clone(), path).await;
+            assert_eq!(header(&resp, "cache-control"), "no-store", "{method} {path}");
+        }
+    }
+
+    /// Framework rejections answer in the den error shape, not axum's plain text or empty body.
+    #[tokio::test]
+    async fn framework_errors_are_json() {
+        let state = metrics_state(None);
+        let cases = [
+            (
+                send(state.clone(), Method::DELETE, "/health", "text/plain", "").await,
+                405,
+                "method_not_allowed",
+            ),
+            (
+                send(state.clone(), Method::POST, "/embed", "application/json", "{not json").await,
+                400,
+                "bad_request",
+            ),
+            (
+                send(state.clone(), Method::POST, "/embed/batch", "application/json", "{}").await,
+                422,
+                "bad_request",
+            ),
+        ];
+        for (resp, status, slug) in cases {
+            assert_eq!(resp.status().as_u16(), status, "{slug}");
+            assert_eq!(header(&resp, "content-type"), "application/json", "{slug}");
+            assert_eq!(header(&resp, "cache-control"), "no-store", "{slug}");
+            let body = body_json(resp).await;
+            assert_eq!(body["error"], slug, "{body}");
+        }
+    }
+
+    /// Cache-only work remains available even while the model is unloaded or its files are absent.
+    #[tokio::test]
+    async fn empty_blank_and_cached_batches_do_not_load_the_model() {
+        let mut state = metrics_state(None);
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.cfg.onnx_path = "/missing-den-embed-test-model.onnx".into();
+        st.cfg.tokenizer_path = "/missing-den-embed-test-tokenizer.json".into();
+        st.cfg.max_chars = 4;
+        st.cfg.max_request_tokens = 1;
+        *lock(&st.cache) = Lru::new(1);
+        let cached = vec![7; DIMS];
+        lock(&st.cache).put(cache_key("hola"), cached.clone());
+        for (texts, expected) in [
+            (serde_json::json!([]), vec![]),
+            (serde_json::json!(["", " \t\n"]), vec![zero_vector(), zero_vector()]),
+            (serde_json::json!(["hola longer", " ", "hola"]), vec![cached.clone(), zero_vector(), cached]),
+        ] {
+            let request = serde_json::json!({ "texts": texts }).to_string();
+            let resp = send(state.clone(), Method::POST, "/embed/batch", "application/json", &request).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{texts}");
+            assert!(!header(&resp, "server-timing").contains("load;"));
+            let body = body_json(resp).await;
+            assert_eq!(body["vectors"], serde_json::json!(expected));
+            assert_eq!(body["dims"], DIMS);
+            assert!(lock(&state.model).is_none());
+            assert!(!state.load_failing.load(Ordering::Relaxed));
+            assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_cache_miss_still_requires_model_admission() {
+        let mut state = metrics_state(None);
+        let st = Arc::get_mut(&mut state).unwrap();
+        st.cfg.onnx_path = "/missing-den-embed-test-model.onnx".into();
+        st.cfg.tokenizer_path = "/missing-den-embed-test-tokenizer.json".into();
+        lock(&st.cache).put(cache_key("cached"), zero_vector());
+        let resp = send(
+            state.clone(),
+            Method::POST,
+            "/embed/batch",
+            "application/json",
+            r#"{"texts":["cached","uncached"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"], "embedding_failed");
+        assert!(state.load_failing.load(Ordering::Relaxed));
+    }
+
+    /// A batch over the limit names itself, with the numbers in `detail`.
+    #[tokio::test]
+    async fn an_oversized_batch_is_a_typed_413() {
+        let mut cfg = Config::from_env();
+        cfg.max_batch = 1;
+        let state = metrics_state(None);
+        let state = Arc::new(AppState {
+            cache: Mutex::new(Lru::new(0)),
+            model: Mutex::new(None),
+            last_used_ms: AtomicU64::new(0),
+            started: state.started,
+            failures: Mutex::new(HashMap::new()),
+            load_failing: AtomicBool::new(false),
+            cfg,
+        });
+        let resp =
+            send(state, Method::POST, "/embed/batch", "application/json", r#"{"texts":["a","b"]}"#).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "too_many_texts");
+        assert!(body["detail"].as_str().unwrap().contains("max 1"), "{body}");
+    }
+
+    /// A model that cannot load is a typed 500 AND a degraded /health — which never loads the model
+    /// itself, so it reports what the last real attempt found. The test's model path does not exist.
+    #[tokio::test]
+    async fn a_model_that_will_not_load_degrades_health() {
+        let state = metrics_state(None);
+        let healthy = body_json(call(state.clone(), Method::GET, "/health").await).await;
+        assert_eq!(healthy["status"], "ok");
+        assert!(healthy.get("reason").is_none(), "{healthy}");
+
+        let resp = call(state.clone(), Method::GET, "/embed?text=hola").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await, serde_json::json!({ "error": "embedding_failed" }));
+
+        let health = body_json(call(state, Method::GET, "/health").await).await;
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "model_unavailable");
+        assert!(health["detail"].is_string(), "{health}");
+        assert_eq!(health["model"], MODEL_LABEL, "the identity fields must survive a degraded answer");
+    }
+
+    /// A bare token is not an Authorization value; every den addon requires the scheme.
+    #[tokio::test]
+    async fn metrics_requires_the_bearer_scheme() {
+        let (status, _, _) = scrape(metrics_state(Some("s3cret")), Some("s3cret")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = scrape(metrics_state(Some("s3cret")), Some("Bearer  s3cret ")).await;
+        assert_eq!(status, StatusCode::OK, "the token is trimmed after the scheme");
+    }
+
+    /// `GET /embed?text=` carries the user's search in the query, so the line has the path alone.
+    #[test]
+    fn the_request_log_never_carries_the_query() {
+        let uri: Uri = "/embed?text=a%20private%20search".parse().unwrap();
+        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(12), None);
+        assert_eq!(line, "GET /embed 200 12ms");
+        assert!(!line.contains("private"), "{line}");
+    }
+
+    /// The caller's request id closes the line, so it can be joined to the app's line for the request.
+    #[test]
+    fn the_request_log_carries_the_callers_request_id() {
+        let uri: Uri = "/embed?text=x".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("a1B2-c3_d4"));
+        let rid = request_id(&headers);
+        let line = request_line(&Method::GET, &uri, StatusCode::OK, Duration::from_millis(3), rid.as_deref());
+        assert_eq!(line, "GET /embed 200 3ms rid=a1B2-c3_d4");
+    }
+
+    /// It is client input going into a log line: anything that could break the line or pose as another
+    /// field is dropped, and a flood is cut to 32 characters. Nothing usable left means no `rid=` at all.
+    #[test]
+    fn a_hostile_request_id_is_sanitized_truncated_or_dropped() {
+        let id = |v: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-request-id", HeaderValue::from_static(v));
+            request_id(&headers)
+        };
+        assert_eq!(id("ab c=d\tGET /x 200").as_deref(), Some("abcdGETx200"));
+        assert_eq!(
+            id("0123456789abcdef0123456789abcdefXYZ").as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(id(" =/ "), None);
+        assert_eq!(request_id(&HeaderMap::new()), None);
+    }
+
+    async fn scrape(state: Arc<AppState>, auth: Option<&str>) -> (StatusCode, String, String) {
+        let mut headers = HeaderMap::new();
+        if let Some(auth) = auth {
+            headers.insert(AUTHORIZATION, auth.parse().unwrap());
+        }
+        let resp = metrics(State(state), headers).await;
+        let status = resp.status();
+        let content_type =
+            resp.headers().get(CONTENT_TYPE).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, content_type, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// Unset means OFF, and indistinguishable from a route that does not exist — not an empty 200.
+    #[tokio::test]
+    async fn metrics_is_not_found_without_a_configured_token() {
+        for auth in [None, Some("Bearer "), Some("Bearer anything")] {
+            let (status, content_type, body) = scrape(metrics_state(None), auth).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "served metrics with no token configured ({auth:?})");
+            assert_eq!(content_type, "application/json");
+            assert_eq!(body, r#"{"error":"not_found"}"#, "unlike an unknown route's 404");
+        }
+    }
+
+    async fn call(state: Arc<AppState>, method: Method, uri: &str) -> Response {
+        use tower::ServiceExt;
+        let req =
+            axum::http::Request::builder().method(method).uri(uri).body(axum::body::Body::empty()).unwrap();
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    fn header<'a>(resp: &'a Response, name: &str) -> &'a str {
+        resp.headers().get(name).map(|v| v.to_str().unwrap()).unwrap_or_default()
+    }
+
+    /// A browser preflights any path it means to call, including ones with no OPTIONS route, and
+    /// answering one must not count as use: that would keep ~1.2 GB resident for anything that
+    /// preflights on a timer, which is what idle-unload exists to prevent.
+    #[tokio::test]
+    async fn a_preflight_on_any_path_is_answered_without_waking_the_model() {
+        let state = metrics_state(None);
+        for path in ["/embed", "/embed/batch", "/health", "/metrics", "/nope"] {
+            let resp = call(state.clone(), Method::OPTIONS, path).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{path}");
+            assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{path}");
+            assert_eq!(header(&resp, "access-control-allow-methods"), "GET, HEAD, POST, OPTIONS", "{path}");
+            assert_eq!(header(&resp, "access-control-allow-headers"), "*", "{path}");
+            assert_eq!(header(&resp, "access-control-max-age"), "86400", "{path}");
+        }
+        assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "a preflight reset the idle clock");
+        assert!(lock(&state.model).is_none(), "a preflight loaded the model");
+    }
+
+    /// Success, a refused route, an unknown path and a wrong method alike: a response without the
+    /// header is unreadable to a browser, whatever its status says.
+    #[tokio::test]
+    async fn every_response_is_readable_cross_origin() {
+        for (method, path, status) in [
+            (Method::GET, "/health", StatusCode::OK),
+            (Method::GET, "/embed?text=", StatusCode::OK), // blank: a zero vector, no model needed
+            (Method::GET, "/metrics", StatusCode::NOT_FOUND),
+            (Method::GET, "/nope", StatusCode::NOT_FOUND),
+            (Method::DELETE, "/health", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let resp = call(metrics_state(None), method.clone(), path).await;
+            assert_eq!(resp.status(), status, "{method} {path}");
+            assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{method} {path}");
+        }
+    }
+
+    /// Without the model the only /embed that succeeds is a blank one, which does no phase at all.
+    #[tokio::test]
+    async fn an_embed_response_carries_server_timing() {
+        let resp = call(metrics_state(None), Method::GET, "/embed?text=").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let timing = header(&resp, "server-timing");
+        assert!(timing.starts_with("total;dur="), "{timing:?}");
+    }
+
+    #[test]
+    fn server_timing_names_only_the_phases_that_ran() {
+        let ms = Duration::from_millis;
+        let cold =
+            Phases { load: Some(ms(1283)), tokenize: Some(ms(1)), inference: Some(ms(312)), cache_hits: 0 };
+        assert_eq!(
+            cold.header(ms(1600)),
+            "load;dur=1283.0, tokenize;dur=1.0, inference;dur=312.0, total;dur=1600.0"
+        );
+        let cached = Phases { cache_hits: 2, ..Phases::default() };
+        assert_eq!(cached.header(ms(1)), "cache;desc=hit, total;dur=1.0");
+        // Some texts cached, some not: inference ran, so it is not a hit.
+        let mixed = Phases { tokenize: Some(ms(1)), inference: Some(ms(2)), cache_hits: 1, load: None };
+        assert!(!mixed.header(ms(3)).contains("cache"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_path_is_a_json_404() {
+        let resp = call(metrics_state(None), Method::GET, "/nope").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&resp, "content-type"), "application/json");
+        assert_eq!(header(&resp, "cache-control"), "no-store");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"not_found"}"#);
+    }
+
+    #[tokio::test]
+    async fn metrics_is_not_found_with_the_wrong_token() {
+        for auth in [None, Some("Bearer wrong"), Some("Bearer s3cre"), Some("Bearer s3cret2")] {
+            let (status, _, _) = scrape(metrics_state(Some("s3cret")), auth).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{auth:?} was accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_serves_prometheus_text_with_the_right_token() {
+        let (status, content_type, body) = scrape(metrics_state(Some("s3cret")), Some("Bearer s3cret")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/plain; version=0.0.4; charset=utf-8");
+        let build_info =
+            format!("embed_build_info{{version=\"{}\",model=\"bge-m3\"}} 1\n", release_version());
+        assert!(body.contains(&build_info), "no build_info line in:\n{body}");
+        assert!(body.contains("\nembed_idle_unload_seconds 600\n"), "{body}");
+        assert!(body.contains("# TYPE embed_model_loaded gauge\n"), "{body}");
+    }
+
+    /// A scrape must not keep the model warm: counting it as activity would pin ~1.2 GB resident for
+    /// as long as anything polls, and loading the model to report on it would be worse.
+    #[tokio::test]
+    async fn a_scrape_is_not_activity_and_does_not_load_the_model() {
+        let state = metrics_state(Some("s3cret"));
+        let (_, _, body) = scrape(state.clone(), Some("Bearer s3cret")).await;
+
+        assert_eq!(state.last_used_ms.load(Ordering::Relaxed), 0, "the scrape reset the idle clock");
+        assert!(lock(&state.model).is_none(), "the scrape loaded the model");
+        assert!(body.contains("\nembed_model_loaded 0\n"), "{body}");
+        let idle: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("embed_idle_seconds "))
+            .and_then(|v| v.parse().ok())
+            .expect("no embed_idle_seconds sample");
+        assert!(idle >= 60, "idle clock reads {idle}s on a service untouched for a minute");
+    }
+
+    #[test]
+    fn constant_time_eq_is_plain_equality() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3creT"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(!constant_time_eq(b"", b"s3cret"));
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_and_model_scoped() {
+        let a = cache_key("hola");
+        assert_eq!(a, cache_key("hola"));
+        assert_ne!(a, cache_key("adios"));
+        // blake2b-128 -> 32 hex chars.
+        assert_eq!(a.len(), 32);
+    }
+}

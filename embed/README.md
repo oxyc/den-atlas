@@ -1,0 +1,121 @@
+# den-embed engine
+
+The embedding service behind Den's semantic search: **BAAI/bge-m3**, int8, 1024 dims, served over
+HTTP by a small Rust binary (axum + ONNX Runtime via `ort` + HuggingFace `tokenizers`). den-atlas
+calls it to embed search queries; den-dataset runs the same image to embed the corpus.
+
+This package is now owned by the den-atlas workspace. Its library is the canonical engine; the binary
+keeps the old HTTP service intact while deployment migrates. See [`../docs/EMBED-MIGRATION.md`](../docs/EMBED-MIGRATION.md).
+
+## The alignment rule
+
+Query vectors and corpus vectors are only comparable because both come out of **one path**: the same
+tokenizer, the same model file, the same ONNX Runtime, the same pooling and the same quantization.
+Change any of them on one side and the other side has to be re-embedded through the new path. "The
+same model" is not enough — an ONNX Runtime upgrade alone moved the int8 output far enough to reorder
+results, and a different serving path such as Workers AI's
+`@cf/baai/bge-m3` would too. `vector_epoch` in `/health` names the generation of vectors this build
+produces; den-dataset records it with a corpus and refuses to mix generations.
+
+## The path
+
+1. Blank or whitespace-only text returns an all-zero vector, never an error.
+2. The text is cut to `MAX_CHARS` characters, then the tokenizer truncates it to `MAX_TOKENS`
+   tokens. Both cuts are silent.
+3. `tokenizer.json` and `onnx/model_int8.onnx` from `Xenova/bge-m3`, pinned to a commit and
+   checksum-verified in the workspace Dockerfile, run on the ONNX Runtime CPU provider.
+4. CLS pooling: token 0 of `last_hidden_state`.
+5. L2-normalize in f64, then `clamp(round_half_to_even(x * 127), -127, 127)`.
+
+A batch is embedded one text at a time, so a text gets the same vector in a batch as on its own.
+Vectors are cached in memory, keyed by content.
+
+## Idle unload
+
+With `IDLE_UNLOAD_SECS` above 0 (the box sets 600) the model is not loaded at boot. The first
+request that needs it loads it, and a background task drops it after that many seconds without an
+inference, then hands the freed memory back to the OS. `/health`, `/metrics` and `OPTIONS` do not
+count as activity and never load it, so nothing that polls them keeps it warm. With 0 it loads at
+boot and stays. The measured rollout bounds are recorded in the migration document.
+
+## Routes
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| GET | `/health` | — | `{"status":"ok","model":"bge-m3","dims":1024,"vector_epoch":1,"runtime":"den-embed/<version>","max_tokens":512}` |
+| GET | `/embed` | `?text=<url-encoded>` | `{"vector":[<1024 ints>],"dims":1024,"model":"bge-m3"}` |
+| POST | `/embed` | `{"text":"…"}` | same as GET |
+| POST | `/embed/batch` | `{"texts":["…","…"]}` | `{"vectors":[[…],…],"dims":1024,"model":"bge-m3"}` |
+| GET | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | Prometheus text (`embed_*` series) |
+
+- `/health` never loads the model. It says `ok` until an embed fails to load the model, then
+  `{"status":"degraded","reason":"model_unavailable","detail":"…", …}` until a load succeeds — so a
+  missing model shows only after something has tried to embed. The identity fields are always there.
+- An unknown path answers 404 `{"error":"not_found"}` (`application/json`, `no-store`), and so does
+  `/metrics` when `METRICS_TOKEN` is unset or the token is wrong.
+- Every response carries `Access-Control-Allow-Origin: *` and `Cache-Control: no-store`. `OPTIONS`
+  on any path answers 204 with the preflight headers and, like `/health` and `/metrics`, is not
+  activity for idle unload.
+- Errors are JSON, `{"error":"<slug>"[,"detail":"…"]}`, `no-store`:
+  - 413 `too_many_texts` / `batch_too_large` over `MAX_BATCH` texts or `MAX_REQUEST_TOKENS` tokens
+    in total; 413 `payload_too_large` for a body over `MAX_BODY_BYTES`.
+  - 400/422 `bad_request` for a malformed body or query, 405 `method_not_allowed`.
+  - 500 `embedding_failed` when inference fails; the real error goes to the log.
+- A successful `/embed` or `/embed/batch` carries `Server-Timing`, in milliseconds: `load` when this
+  request had to load the model, `tokenize`, `inference` (or `cache;desc=hit` when every text came
+  from the cache), then `total`.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | 8080 | Listen port, on 0.0.0.0. |
+| `METRICS_TOKEN` | unset | Enables `/metrics`. |
+| `LOG_REQUESTS` | unset | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, never with the query string. Empty or `0` is off. |
+| `MODEL_DIR` | `/models` | Directory holding `model_int8.onnx` and `tokenizer.json`. |
+| `ONNX_PATH`, `TOKENIZER_PATH` | inside the model dir | Point at either file directly. |
+| `IDLE_UNLOAD_SECS` | 0 | Unload the model after this long idle (0–86400); 0 keeps it loaded. |
+| `MAX_CHARS` | 8000 | Per-text character cut (500–100000). |
+| `MAX_TOKENS` | 512 | Per-text token cap (16–1024). Changing it changes the vector of anything longer. |
+| `MAX_REQUEST_TOKENS` | 8192 | Total tokens per request (512–12288). |
+| `MAX_BATCH` | 512 | Texts per batch (1–4096). A rejection threshold, not a micro-batch. |
+| `MAX_BODY_BYTES` | 4 MiB | Request body limit (64 KiB–16 MiB). |
+| `CACHE_MAX_ENTRIES` | 8192 | Cached vectors, ~4.2 KB each (0–32768); 0 turns the cache off. |
+| `INTRA_THREADS` | 0 | ONNX Runtime intra-op threads (0–256); 0 uses all cores. |
+| `DRAIN_GRACE_SECS` | 8 | How long a SIGTERM waits for in-flight requests (1–9). |
+
+A number outside its range is clamped and a malformed one falls back to the default, each with a log
+line. The ranges are memory and latency bounds, sized against a 1536 MiB container and den-atlas's
+10 s timeout on this call.
+
+## Run
+
+```sh
+MODEL_DIR=<dir with model_int8.onnx + tokenizer.json> cargo run --release -p den-embed
+curl 'http://127.0.0.1:8080/embed?text=a%20heist%20thriller%20about%20a%20bank%20robbery'
+curl -X POST http://127.0.0.1:8080/embed/batch \
+  -H 'content-type: application/json' \
+  -d '{"texts":["a bank robbery","","a quiet romance"]}'
+```
+
+Take the model files from the revision the workspace Dockerfile pins, so local vectors match the image's.
+
+```sh
+cargo test
+TEST_MODEL_DIR=<dir> cargo test --test shutdown -- --ignored   # the one test that needs the model
+```
+
+The unit tests pin the quantization, the cache key, the limits and `/metrics`; `tests/shutdown.rs`
+runs the binary to test SIGTERM draining. CI also runs `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings`.
+
+`tests/parity_check.py <base_url> <golden.ndjson>` is a manual parity gate against a running
+instance: it compares each `{"text","vector"}` line with what `/embed` returns now. Golden sets
+captured from the Python service predate the ONNX Runtime 1.28 move and no longer match exactly.
+
+## Deploy
+
+Until the migration gates pass, the existing standalone image remains deployed and reached by Atlas over
+the internal network. New compatibility and integrated images are built from the workspace Dockerfile's
+`den-embed` and `den-atlas-embedded` targets. Publishing, canarying, and retiring the legacy image are
+deliberately separate rollout steps; see the migration document.

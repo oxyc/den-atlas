@@ -181,22 +181,89 @@ impl AppState {
     }
 }
 
-/// Search query-embed proxy. den-atlas never runs the model — it forwards to the single den-embed authority
-/// so a search query embeds through the SAME bge-m3 + int8 quantizer that built the corpus (the alignment
-/// rule). den-embed stays internal; the app only ever talks to den-atlas.
+/// One embedding authority behind Atlas's existing bounded HTTP-facing facade. The default stays the external
+/// den-embed service during migration. An `embedded-model` build may opt into the in-process service, which is
+/// built from the same workspace package and the same HTTP router as the compatibility den-embed binary.
 pub struct EmbedProxy {
-    pub client: reqwest::Client,
-    pub base: String,
+    transport: EmbedTransport,
     /// The same bound the JustWatch path has, for the same reason: this is an unauthenticated public
     /// POST that fans out 1:1 to the internal model service, and each call holds a 10s timeout.
     /// Without it, N concurrent requests are N concurrent model invocations.
     pub inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
+enum EmbedTransport {
+    Remote {
+        client: reqwest::Client,
+        base: String,
+    },
+    #[cfg(feature = "embedded-model")]
+    Local(den_embed::EmbeddedService),
+}
+
+pub struct EmbedAnswer {
+    pub status: axum::http::StatusCode,
+    pub headers: axum::http::HeaderMap,
+    pub body: bytes::Bytes,
+}
+
+impl EmbedProxy {
+    pub async fn call(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+        request_id: Option<&str>,
+    ) -> Result<EmbedAnswer, String> {
+        match &self.transport {
+            EmbedTransport::Remote { client, base } => {
+                let mut request = client
+                    .post(format!("{base}{path}"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+                if let Some(request_id) = request_id {
+                    request = request.header("x-request-id", request_id);
+                }
+                let response = request.send().await.map_err(|error| error.to_string())?;
+                let status = axum::http::StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                let headers = response.headers().clone();
+                // Preserve the old proxy's behaviour for an upstream that closes mid-body: its status and
+                // headers still reached the caller with an empty JSON body instead of becoming an Atlas 502.
+                let body = response.bytes().await.unwrap_or_default();
+                Ok(EmbedAnswer { status, headers, body })
+            }
+            #[cfg(feature = "embedded-model")]
+            EmbedTransport::Local(service) => {
+                use tower::ServiceExt;
+
+                let mut request = axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(path)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json");
+                if let Some(request_id) = request_id {
+                    request = request.header("x-request-id", request_id);
+                }
+                let call = service
+                    .router()
+                    .oneshot(request.body(axum::body::Body::from(body)).map_err(|error| error.to_string())?);
+                let response = tokio::time::timeout(EMBED_CALL_TIMEOUT, call)
+                    .await
+                    .map_err(|_| "embedded model timed out".to_owned())?
+                    .map_err(|error| error.to_string())?;
+                let (parts, body) = response.into_parts();
+                let body =
+                    axum::body::to_bytes(body, 16 * 1024 * 1024).await.map_err(|error| error.to_string())?;
+                Ok(EmbedAnswer { status: parts.status, headers: parts.headers, body })
+            }
+        }
+    }
+}
+
 /// Concurrent embeds allowed through to den-embed. A search query is interactive, so a short queue
 /// with a deadline beats an unbounded one.
 pub const MAX_EMBED_INFLIGHT: usize = 4;
 pub const EMBED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const EMBED_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `den-atlas check <dir>` — load a dataset directory exactly as serving would, and say whether it is fit to
 /// swap in.
@@ -347,21 +414,9 @@ async fn main() {
         }
     }
 
-    // Optional query-embed proxy → den-embed. Absent env ⇒ search embeds are disabled (503), dataset serving
-    // is unaffected. A short timeout: a query embed is a fast single call, not the slow corpus build.
-    let embed = env_opt("EMBED_URL").and_then(|base| {
-        match reqwest::Client::builder().timeout(Duration::from_secs(10)).build() {
-            Ok(client) => Some(EmbedProxy {
-                client,
-                base: base.trim_end_matches('/').to_owned(),
-                inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT)),
-            }),
-            Err(e) => {
-                eprintln!("embed proxy disabled (reqwest build failed: {e})");
-                None
-            }
-        }
-    });
+    // External remains the default during migration. The local engine is compiled and selected separately;
+    // merely merging this code neither loads the model nor changes the deployed request path.
+    let embed = embed_proxy();
 
     // Off unless TITLE_SEARCH is set (on for anything but empty or 0): the tvOS app fuses every addon search
     // catalog into its text search as soon as one is declared, so turning this on changes the TV's search.
@@ -583,6 +638,44 @@ async fn replay(dir: &str, path: &str) -> i32 {
 /// uses. `EMBED_URL=` read as set produced a proxy to "".
 fn env_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn embed_proxy() -> Option<EmbedProxy> {
+    let inflight = || std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT));
+    if let Some(base) = env_opt("EMBED_URL") {
+        return match reqwest::Client::builder().timeout(EMBED_CALL_TIMEOUT).build() {
+            Ok(client) => Some(EmbedProxy {
+                transport: EmbedTransport::Remote { client, base: base.trim_end_matches('/').to_owned() },
+                inflight: inflight(),
+            }),
+            Err(e) => {
+                eprintln!("embed proxy disabled (reqwest build failed: {e})");
+                None
+            }
+        };
+    }
+
+    let local = std::env::var("EMBED_LOCAL").is_ok_and(|value| !matches!(value.as_str(), "" | "0" | "false"));
+    if !local {
+        return None;
+    }
+    #[cfg(feature = "embedded-model")]
+    {
+        match den_embed::EmbeddedService::from_env_prefix("EMBED_") {
+            Ok(service) => {
+                Some(EmbedProxy { transport: EmbedTransport::Local(service), inflight: inflight() })
+            }
+            Err(error) => {
+                eprintln!("embedded model disabled ({error:#})");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "embedded-model"))]
+    {
+        eprintln!("embedded model disabled (this den-atlas build lacks the embedded-model feature)");
+        None
+    }
 }
 
 /// `LOG_IDENTITY`: on by default — unset, empty, or anything but one of the usual off-tokens. The
