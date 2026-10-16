@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
+mod imda;
+mod kmrb;
+
 type Key = (MediaType, u32);
 const FILE: &str = "maturity-providers.v2.json";
 const SCHEMA: u32 = 2;
@@ -87,6 +90,11 @@ pub trait Backend: Send + Sync {
     /// Whether this authority's observation is useful for this viewer. This is deliberately separate from the
     /// observation's jurisdiction: an official Finnish classification can still inform a viewer in the US.
     fn applies_to(&self, viewer_region: Option<Region>) -> bool;
+    /// A bulk provider may answer more identities from an already loaded snapshot after its request budget is
+    /// exhausted. Per-title providers keep the default: no budget means no useful work remains.
+    fn can_lookup_without_request(&self) -> bool {
+        false
+    }
     async fn lookup(&self, identity: &Identity, budget: &mut Budget) -> Result<Lookup, String>;
 }
 
@@ -166,7 +174,14 @@ impl Providers {
         if names.contains("kavi") {
             configured.push(Configured { backend: Arc::new(Kavi::new()?), daily_max, pace });
         }
-        let unknown: Vec<&String> = names.iter().filter(|name| name.as_str() != "kavi").collect();
+        if names.contains("imda") {
+            configured.push(Configured { backend: Arc::new(imda::Imda::new()?), daily_max, pace });
+        }
+        if names.contains("kmrb") {
+            configured.push(Configured { backend: Arc::new(kmrb::Kmrb::from_env()?), daily_max, pace });
+        }
+        let unknown: Vec<&String> =
+            names.iter().filter(|name| !matches!(name.as_str(), "kavi" | "imda" | "kmrb")).collect();
         if !unknown.is_empty() {
             return Err(format!(
                 "unknown MATURITY_PROVIDERS: {}",
@@ -283,7 +298,7 @@ impl Providers {
         let mut changed = false;
         let total = self.catalog.len();
         let mut visited = 0usize;
-        while visited < total && budget.left > 0 {
+        while visited < total && (budget.left > 0 || configured.backend.can_lookup_without_request()) {
             let identity = &self.catalog[cursor];
             visited += 1;
             if !configured.backend.media_types().contains(&identity.key.0) {
