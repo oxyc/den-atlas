@@ -108,7 +108,7 @@ dataset's embedding model and width, so a repeated search does not call den-embe
 | Route | Returns |
 |---|---|
 | `GET /`, `GET /configure` | landing/configure page: pick region + services, get the install URL |
-| `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `stale_catalog` (last JustWatch refresh failed), `catalog_schema_suspect` (a served chart came back mostly empty) or `facts_unusable` (the dataset declares a facts file the last index load couldn't read; `/recommend` and search run without facts) |
+| `GET /health` | always `200`: `{"status":"ok"}`, or `{"status":"degraded","reason":…,"detail":…}` with reason `dataset_unavailable`, `embed_unavailable` (the configured local engine failed identity validation or its real inference canary), `stale_catalog` (last JustWatch refresh failed), `catalog_schema_suspect` (a served chart came back mostly empty) or `facts_unusable` (the dataset declares a facts file the last index load couldn't read; `/recommend` and search run without facts) |
 | `GET /manifest.json` | the `dataset` + `catalog` manifest (also under a `/<region>_<codes>/` install prefix) |
 | `GET /dataset.json` | the descriptor — what the dataset IS (`datasetVersion`, `taxonomyVersion`, `embeddingModel`, `dims`, `count`, `quantization`, `signature`, the `embed`/`queries` capability flags). It names no files to download; `503` when the dataset did not load |
 | `GET /catalog/<type>/<id>[/<extra>].json` | a "most popular" row of `{id,type,name,poster}` metas |
@@ -445,7 +445,7 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `JW_CACHE_TTL_SECS` | `21600` | in-process freshness of the catalog rows |
 | `CACHE_DIR` | unset | a writable directory the catalog rows are also kept in, so a restart serves them instead of asking JustWatch again; written only when a row is refreshed. TMDB's kept numbers and credits live here too (`tmdb-votes.tsv`, `tmdb-credits.tsv`, `tmdb-sweep.tsv`), and nowhere else. Unset ⇒ memory only |
 | `EMBED_URL` | unset | den-embed base URL for `POST /embed`; it wins over `EMBED_LOCAL` during migration |
-| `EMBED_LOCAL` | off | with an `embedded-model` build, `1` runs the workspace's engine in Atlas; without either engine `/embed` answers `503` |
+| `EMBED_LOCAL` | off | with an `embedded-model` build, `1` runs the workspace's engine in Atlas after its model/dims/vector-epoch/token-cap exactly match the corpus and a real inference canary succeeds; without a ready engine `/embed` answers `503` |
 | `EMBED_MODEL_DIR` | `/models` | model directory for the local engine; its other settings are the den-embed variables prefixed with `EMBED_` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load as atlas starts and stay loaded |
 | `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |

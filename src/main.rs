@@ -184,14 +184,17 @@ impl AppState {
 /// One embedding authority behind Atlas's existing bounded HTTP-facing facade. The default stays the external
 /// den-embed service during migration. An `embedded-model` build may opt into the in-process service, which is
 /// built from the same workspace package and the same HTTP router as the compatibility den-embed binary.
+#[derive(Clone)]
 pub struct EmbedProxy {
     transport: EmbedTransport,
     /// The same bound the JustWatch path has, for the same reason: this is an unauthenticated public
     /// POST that fans out 1:1 to the internal model service, and each call holds a 10s timeout.
     /// Without it, N concurrent requests are N concurrent model invocations.
     pub inflight: std::sync::Arc<tokio::sync::Semaphore>,
+    readiness: Arc<std::sync::Mutex<EmbedReadiness>>,
 }
 
+#[derive(Clone)]
 enum EmbedTransport {
     Remote {
         client: reqwest::Client,
@@ -201,6 +204,13 @@ enum EmbedTransport {
     Local(den_embed::EmbeddedService),
 }
 
+#[derive(Clone, Debug)]
+enum EmbedReadiness {
+    Checking,
+    Ready,
+    Failed,
+}
+
 pub struct EmbedAnswer {
     pub status: axum::http::StatusCode,
     pub headers: axum::http::HeaderMap,
@@ -208,7 +218,27 @@ pub struct EmbedAnswer {
 }
 
 impl EmbedProxy {
+    fn available(&self) -> bool {
+        matches!(*crate::util::lock(&self.readiness), EmbedReadiness::Ready)
+    }
+
+    fn unready(&self) -> bool {
+        !self.available()
+    }
+
     pub async fn call(
+        &self,
+        path: &str,
+        body: bytes::Bytes,
+        request_id: Option<&str>,
+    ) -> Result<EmbedAnswer, String> {
+        if !self.available() {
+            return Err("embedding engine is not ready".into());
+        }
+        self.call_raw(path, body, request_id).await
+    }
+
+    async fn call_raw(
         &self,
         path: &str,
         body: bytes::Bytes,
@@ -256,6 +286,27 @@ impl EmbedProxy {
                 Ok(EmbedAnswer { status: parts.status, headers: parts.headers, body })
             }
         }
+    }
+
+    #[cfg(feature = "embedded-model")]
+    async fn canary(&self) -> Result<(), String> {
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            vector: Vec<i8>,
+            dims: usize,
+            model: String,
+        }
+        let body = serde_json::to_vec(&serde_json::json!({"text":"Den integrated embedding readiness"}))
+            .map_err(|error| error.to_string())?;
+        let answer = self.call_raw("/embed", body.into(), None).await?;
+        if !answer.status.is_success() {
+            return Err(format!("engine answered HTTP {}", answer.status));
+        }
+        let answer: Answer = serde_json::from_slice(&answer.body).map_err(|error| error.to_string())?;
+        if answer.model != "bge-m3" || answer.dims != 1024 || answer.vector.len() != answer.dims {
+            return Err("engine canary returned the wrong identity or width".into());
+        }
+        Ok(())
     }
 }
 
@@ -416,7 +467,7 @@ async fn main() {
 
     // External remains the default during migration. The local engine is compiled and selected separately;
     // merely merging this code neither loads the model nor changes the deployed request path.
-    let embed = embed_proxy();
+    let embed = embed_proxy(dataset.as_ref());
 
     // Off unless TITLE_SEARCH is set (on for anything but empty or 0): the tvOS app fuses every addon search
     // catalog into its text search as soon as one is declared, so turning this on changes the TV's search.
@@ -505,6 +556,25 @@ async fn main() {
         playground: std::env::var("PLAYGROUND").is_ok_and(|v| !v.is_empty() && v != "0"),
         health: std::sync::Mutex::new(health),
     });
+    #[cfg(feature = "embedded-model")]
+    if state.embed.as_ref().is_some_and(|embed| {
+        matches!(&embed.transport, EmbedTransport::Local(_))
+            && matches!(*crate::util::lock(&embed.readiness), EmbedReadiness::Checking)
+    }) {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let embed = state.embed.as_ref().expect("checked above").clone();
+            let readiness = match embed.canary().await {
+                Ok(()) => EmbedReadiness::Ready,
+                Err(error) => {
+                    eprintln!("embedded model readiness failed ({error})");
+                    EmbedReadiness::Failed
+                }
+            };
+            *crate::util::lock(&embed.readiness) = readiness;
+            handler::note_embed_health(&state);
+        });
+    }
     if let Some(search) = &state.titles {
         tokio::spawn(titles::refresh_forever(Arc::clone(search)));
     }
@@ -581,7 +651,7 @@ async fn main() {
         providers.join(","),
         ttl.as_secs(),
         cache_dir.as_deref().unwrap_or("memory"),
-        on(state.embed.is_some()),
+        on(state.embed.as_ref().is_some_and(EmbedProxy::available)),
         on(state.titles.is_some()),
         on(state.index.is_some()),
         match &tmdb {
@@ -640,13 +710,22 @@ fn env_opt(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn embed_proxy() -> Option<EmbedProxy> {
+#[cfg(feature = "embedded-model")]
+fn local_identity_matches(meta: &dataset::Meta, identity: &den_embed::EngineIdentity) -> bool {
+    meta.embedding_model == identity.model
+        && meta.dims as usize == identity.dims
+        && meta.embedder_vector_epoch == Some(identity.vector_epoch)
+        && meta.embedder_max_tokens == u32::try_from(identity.max_tokens).ok()
+}
+
+fn embed_proxy(dataset: Option<&dataset::Dataset>) -> Option<EmbedProxy> {
     let inflight = || std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT));
     if let Some(base) = env_opt("EMBED_URL") {
         return match reqwest::Client::builder().timeout(EMBED_CALL_TIMEOUT).build() {
             Ok(client) => Some(EmbedProxy {
                 transport: EmbedTransport::Remote { client, base: base.trim_end_matches('/').to_owned() },
                 inflight: inflight(),
+                readiness: Arc::new(std::sync::Mutex::new(EmbedReadiness::Ready)),
             }),
             Err(e) => {
                 eprintln!("embed proxy disabled (reqwest build failed: {e})");
@@ -663,7 +742,22 @@ fn embed_proxy() -> Option<EmbedProxy> {
     {
         match den_embed::EmbeddedService::from_env_prefix("EMBED_") {
             Ok(service) => {
-                Some(EmbedProxy { transport: EmbedTransport::Local(service), inflight: inflight() })
+                let identity = service.identity();
+                let compatible = dataset.is_some_and(|dataset| local_identity_matches(&dataset.meta, &identity));
+                if !compatible {
+                    eprintln!(
+                        "embedded model unavailable (engine identity does not exactly match dataset model/dims/vector_epoch/max_tokens)"
+                    );
+                }
+                Some(EmbedProxy {
+                    transport: EmbedTransport::Local(service),
+                    inflight: inflight(),
+                    readiness: Arc::new(std::sync::Mutex::new(if compatible {
+                        EmbedReadiness::Checking
+                    } else {
+                        EmbedReadiness::Failed
+                    })),
+                })
             }
             Err(error) => {
                 eprintln!("embedded model disabled ({error:#})");
@@ -930,6 +1024,118 @@ mod tests {
         for v in ["0", "false", "off", "no", "FALSE", " Off "] {
             assert!(!log_identity_on(Some(v)), "{v:?} should turn identity logging off");
         }
+    }
+
+    #[cfg(feature = "embedded-model")]
+    #[tokio::test]
+    async fn local_transport_drives_the_real_embedded_router() {
+        let prefix = format!("ATLAS_LOCAL_TRANSPORT_{}_,", std::process::id()).replace(',', "");
+        // Lazy load lets the service be constructed without shipping a 555 MB model in the unit-test fixture. A
+        // blank input is the engine's real model-free zero vector, so this still proves the feature-gated Local
+        // transport traverses den-embed's router and decodes its response rather than testing a mock.
+        unsafe {
+            std::env::set_var(format!("{prefix}IDLE_UNLOAD_SECS"), "60");
+        }
+        let service = den_embed::EmbeddedService::from_env_prefix(&prefix).unwrap();
+        let proxy = EmbedProxy {
+            transport: EmbedTransport::Local(service),
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+            readiness: Arc::new(std::sync::Mutex::new(EmbedReadiness::Ready)),
+        };
+        let response = proxy
+            .call("/embed", bytes::Bytes::from_static(br#"{"text":""}"#), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, axum::http::StatusCode::OK);
+        let body = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
+        assert_eq!(body["model"], "bge-m3");
+        assert_eq!(body["vector"].as_array().unwrap().len(), 1024);
+        unsafe {
+            std::env::remove_var(format!("{prefix}IDLE_UNLOAD_SECS"));
+        }
+    }
+
+    #[cfg(feature = "embedded-model")]
+    #[tokio::test]
+    async fn atlas_health_and_readiness_surface_a_failed_local_canary() {
+        use tower::ServiceExt;
+
+        let prefix = format!("ATLAS_LOCAL_HEALTH_{}_,", std::process::id()).replace(',', "");
+        unsafe { std::env::set_var(format!("{prefix}IDLE_UNLOAD_SECS"), "60") };
+        let service = den_embed::EmbeddedService::from_env_prefix(&prefix).unwrap();
+        let dir = staged(
+            "embed-health",
+            r#", "storeFile":"den.store", "embedderVectorEpoch":1, "embedderMaxTokens":1024"#,
+        );
+        let title = store::fixture::Title {
+            media: 0,
+            tmdb_id: 1,
+            plot: vec![0; 1024],
+            premise: vec![0; 1024],
+            ..store::fixture::Title::default()
+        };
+        store::fixture::write(&dir.join("den.store"), "fixture", 1024, &[title], &[]);
+        let dataset = dataset::Dataset::load(&dir).unwrap();
+        let mut state = AppState::for_test(Some(dataset));
+        state.embed = Some(EmbedProxy {
+            transport: EmbedTransport::Local(service),
+            inflight: Arc::new(tokio::sync::Semaphore::new(1)),
+            readiness: Arc::new(std::sync::Mutex::new(EmbedReadiness::Failed)),
+        });
+        let app = axum::Router::new().fallback(handler::handle).with_state(Arc::new(state));
+        for (path, status) in [
+            ("/health", axum::http::StatusCode::OK),
+            ("/ready", axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["reason"], "embed_unavailable");
+        }
+        unsafe { std::env::remove_var(format!("{prefix}IDLE_UNLOAD_SECS")) };
+    }
+
+    #[cfg(feature = "embedded-model")]
+    #[test]
+    fn local_engine_identity_matches_all_four_corpus_fields_fail_closed() {
+        let identity = den_embed::EngineIdentity {
+            model: "bge-m3",
+            dims: 1024,
+            vector_epoch: 1,
+            max_tokens: 1024,
+        };
+        let good = serde_json::from_str::<dataset::Meta>(
+            r#"{"datasetVersion":"v","taxonomyVersion":"t","embeddingModel":"bge-m3","dims":1024,
+                "quantization":"int8","storeFile":"s","embedderVectorEpoch":1,"embedderMaxTokens":1024}"#,
+        )
+        .unwrap();
+        assert!(local_identity_matches(&good, &identity));
+        let mut mismatches = Vec::new();
+        let mut bad = good.clone();
+        bad.embedding_model = "other".to_owned();
+        mismatches.push(bad);
+        let mut bad = good.clone();
+        bad.dims = 384;
+        mismatches.push(bad);
+        let mut bad = good.clone();
+        bad.embedder_vector_epoch = Some(2);
+        mismatches.push(bad);
+        let mut bad = good.clone();
+        bad.embedder_max_tokens = Some(512);
+        mismatches.push(bad);
+        for bad in mismatches {
+            assert!(!local_identity_matches(&bad, &identity), "accepted identity mismatch");
+        }
+        let missing: dataset::Meta = serde_json::from_str(
+            r#"{"datasetVersion":"v","taxonomyVersion":"t","embeddingModel":"bge-m3","dims":1024,
+                "quantization":"int8","storeFile":"s"}"#,
+        )
+        .unwrap();
+        assert!(!local_identity_matches(&missing, &identity), "missing epoch/cap must fail closed");
     }
 
     /// A client that opens a socket and sends HALF a request head held the whole process open —

@@ -98,6 +98,8 @@ mod tests {
                 dims: 1024,
                 quantization: "int8-symmetric-x127".into(),
                 embedding_space: None,
+                embedder_vector_epoch: None,
+                embedder_max_tokens: None,
                 plot_vector_transform: None,
                 plot_vector_transform_sha256: None,
                 signature: signature.map(Into::into),

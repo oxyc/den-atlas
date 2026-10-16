@@ -330,6 +330,9 @@ struct AppState {
     /// The last attempt to load the model failed and none has succeeded since — what `/health`
     /// reports as degraded, without itself ever loading the model.
     load_failing: AtomicBool,
+    /// One expensive tokenizer/model job at a time. The permit moves into the blocking closure, so cancelling or
+    /// timing out the async HTTP request cannot release capacity while CPU work is still running.
+    blocking: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -621,8 +624,27 @@ async fn run_blocking<T: Send + 'static>(
     state: &Arc<AppState>,
     f: impl FnOnce(&AppState) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<T, AppErr> {
+    let permit = tokio::time::timeout(Duration::from_secs(2), Arc::clone(&state.blocking).acquire_owned())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrResp { error: "embed_busy", detail: None }),
+            )
+        })?
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrResp { error: "embed_unavailable", detail: None }),
+            )
+        })?;
     let st = Arc::clone(state);
-    match tokio::task::spawn_blocking(move || f(&st)).await {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f(&st)
+    })
+    .await
+    {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(internal(state, e)),
         Err(e) => Err(internal(state, e.into())),
@@ -963,6 +985,7 @@ fn build_state(cfg: Config) -> anyhow::Result<Arc<AppState>> {
         started: Instant::now(),
         failures: Mutex::new(HashMap::new()),
         load_failing: AtomicBool::new(false),
+        blocking: Arc::new(tokio::sync::Semaphore::new(1)),
         cfg,
     });
     match idle {
@@ -979,6 +1002,17 @@ fn build_state(cfg: Config) -> anyhow::Result<Arc<AppState>> {
 #[derive(Clone)]
 pub struct EmbeddedService {
     router: Router,
+    state: Arc<AppState>,
+}
+
+/// The fields that define vector compatibility. Runtime/version is deliberately absent: a logging-only release
+/// must not invalidate a corpus, while changing any of these four must.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineIdentity {
+    pub model: &'static str,
+    pub dims: usize,
+    pub vector_epoch: u32,
+    pub max_tokens: usize,
 }
 
 impl EmbeddedService {
@@ -990,11 +1024,20 @@ impl EmbeddedService {
 
     fn from_config(cfg: Config) -> anyhow::Result<Self> {
         let state = build_state(cfg)?;
-        Ok(Self { router: router(state) })
+        Ok(Self { router: router(Arc::clone(&state)), state })
     }
 
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    pub fn identity(&self) -> EngineIdentity {
+        EngineIdentity {
+            model: MODEL_LABEL,
+            dims: DIMS,
+            vector_epoch: VECTOR_EPOCH,
+            max_tokens: self.state.cfg.max_tokens,
+        }
     }
 }
 
@@ -1263,6 +1306,31 @@ async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn blocking_admission_outlives_a_cancelled_request() {
+        let mut cfg = Config::from_get(&|_| None);
+        cfg.idle_unload = Some(Duration::from_secs(600));
+        let state = build_state(cfg).unwrap();
+        let (started, arrived) = tokio::sync::oneshot::channel();
+        let running = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                run_blocking(&state, move |_| {
+                    let _ = started.send(());
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                })
+                .await
+            })
+        };
+        arrived.await.unwrap();
+        running.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(state.blocking.available_permits(), 0, "cancelling HTTP work freed live CPU capacity");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(state.blocking.available_permits(), 1, "completed blocking work did not return capacity");
+    }
+
     /// Atlas embeds this router instead of reimplementing the service. Lazy loading lets the contract be
     /// exercised without model files; a blank query is intentionally a model-free zero vector.
     #[tokio::test]
@@ -1443,6 +1511,7 @@ mod tests {
             started: Instant::now() - Duration::from_secs(60),
             failures: Mutex::new(HashMap::new()),
             load_failing: AtomicBool::new(false),
+            blocking: Arc::new(tokio::sync::Semaphore::new(1)),
             cfg,
         })
     }
@@ -1574,6 +1643,7 @@ mod tests {
             started: state.started,
             failures: Mutex::new(HashMap::new()),
             load_failing: AtomicBool::new(false),
+            blocking: Arc::new(tokio::sync::Semaphore::new(1)),
             cfg,
         });
         let resp =

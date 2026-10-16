@@ -46,12 +46,17 @@ Before setting `EMBED_LOCAL=1` in production:
    the same `MAX_TOKENS` (currently 1024 for the corpus); changing it requires a new vector epoch/corpus.
 3. Raise and measure Atlas's memory limit. The current 256 MiB Atlas limit cannot also hold the model; prior
    den-embed measurements are roughly 1.2 GiB at 1024 tokens before Atlas indexes and caches.
-4. Add an embedded-image canary/probe and observe cold-load latency, RSS after idle unload, and shutdown
-   during inference. The existing release pipeline only probes the default image.
-5. Decide how Atlas health should expose a failed local model load. Embedding requests already return the
-   same typed error, but Atlas `/health` does not yet include the engine's degraded state.
+4. Observe cold-load latency, RSS after idle unload, and shutdown during inference. Atlas now runs a real
+   inference canary before advertising the local engine and reports failures through `/health` and `/ready`,
+   but the release pipeline still probes only the default image.
+5. Publish a corpus whose manifest carries `embedderVectorEpoch` and `embedderMaxTokens`. Local mode compares
+   those with `embeddingModel` and `dims` against the engine and remains unavailable if any field is absent or
+   different; existing manifests intentionally fail closed.
 6. Point den-dataset at the Atlas-owned compatibility image and complete a corpus build before retiring the
    standalone den-embed release workflow/repository.
+7. Pin the optional image's Debian packages/base digest and choose a smaller explicit maximum for responses
+   collected across the in-process HTTP boundary. Both are release-hardening follow-ups; neither changes the
+   default-off engine selection or the engine-owned inference bound.
 
 Keeping these as rollout gates avoids adding a second abstraction or configuration service. The public
 Atlas routes, response bodies, error codes, headers, concurrency bound, timeout, and default deployment stay
