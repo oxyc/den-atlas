@@ -2,8 +2,9 @@
 //!
 //! A provider resolves the corpus identities it understands and returns normalized, attributed observations.
 //! The coordinator owns the common operational policy: a daily request ceiling, pacing, refresh age, negative
-//! caching, atomic persistence under `CACHE_DIR`, and region-scoped reads. Adding another authority should only
-//! require another `Backend`; it must not grow another cache or another policy path.
+//! caching, atomic persistence under `CACHE_DIR`, and applicability rules independent of an authority's
+//! jurisdiction. Adding another authority should only require another `Backend`; it must not grow another cache
+//! or another policy path.
 
 use crate::maturity::Region;
 use crate::store::MappedStore;
@@ -18,8 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 type Key = (MediaType, u32);
-const FILE: &str = "maturity-providers.v1.json";
-const SCHEMA: u32 = 1;
+const FILE: &str = "maturity-providers.v2.json";
+const SCHEMA: u32 = 2;
 const DAY: u64 = 86_400;
 const REFRESH_AFTER: u64 = 30 * DAY;
 const RETRY_AFTER: u64 = 3600;
@@ -31,7 +32,7 @@ const DEFAULT_PACE_MS: u64 = 250;
 pub struct RuntimeRating {
     pub authority: String,
     pub authority_id: String,
-    pub region: String,
+    pub jurisdiction: String,
     pub rating: String,
     pub normalized_age: u8,
     pub warnings: Vec<String>,
@@ -49,7 +50,9 @@ pub struct Identity {
 
 impl Identity {
     fn candidate_is_unique(&self, candidate: &str) -> bool {
-        self.unique.get(&name_key(candidate)).is_some_and(|keys| keys.len() == 1 && keys.contains(&self.key))
+        self.unique.get(&name_key(candidate)).is_some_and(|keys| {
+            keys.contains(&self.key) && keys.iter().filter(|key| key.0 == self.key.0).count() == 1
+        })
     }
 }
 
@@ -80,7 +83,10 @@ impl Budget {
 #[async_trait]
 pub trait Backend: Send + Sync {
     fn authority(&self) -> &'static str;
-    fn regions(&self) -> &'static [&'static str];
+    fn media_types(&self) -> &'static [MediaType];
+    /// Whether this authority's observation is useful for this viewer. This is deliberately separate from the
+    /// observation's jurisdiction: an official Finnish classification can still inform a viewer in the US.
+    fn applies_to(&self, viewer_region: Option<Region>) -> bool;
     async fn lookup(&self, identity: &Identity, budget: &mut Budget) -> Result<Lookup, String>;
 }
 
@@ -122,6 +128,14 @@ pub struct Providers {
     state: Mutex<CacheFile>,
     file: Option<PathBuf>,
     generation: AtomicU64,
+}
+
+pub struct Coverage {
+    pub authority: &'static str,
+    pub media_type: MediaType,
+    pub catalog: usize,
+    pub checked: usize,
+    pub matched: usize,
 }
 
 impl Providers {
@@ -188,25 +202,50 @@ impl Providers {
     }
 
     pub fn applies_to(&self, region: Option<Region>) -> bool {
-        let Some(region) = region else { return false };
-        self.configured.iter().any(|provider| provider.backend.regions().contains(&region.as_str()))
+        self.configured.iter().any(|provider| provider.backend.applies_to(region))
     }
 
     pub fn ratings(&self, key: Key, region: Option<Region>) -> Vec<RuntimeRating> {
-        let Some(region) = region else { return Vec::new() };
-        let region = region.as_str();
         let state = crate::util::lock(&self.state);
         self.configured
             .iter()
-            .filter(|provider| provider.backend.regions().contains(&region))
+            .filter(|provider| provider.backend.applies_to(region))
             .filter_map(|provider| state.providers.get(provider.backend.authority()))
             .filter_map(|provider| provider.entries.get(&key_string(key)))
-            .flat_map(|cached| cached.ratings.iter().filter(|rating| rating.region == region).cloned())
+            .flat_map(|cached| cached.ratings.iter().cloned())
             .collect()
     }
 
     pub fn minimum_age(&self, key: Key, region: Option<Region>) -> Option<u8> {
         self.ratings(key, region).into_iter().map(|rating| rating.normalized_age).max()
+    }
+
+    pub fn coverage(&self) -> Vec<Coverage> {
+        let state = crate::util::lock(&self.state);
+        self.configured
+            .iter()
+            .flat_map(|configured| {
+                configured.backend.media_types().iter().copied().map(|media_type| {
+                    let authority = configured.backend.authority();
+                    let prefix = if media_type == MediaType::Tv { "tv:" } else { "movie:" };
+                    let entries = state.providers.get(authority).map(|provider| &provider.entries);
+                    Coverage {
+                        authority,
+                        media_type,
+                        catalog: self.catalog.iter().filter(|identity| identity.key.0 == media_type).count(),
+                        checked: entries.map_or(0, |entries| {
+                            entries.keys().filter(|key| key.starts_with(prefix)).count()
+                        }),
+                        matched: entries.map_or(0, |entries| {
+                            entries
+                                .iter()
+                                .filter(|(key, cached)| key.starts_with(prefix) && !cached.ratings.is_empty())
+                                .count()
+                        }),
+                    }
+                })
+            })
+            .collect()
     }
 
     pub async fn refresh_forever(self: Arc<Self>) {
@@ -247,6 +286,10 @@ impl Providers {
         while visited < total && budget.left > 0 {
             let identity = &self.catalog[cursor];
             visited += 1;
+            if !configured.backend.media_types().contains(&identity.key.0) {
+                cursor = (cursor + 1) % total;
+                continue;
+            }
             let fresh = {
                 let state = crate::util::lock(&self.state);
                 state
@@ -349,9 +392,11 @@ fn identities(store: &MappedStore) -> Result<Vec<Identity>, String> {
     let strings = view.strings().map_err(err)?;
     let mut raw = Vec::new();
     for (at, &packed) in keys.iter().enumerate() {
-        if packed >> 32 != 1 {
-            continue;
-        }
+        let media_type = match packed >> 32 {
+            0 => MediaType::Movie,
+            1 => MediaType::Tv,
+            _ => continue,
+        };
         let row = den_store::Row(at);
         let mut names: Vec<String> = std::iter::once(card_titles[at])
             .chain(aliases.get(row).iter().copied())
@@ -367,7 +412,7 @@ fn identities(store: &MappedStore) -> Result<Vec<Identity>, String> {
             continue;
         }
         raw.push((
-            (MediaType::Tv, packed as u32),
+            (media_type, packed as u32),
             (years[at] != den_store::NONE_I16).then_some(i64::from(years[at])),
             names,
         ));
@@ -455,8 +500,12 @@ impl Backend for Kavi {
         "KAVI"
     }
 
-    fn regions(&self) -> &'static [&'static str] {
-        &["FI"]
+    fn media_types(&self) -> &'static [MediaType] {
+        &[MediaType::Tv]
+    }
+
+    fn applies_to(&self, _viewer_region: Option<Region>) -> bool {
+        true
     }
 
     async fn lookup(&self, identity: &Identity, budget: &mut Budget) -> Result<Lookup, String> {
@@ -494,7 +543,7 @@ impl Backend for Kavi {
             return Ok(Lookup::Complete(vec![RuntimeRating {
                 authority: self.authority().to_owned(),
                 authority_id: format!("iklu:{}", row.id),
-                region: "FI".to_owned(),
+                jurisdiction: "FI".to_owned(),
                 rating: age.to_string(),
                 normalized_age: age,
                 warnings: row.warnings,
@@ -533,8 +582,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("den-atlas-maturity-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(FILE);
-        std::fs::write(&path, br#"{"schema":2,"providers":{}}"#).unwrap();
-        assert!(read_cache(&path).unwrap_err().contains("unsupported schema 2"));
+        std::fs::write(&path, br#"{"schema":3,"providers":{}}"#).unwrap();
+        assert!(read_cache(&path).unwrap_err().contains("unsupported schema 3"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -567,15 +616,18 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_rating_is_region_scoped_and_persisted_as_normalized_data() {
+    fn an_authoritys_jurisdiction_does_not_limit_where_its_rating_is_useful() {
         struct Fake;
         #[async_trait]
         impl Backend for Fake {
             fn authority(&self) -> &'static str {
                 "FAKE"
             }
-            fn regions(&self) -> &'static [&'static str] {
-                &["FI"]
+            fn media_types(&self) -> &'static [MediaType] {
+                &[MediaType::Tv]
+            }
+            fn applies_to(&self, _viewer_region: Option<Region>) -> bool {
+                true
             }
             async fn lookup(&self, _: &Identity, _: &mut Budget) -> Result<Lookup, String> {
                 unreachable!()
@@ -585,7 +637,7 @@ mod tests {
         let rating = RuntimeRating {
             authority: "FAKE".into(),
             authority_id: "record:1".into(),
-            region: "FI".into(),
+            jurisdiction: "FI".into(),
             rating: "7".into(),
             normalized_age: 7,
             warnings: vec!["anxiety".into()],
@@ -608,8 +660,12 @@ mod tests {
             generation: AtomicU64::new(1),
         };
         assert_eq!(providers.minimum_age(key, Some(Region::parse("fi").unwrap())), Some(7));
-        assert_eq!(providers.minimum_age(key, Some(Region::parse("se").unwrap())), None);
-        assert_eq!(providers.minimum_age(key, None), None);
+        assert_eq!(providers.minimum_age(key, Some(Region::parse("us").unwrap())), Some(7));
+        assert_eq!(providers.minimum_age(key, None), Some(7));
+        let coverage = providers.coverage();
+        assert_eq!(coverage.len(), 1);
+        assert_eq!(coverage[0].checked, 1);
+        assert_eq!(coverage[0].matched, 1);
         let json = serde_json::to_string(&*crate::util::lock(&providers.state)).unwrap();
         assert!(json.contains("record:1"));
         assert!(!json.contains("Pippi"), "the operational cache stores no source title or raw response");
