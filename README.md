@@ -207,15 +207,19 @@ back full, in tmdb-id order, which is the one degradation here that looks like a
 
 This product uses the TMDB API but is not endorsed or certified by TMDB.
 
-Box-local maturity providers are a separate runtime tier. `MATURITY_PROVIDERS=kavi` walks the store's series
-identities against KAVI's public IKLU search, accepting only an exact title (including Wikidata aliases), a
-compatible year where KAVI supplies one, and a title identity unique in the local corpus. Both matches and
-misses are refreshed after 30 days. The shared provider coordinator limits and paces requests, writes
+Box-local maturity providers are a separate runtime tier. `MATURITY_PROVIDERS=kavi,imda` walks the store's
+movie and series identities against official classifications. KAVI's public IKLU search covers series. IMDA's
+open dataset is fetched in a few paged requests and covers whole films plus TV submissions that explicitly name an
+episode or episode range; an episode title is never promoted to its parent series. `kmrb` adds Korean
+self-classifications for streaming movies and series when `KMRB_SERVICE_KEY` holds a data.go.kr service key.
+All accept only an exact title (including Wikidata aliases), a compatible year where the authority supplies
+one, and a title identity unique in the local corpus. Both matches and misses are refreshed after 30 days. The
+shared provider coordinator limits and paces requests, writes
 `maturity-providers.v2.json` atomically under `CACHE_DIR`, and keeps only normalized observations plus check
 times — never raw API responses or source titles. The observation keeps KAVI's Finnish jurisdiction as
-provenance, but its age guidance applies regardless of the viewer's region: a US viewer watching Pippi benefits
-from the same official evidence. Answers are private-cached for five minutes while KAVI is enabled because
-provider data can change without a dataset release or its shared-cache purge. KAVI's
+provenance (and likewise SG/KR for IMDA/KMRB), but age guidance applies regardless of the viewer's region: a US
+viewer watching Pippi benefits from the same official evidence. Answers are private-cached for five minutes
+while a provider is enabled because provider data can change without a dataset release or its shared-cache purge. KAVI's
 HTTP response says `no-store`; this operator cache is therefore intentionally private and is never copied into
 den-dataset, an atlas download, or a release artifact.
 
@@ -440,7 +444,8 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load as atlas starts and stay loaded |
 | `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |
 | `TMDB_DAILY_MAX` | `1500` | questions atlas asks the proxy in a UTC day, two seconds apart. A full vote sweep is ~4,800, so it spreads over a few days; den-edge's own ceiling (`TMDB_DAILY_MAX` there) is shared with the web app's guests and must leave room for this |
-| `MATURITY_PROVIDERS` | unset | comma-separated box-local maturity authorities. `kavi` enables exact Finnish IKLU series matching for viewers in every region and persists normalized observations under `CACHE_DIR`; observations retain their authority jurisdiction, and no provider data enters dataset or release artifacts |
+| `MATURITY_PROVIDERS` | unset | comma-separated box-local maturity authorities: `kavi` (Finnish series), `imda` (Singapore films and episode-range TV submissions), and `kmrb` (Korean streaming movies/series; needs `KMRB_SERVICE_KEY`). Exact, unambiguous matches apply to viewers in every region, retain authority jurisdiction, and persist normalized observations under `CACHE_DIR`; no raw provider response enters dataset or release artifacts |
+| `KMRB_SERVICE_KEY` | unset | data.go.kr service key required only when `MATURITY_PROVIDERS` includes `kmrb`; it is sent to the gateway but never cached or logged |
 | `MATURITY_DAILY_MAX` | `4000` | upstream questions each maturity provider may ask in one UTC day |
 | `MATURITY_PACE_MS` | `250` | minimum pause between a maturity provider's upstream questions |
 | `MOTN_KEY` | unset | a Movie of the Night (Streaming Availability API) key. Each service's own daily Top 10 and what was added to it, per country, then lead the "Popular on" and "New on" rows and count as attention on `/recommend`; Netflix's US Top 10 reaches every billboard. Each such service also gets "Leaving <service> Soon" and "Coming to <service>" rows (the next 30 days, read every 3 days). Fetched in the background at most once a day for the markets requests ask for, 30 requests a day at most (the free plan allows 1,000 a month), and kept in `CACHE_DIR`. A country the API lacks is read as a neighbour (Uruguay as Argentina). Unset ⇒ JustWatch alone |
