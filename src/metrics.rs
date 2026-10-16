@@ -130,6 +130,62 @@ pub fn render(state: &AppState) -> String {
             ));
         }
     }
+    let maturity_status = state.maturity_providers.status();
+    if !maturity_status.is_empty() {
+        b.push_str(
+            "# HELP atlas_maturity_provider_requests_total Upstream requests made by a runtime maturity provider.\n\
+             # TYPE atlas_maturity_provider_requests_total counter\n\
+             # HELP atlas_maturity_provider_errors_total Failed refresh attempts by a runtime maturity provider.\n\
+             # TYPE atlas_maturity_provider_errors_total counter\n\
+             # HELP atlas_maturity_provider_last_success_seconds Unix time of the last refresh that checked titles.\n\
+             # TYPE atlas_maturity_provider_last_success_seconds gauge\n\
+             # HELP atlas_maturity_provider_last_error_seconds Unix time of the last failed refresh.\n\
+             # TYPE atlas_maturity_provider_last_error_seconds gauge\n\
+             # HELP atlas_maturity_provider_last_refresh_milliseconds Duration of the last refresh attempt.\n\
+             # TYPE atlas_maturity_provider_last_refresh_milliseconds gauge\n\
+             # HELP atlas_maturity_provider_retry_seconds Seconds left in an authority-requested or exponential backoff.\n\
+             # TYPE atlas_maturity_provider_retry_seconds gauge\n\
+             # HELP atlas_maturity_provider_snapshot_age_seconds Age of a provider's in-memory bulk snapshot, or zero without one.\n\
+             # TYPE atlas_maturity_provider_snapshot_age_seconds gauge\n\
+             # HELP atlas_maturity_provider_available Whether the configured authority initialized successfully.\n\
+             # TYPE atlas_maturity_provider_available gauge\n\
+             # HELP atlas_maturity_provider_persists_http_no_store Whether normalized results are deliberately persisted despite the authority's HTTP no-store directive.\n\
+             # TYPE atlas_maturity_provider_persists_http_no_store gauge\n",
+        );
+    }
+    for status in maturity_status {
+        let labels = format!("{{authority=\"{}\"}}", label(status.authority));
+        for (name, value) in [
+            ("atlas_maturity_provider_requests_total", status.requests),
+            ("atlas_maturity_provider_errors_total", status.errors),
+            ("atlas_maturity_provider_last_success_seconds", status.last_success),
+            ("atlas_maturity_provider_last_error_seconds", status.last_error),
+            ("atlas_maturity_provider_last_refresh_milliseconds", status.last_refresh_ms),
+            ("atlas_maturity_provider_retry_seconds", status.retry_seconds),
+            ("atlas_maturity_provider_snapshot_age_seconds", status.snapshot_age_seconds),
+            ("atlas_maturity_provider_available", u64::from(status.available)),
+            ("atlas_maturity_provider_persists_http_no_store", u64::from(status.persists_http_no_store)),
+        ] {
+            b.push_str(&format!("{name}{labels} {value}\n"));
+        }
+    }
+    let cache = state.maturity_providers.cache_status();
+    b.push_str(
+        "# HELP atlas_maturity_cache_writes_total Successful maturity-cache file replacements since process start.\n\
+         # TYPE atlas_maturity_cache_writes_total counter\n\
+         # HELP atlas_maturity_cache_write_bytes_total Bytes written to maturity-cache files since process start.\n\
+         # TYPE atlas_maturity_cache_write_bytes_total counter\n\
+         # HELP atlas_maturity_cache_write_errors_total Failed maturity-cache serialization or write attempts.\n\
+         # TYPE atlas_maturity_cache_write_errors_total counter\n\
+         # HELP atlas_maturity_cache_bytes Current serialized maturity-cache file size.\n\
+         # TYPE atlas_maturity_cache_bytes gauge\n\
+         # HELP atlas_maturity_cache_last_write_milliseconds Duration of the last successful durable cache replacement.\n\
+         # TYPE atlas_maturity_cache_last_write_milliseconds gauge\n",
+    );
+    b.push_str(&format!(
+        "atlas_maturity_cache_writes_total {}\natlas_maturity_cache_write_bytes_total {}\natlas_maturity_cache_write_errors_total {}\natlas_maturity_cache_bytes {}\natlas_maturity_cache_last_write_milliseconds {}\n",
+        cache.writes, cache.bytes, cache.errors, cache.size, cache.last_write_ms
+    ));
     gauge(
         &mut b,
         "atlas_catalog_fresh",
