@@ -50,7 +50,8 @@ boot and stays. The measured rollout bounds are recorded in the migration docume
 
 - `/health` never loads the model. It says `ok` until an embed fails to load the model, then
   `{"status":"degraded","reason":"model_unavailable","detail":"…", …}` until a load succeeds — so a
-  missing model shows only after something has tried to embed. The identity fields are always there.
+  missing model shows only after something has tried to embed. The comparable identity fields (`model`,
+  `dims`, `vector_epoch`, `max_tokens`) and the human-readable `runtime` provenance are always there.
 - An unknown path answers 404 `{"error":"not_found"}` (`application/json`, `no-store`), and so does
   `/metrics` when `METRICS_TOKEN` is unset or the token is wrong.
 - Every response carries `Access-Control-Allow-Origin: *` and `Cache-Control: no-store`. `OPTIONS`

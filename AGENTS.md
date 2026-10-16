@@ -15,9 +15,10 @@ integrated Atlas image. Read `docs/EMBED-MIGRATION.md` before changing either ta
 
 ## Embedding-space safety
 
-Never conclude that an image is compatible from matching `model`, `dims`, `vector_epoch`, `runtime`, or
-`max_tokens`. Those fields are necessary identity checks, but only den-dataset's committed byte-exact canary
-proves that the returned vectors belong to the published corpus space.
+Never conclude that an image is compatible from matching `model`, `dims`, `vector_epoch`, and `max_tokens`.
+Those four fields are necessary identity checks, but only den-dataset's committed byte-exact canary proves
+that the returned vectors belong to the published corpus space. `runtime` is human-readable provenance, not
+part of the comparable identity; it may legitimately name the older build that created unchanged rows.
 
 - Test an immutable `ghcr.io/...@sha256:...` reference with den-dataset's `embed image parity` workflow.
 - The host CPU is part of the inference environment. Never use an amd64 image under Apple Silicon Docker
@@ -26,8 +27,9 @@ proves that the returned vectors belong to the published corpus space.
 - Never regenerate or weaken the canary to make a candidate pass.
 - On a failed or invalid comparison, keep the current digest and investigate. Do not infer that the corpus
   needs rebuilding, bump the vector epoch, change production variables, or deploy anything.
-- An intentional model, tokenizer, runtime, pooling, quantization, token-cap, or vector-space change must be
-  coordinated in den-dataset as a new space with a complete corpus rebuild and publication.
+- An intentional model, tokenizer, inference-runtime behavior, pooling, quantization, token-cap, or
+  vector-space change that changes the vectors must be coordinated in den-dataset as a new space with a
+  complete corpus rebuild and publication. A release/version string changing does not imply such a move.
 
 Do not enable `EMBED_LOCAL` while moving image ownership or the compatibility service. Local inference is a
 separate rollout: the live dataset must expose the full identity it validates, memory/cold-start behavior must
