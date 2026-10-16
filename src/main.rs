@@ -206,8 +206,10 @@ enum EmbedTransport {
 
 #[derive(Clone, Debug)]
 enum EmbedReadiness {
+    #[cfg(feature = "embedded-model")]
     Checking,
     Ready,
+    #[cfg(feature = "embedded-model")]
     Failed,
 }
 
@@ -718,7 +720,7 @@ fn local_identity_matches(meta: &dataset::Meta, identity: &den_embed::EngineIden
         && meta.embedder_max_tokens == u32::try_from(identity.max_tokens).ok()
 }
 
-fn embed_proxy(dataset: Option<&dataset::Dataset>) -> Option<EmbedProxy> {
+fn embed_proxy(_dataset: Option<&dataset::Dataset>) -> Option<EmbedProxy> {
     let inflight = || std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_EMBED_INFLIGHT));
     if let Some(base) = env_opt("EMBED_URL") {
         return match reqwest::Client::builder().timeout(EMBED_CALL_TIMEOUT).build() {
@@ -743,7 +745,8 @@ fn embed_proxy(dataset: Option<&dataset::Dataset>) -> Option<EmbedProxy> {
         match den_embed::EmbeddedService::from_env_prefix("EMBED_") {
             Ok(service) => {
                 let identity = service.identity();
-                let compatible = dataset.is_some_and(|dataset| local_identity_matches(&dataset.meta, &identity));
+                let compatible =
+                    _dataset.is_some_and(|dataset| local_identity_matches(&dataset.meta, &identity));
                 if !compatible {
                     eprintln!(
                         "embedded model unavailable (engine identity does not exactly match dataset model/dims/vector_epoch/max_tokens)"
@@ -1042,10 +1045,8 @@ mod tests {
             inflight: Arc::new(tokio::sync::Semaphore::new(1)),
             readiness: Arc::new(std::sync::Mutex::new(EmbedReadiness::Ready)),
         };
-        let response = proxy
-            .call("/embed", bytes::Bytes::from_static(br#"{"text":""}"#), None)
-            .await
-            .unwrap();
+        let response =
+            proxy.call("/embed", bytes::Bytes::from_static(br#"{"text":""}"#), None).await.unwrap();
         assert_eq!(response.status, axum::http::StatusCode::OK);
         let body = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
         assert_eq!(body["model"], "bge-m3");
@@ -1083,10 +1084,9 @@ mod tests {
             readiness: Arc::new(std::sync::Mutex::new(EmbedReadiness::Failed)),
         });
         let app = axum::Router::new().fallback(handler::handle).with_state(Arc::new(state));
-        for (path, status) in [
-            ("/health", axum::http::StatusCode::OK),
-            ("/ready", axum::http::StatusCode::SERVICE_UNAVAILABLE),
-        ] {
+        for (path, status) in
+            [("/health", axum::http::StatusCode::OK), ("/ready", axum::http::StatusCode::SERVICE_UNAVAILABLE)]
+        {
             let response = app
                 .clone()
                 .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap())
@@ -1094,7 +1094,10 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), status);
             let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["reason"], "embed_unavailable");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["reason"],
+                "embed_unavailable"
+            );
         }
         unsafe { std::env::remove_var(format!("{prefix}IDLE_UNLOAD_SECS")) };
     }
@@ -1102,12 +1105,8 @@ mod tests {
     #[cfg(feature = "embedded-model")]
     #[test]
     fn local_engine_identity_matches_all_four_corpus_fields_fail_closed() {
-        let identity = den_embed::EngineIdentity {
-            model: "bge-m3",
-            dims: 1024,
-            vector_epoch: 1,
-            max_tokens: 1024,
-        };
+        let identity =
+            den_embed::EngineIdentity { model: "bge-m3", dims: 1024, vector_epoch: 1, max_tokens: 1024 };
         let good = serde_json::from_str::<dataset::Meta>(
             r#"{"datasetVersion":"v","taxonomyVersion":"t","embeddingModel":"bge-m3","dims":1024,
                 "quantization":"int8","storeFile":"s","embedderVectorEpoch":1,"embedderMaxTokens":1024}"#,

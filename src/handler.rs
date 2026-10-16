@@ -309,7 +309,11 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
                 serve_json(
                     &method,
                     &headers,
-                    build_descriptor(ds, state.embed.as_ref().is_some_and(EmbedProxy::available), state.index.is_some()),
+                    build_descriptor(
+                        ds,
+                        state.embed.as_ref().is_some_and(EmbedProxy::available),
+                        state.index.is_some(),
+                    ),
                     "public, max-age=300, stale-while-revalidate=3600, stale-if-error=86400",
                     None,
                 )
@@ -743,6 +747,7 @@ pub(crate) fn note_catalog_health(state: &AppState) {
     note_health(state);
 }
 
+#[cfg(feature = "embedded-model")]
 pub(crate) fn note_embed_health(state: &AppState) {
     note_health(state);
 }
@@ -1460,8 +1465,9 @@ async fn query_answer(
         }
         _ => None,
     };
-    let unembedded =
-        vector.is_none() && state.embed.as_ref().is_some_and(EmbedProxy::available) && parsed.embed_text().is_some();
+    let unembedded = vector.is_none()
+        && state.embed.as_ref().is_some_and(EmbedProxy::available)
+        && parsed.embed_text().is_some();
     let embedded_in = embedding.elapsed();
     let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());

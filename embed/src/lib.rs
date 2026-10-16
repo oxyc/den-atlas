@@ -626,17 +626,9 @@ async fn run_blocking<T: Send + 'static>(
 ) -> Result<T, AppErr> {
     let permit = tokio::time::timeout(Duration::from_secs(2), Arc::clone(&state.blocking).acquire_owned())
         .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(ErrResp { error: "embed_busy", detail: None })))?
         .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrResp { error: "embed_busy", detail: None }),
-            )
-        })?
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrResp { error: "embed_unavailable", detail: None }),
-            )
+            (StatusCode::SERVICE_UNAVAILABLE, Json(ErrResp { error: "embed_unavailable", detail: None }))
         })?;
     let st = Arc::clone(state);
     match tokio::task::spawn_blocking(move || {
