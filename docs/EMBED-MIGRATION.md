@@ -31,11 +31,15 @@ Local-engine settings use the compatibility names with `EMBED_` prepended, for e
 `EMBED_MODEL_DIR`, `EMBED_MAX_TOKENS`, `EMBED_CACHE_MAX_ENTRIES`, and
 `EMBED_IDLE_UNLOAD_SECS`. `EMBED_PORT` is ignored because no second listener is opened.
 
-den-dataset should keep calling the batch HTTP API while migrating its image reference. After the first
-release containing this pipeline, its exact compatibility image is
-`ghcr.io/oxyc/den-atlas-embed:<Atlas VERSION>` (prefer the release's immutable digest in CI). That image
-guarantees corpus and Atlas queries execute the same Rust code, 1024-token cap, vector epoch and pinned model.
-Do not archive the standalone repository until a corpus built with this image passes its parity gate.
+den-dataset keeps calling the batch HTTP API. Release 0.96.11's exact compatibility image passed
+den-dataset's committed byte-exact canary on both the native homelab Intel CPU and an allowed native GitHub
+Actions AMD EPYC 7763 runner. The dataset workflow now pins that immutable digest. This proves it belongs to
+the existing corpus space; it does not require a corpus rebuild or vector-epoch change.
+
+The compatibility service deployment is a separate operation in the den repository. Keep its unattended
+update hold, verify the Atlas release signature and exact digest, then explicitly update and run the same
+canary against the live service. Do not archive the standalone repository until that switch is live and
+verified. None of this enables `EMBED_LOCAL`.
 
 ## Rollout blockers
 
@@ -43,8 +47,11 @@ Before setting `EMBED_LOCAL=1` in production:
 
 1. Both optional Debian targets are built, probed, scanned, signed and published by the Atlas release. The
    model/ORT build needs glibc and cannot use Atlas's current Alpine/scratch image.
-2. Run the existing golden-vector parity check on the production amd64 CPU. Query and corpus jobs must use
-   the same `MAX_TOKENS` (currently 1024 for the corpus); changing it requires a new vector epoch/corpus.
+2. Pass den-dataset's `embed image parity` workflow for the exact immutable digest. It rejects known
+   incompatible CPUs and runs the corpus's committed byte-exact canary on native x86_64. Never use amd64
+   Docker emulation on Apple Silicon as parity evidence, and never regenerate the canary to make a build
+   pass. Query and corpus paths must use the same `MAX_TOKENS` (currently 1024); changing it requires a new
+   vector epoch and complete corpus rebuild.
 3. Raise and measure Atlas's memory limit. The current 256 MiB Atlas limit cannot also hold the model; prior
    den-embed measurements are roughly 1.2 GiB at 1024 tokens before Atlas indexes and caches.
 4. Observe cold-load latency, RSS after idle unload, and shutdown during inference. Atlas now runs a real
@@ -53,8 +60,11 @@ Before setting `EMBED_LOCAL=1` in production:
 5. Publish a corpus whose manifest carries `embedderVectorEpoch` and `embedderMaxTokens`. Local mode compares
    those with `embeddingModel` and `dims` against the engine and remains unavailable if any field is absent or
    different; existing manifests intentionally fail closed.
-6. Point den-dataset at the Atlas-owned compatibility image and complete a corpus build before retiring the
-   standalone den-embed release workflow/repository.
+6. Keep den-dataset pinned to the exact validated Atlas-owned compatibility digest. Retire the standalone
+   den-embed release workflow/repository only after the compatibility service is deployed and its live
+   canary passes. A fresh dataset publication carrying the complete embedder identity is still required
+   before enabling local mode, but byte-identical image ownership migration does not require rebuilding the
+   existing corpus.
 7. The Rust and Debian bases are digest-pinned and Dependabot owns their refresh. In-process compatibility
    responses have a 10 MiB collection bound, large enough for the engine's maximum batch shape.
 
