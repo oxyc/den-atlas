@@ -62,9 +62,10 @@ Before setting `EMBED_LOCAL=1` in production:
    different; existing manifests intentionally fail closed.
 6. Keep den-dataset pinned to the exact validated Atlas-owned compatibility digest. Retire the standalone
    den-embed release workflow/repository only after the compatibility service is deployed and its live
-   canary passes. A fresh dataset publication carrying the complete embedder identity is still required
-   before enabling local mode, but byte-identical image ownership migration does not require rebuilding the
-   existing corpus.
+   canary passes. A fresh dataset publication carrying the complete comparable identity (model, dimensions,
+   vector epoch, and token cap) is still required before enabling local mode, but byte-identical image
+   ownership migration does not require rebuilding the existing corpus. `embedderRuntime` is provenance for
+   the build that created the rows and is deliberately not compared.
 7. The Rust and Debian bases are digest-pinned and Dependabot owns their refresh. In-process compatibility
    responses have a 10 MiB collection bound, large enough for the engine's maximum batch shape.
 
