@@ -65,6 +65,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     let exempt = crate::tos::exempt(&split_config(req.uri().path()).1);
     let mut resp = crate::tos::guard_response(route(State(state), req).await, exempt).await;
     resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    resp.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
     resp.headers_mut().insert(
@@ -832,7 +833,7 @@ async fn handle_catalog(
                 cc,
                 None,
                 maturity,
-                &state.maturity_providers,
+                maturity.restricted() && state.maturity_providers.applies_to(maturity.region),
             )
             .await;
             // Not fresh is the last-good copy or an empty fallback after a failed refresh — the
@@ -1975,7 +1976,7 @@ async fn handle_recommend_get(
         &cache_control,
         None,
         maturity,
-        &state.maturity_providers,
+        maturity.restricted() && state.maturity_providers.applies_to(maturity.region),
     )
     .await;
     with_timing(resp, &format!("{timing}, total;dur={}", ms(started.elapsed())))
@@ -2296,7 +2297,7 @@ async fn handle_index(
                     cache_control,
                     None,
                     maturity,
-                    &state.maturity_providers,
+                    maturity.restricted() && state.maturity_providers.applies_to(maturity.region),
                 )
                 .await;
                 if let Some(location) = location.and_then(|l| header::HeaderValue::from_str(&l).ok()) {
@@ -2352,6 +2353,7 @@ async fn handle_index(
         }
     }
     let mut phases = String::new();
+    let runtime_dependent = maturity.restricted() || matches!(&question, IndexQuestion::Title { .. });
     let body = match question {
         IndexQuestion::Search => match search_answer(state, &indexes, query, maturity).await {
             Ok(body) => body,
@@ -2407,7 +2409,7 @@ async fn handle_index(
         cache_control,
         None,
         maturity,
-        &state.maturity_providers,
+        runtime_dependent && state.maturity_providers.applies_to(maturity.region),
     )
     .await;
     with_timing(resp, &format!("{load}{phases}total;dur={}", ms(started.elapsed())))
@@ -2507,7 +2509,7 @@ async fn handle_title_search(
         DATASET_ANSWER,
         None,
         maturity,
-        &state.maturity_providers,
+        maturity.restricted() && state.maturity_providers.applies_to(maturity.region),
     )
     .await;
     with_timing(resp, &format!("titles;dur={}, total;dur={}", ms(searched), ms(started.elapsed())))
@@ -2553,14 +2555,13 @@ async fn serve_json_for_policy(
     cache_control: &str,
     last_modified: Option<String>,
     maturity: crate::maturity::Policy,
-    providers: &crate::maturity_providers::Providers,
+    runtime_provider_applies: bool,
 ) -> Response {
     let identity = maturity.cache_identity();
     // Runtime providers can change without a dataset publish (and therefore without the release cache purge).
-    // An answer to which a live provider applies is kept briefly by the caller only, never in a shared cache
-    // for a month. Applicability is separate from the authority's jurisdiction.
-    let cache_control =
-        if providers.applies_to(maturity.region) { "private, max-age=300" } else { cache_control };
+    // Only answers whose body consulted them get a short TTL. Their observations are public, so ordinary answers
+    // remain shareable; a taste-bearing URL that was already private stays private.
+    let cache_control = runtime_provider_cache_control(cache_control, runtime_provider_applies);
     let mut response =
         serve_json_with_identity(method, headers, body, cache_control, last_modified, identity.as_deref())
             .await;
@@ -2568,6 +2569,18 @@ async fn serve_json_for_policy(
         response.headers_mut().insert(POLICY, identity);
     }
     response
+}
+
+fn runtime_provider_cache_control(cache_control: &str, runtime_provider_applies: bool) -> &str {
+    if runtime_provider_applies {
+        if cache_control.starts_with("private") {
+            "private, max-age=300"
+        } else {
+            "public, max-age=300, s-maxage=300, stale-while-revalidate=300"
+        }
+    } else {
+        cache_control
+    }
 }
 
 async fn serve_json_with_identity(
@@ -3065,6 +3078,23 @@ mod tests {
             .unwrap();
         assert_eq!(handle(State(Arc::clone(&state)), cross_region).await.status(), StatusCode::OK);
         assert_eq!(get(&state, &format!("{path}?region=fin")).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn runtime_provider_cache_ttl_changes_only_answers_the_provider_can_change() {
+        assert_eq!(
+            runtime_provider_cache_control(DATASET_ANSWER, false),
+            DATASET_ANSWER,
+            "an unrestricted taxonomy or row stays on the release-purged dataset TTL"
+        );
+        assert_eq!(
+            runtime_provider_cache_control(DATASET_ANSWER, true),
+            "public, max-age=300, s-maxage=300, stale-while-revalidate=300"
+        );
+        assert_eq!(
+            runtime_provider_cache_control("private, max-age=300, stale-while-revalidate=86400", true),
+            "private, max-age=300"
+        );
     }
 
     /// Eligibility is applied to the full ordered row before either limit or pagination. The fixture's first
@@ -5818,6 +5848,7 @@ mod tests {
             assert_eq!(resp.status(), status, "{what}");
             let acao: Vec<_> = resp.headers().get_all("access-control-allow-origin").iter().collect();
             assert_eq!(acao, ["*"], "{what} did not carry exactly one wildcard origin");
+            assert_eq!(resp.headers().get("x-content-type-options").unwrap(), "nosniff", "{what}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

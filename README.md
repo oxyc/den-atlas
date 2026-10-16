@@ -215,13 +215,15 @@ self-classifications for streaming movies and series when `KMRB_SERVICE_KEY` hol
 All accept only an exact title (including Wikidata aliases), a compatible year where the authority supplies
 one, and a title identity unique in the local corpus. Both matches and misses are refreshed after 30 days. The
 shared provider coordinator limits and paces requests, writes
-`maturity-providers.v2.json` atomically under `CACHE_DIR`, and keeps only normalized observations plus check
-times — never raw API responses or source titles. The observation keeps KAVI's Finnish jurisdiction as
+`maturity-providers.v2.json` durably and atomically under `CACHE_DIR` only when state actually changes, honors
+authority retry/rate-limit headers with bounded backoff, and keeps only normalized observations plus check times —
+never raw API responses or source titles. The observation keeps KAVI's Finnish jurisdiction as
 provenance (and likewise SG/KR for IMDA/KMRB), but age guidance applies regardless of the viewer's region: a US
-viewer watching Pippi benefits from the same official evidence. Answers are private-cached for five minutes
-while a provider is enabled because provider data can change without a dataset release or its shared-cache purge. KAVI's
-HTTP response says `no-store`; this operator cache is therefore intentionally private and is never copied into
-den-dataset, an atlas download, or a release artifact.
+viewer watching Pippi benefits from the same official evidence. Only answers actually affected by runtime ratings
+use a five-minute shared-cache TTL because provider data can change without a dataset release or its cache purge;
+unaffected routes retain their normal dataset TTL. KAVI's HTTP response says `no-store`; this operator cache is
+therefore an explicit exception, is identified in metrics, and is never copied into den-dataset, an atlas download,
+or a release artifact.
 
 ### Filters
 

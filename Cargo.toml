@@ -43,6 +43,9 @@ den-index = { path = "crates/den-index" }
 flate2 = "1"
 # Character names folded as the franchise audit folded them (NFKD, combining marks dropped).
 unicode-normalization = "0.1"
+# Runtime authority results are rebuilt off the request path and swapped as one immutable view. Readers never
+# contend with refresh, persistence, or a metrics scrape.
+arc-swap = "1"
 
 [workspace]
 members = ["crates/den-index", "crates/den-titlesearch"]

@@ -5,12 +5,15 @@
 //! range is TV evidence, while a row without one is film evidence. We never reinterpret an individual episode
 //! title as its parent series.
 
-use super::{name_key, now_secs, Backend, Budget, Identity, Lookup, RuntimeRating};
+use super::{
+    name_key, now_secs, read_limited, requested_wait, user_agent, Backend, Budget, Identity, Lookup,
+    RuntimeRating,
+};
 use crate::maturity::Region;
 use async_trait::async_trait;
 use den_index::MediaType;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +21,7 @@ const DATASET: &str = "d_ee0231c767e05c37f61e01923df2e461";
 const SOURCE: &str = "https://data.gov.sg/datasets/d_ee0231c767e05c37f61e01923df2e461/view";
 const SNAPSHOT_MAX_AGE: u64 = 24 * 60 * 60;
 const PAGE_SIZE: usize = 1_000;
+const MAX_PAGE_BODY: usize = 16 * 1024 * 1024;
 
 type Index = HashMap<(MediaType, String), Vec<ImdaRow>>;
 
@@ -25,6 +29,7 @@ pub(super) struct Imda {
     client: reqwest::Client,
     endpoint: reqwest::Url,
     snapshot: Mutex<Option<(u64, Arc<Index>)>>,
+    backoff: crate::util::Backoff,
 }
 
 impl Imda {
@@ -32,13 +37,17 @@ impl Imda {
         let mut endpoint = reqwest::Url::parse("https://data.gov.sg/api/action/datastore_search")
             .map_err(|error| error.to_string())?;
         endpoint.query_pairs_mut().append_pair("resource_id", DATASET);
+        endpoint.query_pairs_mut().append_pair("sort", "_id asc");
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(user_agent())
                 .build()
                 .map_err(|error| error.to_string())?,
             endpoint,
             snapshot: Mutex::new(None),
+            backoff: crate::util::Backoff::new(Duration::from_secs(10), Duration::from_secs(3_600)),
         })
     }
 
@@ -54,9 +63,16 @@ impl Imda {
         if let Some(index) = self.current() {
             return Ok(Some(index));
         }
+        if self.backoff.paused().is_some() {
+            return Ok(None);
+        }
         let mut records = Vec::new();
+        let mut ids = HashSet::new();
         let mut total = None;
         loop {
+            if self.backoff.paused().is_some() {
+                return Ok(crate::util::lock(&self.snapshot).as_ref().map(|(_, index)| Arc::clone(index)));
+            }
             if total.is_some_and(|total| records.len() >= total) {
                 break;
             }
@@ -69,18 +85,32 @@ impl Imda {
             url.query_pairs_mut()
                 .append_pair("limit", &PAGE_SIZE.to_string())
                 .append_pair("offset", &records.len().to_string());
-            let response = self
-                .client
-                .get(url)
-                .header("accept", "application/json")
-                .send()
-                .await
-                .map_err(|error| format!("{}: {error}", self.endpoint))?;
+            let response =
+                self.client.get(url).header("accept", "application/json").send().await.map_err(|error| {
+                    self.backoff.refused(None);
+                    format!("IMDA request failed: {}", error.without_url())
+                })?;
             if !response.status().is_success() {
-                return Err(format!("{} answered {}", self.endpoint, response.status()));
+                let status = response.status();
+                if crate::util::backs_off(status) {
+                    self.backoff.refused(requested_wait(response.headers()));
+                } else {
+                    self.backoff.answered();
+                }
+                return Err(format!("IMDA answered {status}"));
             }
-            let payload: ImdaResponse =
-                response.json().await.map_err(|error| format!("{}: {error}", self.endpoint))?;
+            let exhausted_for = crate::util::exhausted_for(response.headers());
+            let body = read_limited(response, MAX_PAGE_BODY, "IMDA").await.inspect_err(|_error| {
+                self.backoff.refused(None);
+            })?;
+            let payload: ImdaResponse = serde_json::from_slice(&body).map_err(|error| {
+                self.backoff.refused(None);
+                format!("IMDA JSON: {error}")
+            })?;
+            self.backoff.answered();
+            if let Some(wait) = exhausted_for {
+                self.backoff.refused(Some(wait));
+            }
             if !payload.success || total.is_some_and(|expected| expected != payload.result.total) {
                 return Err(format!("{} returned an inconsistent dataset snapshot", self.endpoint));
             }
@@ -93,7 +123,15 @@ impl Imda {
                     payload.result.total
                 ));
             }
-            records.extend(payload.result.records);
+            for record in payload.result.records {
+                if !ids.insert(record.id) {
+                    return Err(format!(
+                        "{} returned duplicate row {}; refusing an unstable classification snapshot",
+                        self.endpoint, record.id
+                    ));
+                }
+                records.push(record);
+            }
         }
         if records.len() != total.unwrap_or_default() {
             return Err(format!(
@@ -236,6 +274,16 @@ impl Backend for Imda {
 
     fn can_lookup_without_request(&self) -> bool {
         crate::util::lock(&self.snapshot).is_some()
+    }
+
+    fn retry_in(&self) -> Option<Duration> {
+        self.backoff.paused()
+    }
+
+    fn snapshot_age(&self) -> Option<Duration> {
+        crate::util::lock(&self.snapshot)
+            .as_ref()
+            .map(|(loaded_at, _)| Duration::from_secs(now_secs().saturating_sub(*loaded_at)))
     }
 
     async fn lookup(&self, identity: &Identity, budget: &mut Budget) -> Result<Lookup, String> {
