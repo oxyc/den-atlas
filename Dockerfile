@@ -2,20 +2,30 @@
 # `scratch` → a ~few-MB, dependency-free image. The server speaks plain HTTP, and its outbound HTTPS
 # (JustWatch) uses rustls with bundled roots, so scratch needs no CA bundle. CI builds this with an empty
 # data/ (blobs gitignored) → the published image is the SERVER ONLY; mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
-FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS build
-RUN apk add --no-cache musl-dev
+FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS chef
+RUN apk add --no-cache musl-dev \
+    && cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /app
+
+# Keep third-party crates in a layer keyed only by the manifests and lockfile. The planner reruns after a source
+# edit, but emits the same recipe, so ordinary PRs no longer rebuild Atlas's whole dependency graph.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json -p den-atlas
+# Keep the application compile keyed only by inputs Cargo or compile-time fixtures read. In particular,
+# VERSION and data/ belong to later image layers and must not rebuild the Rust binary.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
-# The package is optional for the normal Atlas binary, but it is a workspace member and Cargo must be able
-# to read its manifest while resolving the locked workspace. It is not linked into this default build.
 COPY embed/Cargo.toml ./embed/Cargo.toml
 COPY embed/src ./embed/src
-# Compiled in (`raileval.rs`): the playground scores its knobs against the judged set, both files.
 COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
 # rust:alpine's default host target is x86_64-unknown-linux-musl → a fully static binary.
-RUN cargo build --release --locked
+RUN cargo build --release --locked -p den-atlas
 
 # The release version reaches only the final image configuration (and this marker), never the Rust build above,
 # so a release commit that changes only VERSION reuses the cached compile. A missing or malformed value fails
@@ -29,10 +39,20 @@ RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 # Optional migration targets. Neither is the Dockerfile's final/default target, so the published Atlas image
 # remains the same static-musl server. Select `--target den-atlas-embedded` or `--target den-embed` explicitly.
 # ORT's archive needs Debian trixie's newer libstdc++; this cannot reuse the normal Alpine/musl builder.
-FROM rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS embedded-build
+FROM rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS embedded-chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef --version 0.1.78 --locked
+
+FROM embedded-chef AS embedded-planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM embedded-chef AS embedded-build
+COPY --from=embedded-planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
+      -p den-atlas -p den-embed --features den-atlas/embedded-model
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY crates ./crates
