@@ -82,31 +82,27 @@ const ROWS: &[Row] = &[
     },
     Row {
         id: "mickey-and-friends",
-        title: "Mickey & Friends",
+        title: "Mickey, Donald & Friends",
         group: "favorite-worlds",
+        // One world, not three shelves: Donald's and Scrooge's titles (DuckTales among them) are Mickey's too.
         source: Source::filter_with(
             "all",
-            &["character:mickey-mouse|donald-duck"],
+            &["character:mickey-mouse|donald-duck|scrooge-mcduck"],
             &[
                 TitleRef { r#type: "series", id: 46879 },
                 TitleRef { r#type: "series", id: 3934 },
                 TitleRef { r#type: "movie", id: 21385 },
-            ],
-        ),
-    },
-    Row {
-        id: "donald-duck",
-        title: "Donald Duck",
-        group: "favorite-worlds",
-        source: Source::filter_with(
-            "all",
-            &["character:donald-duck"],
-            &[
                 TitleRef { r#type: "series", id: 720 },
                 TitleRef { r#type: "series", id: 72350 },
                 TitleRef { r#type: "movie", id: 74654 },
             ],
         ),
+    },
+    Row {
+        id: "astrid-lindgren",
+        title: "Astrid Lindgren's Stories",
+        group: "favorite-worlds",
+        source: Source::filter("all", &["author:Q55767"]),
     },
     Row {
         id: "paddington",
@@ -197,20 +193,6 @@ const ROWS: &[Row] = &[
         title: "Game Worlds",
         group: "favorite-worlds",
         source: Source::filter("all", &["source:game"]),
-    },
-    Row {
-        id: "ducktales",
-        title: "DuckTales Adventures",
-        group: "favorite-worlds",
-        source: Source::query_with(
-            "DuckTales",
-            0.70,
-            &[
-                TitleRef { r#type: "series", id: 720 },
-                TitleRef { r#type: "series", id: 72350 },
-                TitleRef { r#type: "movie", id: 10837 },
-            ],
-        ),
     },
     Row {
         id: "looney-tunes",
