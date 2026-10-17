@@ -1,5 +1,5 @@
-# The builds copy only the workspace sources, selected judged fixtures, and data/. Everything below is
-# context they never read.
+# The planner reads this filtered context to derive Cargo's dependency recipe. The expensive application
+# compile copies only workspace sources and selected judged fixtures; data/ is consumed by the final images.
 target
 .git
 .github
