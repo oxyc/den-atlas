@@ -487,7 +487,8 @@ cargo run                  # http://localhost:8080  (add /manifest.json in Den �
 cargo run --features embedded-model  # opt-in local-engine build; still needs EMBED_LOCAL=1 and model files
 cargo test                 # the caching layer (ETag / Range / gzip / 304), routes, catalog, shutdown
 cargo fmt --all --check    # CI gates on this — see below if the command is missing
-scripts/release.sh 0.94.0  # bumps VERSION, waits for its main CI, tags, and WAITS for the promotion
+scripts/release.sh --prepare 0.96.15 # opens a VERSION-only PR when a future release needs a bump
+scripts/release.sh 0.96.14          # from exact merged main: waits for CI, tags, and waits for promotion
 ```
 **If `cargo fmt` reports "no such command"**, the toolchain has no rustfmt component and there is no rustup
 to add one. Run the formatter through nix instead — it reads this repo's `rustfmt.toml` and matches CI
@@ -543,10 +544,13 @@ rollback.
 tests run, starts it and checks `/manifest.json` reports `VERSION`, scans it, and records its digest. It also
 builds, probes and scans `ghcr.io/oxyc/den-atlas-embed`, the compatibility service consumed under the
 cross-repository gates in [`docs/EMBED-MIGRATION.md`](docs/EMBED-MIGRATION.md), and the currently unused
-`ghcr.io/oxyc/den-atlas-integrated` image from the same bake. Run
-`scripts/release.sh X.Y.Z`: it changes only `VERSION` (never `Cargo.toml`, so the cached Rust build is
-reused; the image carries the version as `DEN_VERSION`), pushes that commit, waits for its exact main CI and
-only then creates `vX.Y.Z`. The tag's `docker-publish` run verifies and signs all three exact digests, adds
+`ghcr.io/oxyc/den-atlas-integrated` image from the same bake. When `VERSION` needs to change,
+`scripts/release.sh --prepare X.Y.Z` opens the required version-only pull request
+and stops without tagging or publishing. After it merges, update the checkout to `main` and run
+`scripts/release.sh X.Y.Z`. Publishing never writes or pushes directly to protected `main`; it waits for that exact
+merged commit's main CI and only then creates `vX.Y.Z`. `Cargo.toml` is never changed, so the cached Rust build is
+reused and the image carries the version as `DEN_VERSION`. The tag's `docker-publish` run verifies and signs all
+three exact digests, adds
 their `:X.Y.Z`, `:X.Y`, `:X` and `:sha-` tags and moves each package's `:latest`; it does not rebuild or
 retest. Publishing either optional package does not enable Atlas's in-process engine.
 
