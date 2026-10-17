@@ -832,6 +832,45 @@ impl Index {
         f64::from(dot(self.row_vector(a as usize), self.row_vector(b as usize))) / (QUANTUM * QUANTUM)
     }
 
+    /// The weighted mean of `row`'s best `K` similarities to `others`, keeping input order when
+    /// similarities tie. Resolves the mapped matrix once for the whole batch; repeated calls to
+    /// [`similarity`](Self::similarity) would resolve it twice per pair.
+    ///
+    /// `None` means `K` or `others` is empty, or the retained weights sum to zero. Row numbers have
+    /// the same precondition as [`similarity`](Self::similarity).
+    pub fn weighted_nearest<const K: usize>(&self, row: u32, others: &[(u32, f64)]) -> Option<f64> {
+        if K == 0 || others.is_empty() {
+            return None;
+        }
+        let matrix = self.matrix();
+        let candidate = matrix.row(row as usize);
+        let mut nearest: [Option<(i32, f64)>; K] = [None; K];
+        let mut held = 0usize;
+        for &(other, weight) in others {
+            let score = dot(candidate, matrix.row(other as usize));
+            // Strictly greater puts an equal score after the one seen first, matching stable sort.
+            let at = (0..held).find(|&at| score > nearest[at].unwrap().0).unwrap_or(held);
+            if at < K {
+                for move_to in (at + 1..=held.min(K.saturating_sub(1))).rev() {
+                    nearest[move_to] = nearest[move_to - 1];
+                }
+                nearest[at] = Some((score, weight));
+                held = (held + 1).min(K);
+            }
+        }
+        let nearest = nearest[..held].iter().flatten();
+        let weight: f64 = nearest.clone().map(|&(_, weight)| weight).sum();
+        (weight != 0.0).then(|| {
+            nearest
+                .map(|&(score, weight)| {
+                    let similarity = f64::from(score) / (QUANTUM * QUANTUM);
+                    weight * similarity
+                })
+                .sum::<f64>()
+                / weight
+        })
+    }
+
     /// The mean of every row's vector, in `similarity`'s units: a row's `projection` on it is how close that title
     /// sits to the index as a whole.
     pub fn mean_vector(&self) -> Vec<f64> {
@@ -845,6 +884,21 @@ impl Index {
         let scale = QUANTUM * self.records.len().max(1) as f64;
         mean.iter_mut().for_each(|m| *m /= scale);
         mean
+    }
+
+    /// Every row's projection on `vector`, resolving the mapped matrix once. An empty result means
+    /// the vector belongs to another space.
+    pub fn projections(&self, vector: &[f64]) -> Vec<f64> {
+        if vector.len() != self.dim {
+            return Vec::new();
+        }
+        let matrix = self.matrix();
+        (0..self.records.len())
+            .map(|row| {
+                matrix.row(row).iter().zip(vector).map(|(&v, &x)| f64::from(v as i8) * x).sum::<f64>()
+                    / QUANTUM
+            })
+            .collect()
     }
 
     /// A row's dot product with a vector in `similarity`'s units (`mean_vector`).
@@ -1392,6 +1446,33 @@ pub(crate) mod tests {
         assert_eq!(near.iter().map(|n| n.tmdb_id).collect::<Vec<_>>(), vec![2, 4]);
         assert_eq!(near[0].score, 100 * 90);
         assert!(idx.nearest(99, MediaType::Movie, 5).is_empty());
+    }
+
+    #[test]
+    fn weighted_nearest_matches_the_stable_full_sort_equation() {
+        let idx = sample();
+        let row = idx.row_of(1, MediaType::Movie).unwrap();
+        let others = [
+            (idx.row_of(4, MediaType::Movie).unwrap(), 8.0),
+            (idx.row_of(2, MediaType::Movie).unwrap(), 3.0),
+            (idx.row_of(3, MediaType::Tv).unwrap(), 1.0),
+        ];
+        let expected = (idx.similarity(row, others[2].0) + 3.0 * idx.similarity(row, others[1].0)) / 4.0;
+        assert_eq!(idx.weighted_nearest::<2>(row, &others), Some(expected));
+        assert_eq!(idx.weighted_nearest::<0>(row, &others), None);
+        assert_eq!(idx.weighted_nearest::<2>(row, &[]), None);
+    }
+
+    #[test]
+    fn batch_projections_match_one_at_a_time() {
+        let idx = sample();
+        let vector = idx.mean_vector();
+        let batch = idx.projections(&vector);
+        assert_eq!(batch.len(), idx.len());
+        for (row, projection) in batch.into_iter().enumerate() {
+            assert_eq!(projection, idx.projection(row as u32, &vector));
+        }
+        assert!(idx.projections(&[1.0, 2.0]).is_empty());
     }
 
     #[test]
