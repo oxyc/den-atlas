@@ -14,6 +14,10 @@ use crate::justwatch::TrendingItem;
 use crate::util::{backs_off, lock, retry_after, Backoff};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,7 +81,7 @@ pub struct Show {
 }
 
 /// What the passes have fetched. A market is `service@COUNTRY`, the country after `STAND_INS`.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Kept {
     /// Each market's titles leaving within `SOON_AHEAD`, soonest first, and those coming.
@@ -105,6 +109,9 @@ pub struct Motn {
     http: reqwest::Client,
     kept: Mutex<Kept>,
     file: Option<PathBuf>,
+    /// The canonical body represented by the file. Comparing snapshots makes a due-but-idle pass a true filesystem
+    /// no-op without spreading a fallible dirty flag over every place that changes `Kept`.
+    persisted: Mutex<Option<Vec<u8>>>,
     /// The day a request was last refused for the budget, so that is said once a day.
     refused_on: AtomicI64,
     /// A pause after the API refused or couldn't be reached: nothing is asked, or spent, until it ends.
@@ -115,25 +122,27 @@ impl Motn {
     /// With no key it fetches nothing and every list is `None`, so rows and billboards read JustWatch alone.
     pub fn new(key: Option<String>, dir: Option<&Path>) -> Motn {
         let file = dir.map(|dir| dir.join(FILE));
-        let kept = file
-            .as_ref()
-            .and_then(|file| match std::fs::read(file) {
-                Ok(bytes) => serde_json::from_slice(&bytes)
-                    .map_err(|e| eprintln!("motn: {} is unreadable ({e}) — starting empty", file.display()))
-                    .ok(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    eprintln!("motn: could not read {} ({e}) — starting empty", file.display());
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let loaded = file.as_ref().and_then(|file| match std::fs::read(file) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| eprintln!("motn: {} is unreadable ({e}) — starting empty", file.display()))
+                .ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                eprintln!("motn: could not read {} ({e}) — starting empty", file.display());
+                None
+            }
+        });
+        // Compare logical state, not the original spelling: an older valid file with omitted default fields or the
+        // old `added` alias does not need a normalization-only rewrite.
+        let persisted = loaded.as_ref().and_then(|kept| serde_json::to_vec(kept).ok());
+        let kept = loaded.unwrap_or_default();
         let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap_or_default();
         Motn {
             key: key.filter(|k| !k.is_empty()),
             http,
             kept: Mutex::new(kept),
             file,
+            persisted: Mutex::new(persisted),
             refused_on: AtomicI64::new(-1),
             backoff: Backoff::new(REFUSED_PAUSE, MAX_REFUSED_PAUSE),
         }
@@ -198,9 +207,9 @@ impl Motn {
     }
 
     /// Fetch what is wanted and due, within the day's budget, and keep it.
-    async fn pass(&self, now: i64) {
+    async fn pass(&self, now: i64) -> bool {
         if !self.enabled() {
-            return;
+            return false;
         }
         let (wanted, services_due) = {
             let mut kept = lock(&self.kept);
@@ -208,7 +217,9 @@ impl Motn {
             (kept.wanted.keys().cloned().collect::<Vec<_>>(), now - kept.services_at >= SERVICES_AFTER)
         };
         if wanted.is_empty() {
-            return;
+            // `retain` may have removed the last expired market. Persist that real state change rather than
+            // resurrecting it after a restart; an unchanged empty pass compares equal and writes nothing.
+            return self.save();
         }
         if services_due {
             if let Some(countries) = self.ask("/countries?output_language=en").await {
@@ -298,7 +309,7 @@ impl Motn {
             keep_soon(&mut kept.coming, country, coming);
             kept.soon_at.insert(country.to_owned(), now);
         }
-        self.save();
+        self.save()
     }
 
     /// A country's changes of one kind to `catalogs` between `from` and `to`, by market and oldest first, over at most
@@ -382,18 +393,58 @@ impl Motn {
         serde_json::from_str(&body).map_err(|e| eprintln!("motn: {path}: unreadable answer ({e})")).ok()
     }
 
-    fn save(&self) {
-        let Some(file) = &self.file else { return };
-        let bytes = match serde_json::to_vec(&*lock(&self.kept)) {
+    /// Persist a changed logical snapshot. Returns whether the file was replaced.
+    ///
+    /// Request paths take `kept` briefly to read a list or refresh `wanted`; clone under that mutex, then serialize,
+    /// sync and rename after releasing it. `persisted` serializes writers only and is never read by a request.
+    fn save(&self) -> bool {
+        let Some(file) = &self.file else { return false };
+        let snapshot = lock(&self.kept).clone();
+        let bytes = match serde_json::to_vec(&snapshot) {
             Ok(bytes) => bytes,
-            Err(e) => return eprintln!("motn: could not serialise what was fetched ({e})"),
+            Err(e) => {
+                eprintln!("motn: could not serialise what was fetched ({e})");
+                return false;
+            }
         };
-        let written =
-            file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(file, bytes));
-        if let Err(e) = written {
-            eprintln!("motn: could not keep what was fetched in {} ({e})", file.display());
+        let mut persisted = lock(&self.persisted);
+        if persisted.as_deref() == Some(bytes.as_slice()) {
+            return false;
+        }
+        match write_atomically(file, &bytes) {
+            Ok(()) => {
+                *persisted = Some(bytes);
+                true
+            }
+            Err(e) => {
+                eprintln!("motn: could not keep what was fetched in {} ({e})", file.display());
+                false
+            }
         }
     }
+}
+
+/// Write beside the current state, sync the complete replacement, then atomically publish it. Syncing the parent
+/// makes the rename durable across a host crash, matching the stronger persistent-cache path used by maturity data.
+fn write_atomically(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let partial = path.with_extension("json.partial");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options.open(&partial)?;
+    #[cfg(unix)]
+    output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    output.write_all(body)?;
+    output.sync_all()?;
+    std::fs::rename(&partial, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// `shows` of one type as catalog items, in order.
@@ -568,6 +619,13 @@ fn keep_soon(lists: &mut BTreeMap<String, Vec<Show>>, country: &str, read: Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("den-atlas-motn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn provider(motn: &'static str) -> Provider {
         Provider { code: "x", id: "jw-x", name: "Popular on X", package_ids: &[], motn }
@@ -752,5 +810,117 @@ mod tests {
         motn.want(&provider("netflix"), "US");
         assert!(lock(&motn.kept).wanted.is_empty());
         assert_eq!(motn.top(&provider("netflix"), "US"), None);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_pass_does_not_replace_the_state_file() {
+        let dir = temp("unchanged");
+        let at = 100 * DAY;
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        {
+            let mut kept = lock(&motn.kept);
+            kept.wanted.insert("netflix@US".into(), at);
+            kept.services.insert("us".into(), vec!["netflix".into()]);
+            kept.services_at = at;
+            kept.top.insert("netflix@US".into(), (at, Vec::new()));
+            kept.added.insert("netflix@US".into(), Vec::new());
+            kept.added_until.insert("US".into(), at);
+            kept.soon_at.insert("US".into(), at);
+        }
+        assert!(motn.save());
+        let before = std::fs::read(dir.join(FILE)).unwrap();
+        assert!(!motn.pass(at).await, "a due pass with identical logical state must not touch the file");
+        assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), before);
+        assert!(!dir.join("motn.v1.json.partial").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_changed_wanted_timestamp_is_persisted_and_read_after_restart() {
+        let dir = temp("wanted");
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        lock(&motn.kept).wanted.insert("netflix@US".into(), 1234);
+        assert!(motn.save());
+        assert!(!motn.save(), "the same snapshot is not written twice");
+        lock(&motn.kept).wanted.insert("netflix@US".into(), 5678);
+        assert!(motn.save(), "a timestamp change is state, not an idle pass");
+        let restarted = Motn::new(Some("unused".into()), Some(&dir));
+        assert_eq!(lock(&restarted.kept).wanted["netflix@US"], 5678);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pruning_the_last_expired_market_is_persisted() {
+        let dir = temp("pruned");
+        let now = 100 * DAY;
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        lock(&motn.kept).wanted.insert("netflix@US".into(), now - WANTED_FOR);
+        assert!(motn.save());
+        assert!(
+            motn.pass(now).await,
+            "the pass removed persisted state even though nothing remained to fetch"
+        );
+        let restarted = Motn::new(Some("unused".into()), Some(&dir));
+        assert!(lock(&restarted.kept).wanted.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_atomic_replacement_keeps_the_old_file_and_can_retry() {
+        let dir = temp("atomic");
+        let file = dir.join(FILE);
+        let partial = file.with_extension("json.partial");
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        lock(&motn.kept).wanted.insert("netflix@US".into(), 1);
+        assert!(motn.save());
+        let old = std::fs::read(&file).unwrap();
+
+        lock(&motn.kept).wanted.insert("netflix@US".into(), 2);
+        std::fs::create_dir(&partial).unwrap();
+        assert!(!motn.save(), "a partial path that cannot be opened must fail closed");
+        assert_eq!(std::fs::read(&file).unwrap(), old, "the published file remains whole and old");
+        assert_eq!(lock(&Motn::new(None, Some(&dir)).kept).wanted["netflix@US"], 1);
+
+        std::fs::remove_dir(&partial).unwrap();
+        assert!(motn.save(), "the unchanged dirty snapshot is retried after the filesystem recovers");
+        assert_eq!(lock(&Motn::new(None, Some(&dir)).kept).wanted["netflix@US"], 2);
+        assert!(!partial.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Manual release-mode measurement for the only request-visible critical section in persistence.
+    #[test]
+    #[ignore = "microbenchmark: cargo test --release motn_snapshot_cost -- --ignored --nocapture"]
+    fn motn_snapshot_cost() {
+        let motn = Motn::new(None, None);
+        let mut kept = Kept::default();
+        for market_no in 0..100 {
+            let market = format!("service{market_no}@US");
+            let shows: Vec<Show> = (0..60)
+                .map(|title_no| at(&format!("Title {market_no}-{title_no}"), title_no, title_no as i64))
+                .collect();
+            kept.top.insert(market.clone(), (1234, shows[..10].to_vec()));
+            kept.added.insert(market.clone(), shows.clone());
+            kept.leaving.insert(market.clone(), shows[..20].to_vec());
+            kept.coming.insert(market, shows[..20].to_vec());
+        }
+        *lock(&motn.kept) = kept;
+        let mut clone_time = Duration::ZERO;
+        let mut serialize_time = Duration::ZERO;
+        let mut bytes = 0;
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            let snapshot = lock(&motn.kept).clone();
+            clone_time += started.elapsed();
+            let started = std::time::Instant::now();
+            let body = serde_json::to_vec(&snapshot).unwrap();
+            serialize_time += started.elapsed();
+            bytes = std::hint::black_box(body.len());
+        }
+        eprintln!(
+            "motn snapshot: {bytes} bytes, clone-under-lock {:?}/pass, serialize {:?}/pass",
+            clone_time / 100,
+            serialize_time / 100
+        );
     }
 }
