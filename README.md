@@ -428,7 +428,9 @@ This ranker failed to return.
 
 `/metrics` publishes only what the addon already knows: `atlas_build_info{version}`,
 `atlas_dataset_loaded`, `atlas_dataset_info{dataset_version,taxonomy,embedding_model}`,
-`atlas_dataset_titles`, runtime-provider coverage as
+`atlas_dataset_titles`, local admission state and totals as
+`atlas_admission_{active,queued,refused_total,completed_total,hold_seconds_total,capacity,queue_capacity}{class="cpu|body"}`,
+runtime-provider coverage as
 `atlas_maturity_provider_titles{authority,media_type,status="catalog|checked|matched"}`, and the two catalog
 signals behind `/health` — `atlas_catalog_fresh` and `atlas_catalog_schema_suspect`.
 Catalog-row and maturity persistence expose successful replacement, bytes-written, error, and last-write-duration
@@ -453,6 +455,8 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `EMBED_LOCAL` | off | with an `embedded-model` build, `1` runs the workspace's engine in Atlas after its model/dims/vector-epoch/token-cap exactly match the corpus and a real inference canary succeeds; without a ready engine `/embed` answers `503` |
 | `EMBED_MODEL_DIR` | `/models` | model directory for the local engine; its other settings are the den-embed variables prefixed with `EMBED_` |
 | `INDEX_QUERIES` | off | `1` turns on the `/index/…` routes (taxonomy, label rows, More Like This, neighbours, semantic and facet search, filters, labels, taste scores, suggestions); the indexes load as atlas starts and stay loaded |
+| `ATLAS_CPU_JOBS` | visible CPUs minus one, at most `4` | simultaneous local full-corpus scans/rankings; its bounded queue holds twice this many requests for 100 ms, then answers `503` with `Retry-After` |
+| `ATLAS_BODY_JOBS` | `4` | simultaneous POST body aggregations; its bounded queue holds twice this many requests for 100 ms, then answers `503` with `Retry-After`. An upload that does not finish in 30 seconds answers `408` and releases its slot |
 | `TMDB_PROXY` | unset | den-edge's TMDB proxy base (e.g. `http://den-edge:8080/tmdb`), which atlas asks for TMDB's vote counts, scores and credits (see above); atlas holds no TMDB key. Only alongside `INDEX_QUERIES`. Unset ⇒ atlas serves what `CACHE_DIR` keeps and asks for nothing |
 | `TMDB_DAILY_MAX` | `1500` | questions atlas asks the proxy in a UTC day, two seconds apart. A full vote sweep is ~4,800, so it spreads over a few days; den-edge's own ceiling (`TMDB_DAILY_MAX` there) is shared with the web app's guests and must leave room for this |
 | `MATURITY_PROVIDERS` | unset | comma-separated box-local maturity authorities: `kavi` (Finnish series), `imda` (Singapore films and episode-range TV submissions), and `kmrb` (Korean streaming movies/series; needs `KMRB_SERVICE_KEY`). Exact, unambiguous matches apply to viewers in every region, retain authority jurisdiction, and persist normalized observations under `CACHE_DIR`; no raw provider response enters dataset or release artifacts |
@@ -466,6 +470,15 @@ Every variable is optional; the binary reads the process environment only (no `.
 | `PLAYGROUND` | off | `1` turns on the `/playground` tuning routes (only alongside `INDEX_QUERIES`); computed per request, so enable it only where anyone reaching atlas may spend that. `/index/similar` never reads an override |
 | `LOG_REQUESTS` | off | `1` writes one stderr line per request, `<METHOD> <path> <status> <ms>ms`, with a config segment shown as `<config>` and the query dropped; a degraded answer adds ` degraded=<reason>` (the same reason `/health`/`/ready` report), so the one request it affected carries why |
 | `LOG_IDENTITY` | on | Gates the title names/ids in `/recommend`'s decision log (one throttled line per answer naming the pool/library counts, slide count, and why the top slides scored what they did). `0`/`false`/`off`/`no` (case-insensitive) drops the names and ids; everything else in the line is unaffected |
+
+Completed POST bodies remain charged to the body class across a cold index load until the request acquires its
+next bounded CPU stage (or finishes a cheap answer), so near-limit buffers cannot accumulate behind one lazy load.
+Recommendation then holds one CPU admission slot across its local preparation, catalogue-list lookup and final
+blocking rank. This deliberately limits successful work during overload and may hold a CPU slot while a cold list
+is fetched, but keeps one simple bound over all per-request recommendation work. Catalogue routes, their
+single-flight fills, and shared/Edge cache hits do not use this gate. Heavy index route classes enter CPU admission
+even when an in-process memo could answer them; avoiding a racy cache-specific fast path keeps overload behavior
+predictable.
 
 ## Run
 ```sh

@@ -48,6 +48,41 @@ pub fn render(state: &AppState) -> String {
         &format!("{{version=\"{}\"}}", crate::release_version()),
         1,
     );
+    b.push_str(
+        "# HELP atlas_admission_active Work currently holding a local admission permit.\n\
+         # TYPE atlas_admission_active gauge\n\
+         # HELP atlas_admission_queued Requests currently waiting in a bounded local admission queue.\n\
+         # TYPE atlas_admission_queued gauge\n\
+         # HELP atlas_admission_refused_total Requests refused because a local admission queue filled or timed out.\n\
+         # TYPE atlas_admission_refused_total counter\n\
+         # HELP atlas_admission_completed_total Work that released a local admission permit.\n\
+         # TYPE atlas_admission_completed_total counter\n\
+         # HELP atlas_admission_hold_seconds_total Seconds local admission permits were held.\n\
+         # TYPE atlas_admission_hold_seconds_total counter\n\
+         # HELP atlas_admission_capacity Configured active permits for a local admission class.\n\
+         # TYPE atlas_admission_capacity gauge\n\
+         # HELP atlas_admission_queue_capacity Configured waiting slots for a local admission class.\n\
+         # TYPE atlas_admission_queue_capacity gauge\n",
+    );
+    for snapshot in state.admission.snapshots() {
+        let labels = format!("{{class=\"{}\"}}", snapshot.class.name());
+        b.push_str(&format!(
+            "atlas_admission_active{labels} {}\n\
+             atlas_admission_queued{labels} {}\n\
+             atlas_admission_refused_total{labels} {}\n\
+             atlas_admission_completed_total{labels} {}\n\
+             atlas_admission_hold_seconds_total{labels} {:.6}\n\
+             atlas_admission_capacity{labels} {}\n\
+             atlas_admission_queue_capacity{labels} {}\n",
+            snapshot.active,
+            snapshot.queued,
+            snapshot.refused,
+            snapshot.completed,
+            snapshot.held_micros as f64 / 1_000_000.0,
+            snapshot.capacity,
+            snapshot.queue_max,
+        ));
+    }
     // What /health says, as a number a monitor can alert on. `serious` separates "a feature class is off"
     // from "the rows are a day old": the first deserves waking someone, the second does not, and before this
     // they were indistinguishable to anything but a human reading JSON.
@@ -226,4 +261,23 @@ fn gauge(b: &mut String, name: &str, help: &str, labels: &str, value: u64) {
 /// fetched from a release over the network; a stray quote must not break every series after it.
 fn label(v: &str) -> String {
     v.replace('\\', r"\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn admission_metrics_have_fixed_class_labels_and_no_request_identity() {
+        let mut state = AppState::for_test(None);
+        state.admission = crate::admission::Admission::new(1, 2, 3, 4, std::time::Duration::from_secs(1));
+        let gate = state.admission.gate(crate::admission::Class::Cpu);
+        let _permit = crate::admission::Gate::acquire(&gate).await.unwrap();
+        let body = render(&state);
+
+        assert!(body.contains("atlas_admission_active{class=\"cpu\"} 1"), "{body}");
+        assert!(body.contains("atlas_admission_capacity{class=\"body\"} 3"), "{body}");
+        assert!(body.contains("atlas_admission_queue_capacity{class=\"body\"} 4"), "{body}");
+        assert!(!body.contains("path=") && !body.contains("query="), "{body}");
+    }
 }

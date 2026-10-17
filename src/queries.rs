@@ -980,6 +980,9 @@ pub struct IndexQueries {
     /// The character neighbour list from TMDB's credits over this store's rows (`tmdb`).
     characters: Option<Arc<Characters>>,
     maturity: Arc<crate::maturity_providers::Providers>,
+    /// Deterministic cold-load pause for handler admission tests; absent from production builds.
+    #[cfg(test)]
+    load_latch: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl IndexQueries {
@@ -1002,7 +1005,19 @@ impl IndexQueries {
             ratings: None,
             characters: None,
             maturity: crate::maturity_providers::Providers::disabled(),
+            #[cfg(test)]
+            load_latch: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_load_latch(
+        mut self,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.load_latch = Some((started, release));
+        self
     }
 
     /// The TMDB counts these indexes order rows by. Separate from `new` because they live in `tmdb`, and
@@ -1071,6 +1086,11 @@ impl IndexQueries {
         let _loading = self.loading.lock().await;
         if let Some(indexes) = self.touch() {
             return Ok((indexes, None));
+        }
+        #[cfg(test)]
+        if let Some((started, release)) = &self.load_latch {
+            started.notify_one();
+            release.notified().await;
         }
         on_load();
         let started = Instant::now();

@@ -16,6 +16,71 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Instant;
 
+fn overloaded(class: crate::admission::Class) -> Response {
+    let detail = match class {
+        crate::admission::Class::Cpu => "Atlas is busy ranking; retry shortly",
+        crate::admission::Class::Body => "Atlas is busy reading request bodies; retry shortly",
+    };
+    unavailable_response(
+        serde_json::json!({ "error": "overloaded", "class": class.name(), "detail": detail }).to_string(),
+        crate::admission::RETRY_AFTER,
+    )
+}
+
+#[derive(Debug)]
+enum BodyRead {
+    Busy,
+    TooLarge,
+    TimedOut,
+}
+
+/// A body slot cannot be held forever by a producer that stops mid-upload. This is a total deadline rather than
+/// a per-chunk timer, so a trickle cannot reset it indefinitely; even the largest accepted body has ample time at
+/// roughly 2.2 Mbit/s.
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Aggregate one POST only after entering the body-work class. `Content-Length` lets an oversized request fail
+/// without consuming a slot; the streamed cap remains authoritative for chunked or dishonest requests.
+async fn body_bytes_held(
+    state: &AppState,
+    req: Request,
+    limit: usize,
+) -> Result<(Bytes, crate::admission::Permit), BodyRead> {
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(BodyRead::TooLarge);
+    }
+    let permit = state.admission.body().await.map_err(|_| BodyRead::Busy)?;
+    let body = tokio::time::timeout(BODY_READ_TIMEOUT, axum::body::to_bytes(req.into_body(), limit))
+        .await
+        .map_err(|_| BodyRead::TimedOut)?
+        .map_err(|_| BodyRead::TooLarge)?;
+    Ok((body, permit))
+}
+
+#[cfg(test)]
+async fn body_bytes(state: &AppState, req: Request, limit: usize) -> Result<Bytes, BodyRead> {
+    let (body, permit) = body_bytes_held(state, req, limit).await?;
+    drop(permit);
+    Ok(body)
+}
+
+fn body_error(error: BodyRead, too_large: impl FnOnce() -> Response) -> Response {
+    match error {
+        BodyRead::Busy => overloaded(crate::admission::Class::Body),
+        BodyRead::TooLarge => too_large(),
+        BodyRead::TimedOut => json_response(
+            r#"{"error":"body_timeout","detail":"The request body did not finish within 30 seconds"}"#,
+            StatusCode::REQUEST_TIMEOUT,
+        ),
+    }
+}
+
 /// The /configure page, embedded so the binary is self-contained. Region + provider choice is plaintext
 /// (no secrets to seal); the page's JS builds the `<region>_<codes>` install URL client-side.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
@@ -352,8 +417,9 @@ async fn handle_playground_import(state: &Arc<AppState>, req: Request) -> Respon
         )
     };
     // A full export of twelve seeds at 200 titles each is well under this.
-    let Ok(body) = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024).await else {
-        return bad_request("the file is larger than 8 MB".to_owned());
+    let (body, _body_permit) = match body_bytes_held(state, req, 8 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(error) => return body_error(error, || bad_request("the file is larger than 8 MB".to_owned())),
     };
     let file: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(file) => file,
@@ -477,40 +543,43 @@ async fn handle_playground(
         }
     };
     let ranking = Instant::now();
-    let answered = tokio::task::spawn_blocking(move || {
-        let export = titles.as_ref().and_then(|t| t.index());
-        let sources = crate::playground::Sources { indexes: &indexes, export: export.as_deref() };
-        let s = &playground_state;
-        match ask {
-            Ask::Similar(media_type, tmdb_id) => {
-                crate::playground::answer(&sources, media_type, tmdb_id, &s.tuning).to_string()
-            }
-            Ask::Rows { judged } => {
-                let mut answer =
-                    crate::playground::rows(&sources, &s.seeds, &s.suggest, s.inspect, &s.tuning);
-                if judged {
-                    answer["judged"] = crate::playground::judged(&sources, &s.tuning);
+    let answered = state
+        .admission
+        .cpu(move || {
+            let export = titles.as_ref().and_then(|t| t.index());
+            let sources = crate::playground::Sources { indexes: &indexes, export: export.as_deref() };
+            let s = &playground_state;
+            match ask {
+                Ask::Similar(media_type, tmdb_id) => {
+                    crate::playground::answer(&sources, media_type, tmdb_id, &s.tuning).to_string()
                 }
-                answer.to_string()
+                Ask::Rows { judged } => {
+                    let mut answer =
+                        crate::playground::rows(&sources, &s.seeds, &s.suggest, s.inspect, &s.tuning);
+                    if judged {
+                        answer["judged"] = crate::playground::judged(&sources, &s.tuning);
+                    }
+                    answer.to_string()
+                }
+                Ask::Judged => crate::playground::judged(&sources, &s.tuning).to_string(),
+                Ask::Export { full, judged } => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let provenance = crate::playground::Provenance {
+                        dataset_version: meta.as_ref().map_or("", |m| m.dataset_version.as_str()),
+                        store_sha256: meta.as_ref().and_then(|m| m.store_sha256.as_deref()),
+                        now,
+                    };
+                    crate::playground::export(&sources, s, &provenance, full, judged).to_string()
+                }
             }
-            Ask::Judged => crate::playground::judged(&sources, &s.tuning).to_string(),
-            Ask::Export { full, judged } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                let provenance = crate::playground::Provenance {
-                    dataset_version: meta.as_ref().map_or("", |m| m.dataset_version.as_str()),
-                    store_sha256: meta.as_ref().and_then(|m| m.store_sha256.as_deref()),
-                    now,
-                };
-                crate::playground::export(&sources, s, &provenance, full, judged).to_string()
-            }
-        }
-    })
-    .await;
+        })
+        .await;
     let body = match answered {
         Ok(body) => body,
-        Err(e) => {
+        Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+        Err(crate::admission::RunError::Failed(e)) => {
             eprintln!("playground answer failed: {e}");
             return json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -538,9 +607,13 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
     // Passed on to den-embed, so its log line for this query carries the same id as the app's and ours.
     let rid = request_id(req.headers());
     // A search query is short — cap the body so this can't relay large payloads to the internal service.
-    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST),
+    // Keep the body-class permit until an embed slot belongs to this request. Otherwise a fast producer wave
+    // could leave arbitrarily many completed bodies queued in front of the proxy's four permits.
+    let (body, body_permit) = match body_bytes_held(state, req, 64 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return body_error(error, || json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST))
+        }
     };
     // Bounded, with a deadline — an unauthenticated public POST must not be able to open as many
     // concurrent model invocations as a client cares to make, and a queue without a deadline is just
@@ -554,6 +627,7 @@ async fn handle_embed(state: &Arc<AppState>, req: Request) -> Response {
             crate::EMBED_WAIT,
         );
     };
+    drop(body_permit);
     let upstream = Instant::now();
     let resp = match proxy.call("/embed", body, rid.as_deref()).await {
         Ok(resp) => {
@@ -979,6 +1053,23 @@ impl IndexQuestion {
         }
     }
 
+    /// Routes that scan or rank a material part of the corpus. Metadata, schema and direct keyed lookups stay
+    /// outside local-CPU admission, so a ranking wave cannot make cheap index answers unavailable.
+    fn cpu_heavy(&self) -> bool {
+        matches!(
+            self,
+            Self::Rows { .. }
+                | Self::Similar { .. }
+                | Self::Suggest { .. }
+                | Self::Neighbours { .. }
+                | Self::Search
+                | Self::Facets
+                | Self::Query
+                | Self::Plot { .. }
+                | Self::Filter { .. }
+        )
+    }
+
     /// `export`, TMDB's daily title export, ranks a row's titles facets.bin has no votes for.
     fn answer(
         &self,
@@ -1380,26 +1471,35 @@ fn warm_embed(state: &Arc<AppState>) {
 /// answer.
 async fn search_answer(
     state: &AppState,
-    indexes: &crate::queries::Indexes,
+    indexes: Arc<crate::queries::Indexes>,
     query: &str,
     maturity: crate::maturity::Policy,
-) -> Result<String, String> {
+) -> Result<String, crate::admission::RunError> {
     let text = query_text(query, "q");
     if text.trim().chars().count() < 2 {
         return Ok(serde_json::json!({ "titles": [] }).to_string());
     }
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
-    let vector = embed_query(state, &text).await?;
-    let (neighbours, stats) = indexes.plot.scan_semantic_vector(
-        &vector,
-        |id, kind| media_type.is_none_or(|want| want == kind) && indexes.eligible(maturity, (kind, id)),
-        SEMANTIC_K,
-    );
-    let titles: Vec<serde_json::Value> = neighbours
-        .iter()
-        .map(|n| serde_json::json!({ "type": stremio_type(n.media_type), "id": n.tmdb_id, "score": n.score }))
-        .collect();
-    Ok(serde_json::json!({ "titles": titles, "mean": stats.mean, "sd": stats.sd }).to_string())
+    let vector = embed_query(state, &text).await.map_err(crate::admission::RunError::Failed)?;
+    state
+        .admission
+        .cpu(move || {
+            let (neighbours, stats) = indexes.plot.scan_semantic_vector(
+                &vector,
+                |id, kind| {
+                    media_type.is_none_or(|want| want == kind) && indexes.eligible(maturity, (kind, id))
+                },
+                SEMANTIC_K,
+            );
+            let titles: Vec<serde_json::Value> = neighbours
+                .iter()
+                .map(|n| {
+                    serde_json::json!({ "type": stremio_type(n.media_type), "id": n.tmdb_id, "score": n.score })
+                })
+                .collect();
+            serde_json::json!({ "titles": titles, "mean": stats.mean, "sd": stats.sd }).to_string()
+        })
+        .await
 }
 
 /// `GET /index/query.json?q=&type=&skip=&limit=` — search in one request (`search.rs`), and how long its parts took
@@ -1414,7 +1514,7 @@ async fn query_answer(
     query: &str,
     early: Option<tokio::task::JoinHandle<Result<Vec<i8>, String>>>,
     maturity: crate::maturity::Policy,
-) -> Result<(String, String, bool), String> {
+) -> Result<(String, String, bool), crate::admission::RunError> {
     let text = query_text(query, "q");
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
     let number =
@@ -1471,25 +1571,26 @@ async fn query_answer(
     let embedded_in = embedding.elapsed();
     let answering = Instant::now();
     let titles = state.titles.as_ref().and_then(|t| t.index());
-    let body = tokio::task::spawn_blocking(move || {
-        let mut answer = crate::search::answer_with_policy(
-            &indexes,
-            titles.as_deref(),
-            &parsed,
-            media_type,
-            vector.as_deref(),
-            skip,
-            limit,
-            maturity,
-        );
-        answer["ignored"] = serde_json::json!(ignored);
-        if !unknown.is_empty() {
-            answer["unknownValues"] = serde_json::json!(unknown);
-        }
-        answer.to_string()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let body = state
+        .admission
+        .cpu(move || {
+            let mut answer = crate::search::answer_with_policy(
+                &indexes,
+                titles.as_deref(),
+                &parsed,
+                media_type,
+                vector.as_deref(),
+                skip,
+                limit,
+                maturity,
+            );
+            answer["ignored"] = serde_json::json!(ignored);
+            if !unknown.is_empty() {
+                answer["unknownValues"] = serde_json::json!(unknown);
+            }
+            answer.to_string()
+        })
+        .await?;
     let timing = format!(
         "parse;dur={}, embed;dur={}, answer;dur={}",
         ms(parsed_in),
@@ -1570,7 +1671,7 @@ async fn facets_answer(
     indexes: Arc<crate::queries::Indexes>,
     query: &str,
     maturity: crate::maturity::Policy,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool), crate::admission::RunError> {
     let none = || serde_json::json!({ "facet": null, "titles": [] }).to_string();
     let text = query_text(query, "q");
     if !crate::search::parse(&text, &indexes).names_a_facet() {
@@ -1578,7 +1679,8 @@ async fn facets_answer(
     }
     let asked = format!("q={}&limit={FACET_LIMIT}", query_param(query, "q").unwrap_or_default());
     let (body, _, unranked) = query_answer(state, indexes, &asked, None, maturity).await?;
-    let answer: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let answer: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| crate::admission::RunError::Failed(e.to_string()))?;
     let parse = &answer["parse"];
     let titles: Vec<serde_json::Value> = answer["hits"]
         .as_array()
@@ -1820,8 +1922,9 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
             StatusCode::BAD_REQUEST,
         )
     };
-    let Ok(body) = axum::body::to_bytes(req.into_body(), RECOMMEND_BODY).await else {
-        return bad(format!("a body of at most {RECOMMEND_BODY} bytes"));
+    let (body, body_permit) = match body_bytes_held(state, req, RECOMMEND_BODY).await {
+        Ok(body) => body,
+        Err(error) => return body_error(error, || bad(format!("a body of at most {RECOMMEND_BODY} bytes"))),
     };
     let request: crate::recommend::Request = match parse_body(&body) {
         Ok(request) => request,
@@ -1835,7 +1938,7 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
         .ok()
         .filter(|dir| !dir.is_empty())
         .and_then(|_| serde_json::from_slice(&body).ok());
-    match rank(state, queries, config, request, raw, &rid).await {
+    match rank(state, queries, config, request, raw, &rid, Some(body_permit)).await {
         Ok((answer, timing)) => with_timing(
             json_response(answer.to_string(), StatusCode::OK),
             &format!("{timing}, total;dur={}", ms(started.elapsed())),
@@ -1937,7 +2040,7 @@ async fn handle_recommend_get(
             let Ok(request) = serde_json::from_value::<crate::recommend::Request>(body) else {
                 return json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             };
-            let (answer, timing) = match rank(state, queries, config, request, None, "").await {
+            let (answer, timing) = match rank(state, queries, config, request, None, "", None).await {
                 Ok(ranked) => ranked,
                 Err(resp) => return *resp,
             };
@@ -2029,6 +2132,7 @@ async fn rank(
     request: crate::recommend::Request,
     raw: Option<serde_json::Value>,
     rid: &str,
+    body_permit: Option<crate::admission::Permit>,
 ) -> Result<(serde_json::Value, String), Box<Response>> {
     let rid = rid.to_owned();
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
@@ -2038,6 +2142,17 @@ async fn rank(
             return Err(Box::new(unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT)));
         }
     };
+    // Reserve the whole local recommendation job, not merely its final blocking closure. Building an embedding
+    // plan and materialising cached catalogue lists also do synchronous work; letting an overload wave perform
+    // those first made a nominal 100 ms admission refusal take seconds. Catalogue routes and catalogue refresh
+    // have their own admission and remain outside this permit.
+    let cpu_permit = match state.admission.cpu_permit().await {
+        Ok(permit) => permit,
+        Err(_) => return Err(Box::new(overloaded(crate::admission::Class::Cpu))),
+    };
+    // A POST's completed bytes remain charged to the body class across a cold index load and until the request
+    // owns its next bounded stage. This prevents many near-limit bodies accumulating behind one lazy load.
+    drop(body_permit);
     // Only titles absent from the plot index are embedded, from bounded transient client hints. A failed or
     // unconfigured embedder leaves the existing metadata-only fit intact rather than failing the billboard.
     let embedding = Instant::now();
@@ -2077,7 +2192,7 @@ async fn rank(
     let export = state.titles.as_ref().and_then(|t| t.index());
     let log_identity = state.log_identity;
     // More Like This for each seed scans the vectors, so the ranking runs off the request threads.
-    let ranked = tokio::task::spawn_blocking(move || {
+    let ranked = crate::admission::Admission::run_cpu(cpu_permit, move || {
         let now = request
             .now
             .as_deref()
@@ -2107,11 +2222,20 @@ async fn rank(
         answer["datasetVersion"] = serde_json::json!(version);
         answer
     })
-    .await
-    .map_err(|e| {
-        eprintln!("recommend failed: {e}");
-        Box::new(json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR))
-    })?;
+    .await;
+    let ranked = match ranked {
+        Ok(ranked) => ranked,
+        Err(crate::admission::RunError::Busy) => {
+            return Err(Box::new(overloaded(crate::admission::Class::Cpu)))
+        }
+        Err(crate::admission::RunError::Failed(e)) => {
+            eprintln!("recommend failed: {e}");
+            return Err(Box::new(json_response(
+                r#"{"error":"recommend_failed"}"#,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )));
+        }
+    };
     let load = loaded_in.map(|d| format!("load;dur={}, ", ms(d))).unwrap_or_default();
     Ok((
         ranked,
@@ -2133,8 +2257,11 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
     else {
         return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
     };
-    let Ok(body) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
-        return json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST);
+    let (body, body_permit) = match body_bytes_held(state, req, 64 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            return body_error(error, || json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST))
+        }
     };
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
@@ -2143,10 +2270,28 @@ async fn handle_index_post(state: &Arc<AppState>, rest: &str, req: Request) -> R
             return unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT);
         }
     };
-    let answer = match question {
-        "labels" => answer_labels(&indexes, &body),
-        "score" => answer_score(&indexes, &body),
-        _ => answer_suggest(&indexes, &body),
+    let answer = if question == "labels" {
+        answer_labels(&indexes, &body)
+    } else {
+        let question = question.to_owned();
+        let cpu_permit = match state.admission.cpu_permit().await {
+            Ok(permit) => permit,
+            Err(_) => return overloaded(crate::admission::Class::Cpu),
+        };
+        drop(body_permit);
+        match crate::admission::Admission::run_cpu(cpu_permit, move || match question.as_str() {
+            "score" => answer_score(&indexes, &body),
+            _ => answer_suggest(&indexes, &body),
+        })
+        .await
+        {
+            Ok(answer) => answer,
+            Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+            Err(crate::admission::RunError::Failed(e)) => {
+                eprintln!("index POST failed: {e}");
+                return json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
     };
     let resp = match answer {
         Ok(value) => json_response(value.to_string(), StatusCode::OK),
@@ -2176,27 +2321,28 @@ async fn filter_answer(
     request: crate::filter::Request,
     rest: &str,
     maturity: crate::maturity::Policy,
-) -> Result<(String, &'static str, Option<String>, bool), String> {
+) -> Result<(String, &'static str, Option<String>, bool), crate::admission::RunError> {
     let export = state.titles.as_ref().and_then(|t| t.index());
     // The path is part of the key too: `counts` without `.json` answers, but as a second spelling.
     let segment = rest.rsplit('/').next().unwrap_or(rest);
     let canonical = request.canonical && segment.ends_with(".json");
     let location = (!canonical && maturity.cache_identity().is_none())
         .then(|| format!("{}.json{}", segment.strip_suffix(".json").unwrap_or(segment), request.query()));
-    let (body, degraded) = tokio::task::spawn_blocking(move || {
-        let context = crate::filter::Context::new_with_policy(&indexes, scope, export, maturity);
-        let (body, degraded) = match route {
-            crate::filter::Route::Counts => context.counts(&request),
-            crate::filter::Route::Titles => context.titles(&request),
-            crate::filter::Route::Values(spec) => context.values(spec, &request),
-            crate::filter::Route::People => context.people(&request),
-            crate::filter::Route::PeopleCounts => context.people_counts(&request),
-            crate::filter::Route::PeopleValues(kind) => context.people_values(kind, &request),
-        };
-        (body.to_string(), degraded)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let (body, degraded) = state
+        .admission
+        .cpu(move || {
+            let context = crate::filter::Context::new_with_policy(&indexes, scope, export, maturity);
+            let (body, degraded) = match route {
+                crate::filter::Route::Counts => context.counts(&request),
+                crate::filter::Route::Titles => context.titles(&request),
+                crate::filter::Route::Values(spec) => context.values(spec, &request),
+                crate::filter::Route::People => context.people(&request),
+                crate::filter::Route::PeopleCounts => context.people_counts(&request),
+                crate::filter::Route::PeopleValues(kind) => context.people_values(kind, &request),
+            };
+            (body.to_string(), degraded)
+        })
+        .await?;
     let cache_control = if !canonical {
         "private, max-age=60"
     } else if degraded {
@@ -2306,7 +2452,8 @@ async fn handle_index(
                 }
                 with_timing(resp, &format!("{load}total;dur={}", ms(started.elapsed())))
             }
-            Err(e) => {
+            Err(crate::admission::RunError::Busy) => overloaded(crate::admission::Class::Cpu),
+            Err(crate::admission::RunError::Failed(e)) => {
                 eprintln!("filter answer failed: {e}");
                 json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR)
             }
@@ -2352,9 +2499,10 @@ async fn handle_index(
     let mut phases = String::new();
     let runtime_dependent = maturity.restricted() || matches!(&question, IndexQuestion::Title { .. });
     let body = match question {
-        IndexQuestion::Search => match search_answer(state, &indexes, query, maturity).await {
+        IndexQuestion::Search => match search_answer(state, Arc::clone(&indexes), query, maturity).await {
             Ok(body) => body,
-            Err(e) => {
+            Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+            Err(crate::admission::RunError::Failed(e)) => {
                 eprintln!("semantic search unavailable: {e}");
                 return unavailable_response(r#"{"error":"embed_unavailable"}"#, RELOAD_WAIT);
             }
@@ -2364,7 +2512,8 @@ async fn handle_index(
                 unembedded(unranked);
                 body
             }
-            Err(e) => {
+            Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+            Err(crate::admission::RunError::Failed(e)) => {
                 eprintln!("facet search failed: {e}");
                 return json_response(r#"{"error":"search_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             }
@@ -2376,22 +2525,29 @@ async fn handle_index(
                 phases = format!("{timing}, ");
                 body
             }
-            Err(e) => {
+            Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+            Err(crate::admission::RunError::Failed(e)) => {
                 eprintln!("search failed: {e}");
                 return json_response(r#"{"error":"search_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             }
         },
         // The dataset alone, but tens of milliseconds of work for a row or a scan: off the request threads.
         question => {
+            let cpu_heavy = question.cpu_heavy();
             let titles = state.titles.as_ref().and_then(|t| t.index());
             let (indexes, query) = (Arc::clone(&indexes), query.to_owned());
-            match tokio::task::spawn_blocking(move || {
-                question.answer(&indexes, titles.as_deref(), &query, maturity)
-            })
-            .await
-            {
+            let answer = move || question.answer(&indexes, titles.as_deref(), &query, maturity);
+            let answered = if cpu_heavy {
+                state.admission.cpu(answer).await
+            } else {
+                tokio::task::spawn_blocking(answer)
+                    .await
+                    .map_err(|error| crate::admission::RunError::Failed(error.to_string()))
+            };
+            match answered {
                 Ok(body) => body,
-                Err(e) => {
+                Err(crate::admission::RunError::Busy) => return overloaded(crate::admission::Class::Cpu),
+                Err(crate::admission::RunError::Failed(e)) => {
                     eprintln!("index answer failed: {e}");
                     return json_response(r#"{"error":"index_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
                 }
@@ -2950,6 +3106,204 @@ mod tests {
         String::from_utf8_lossy(&b).into_owned()
     }
 
+    fn admission_value(state: &AppState, class: crate::admission::Class) -> crate::admission::Snapshot {
+        state.admission.snapshots().into_iter().find(|snapshot| snapshot.class == class).unwrap()
+    }
+
+    async fn wait_for_admission(
+        state: &AppState,
+        class: crate::admission::Class,
+        active: usize,
+        queued: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = admission_value(state, class);
+                if snapshot.active == active && snapshot.queued == queued {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Chunked producers have no `Content-Length`, so the actual stream cap and the body-work gate both have
+    /// to hold. Only one body is accumulated, one waits without being polled, and the next is explicitly busy.
+    #[tokio::test]
+    async fn slow_chunked_bodies_are_bounded_before_aggregation() {
+        use axum::http::Request as HttpRequest;
+        use std::convert::Infallible;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let mut state = AppState::for_test(None);
+        state.admission = crate::admission::Admission::new(1, 1, 1, 1, std::time::Duration::from_secs(5));
+        let state = Arc::new(state);
+        let stream = || {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(2);
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/recommend")
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .unwrap();
+            (tx, request)
+        };
+        let (first_tx, first) = stream();
+        let first_read = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { body_bytes(&state, first, 8).await }
+        });
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 0).await;
+
+        let (second_tx, second) = stream();
+        let second_read = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { body_bytes(&state, second, 8).await }
+        });
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 1).await;
+
+        let third =
+            HttpRequest::builder().method("POST").uri("/recommend").body(Body::from("third")).unwrap();
+        assert!(matches!(body_bytes(&state, third, 8).await, Err(BodyRead::Busy)));
+
+        first_tx.send(Ok(Bytes::from_static(b"near"))).await.unwrap();
+        first_tx.send(Ok(Bytes::from_static(b"limit"))).await.unwrap();
+        drop(first_tx);
+        assert!(matches!(first_read.await.unwrap(), Err(BodyRead::TooLarge)));
+
+        second_tx.send(Ok(Bytes::from_static(b"chunked"))).await.unwrap();
+        drop(second_tx);
+        assert_eq!(second_read.await.unwrap().unwrap(), Bytes::from_static(b"chunked"));
+        let snapshot = admission_value(&state, crate::admission::Class::Body);
+        assert_eq!((snapshot.active, snapshot.queued, snapshot.refused), (0, 0, 1));
+    }
+
+    /// A producer that stops mid-body cannot own one of the few aggregation slots forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_times_out_and_releases_its_slot() {
+        use axum::http::Request as HttpRequest;
+        use std::convert::Infallible;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let mut state = AppState::for_test(None);
+        state.admission = crate::admission::Admission::new(1, 1, 1, 1, std::time::Duration::from_secs(5));
+        let state = Arc::new(state);
+        let (_sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(1);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/recommend")
+            .body(Body::from_stream(ReceiverStream::new(receiver)))
+            .unwrap();
+        let reading = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { body_bytes_held(&state, request, 8).await }
+        });
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 0).await;
+
+        tokio::time::advance(BODY_READ_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        assert!(matches!(reading.await.unwrap(), Err(BodyRead::TimedOut)));
+        let snapshot = admission_value(&state, crate::admission::Class::Body);
+        assert_eq!((snapshot.active, snapshot.queued, snapshot.completed), (0, 0, 1));
+        let response = body_error(BodyRead::TimedOut, || unreachable!());
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(body_of(response).await.contains(r#""error":"body_timeout""#));
+    }
+
+    /// `/embed` keeps this permit while its completed bytes wait for one of the proxy's own slots. Therefore
+    /// fast producers cannot turn the proxy semaphore into an unbounded queue of already-buffered bodies.
+    #[tokio::test]
+    async fn completed_embed_bodies_remain_bounded_ahead_of_the_proxy() {
+        use axum::http::Request as HttpRequest;
+
+        let mut state = AppState::for_test(None);
+        state.admission = crate::admission::Admission::new(1, 1, 1, 1, std::time::Duration::from_secs(5));
+        let state = Arc::new(state);
+        let request = |body: &'static str| {
+            HttpRequest::builder().method("POST").uri("/embed").body(Body::from(body)).unwrap()
+        };
+        let (first, first_permit) = body_bytes_held(&state, request("first"), 64).await.unwrap();
+        assert_eq!(first, Bytes::from_static(b"first"));
+
+        let second = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { body_bytes_held(&state, request("second"), 64).await }
+        });
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 1).await;
+        assert!(matches!(body_bytes_held(&state, request("third"), 64).await, Err(BodyRead::Busy)));
+
+        drop(first_permit);
+        let (second_body, second_permit) = second.await.unwrap().unwrap();
+        assert_eq!(second_body, Bytes::from_static(b"second"));
+        drop(second_permit);
+    }
+
+    /// A completed body stays charged while the first index question performs its lazy single-flight load.
+    /// Therefore a wave cannot park one near-limit byte buffer per request behind that one cold load.
+    #[tokio::test]
+    async fn completed_index_bodies_remain_bounded_during_a_cold_load() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-admission-cold-index-{}", std::process::id()));
+        let dataset = crate::queries::write_fixture(&dir);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let index = Arc::new(
+            crate::queries::IndexQueries::new(&dataset)
+                .with_load_latch(Arc::clone(&started), Arc::clone(&release)),
+        );
+        let mut state = AppState::for_test(Some(dataset));
+        state.index = Some(index);
+        state.admission = crate::admission::Admission::new(1, 1, 1, 1, std::time::Duration::from_secs(5));
+        let state = Arc::new(state);
+
+        let first = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { post(&state, "/index/labels.json", r#"{"titles":[]}"#).await }
+        });
+        started.notified().await;
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 0).await;
+        let second = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { post(&state, "/index/labels.json", r#"{"titles":[]}"#).await }
+        });
+        wait_for_admission(&state, crate::admission::Class::Body, 1, 1).await;
+
+        let third = post(&state, "/index/labels.json", r#"{"titles":[]}"#).await;
+        assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_of(third).await.contains(r#""class":"body""#));
+        release.notify_one();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        let snapshot = admission_value(&state, crate::admission::Class::Body);
+        assert_eq!((snapshot.active, snapshot.queued, snapshot.refused), (0, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_content_length_is_refused_before_body_admission() {
+        use axum::http::Request as HttpRequest;
+        let mut state = AppState::for_test(None);
+        state.admission = crate::admission::Admission::new(1, 0, 1, 0, std::time::Duration::from_secs(1));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/recommend")
+            .header(header::CONTENT_LENGTH, "9")
+            .body(Body::from("ignored"))
+            .unwrap();
+        assert!(matches!(body_bytes(&state, request, 8).await, Err(BodyRead::TooLarge)));
+        let snapshot = admission_value(&state, crate::admission::Class::Body);
+        assert_eq!((snapshot.active, snapshot.completed), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn overload_is_an_explicit_json_503_with_a_retry_hint() {
+        let response = overloaded(crate::admission::Class::Cpu);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = body_of(response).await;
+        assert!(body.contains(r#""error":"overloaded""#), "{body}");
+        assert!(body.contains(r#""class":"cpu""#), "{body}");
+    }
+
     fn title_state() -> Arc<AppState> {
         use den_titlesearch::{MediaType, TitleIndex, TitleRecord};
         let index = TitleIndex::build(vec![TitleRecord {
@@ -3030,6 +3384,45 @@ mod tests {
         let ds = crate::queries::write_fixture(&dir);
         let index = Arc::new(crate::queries::IndexQueries::new(&ds));
         Arc::new(AppState { index: Some(index), ..AppState::for_test(Some(ds)) })
+    }
+
+    #[tokio::test]
+    async fn a_heavy_index_route_refuses_explicitly_while_static_index_metadata_stays_available() {
+        let mut state = index_state("den-atlas-admission-index");
+        Arc::get_mut(&mut state).unwrap().admission =
+            crate::admission::Admission::new(1, 0, 1, 0, std::time::Duration::from_millis(10));
+        let gate = state.admission.gate(crate::admission::Class::Cpu);
+        let _held = crate::admission::Gate::acquire(&gate).await.unwrap();
+
+        let busy = get(&state, "/index/similar/movie/1.json").await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
+        assert!(body_of(busy).await.contains(r#""class":"cpu""#));
+        assert_eq!(get(&state, "/index/taxonomy.json").await.status(), StatusCode::OK);
+    }
+
+    /// Recommendation reserves its local-work slot before asking for the catalogue lists it will rank. Otherwise
+    /// every request in an overload wave can still perform synchronous list materialisation before discovering
+    /// that the final rank is full, and the nominal short refusal takes seconds.
+    #[tokio::test]
+    async fn recommendation_refuses_before_its_catalogue_lookup() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-admission-recommend-{}", std::process::id()));
+        let dataset = crate::queries::write_fixture(&dir);
+        let index = Arc::new(crate::queries::IndexQueries::new(&dataset));
+        let mut state =
+            AppState::for_test_with_source(Arc::new(SlowSource { dwell: std::time::Duration::from_secs(1) }));
+        state.dataset = Some(dataset);
+        state.index = Some(index);
+        state.admission = crate::admission::Admission::new(1, 0, 1, 0, std::time::Duration::from_secs(1));
+        let state = Arc::new(state);
+        let cpu_gate = state.admission.gate(crate::admission::Class::Cpu);
+        let _held = crate::admission::Gate::acquire(&cpu_gate).await.unwrap();
+
+        let started = Instant::now();
+        let busy = post(&state, "/recommend", r#"{"surface":"movies"}"#).await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_of(busy).await.contains(r#""class":"cpu""#));
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
     }
 
     fn maturity_index_state(name: &str) -> Arc<AppState> {
@@ -5593,6 +5986,29 @@ mod tests {
             tokio::time::sleep(self.dwell).await;
             Ok(vec![(8, "nfx".into()), (119, "prv".into()), (1899, "mxx".into()), (531, "pmp".into())])
         }
+    }
+
+    /// Local overload must not become a router-wide limit. Liveness and a genuinely cold catalogue row still
+    /// answer while both local classes are full; the row then remains cached under the catalogue's own policy.
+    #[tokio::test]
+    async fn cheap_and_cold_catalog_routes_ignore_local_admission() {
+        let mut state = AppState::for_test_with_source(Arc::new(SlowSource {
+            dwell: std::time::Duration::from_millis(10),
+        }));
+        state.admission = crate::admission::Admission::new(1, 0, 1, 0, std::time::Duration::from_secs(1));
+        let state = Arc::new(state);
+        let cpu_gate = state.admission.gate(crate::admission::Class::Cpu);
+        let body_gate = state.admission.gate(crate::admission::Class::Body);
+        let _cpu = crate::admission::Gate::acquire(&cpu_gate).await.unwrap();
+        let _body = crate::admission::Gate::acquire(&body_gate).await.unwrap();
+
+        assert_eq!(get(&state, "/health").await.status(), StatusCode::OK);
+        let cold = get(&state, "/catalog/movie/jw-nfx.json").await;
+        assert_eq!(cold.status(), StatusCode::OK);
+        assert!(body_of(cold).await.contains("tt1"));
+        let warm = get(&state, "/catalog/movie/jw-nfx.json").await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        assert!(timing_of(&warm).starts_with("cache;desc=hit"));
     }
 
     /// Answers the first chart and fails every one after, so a test reaches the real

@@ -1,6 +1,7 @@
 //! den-atlas — the Rust serving layer (RUST-1). Streams the derived dataset from disk with the full caching
 //! layer (ETag / Range / gzip / conditional). Data is mounted at `DATA_DIR` (default `data/`).
 
+mod admission;
 mod awards;
 mod billboardcheck;
 mod billboardeval;
@@ -62,6 +63,9 @@ pub(crate) fn release_version() -> &'static str {
 }
 
 pub struct AppState {
+    /// Separate bounds for synchronous local ranking and POST body aggregation. Catalog cold-fill has its own
+    /// admission and deliberately never touches these gates.
+    pub admission: admission::Admission,
     /// `None` when the dataset couldn't be loaded (old/missing meta) — the addon still serves manifest +
     /// catalog and returns 503 on the dataset routes.
     pub dataset: Option<dataset::Dataset>,
@@ -144,6 +148,7 @@ impl AppState {
     /// Minimal state for a route test: no embed proxy, no index queries, an offline catalog source.
     pub fn for_test(dataset: Option<dataset::Dataset>) -> Self {
         AppState {
+            admission: admission::Admission::new(4, 8, 4, 8, admission::WAIT),
             dataset,
             // An OFFLINE source, not a real client. `JustWatchClient::new()` here pointed every
             // route test at apis.justwatch.com: any test that touched /catalog would have made
@@ -544,6 +549,7 @@ async fn main() {
     let health = handler::health_state(dataset.is_some(), true, false, false, false, false, false, false)
         .map_or("ok", |(reason, _)| reason);
     let state = Arc::new(AppState {
+        admission: admission::Admission::from_env(),
         dataset,
         catalog,
         default_country,
@@ -649,7 +655,7 @@ async fn main() {
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} log_identity={} {dataset} country={} \
          providers={} catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} \
-         motn={} maturity_providers={} playground={}",
+         motn={} maturity_providers={} playground={} admission={}",
         release_version(),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -669,6 +675,7 @@ async fn main() {
         on(state.motn.enabled()),
         on(state.maturity_providers.enabled()),
         on(state.playground && state.index.is_some()),
+        state.admission.description(),
     );
     let outcome = serve_until(listener, app, shutdown, DRAIN_GRACE).await;
     eprintln!("{}", outcome.describe());
