@@ -32,6 +32,8 @@ pub struct TtlCache {
     persistence: Arc<CachePersistence>,
     #[cfg(test)]
     before_write: Arc<Mutex<Option<WritePause>>>,
+    #[cfg(test)]
+    panic_next_write: Arc<AtomicBool>,
 }
 
 /// The file under `CACHE_DIR`. A new format takes a new name, so an old file is ignored, not misread.
@@ -40,7 +42,8 @@ const FILE: &str = "catalog-rows.v1.json";
 /// Catalog rows are disposable upstream cache data. Waiting one second greatly reduces full-map
 /// rewrites during a refresh wave while putting a hard ceiling on how long a successful row remains
 /// memory-only. This is fixed-window batching, not a sliding debounce, so continuous traffic cannot
-/// postpone a flush forever.
+/// postpone a flush forever. The detached coordinator is process-bound: a stop or restart does not
+/// flush it, so at most this window of disposable cache rows may need fetching again.
 const FLUSH_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
@@ -121,6 +124,8 @@ impl TtlCache {
             persistence: Arc::default(),
             #[cfg(test)]
             before_write: Arc::default(),
+            #[cfg(test)]
+            panic_next_write: Arc::default(),
         }
     }
 
@@ -201,15 +206,19 @@ impl TtlCache {
         let flush_after = self.flush_after;
         #[cfg(test)]
         let before_write = Arc::clone(&self.before_write);
+        #[cfg(test)]
+        let panic_next_write = Arc::clone(&self.panic_next_write);
         runtime.spawn(async move {
             loop {
                 tokio::time::sleep(flush_after).await;
                 let map = Arc::clone(&map);
                 let writer_generation = Arc::clone(&generation);
-                let file = file.clone();
-                let persistence = Arc::clone(&persistence);
+                let writer_file = file.clone();
+                let writer_persistence = Arc::clone(&persistence);
                 #[cfg(test)]
                 let before_write = Arc::clone(&before_write);
+                #[cfg(test)]
+                let panic_next_write = Arc::clone(&panic_next_write);
                 let written = tokio::task::spawn_blocking(move || {
                     let started = Instant::now();
                     // Read the generation while holding the map lock. A put is therefore either in this
@@ -223,26 +232,37 @@ impl TtlCache {
                         pause.entered.wait();
                         pause.release.wait();
                     }
+                    #[cfg(test)]
+                    if panic_next_write.swap(false, Ordering::AcqRel) {
+                        panic!("injected catalog cache writer failure");
+                    }
                     match body.map_err(std::io::Error::other).and_then(|body| {
-                        write_atomically(&file, &body)?;
+                        write_atomically(&writer_file, &body)?;
                         Ok(body.len())
                     }) {
                         Ok(bytes) => {
-                            persistence.writes.fetch_add(1, Ordering::Relaxed);
-                            persistence.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-                            persistence
+                            writer_persistence.writes.fetch_add(1, Ordering::Relaxed);
+                            writer_persistence.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                            writer_persistence
                                 .last_write_ms
                                 .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                         }
                         Err(error) => {
-                            persistence.errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("catalog cache: could not write {} ({error})", file.display());
+                            writer_persistence.errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("catalog cache: could not write {} ({error})", writer_file.display());
                         }
                     }
                     snapshot_generation
                 })
-                .await
-                .ok();
+                .await;
+                let written = match written {
+                    Ok(written) => Some(written),
+                    Err(error) => {
+                        persistence.errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("catalog cache: writer task failed for {} ({error})", file.display());
+                        None
+                    }
+                };
 
                 // A failed cache write is retried by the next put, as before; do not spin on a full or
                 // read-only filesystem. A successful write follows every generation it did not include.
@@ -273,6 +293,11 @@ impl TtlCache {
         *lock(&self.before_write) =
             Some(WritePause { entered: Arc::clone(&entered), release: Arc::clone(&release) });
         (entered, release)
+    }
+
+    #[cfg(test)]
+    fn fail_next_writer_task(&self) {
+        self.panic_next_write.store(true, Ordering::Release);
     }
 }
 
@@ -588,6 +613,33 @@ mod tests {
         let status = cache.persistence_status();
         assert_eq!(status.writes, 1);
         assert!(status.bytes > 0);
+        assert_eq!(status.errors, 1);
+        let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        assert!(matches!(restarted.get("before"), Lookup::Fresh(value) if value == "one"));
+        assert!(matches!(restarted.get("after"), Lookup::Fresh(value) if value == "two"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_writer_task_is_counted_and_the_next_put_retries() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-task-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TtlCache::persisted_with_flush_after(Duration::from_secs(3600), &dir, Duration::from_millis(5));
+        cache.fail_next_writer_task();
+        cache.put("before", "one".to_owned());
+        wait_until_idle(&cache).await;
+        assert_eq!(cache.persistence_status().writes, 0);
+        assert_eq!(cache.persistence_status().errors, 1, "the JoinError was hidden");
+
+        cache.put("after", "two".to_owned());
+        wait_until_idle(&cache).await;
+        let status = cache.persistence_status();
+        assert_eq!(status.writes, 1);
         assert_eq!(status.errors, 1);
         let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
         assert!(matches!(restarted.get("before"), Lookup::Fresh(value) if value == "one"));
