@@ -200,6 +200,21 @@ pub fn render(state: &AppState) -> String {
         "",
         state.catalog.schema_suspect() as u64,
     );
+    let catalog_cache = state.catalog.cache_persistence_status();
+    b.push_str(
+        "# HELP atlas_catalog_cache_writes_total Successful catalog-row cache file replacements since process start.\n\
+         # TYPE atlas_catalog_cache_writes_total counter\n\
+         # HELP atlas_catalog_cache_write_bytes_total Bytes written to the catalog-row cache since process start.\n\
+         # TYPE atlas_catalog_cache_write_bytes_total counter\n\
+         # HELP atlas_catalog_cache_write_errors_total Failed catalog-row cache serialization or write attempts.\n\
+         # TYPE atlas_catalog_cache_write_errors_total counter\n\
+         # HELP atlas_catalog_cache_last_write_milliseconds Duration of the last successful catalog-row cache replacement.\n\
+         # TYPE atlas_catalog_cache_last_write_milliseconds gauge\n",
+    );
+    b.push_str(&format!(
+        "atlas_catalog_cache_writes_total {}\natlas_catalog_cache_write_bytes_total {}\natlas_catalog_cache_write_errors_total {}\natlas_catalog_cache_last_write_milliseconds {}\n",
+        catalog_cache.writes, catalog_cache.bytes, catalog_cache.errors, catalog_cache.last_write_ms
+    ));
     b
 }
 

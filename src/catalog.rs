@@ -419,6 +419,10 @@ impl CatalogState {
         self.last_refresh_ok.load(Ordering::Relaxed)
     }
 
+    pub fn cache_persistence_status(&self) -> crate::cache::CachePersistenceStatus {
+        self.cache.persistence_status()
+    }
+
     /// Whether a chart we are STILL SERVING came back looking like a schema break. Distinct from
     /// `fresh()`: a partial break is a successful refresh — the row is short but non-empty, so it
     /// caches as complete and everything else reports healthy.

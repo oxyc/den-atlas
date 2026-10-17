@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, SystemTime};
 
 pub struct TtlCache {
     ttl: Duration,
@@ -22,13 +24,49 @@ pub struct TtlCache {
     /// Where the rows are kept across restarts; `None` keeps them in memory only.
     file: Option<PathBuf>,
     /// A row changed since the file was last written.
-    dirty: Arc<AtomicBool>,
-    /// A writer is running, so a burst of refreshes writes the file a few times rather than once per row.
+    generation: Arc<AtomicU64>,
+    /// A writer is scheduled or running. One fixed batch window bounds both write frequency and delay;
+    /// a later generation gets another window instead of being lost behind the active writer.
     saving: Arc<AtomicBool>,
+    flush_after: Duration,
+    persistence: Arc<CachePersistence>,
+    #[cfg(test)]
+    before_write: Arc<Mutex<Option<WritePause>>>,
+    #[cfg(test)]
+    panic_next_write: Arc<AtomicBool>,
 }
 
 /// The file under `CACHE_DIR`. A new format takes a new name, so an old file is ignored, not misread.
 const FILE: &str = "catalog-rows.v1.json";
+
+/// Catalog rows are disposable upstream cache data. Waiting one second greatly reduces full-map
+/// rewrites during a refresh wave while putting a hard ceiling on how long a successful row remains
+/// memory-only. This is fixed-window batching, not a sliding debounce, so continuous traffic cannot
+/// postpone a flush forever. The detached coordinator is process-bound: a stop or restart does not
+/// flush it, so at most this window of disposable cache rows may need fetching again.
+const FLUSH_AFTER: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct CachePersistence {
+    writes: AtomicU64,
+    bytes: AtomicU64,
+    errors: AtomicU64,
+    last_write_ms: AtomicU64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CachePersistenceStatus {
+    pub writes: u64,
+    pub bytes: u64,
+    pub errors: u64,
+    pub last_write_ms: u64,
+}
+
+#[cfg(test)]
+struct WritePause {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
 
 /// How many rendered rows to keep. Nothing here ever expired an entry — serve-stale reads expired
 /// ones, so the map only grew, for the process lifetime. The keyspace is bounded (countries are
@@ -80,8 +118,14 @@ impl TtlCache {
             max_entries,
             map: Arc::default(),
             file: None,
-            dirty: Arc::default(),
+            generation: Arc::default(),
             saving: Arc::default(),
+            flush_after: FLUSH_AFTER,
+            persistence: Arc::default(),
+            #[cfg(test)]
+            before_write: Arc::default(),
+            #[cfg(test)]
+            panic_next_write: Arc::default(),
         }
     }
 
@@ -108,6 +152,15 @@ impl TtlCache {
         Self { file: Some(file), ..cache }
     }
 
+    pub fn persistence_status(&self) -> CachePersistenceStatus {
+        CachePersistenceStatus {
+            writes: self.persistence.writes.load(Ordering::Relaxed),
+            bytes: self.persistence.bytes.load(Ordering::Relaxed),
+            errors: self.persistence.errors.load(Ordering::Relaxed),
+            last_write_ms: self.persistence.last_write_ms.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn get(&self, key: &str) -> Lookup {
         let map = lock(&self.map);
         match map.get(key) {
@@ -130,37 +183,121 @@ impl TtlCache {
                 evict_one(&mut map);
             }
             map.insert(key.to_owned(), Entry { stored: SystemTime::now(), value });
+            self.generation.fetch_add(1, Ordering::Release);
         }
         self.save();
     }
 
-    /// Write the rows to the file off the request path. One writer at a time; rows stored while it
-    /// writes are picked up by its next pass.
+    /// Write the rows to the file off the request path. The first row opens a fixed batch window;
+    /// rows stored while it waits or writes are included in that pass or a guaranteed follow-up.
     fn save(&self) {
         let Some(file) = self.file.clone() else { return };
-        self.dirty.store(true, Ordering::SeqCst);
-        if self.saving.swap(true, Ordering::SeqCst) {
+        if self.saving.swap(true, Ordering::AcqRel) {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.saving.store(false, Ordering::SeqCst);
+            self.saving.store(false, Ordering::Release);
             return;
         };
-        let (map, dirty, saving) = (Arc::clone(&self.map), Arc::clone(&self.dirty), Arc::clone(&self.saving));
-        runtime.spawn_blocking(move || loop {
-            while dirty.swap(false, Ordering::SeqCst) {
-                let body = serde_json::to_vec(&*lock(&map));
-                if let Err(e) = body.map_err(std::io::Error::other).and_then(|b| write_atomically(&file, &b))
-                {
-                    eprintln!("catalog cache: could not write {} ({e})", file.display());
+        let map = Arc::clone(&self.map);
+        let generation = Arc::clone(&self.generation);
+        let saving = Arc::clone(&self.saving);
+        let persistence = Arc::clone(&self.persistence);
+        let flush_after = self.flush_after;
+        #[cfg(test)]
+        let before_write = Arc::clone(&self.before_write);
+        #[cfg(test)]
+        let panic_next_write = Arc::clone(&self.panic_next_write);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(flush_after).await;
+                let map = Arc::clone(&map);
+                let writer_generation = Arc::clone(&generation);
+                let writer_file = file.clone();
+                let writer_persistence = Arc::clone(&persistence);
+                #[cfg(test)]
+                let before_write = Arc::clone(&before_write);
+                #[cfg(test)]
+                let panic_next_write = Arc::clone(&panic_next_write);
+                let written = tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    // Read the generation while holding the map lock. A put is therefore either in this
+                    // snapshot or has a strictly later generation that forces another pass.
+                    let (body, snapshot_generation) = {
+                        let map = lock(&map);
+                        (serde_json::to_vec(&*map), writer_generation.load(Ordering::Acquire))
+                    };
+                    #[cfg(test)]
+                    if let Some(pause) = lock(&before_write).take() {
+                        pause.entered.wait();
+                        pause.release.wait();
+                    }
+                    #[cfg(test)]
+                    if panic_next_write.swap(false, Ordering::AcqRel) {
+                        panic!("injected catalog cache writer failure");
+                    }
+                    match body.map_err(std::io::Error::other).and_then(|body| {
+                        write_atomically(&writer_file, &body)?;
+                        Ok(body.len())
+                    }) {
+                        Ok(bytes) => {
+                            writer_persistence.writes.fetch_add(1, Ordering::Relaxed);
+                            writer_persistence.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                            writer_persistence
+                                .last_write_ms
+                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            writer_persistence.errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("catalog cache: could not write {} ({error})", writer_file.display());
+                        }
+                    }
+                    snapshot_generation
+                })
+                .await;
+                let written = match written {
+                    Ok(written) => Some(written),
+                    Err(error) => {
+                        persistence.errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("catalog cache: writer task failed for {} ({error})", file.display());
+                        None
+                    }
+                };
+
+                // A failed cache write is retried by the next put, as before; do not spin on a full or
+                // read-only filesystem. A successful write follows every generation it did not include.
+                if written.is_some_and(|written| generation.load(Ordering::Acquire) != written) {
+                    continue;
                 }
-            }
-            saving.store(false, Ordering::SeqCst);
-            // A row stored between the last pass and clearing `saving` saw a writer and left it to this one.
-            if !dirty.load(Ordering::SeqCst) || saving.swap(true, Ordering::SeqCst) {
-                break;
+                saving.store(false, Ordering::Release);
+                let caught_up =
+                    written.map(|written| generation.load(Ordering::Acquire) == written).unwrap_or(true);
+                if caught_up || saving.swap(true, Ordering::AcqRel) {
+                    break;
+                }
+                // A put landed between the caught-up check and clearing `saving`. It saw the active
+                // writer, so this task owns the follow-up window.
             }
         });
+    }
+
+    #[cfg(test)]
+    fn persisted_with_flush_after(ttl: Duration, dir: &Path, flush_after: Duration) -> Self {
+        Self { flush_after, ..Self::persisted(ttl, dir) }
+    }
+
+    #[cfg(test)]
+    fn pause_next_write(&self) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *lock(&self.before_write) =
+            Some(WritePause { entered: Arc::clone(&entered), release: Arc::clone(&release) });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    fn fail_next_writer_task(&self) {
+        self.panic_next_write.store(true, Ordering::Release);
     }
 }
 
@@ -332,6 +469,16 @@ impl EmbedMemo {
 mod tests {
     use super::*;
 
+    async fn wait_until_idle(cache: &TtlCache) {
+        for _ in 0..400 {
+            if !cache.saving.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("catalog cache writer did not become idle");
+    }
+
     /// The map had no eviction at all and `get` deliberately keeps expired entries (serve-stale
     /// reads them), so it only ever grew — one entry per key ever requested, for the process
     /// lifetime, against a 256 MB container.
@@ -388,6 +535,152 @@ mod tests {
         std::fs::write(&file, b"not json").unwrap();
         assert!(matches!(TtlCache::persisted(Duration::from_secs(3600), &dir).get("k"), Lookup::Miss));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Spaced upstream responses used to finish after the active writer and each start another full-map
+    /// serialization. A fixed window makes write count depend on burst duration, not row count.
+    #[tokio::test]
+    async fn a_spaced_put_burst_is_batched_into_a_few_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-burst-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TtlCache::persisted_with_flush_after(Duration::from_secs(3600), &dir, Duration::from_millis(200));
+        for i in 0..40 {
+            cache.put(&format!("k{i}"), format!("v{i}"));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        wait_until_idle(&cache).await;
+
+        let status = cache.persistence_status();
+        assert!((1..=2).contains(&status.writes), "40 spaced puts caused {} full writes", status.writes);
+        assert!(status.bytes > 0, "successful replacement bytes were not counted");
+        assert_eq!(status.errors, 0);
+        let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        assert_eq!(restarted.len(), 40);
+        assert!(matches!(restarted.get("k39"), Lookup::Fresh(value) if value == "v39"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The generation is captured under the same lock as the serialized map. A put after that snapshot
+    /// cannot be mistaken for part of it: the active coordinator must perform a follow-up replacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_during_a_write_is_in_a_guaranteed_follow_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TtlCache::persisted_with_flush_after(Duration::from_secs(3600), &dir, Duration::from_millis(5));
+        let (entered, release) = cache.pause_next_write();
+        cache.put("before", "one".to_owned());
+        tokio::task::spawn_blocking(move || entered.wait()).await.unwrap();
+        cache.put("during", "two".to_owned());
+        tokio::task::spawn_blocking(move || release.wait()).await.unwrap();
+        wait_until_idle(&cache).await;
+
+        assert_eq!(cache.persistence_status().writes, 2);
+        let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        assert!(matches!(restarted.get("before"), Lookup::Fresh(value) if value == "one"));
+        assert!(matches!(restarted.get("during"), Lookup::Fresh(value) if value == "two"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_is_counted_and_the_next_put_retries() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let cache =
+            TtlCache::persisted_with_flush_after(Duration::from_secs(3600), &dir, Duration::from_millis(5));
+        cache.put("before", "one".to_owned());
+        wait_until_idle(&cache).await;
+        assert_eq!(
+            cache.persistence_status(),
+            CachePersistenceStatus { writes: 0, bytes: 0, errors: 1, last_write_ms: 0 }
+        );
+
+        std::fs::create_dir_all(&dir).unwrap();
+        cache.put("after", "two".to_owned());
+        wait_until_idle(&cache).await;
+        let status = cache.persistence_status();
+        assert_eq!(status.writes, 1);
+        assert!(status.bytes > 0);
+        assert_eq!(status.errors, 1);
+        let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        assert!(matches!(restarted.get("before"), Lookup::Fresh(value) if value == "one"));
+        assert!(matches!(restarted.get("after"), Lookup::Fresh(value) if value == "two"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_writer_task_is_counted_and_the_next_put_retries() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-task-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TtlCache::persisted_with_flush_after(Duration::from_secs(3600), &dir, Duration::from_millis(5));
+        cache.fail_next_writer_task();
+        cache.put("before", "one".to_owned());
+        wait_until_idle(&cache).await;
+        assert_eq!(cache.persistence_status().writes, 0);
+        assert_eq!(cache.persistence_status().errors, 1, "the JoinError was hidden");
+
+        cache.put("after", "two".to_owned());
+        wait_until_idle(&cache).await;
+        let status = cache.persistence_status();
+        assert_eq!(status.writes, 1);
+        assert_eq!(status.errors, 1);
+        let restarted = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        assert!(matches!(restarted.get("before"), Lookup::Fresh(value) if value == "one"));
+        assert!(matches!(restarted.get("after"), Lookup::Fresh(value) if value == "two"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Manual release-mode measurement on a catalog-cache-sized map:
+    /// `cargo test --release catalog_cache_refresh_wave -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "release-mode persistence benchmark"]
+    async fn catalog_cache_refresh_wave() {
+        let dir = std::env::temp_dir().join(format!(
+            "den-atlas-cache-bench-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = TtlCache::persisted(Duration::from_secs(3600), &dir);
+        let row = "x".repeat(22 * 1024);
+        for i in 0..250 {
+            cache.put(&format!("k{i}"), row.clone());
+        }
+        wait_until_idle(&cache).await;
+        let before = cache.persistence_status();
+        let started = Instant::now();
+        for i in 0..100 {
+            cache.put(&format!("k{i}"), row.clone());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        wait_until_idle(&cache).await;
+        let after = cache.persistence_status();
+        let writes = after.writes - before.writes;
+        let bytes = after.bytes - before.bytes;
+        eprintln!(
+            "catalog cache refresh wave: writes={writes} bytes={bytes} elapsed_ms={} last_write_ms={}",
+            started.elapsed().as_millis(),
+            after.last_write_ms
+        );
+        assert_eq!(writes, 1, "a sub-window refresh wave should have one replacement");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

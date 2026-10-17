@@ -5903,6 +5903,10 @@ mod tests {
         );
         assert!(body.contains("atlas_dataset_loaded 1\n"), "{body}");
         assert!(body.contains("atlas_dataset_titles 1\n"), "{body}");
+        assert!(body.contains("atlas_catalog_cache_writes_total 0\n"), "{body}");
+        assert!(body.contains("atlas_catalog_cache_write_bytes_total 0\n"), "{body}");
+        assert!(body.contains("atlas_catalog_cache_write_errors_total 0\n"), "{body}");
+        assert!(body.contains("atlas_catalog_cache_last_write_milliseconds 0\n"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
