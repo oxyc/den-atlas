@@ -48,6 +48,9 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+      - name: Release helper
+        run: scripts/release-test.sh
+
       - name: Tests
         run: cargo test --locked --workspace
         env:

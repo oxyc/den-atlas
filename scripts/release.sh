@@ -2,14 +2,24 @@
 # Publish a release without rebuilding or retesting it. Main CI has already built, behavior-probed, and scanned an
 # immutable candidate image for its exact SHA; the vX.Y.Z workflow only verifies, signs and promotes that digest.
 #
-#   scripts/release.sh 0.94.0
+#   scripts/release.sh --prepare 0.94.0  # open the VERSION pull request
+#   scripts/release.sh 0.94.0            # after that pull request is merged
 #
-# Only VERSION changes (Cargo.toml stays put so the cached Rust build survives). The tag is created only after the
-# exact main commit's CI succeeded, so a red build leaves no tag that builds nothing.
+# Only VERSION changes (Cargo.toml stays put so the cached Rust build survives). Protected main means that change
+# must pass through a pull request. Preparation creates that version-only PR; publishing waits for the merged
+# commit's exact main CI and tags it only after that succeeds, so a red build leaves no tag that builds nothing.
 set -euo pipefail
 
+mode=publish
+if [ "${1:-}" = --prepare ]; then
+    mode=prepare
+    shift
+fi
 version="${1:-}"
-[ -n "$version" ] || { echo "usage: scripts/release.sh <version>   e.g. 0.94.0" >&2; exit 1; }
+[ -n "$version" ] && [ "$#" -eq 1 ] || {
+    echo "usage: scripts/release.sh [--prepare] <version>   e.g. 0.94.0" >&2
+    exit 1
+}
 case "$version" in
     v*) echo "error: give the version without the leading v ($version -> ${version#v})" >&2; exit 1 ;;
     *.*.*) ;;
@@ -27,18 +37,73 @@ main="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^orig
 [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$main")" ] \
     || { echo "error: checkout is not the latest origin/$main — update it before releasing" >&2; exit 1; }
 git rev-parse "v$version" >/dev/null 2>&1 && { echo "error: tag v$version already exists" >&2; exit 1; }
-
-current="$(cat VERSION)"
-if [ "$current" != "$version" ]; then
-    printf '%s\n' "$version" > VERSION
-    git add VERSION
-    git commit --quiet -m "${slug#*/} $version"
-    git push --quiet origin "HEAD:$main"
-fi
-sha="$(git rev-parse HEAD)"
-
 command -v gh >/dev/null 2>&1 || {
     echo "error: gh is required to prove exact-main CI before tagging" >&2; exit 1; }
+
+current="$(cat VERSION)"
+if [ "$mode" = publish ] && [ "$current" != "$version" ]; then
+    echo "error: VERSION is $current; protected $main requires a version pull request first" >&2
+    echo "       run: scripts/release.sh --prepare $version" >&2
+    echo "       after it merges, update $main and rerun: scripts/release.sh $version" >&2
+    exit 1
+fi
+
+if [ "$mode" = prepare ]; then
+    [ "$current" != "$version" ] || {
+        echo "error: VERSION is already $version; update $main after the version PR merges, then run:" >&2
+        echo "       scripts/release.sh $version" >&2
+        exit 1
+    }
+    branch="release/$version"
+    existing_pr="$(gh pr list --repo "$slug" --head "$branch" --state open --limit 1 --json url --jq '.[0].url // empty')"
+    if [ -n "$existing_pr" ]; then
+        echo "release preparation already exists: $existing_pr"
+        exit 0
+    fi
+    git show-ref --verify --quiet "refs/heads/$branch" && {
+        echo "error: local branch $branch already exists; inspect or remove it before retrying" >&2
+        exit 1
+    }
+    git show-ref --verify --quiet "refs/remotes/origin/$branch" && {
+        echo "error: origin/$branch exists without an open PR; inspect it before retrying" >&2
+        exit 1
+    }
+fi
+
+# Formatting goes through nix when this machine has no rustfmt: treating "no such command" as success is how
+# broken formatting reached earlier releases.
+run_rustfmt() {
+    if cargo fmt --all --check 2>/dev/null; then return 0; fi
+    command -v nix >/dev/null 2>&1 \
+        || { echo "error: no rustfmt, and no nix to borrow one" >&2; return 1; }
+    # shellcheck disable=SC2046
+    nix run nixpkgs#rustfmt -- --edition 2021 --check $(git ls-files '*.rs')
+}
+echo "==> formatting"; run_rustfmt
+echo "==> tests";      cargo test --locked --workspace --quiet
+
+if [ "$mode" = prepare ]; then
+    echo "==> version $current -> $version"
+    git switch --quiet -c "$branch"
+    printf '%s\n' "$version" > VERSION
+    [ "$(cat VERSION)" = "$version" ] || { echo "error: the version bump did not apply" >&2; exit 1; }
+    git add VERSION
+    git commit --quiet -m "${slug#*/} $version"
+    git push --quiet --set-upstream origin "$branch"
+    body="$(printf '%s\n\n%s\n' \
+        "Prepare ${slug#*/} $version." \
+        "After this merges and exact-main CI passes, publish it with \`scripts/release.sh $version\`.")"
+    if ! pr_url="$(gh pr create --repo "$slug" --base "$main" --head "$branch" \
+        --title "Release $version" --body "$body")"; then
+        echo "error: $branch was pushed, but its pull request could not be created" >&2
+        echo "       retry: gh pr create --repo $slug --base $main --head $branch" >&2
+        exit 1
+    fi
+    echo "release preparation opened: $pr_url"
+    echo "after it merges, update $main and run: scripts/release.sh $version"
+    exit 0
+fi
+sha="$(git rev-parse HEAD)"
 
 echo "==> waiting for exact-main candidate $sha"
 status=""; conclusion=""
