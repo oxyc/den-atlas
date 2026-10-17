@@ -1152,23 +1152,22 @@ fn hidden(candidate: &Candidate<'_>, hide: &Hide) -> bool {
     }
     // A series' genres as TMDB names them for series as well as for films, so a rule written against either
     // name catches it.
-    let mut genres = title.genres.clone();
-    genres.extend(title.hint_genres.iter().filter(|g| !title.genres.contains(g)));
+    let carries_genre = |genre| title.genres.contains(&genre) || title.hint_genres.contains(&genre);
     if candidate.key.0 == MediaType::Tv {
         for (series, films) in [(10759, [28, 12]), (10765, [878, 14]), (10768, [10752, 10752])] {
-            if films.iter().any(|g| genres.contains(g)) {
-                genres.push(series);
+            if hide.genres.contains(&series) && films.into_iter().any(carries_genre) {
+                return true;
             }
         }
     }
-    if genres.iter().any(|g| hide.genres.contains(g)) {
+    if title.genres.iter().chain(&title.hint_genres).any(|genre| hide.genres.contains(genre)) {
         return true;
     }
     let language = title.original_language;
     if language.is_some_and(|code| hide.languages.iter().any(|l| l.as_bytes().eq_ignore_ascii_case(&code))) {
         return true;
     }
-    hide.anime && genres.contains(&ANIMATION) && language == Some(*b"ja")
+    hide.anime && carries_genre(ANIMATION) && language == Some(*b"ja")
 }
 
 /// The answer to a request, given atlas's lists for it.
@@ -1191,19 +1190,16 @@ pub fn answer(
         .filter(|e| e.weight.is_finite() && e.weight != 0.0)
         .filter_map(|e| Some(((media_type(&e.type_)?, e.id), e)))
         .collect();
+    let mut library_unjudged = 0;
     let library: Vec<(Features, f64)> = weighed
         .iter()
         .map(|&(key, e)| {
             let embedding = library_embeddings.and_then(|vectors| vectors.get(&key)).map(Vec::as_slice);
-            (
-                Features::of(indexes, key, &known.title(key, Some(&e.hint), None))
-                    .with_embedding(indexes, embedding),
-                e.weight,
-            )
+            let title = known.title(key, Some(&e.hint), None);
+            library_unjudged += usize::from(title.genres.is_empty());
+            (Features::of(indexes, key, &title).with_embedding(indexes, embedding), e.weight)
         })
         .collect();
-    let library_unjudged =
-        weighed.iter().filter(|&&(key, e)| known.title(key, Some(&e.hint), None).genres.is_empty()).count();
     let library_indexed = library.iter().filter(|(features, _)| features.indexed()).count();
     let library_embedded = library.iter().filter(|(features, _)| features.embedded()).count();
     let library_unindexed = library.len() - library_indexed;

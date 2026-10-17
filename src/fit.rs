@@ -150,8 +150,9 @@ pub struct Corpus {
     credits: HashMap<u32, u32>,
     titles: f64,
     keys: Vec<Key>,
-    /// The mean of the index's vectors: a title's projection on it is how central the title is.
-    centre: Vec<f64>,
+    /// Each row's projection on the index's mean vector: how central that title is. Fixed for the
+    /// life of the index, so a household request only looks it up instead of recomputing the dot.
+    centre_projection: Vec<f64>,
     /// An even sample of the index with vectors, the yardstick every fit is read against.
     sample: Vec<Features>,
     /// Every dated title by the first day it could have come out, with how many days that date spans.
@@ -195,12 +196,13 @@ impl Corpus {
         let shares =
             counts.into_iter().map(|(value, n): (Value, f64)| (value, n / carrying[value.0])).collect();
         dated.sort_unstable();
+        let centre = indexes.plot.mean_vector();
         Corpus {
             shares,
             credits,
             titles: keys.len() as f64,
             keys,
-            centre: indexes.plot.mean_vector(),
+            centre_projection: indexes.plot.projections(&centre),
             sample,
             dated,
         }
@@ -226,6 +228,9 @@ pub struct Fit<'a> {
     indexes: &'a Indexes,
     corpus: &'a Corpus,
     liked: Vec<(Semantic, f64)>,
+    /// The common all-indexed case in a form den-index can scan after resolving its mapped matrix once.
+    /// `None` preserves the mixed indexed/transient-vector order in `liked` for exact tie handling.
+    liked_rows: Option<Vec<(u32, f64)>>,
     disliked: Vec<Semantic>,
     lift: HashMap<Value, f64>,
     /// The lift of a value the library never carries, by family.
@@ -338,10 +343,18 @@ impl<'a> Fit<'a> {
             .map(|(series, _)| (series, indexes.series.series_strength(series)))
             .filter(|&(_, strength)| strength > 0.0)
             .collect();
+        let liked_rows: Option<Vec<_>> = liked
+            .iter()
+            .map(|(semantic, weight)| match semantic {
+                Semantic::Row(row) => Some((*row, *weight)),
+                Semantic::Outside(_) => None,
+            })
+            .collect();
         let mut fit = Fit {
             indexes,
             corpus,
             liked,
+            liked_rows,
             disliked,
             lift,
             unseen,
@@ -430,20 +443,30 @@ impl<'a> Fit<'a> {
             return None;
         }
         let plot = &self.indexes.plot;
+        let hub = *self.corpus.centre_projection.get(row as usize)?;
+        if let Some(liked) = &self.liked_rows {
+            return plot.weighted_nearest::<NEAREST>(row, liked).map(|nearest| nearest - hub);
+        }
         let similarity = |semantic: &Semantic| match semantic {
             Semantic::Row(liked) => Some(plot.similarity(row, *liked)),
             Semantic::Outside(vector) => plot.row_cosine(row, vector),
         };
-        let mut near: Vec<(f64, f64)> =
-            self.liked.iter().filter_map(|(liked, w)| Some((similarity(liked)?, *w))).collect();
-        if near.is_empty() {
-            return None;
+        let mut near: [Option<(f64, f64)>; NEAREST] = [None; NEAREST];
+        let mut held = 0usize;
+        for (liked, weight) in &self.liked {
+            let Some(score) = similarity(liked) else { continue };
+            let at = (0..held).find(|&at| score.total_cmp(&near[at].unwrap().0).is_gt()).unwrap_or(held);
+            if at < NEAREST {
+                for move_to in (at + 1..=held.min(NEAREST - 1)).rev() {
+                    near[move_to] = near[move_to - 1];
+                }
+                near[at] = Some((score, *weight));
+                held = (held + 1).min(NEAREST);
+            }
         }
-        near.sort_by(|a, b| b.0.total_cmp(&a.0));
-        near.truncate(NEAREST);
-        let weight: f64 = near.iter().map(|&(_, w)| w).sum();
-        let hub = plot.projection(row, &self.corpus.centre);
-        Some(near.iter().map(|&(s, w)| w * s).sum::<f64>() / weight - hub)
+        let near = near[..held].iter().flatten();
+        let weight: f64 = near.clone().map(|&(_, weight)| weight).sum();
+        (weight != 0.0).then(|| near.map(|&(score, weight)| weight * score).sum::<f64>() / weight - hub)
     }
 
     /// A row's closeness to the nearest disliked title, less its closeness to the index as a whole.
@@ -457,7 +480,7 @@ impl<'a> Fit<'a> {
                 Semantic::Outside(vector) => plot.row_cosine(row, vector),
             })
             .max_by(f64::total_cmp)?;
-        Some(nearest - plot.projection(row, &self.corpus.centre))
+        Some(nearest - *self.corpus.centre_projection.get(row as usize)?)
     }
 
     fn lifted(&self, features: &Features) -> f64 {
@@ -647,6 +670,7 @@ mod tests {
             indexes: &indexes,
             corpus,
             liked: Vec::new(),
+            liked_rows: None,
             disliked: Vec::new(),
             lift: HashMap::new(),
             unseen: [0.0; 8],
@@ -701,6 +725,7 @@ mod tests {
             indexes: &indexes,
             corpus,
             liked: Vec::new(),
+            liked_rows: None,
             disliked: Vec::new(),
             lift: HashMap::new(),
             unseen: [0.0; 8],
