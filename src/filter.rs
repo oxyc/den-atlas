@@ -27,9 +27,10 @@
 //!
 //! Kinds with few values (≲2k) are one bitset per value over the store's rows, built once per index load; a
 //! selection is an AND of bitsets and a count a popcount. Entity kinds (people, studios, subjects, places)
-//! have far too many values for that: they keep posting lists (entity → rows) for selecting, and count by
-//! walking the matched rows' own entity lists — read in place from the mapped store — then take the top
-//! `TOP_K`. The empty selection's counts are worked out once. What depends on the rating provider (the
+//! have far too many values for that: they keep posting lists (entity → rows) and count by intersecting each
+//! list with the matched-row bitset, then take the top `TOP_K`. A kind made from multiple credit sections
+//! merges their sorted lists so a person credited twice on one title still counts once. The empty selection's
+//! counts are worked out once. What depends on the rating provider (the
 //! `rating` kind and the popularity order `titles.json` walks) is rebuilt when it swaps in new votes.
 //!
 //! # The providers are a seam
@@ -954,6 +955,9 @@ struct EntityKind {
     /// For a section that stores raw Q-ids, the compact posting-list slot to Q-id table. Entity-index
     /// sections leave this absent and use the store's entity table directly.
     qids: Option<Vec<u32>>,
+    /// Values present in at least one section. The entity table also contains places, companies and other
+    /// entities irrelevant to a given credit kind; request-time counts should not revisit those empty slots.
+    candidates: Vec<u32>,
 }
 
 impl EntityKind {
@@ -962,8 +966,41 @@ impl EntityKind {
         self.postings.iter().map(|p| p.of(entity).len()).max().unwrap_or(0)
     }
 
-    fn values(&self, entities: usize) -> usize {
-        self.qids.as_ref().map_or(entities, Vec::len)
+    /// Visit every title crediting `entity`, once. Ordinary kinds have one posting list. `person` combines
+    /// makers and cast, whose sorted lists are merged here so a person holding both credits on one title is
+    /// still one title. The fallback keeps a future kind with more sections correct without complicating the
+    /// common path.
+    fn each_title(&self, entity: u32, mut visit: impl FnMut(u32)) {
+        match self.postings.as_slice() {
+            [] => {}
+            [one] => one.of(entity).iter().copied().for_each(visit),
+            [first, second] => {
+                let (first, second) = (first.of(entity), second.of(entity));
+                let (mut a, mut b) = (0, 0);
+                while a < first.len() || b < second.len() {
+                    let row = match (first.get(a), second.get(b)) {
+                        (Some(&left), Some(&right)) => left.min(right),
+                        (Some(&left), None) => left,
+                        (None, Some(&right)) => right,
+                        (None, None) => break,
+                    };
+                    visit(row);
+                    while first.get(a) == Some(&row) {
+                        a += 1;
+                    }
+                    while second.get(b) == Some(&row) {
+                        b += 1;
+                    }
+                }
+            }
+            many => {
+                let mut rows: Vec<u32> =
+                    many.iter().flat_map(|posting| posting.of(entity).iter().copied()).collect();
+                rows.sort_unstable();
+                rows.dedup();
+                rows.into_iter().for_each(visit);
+            }
+        }
     }
 }
 
@@ -1397,11 +1434,16 @@ impl FilterIndex {
                     None => break,
                 }
             }
-            entities.push((postings.len() == entity.sections.len()).then_some(EntityKind {
-                postings,
-                known,
-                qids,
-            }));
+            entities.push(
+                (postings.len() == entity.sections.len()).then_some(EntityKind {
+                    candidates: (0..qids.as_ref().map_or(entity_count, Vec::len) as u32)
+                        .filter(|&e| postings.iter().any(|posting| !posting.of(e).is_empty()))
+                        .collect(),
+                    postings,
+                    known,
+                    qids,
+                }),
+            );
         }
 
         let bitset = |b: &Bits| b.len() * 8;
@@ -1410,6 +1452,7 @@ impl FilterIndex {
             .map(|v| v.values.values().map(bitset).sum::<usize>() + bitset(&v.known))
             .sum::<usize>()
             + entities.iter().flatten().map(|e| bitset(&e.known)).sum::<usize>()
+            + entities.iter().flatten().map(|e| e.candidates.len() * 4).sum::<usize>()
             + likely.values().flat_map(|v| v.values()).map(bitset).sum::<usize>()
             + postings_bytes
             + keys.len() * std::mem::size_of::<Key>()
@@ -2216,44 +2259,22 @@ impl<'a> Context<'a> {
         Value::Object(out)
     }
 
-    /// Entity counts under `base`: every value credited, and how many titles each.
+    /// Entity counts under `base`: every value credited, and how many titles each. The entity postings are
+    /// already built for selection, so counting walks those contiguous lists rather than transposing every
+    /// matched title's credit lists again on each request.
+    #[cfg(test)]
     fn entity_counts(&self, i: usize, base: &[u64]) -> Vec<(u32, u32)> {
-        let entity = &ENTITY_KINDS[i];
         let Some(kind) = self.filter.entities[i].as_ref() else { return Vec::new() };
-        let lists: Vec<_> =
-            entity.sections.iter().filter_map(|&(v, o)| self.view.list::<u32>(v, o).ok()).collect();
-        let size = kind.values(self.view.column::<u32>("ent_qid").map_or(0, <[u32]>::len));
-        let mut counts = vec![0u32; size];
-        let mut touched: Vec<u32> = Vec::new();
-        let mut seen: Vec<u32> = Vec::new();
-        // A person both making and in a title is one title, so only a kind reading two lists needs to check.
-        let merge = lists.len() > 1;
-        for row in ones(base) {
-            seen.clear();
-            for list in &lists {
-                for &stored in list.get(den_store::Row(row)) {
-                    let e = match &kind.qids {
-                        Some(qids) => match qids.binary_search(&stored) {
-                            Ok(at) => at as u32,
-                            Err(_) => continue,
-                        },
-                        None => stored,
-                    };
-                    if merge {
-                        if seen.contains(&e) {
-                            continue;
-                        }
-                        seen.push(e);
-                    }
-                    let Some(count) = counts.get_mut(e as usize) else { continue };
-                    if *count == 0 {
-                        touched.push(e);
-                    }
-                    *count += 1;
-                }
-            }
-        }
-        touched.into_iter().filter(|&e| self.listable(i, kind, e)).map(|e| (e, counts[e as usize])).collect()
+        kind.candidates
+            .iter()
+            .copied()
+            .filter(|&e| self.listable(i, kind, e))
+            .filter_map(|e| {
+                let mut count = 0;
+                kind.each_title(e, |row| count += u32::from(has(base, row as usize)));
+                (count > 0).then_some((e, count))
+            })
+            .collect()
     }
 
     /// Whether an entity kind lists and searches a value: enough titles, and in its `only` list if it has one.
@@ -2271,17 +2292,23 @@ impl<'a> Context<'a> {
     /// Entity counts under `base`, each with how many of its titles are likely matches: the counts over `any`,
     /// less those over `sure` where the two differ.
     fn entity_tallies(&self, i: usize, base: &Matched) -> Vec<(u32, Counted)> {
-        let counted = self.entity_counts(i, &base.any);
-        // Compared once: the two are whole-corpus bitsets (~6 KB), and asked per entity this was most of
-        // `counts.json` on the musl build, whose memcmp is a byte loop — ~400 ms a request against ~40 ms.
+        let Some(kind) = self.filter.entities[i].as_ref() else { return Vec::new() };
+        // Compared once: the two are whole-corpus bitsets (~6 KB). When they differ, count both tiers during
+        // the same posting-list walk.
         let split = base.sure != base.any;
-        let sure: HashMap<u32, u32> =
-            if split { self.entity_counts(i, &base.sure).into_iter().collect() } else { HashMap::new() };
-        counted
-            .into_iter()
-            .map(|(e, n)| {
-                let likely = if split { n - sure.get(&e).copied().unwrap_or(0) } else { 0 };
-                (e, Counted { total: n as usize, likely: likely as usize })
+        kind.candidates
+            .iter()
+            .copied()
+            .filter(|&e| self.listable(i, kind, e))
+            .filter_map(|e| {
+                let (mut total, mut sure) = (0, 0);
+                kind.each_title(e, |row| {
+                    total += usize::from(has(&base.any, row as usize));
+                    if split {
+                        sure += usize::from(has(&base.sure, row as usize));
+                    }
+                });
+                (total > 0).then_some((e, Counted { total, likely: if split { total - sure } else { 0 } }))
             })
             .collect()
     }
@@ -2996,6 +3023,69 @@ mod tests {
         let feature = counts(&indexes, Movie, "sel=format:Q90");
         assert_eq!(feature["total"], 2);
         assert_eq!(feature["kinds"]["format"]["labels"], json!({ "Q90": "feature film" }));
+    }
+
+    /// Entity value counts come from the inverted posting lists. A person in both source sections on one
+    /// title is still one person-title pair, under scopes, ordinary selections, exclusions and Kid policy.
+    #[test]
+    fn entity_postings_count_each_title_once_under_every_base() {
+        use crate::store::fixture::{Entity, Title};
+        let title = |media, tmdb_id, year, minimum_age, makers, cast| Title {
+            media,
+            tmdb_id,
+            primary_genre: "Drama",
+            plot: vec![100, 0, 0],
+            premise: vec![100, 0, 0],
+            card: Some(("A title", None, Some(year))),
+            votes: 100,
+            minimum_age,
+            makers,
+            cast,
+            ..Title::default()
+        };
+        let titles = [
+            title(0, 1, 2000, Some(7), vec![10], vec![10, 20]),
+            title(0, 2, 1990, Some(13), vec![10], vec![20]),
+            title(1, 3, 2000, None, vec![], vec![10]),
+        ];
+        let entities = [
+            Entity { qid: 10, name: "Both Roles", ..Entity::default() },
+            Entity { qid: 20, name: "Cast Only", ..Entity::default() },
+        ];
+        let indexes = store_of("entity-postings", &titles, &entities);
+
+        let movies = counts(&indexes, Movie, "");
+        assert_eq!(movies["kinds"]["person"]["values"], json!({ "Q10": 2, "Q20": 2 }));
+        assert_eq!(movies["kinds"]["made"]["values"], json!({ "Q10": 2 }));
+        assert_eq!(movies["kinds"]["cast"]["values"], json!({ "Q10": 1, "Q20": 2 }));
+        assert_eq!(counts(&indexes, Scope::All, "")["kinds"]["person"]["values"]["Q10"], 3);
+        assert_eq!(
+            counts(&indexes, Scope::All, "sel=decade:2000")["kinds"]["person"]["values"],
+            json!({ "Q10": 2, "Q20": 1 })
+        );
+        assert_eq!(
+            counts(&indexes, Scope::All, "sel=-cast:Q20")["kinds"]["person"]["values"],
+            json!({ "Q10": 1 })
+        );
+
+        let policy = crate::maturity::Policy {
+            maximum_age: Some(12),
+            unknown_ratings: crate::maturity::UnknownRatings::Block,
+            region: None,
+            kid_audience: None,
+        };
+        let context = Context::new_with_policy(&indexes, Scope::All, None, policy);
+        assert_eq!(
+            context.counts(&request_all(Route::Counts, "")).0["kinds"]["person"]["values"],
+            json!({ "Q10": 1, "Q20": 1 })
+        );
+
+        let spec = spec("person").unwrap();
+        let values = context.values(spec, &request_all(Route::Values(spec), "")).0;
+        assert_eq!(values["values"][0]["id"], "Q10");
+        assert_eq!(values["values"][0]["count"], 1);
+        assert_eq!(values["values"][1]["id"], "Q20");
+        assert_eq!(values["values"][1]["count"], 1);
     }
 
     /// Split credits and franchises are first-class title filters. Franchise lists hold raw Q-id numbers,
@@ -4252,10 +4342,33 @@ mod tests {
             );
             time(&format!("titles {query:?} limit=40"), &|| context.titles(&parsed).0.to_string());
         }
-        for (kind, query) in [("person", ""), ("person", "sel=-genre:99999"), ("cast", "sel=genre:18")] {
+        for (kind, query) in [
+            ("person", ""),
+            ("made", ""),
+            ("cast", ""),
+            ("person", "sel=-genre:99999"),
+            ("made", "sel=genre:18"),
+            ("cast", "sel=genre:18"),
+        ] {
             let spec = spec(kind).unwrap();
             let parsed = request(Route::Values(spec), query);
             time(&format!("values/{kind} {query:?}"), &|| context.values(spec, &parsed).0.to_string());
+        }
+        let kid = Context::new_with_policy(
+            &indexes,
+            Movie,
+            None,
+            crate::maturity::Policy {
+                maximum_age: Some(12),
+                unknown_ratings: crate::maturity::UnknownRatings::Block,
+                region: None,
+                kid_audience: Some(crate::maturity::KidAudience::ChildOrTeen),
+            },
+        );
+        for kind in ["made", "cast"] {
+            let spec = spec(kind).unwrap();
+            let parsed = request(Route::Values(spec), "");
+            time(&format!("values/{kind} Kid 12"), &|| kid.values(spec, &parsed).0.to_string());
         }
         for (kind, q) in [
             ("person", "nolan"),
