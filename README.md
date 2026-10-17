@@ -431,6 +431,9 @@ This ranker failed to return.
 `atlas_dataset_titles`, runtime-provider coverage as
 `atlas_maturity_provider_titles{authority,media_type,status="catalog|checked|matched"}`, and the two catalog
 signals behind `/health` — `atlas_catalog_fresh` and `atlas_catalog_schema_suspect`.
+Catalog-row and maturity persistence expose successful replacement, bytes-written, error, and last-write-duration
+series under `atlas_catalog_cache_*` and `atlas_maturity_cache_*`, so write amplification is visible without
+tracing host syscalls.
 
 ## Configuration
 Every variable is optional; the binary reads the process environment only (no `.env` loader).
