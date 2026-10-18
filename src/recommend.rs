@@ -1717,7 +1717,7 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
     for &t in &types {
         let series = t == "series";
         for (provider, there) in &services {
-            state.motn.want(provider, there);
+            want_recommendation_lists(&state.motn, provider, there);
             match state.motn.added(provider, there) {
                 Some(shows) => out.arrivals.push(motn_listed(&shows, series)),
                 None => arrivals.push((new_catalog_id(provider), t, there.clone(), vec![*provider])),
@@ -1728,7 +1728,7 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
             }
         }
         if let (None, Some(netflix)) = (&request.service, netflix) {
-            state.motn.want(netflix, "US");
+            state.motn.want_top(netflix, "US");
             out.charts.extend(state.motn.top(netflix, "US").map(|shows| motn_listed(&shows, series)));
         }
     }
@@ -1781,6 +1781,11 @@ pub async fn lists(state: &Arc<AppState>, config: &Config, request: &Request) ->
     out
 }
 
+fn want_recommendation_lists(motn: &crate::motn::Motn, provider: &Provider, country: &str) {
+    motn.want_top(provider, country);
+    motn.want_added(provider, country);
+}
+
 /// The days-since-epoch of a calendar date, for tests elsewhere.
 #[cfg(test)]
 pub fn day(year: i64, month: u32, day: u32) -> f64 {
@@ -1793,6 +1798,14 @@ mod tests {
 
     const CRIME: u16 = 80;
     const DRAMA: u16 = 18;
+
+    #[test]
+    fn recommendations_request_top_and_additions_but_not_soon_feeds() {
+        let motn = crate::motn::Motn::new(Some("unused".into()), None);
+        let provider = crate::catalog::provider_by_code("nfx").unwrap();
+        want_recommendation_lists(&motn, provider, "US");
+        assert_eq!(motn.wanted_lists(provider, "US"), (true, true, false));
+    }
 
     #[test]
     fn an_unindexed_library_hint_has_bounded_embedding_text_without_inventing_prose() {
