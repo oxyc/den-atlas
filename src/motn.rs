@@ -151,6 +151,30 @@ struct ChangeRead {
     read: Vec<(String, Show)>,
 }
 
+struct ChangeRequest<'a> {
+    slot: &'a str,
+    country: &'a str,
+    kind: &'a str,
+    catalogs: &'a [&'a str],
+    from: i64,
+    to: i64,
+    pages: u32,
+}
+
+impl<'a> ChangeRequest<'a> {
+    fn new(
+        slot: &'a str,
+        country: &'a str,
+        kind: &'a str,
+        catalogs: &'a [&'a str],
+        from: i64,
+        to: i64,
+        pages: u32,
+    ) -> Self {
+        Self { slot, country, kind, catalogs, from, to, pages }
+    }
+}
+
 pub struct Motn {
     key: Option<String>,
     base: String,
@@ -385,8 +409,17 @@ impl Motn {
                     }
                     let from = covered.unwrap_or((now - FIRST_LOOK_BACK).min(until));
                     let slot = format!("added-market:{market}");
-                    if let Some(done) =
-                        self.changes(&slot, country, "new", &[service], from, until, ADDED_PAGES).await
+                    if let Some(done) = self
+                        .changes(ChangeRequest::new(
+                            &slot,
+                            country,
+                            "new",
+                            &[service],
+                            from,
+                            until,
+                            ADDED_PAGES,
+                        ))
+                        .await
                     {
                         let mut kept = lock(&self.kept);
                         keep_added(&mut kept, std::slice::from_ref(&market), done.read, now);
@@ -400,7 +433,10 @@ impl Motn {
                 .filter(|service| {
                     let market = format!("{service}@{country}");
                     until.is_none_or(|until| {
-                        lock(&self.kept).added_covered_until.get(&market).is_some_and(|covered| *covered >= until)
+                        lock(&self.kept)
+                            .added_covered_until
+                            .get(&market)
+                            .is_some_and(|covered| *covered >= until)
                     })
                 })
                 .collect();
@@ -409,7 +445,10 @@ impl Motn {
                 continue;
             }
             let slot = format!("added-country:{country}");
-            if let Some(done) = self.changes(&slot, country, "new", &catalogs, since, now, ADDED_PAGES).await {
+            if let Some(done) = self
+                .changes(ChangeRequest::new(&slot, country, "new", &catalogs, since, now, ADDED_PAGES))
+                .await
+            {
                 let markets: Vec<String> =
                     done.catalogs.iter().map(|service| format!("{service}@{country}")).collect();
                 let mut kept = lock(&self.kept);
@@ -433,7 +472,7 @@ impl Motn {
                 continue;
             }
             let leaving = self
-                .changes(
+                .changes(ChangeRequest::new(
                     &format!("soon-expiring:{country}"),
                     country,
                     "expiring",
@@ -441,7 +480,7 @@ impl Motn {
                     now,
                     now + SOON_AHEAD,
                     SOON_PAGES,
-                )
+                ))
                 .await;
             let upcoming = services_in(&soon_wanted, country, Some(UPCOMING));
             let coming = if upcoming.is_empty() {
@@ -452,7 +491,7 @@ impl Motn {
                     read: Vec::new(),
                 })
             } else {
-                self.changes(
+                self.changes(ChangeRequest::new(
                     &format!("soon-upcoming:{country}"),
                     country,
                     "upcoming",
@@ -460,7 +499,7 @@ impl Motn {
                     now,
                     now + SOON_AHEAD,
                     SOON_PAGES,
-                )
+                ))
                 .await
             };
             let (Some(leaving), Some(coming)) = (leaving, coming) else { continue };
@@ -482,20 +521,13 @@ impl Motn {
 
     /// A country's complete changes snapshot. At most `pages` are bought by one pass; an unfinished query, its pages,
     /// cursor and every cursor already seen remain in `Kept` and resume on the next pass or after a restart.
-    async fn changes(
-        &self,
-        slot: &str,
-        country: &str,
-        kind: &str,
-        catalogs: &[&str],
-        from: i64,
-        to: i64,
-        pages: u32,
-    ) -> Option<ChangeRead> {
+    async fn changes(&self, request: ChangeRequest<'_>) -> Option<ChangeRead> {
+        let ChangeRequest { slot, country, kind, catalogs, from, to, pages } = request;
         let key = slot.to_owned();
         {
             let mut kept = lock(&self.kept);
-            let requested_catalogs: Vec<String> = catalogs.iter().map(|catalog| (*catalog).to_owned()).collect();
+            let requested_catalogs: Vec<String> =
+                catalogs.iter().map(|catalog| (*catalog).to_owned()).collect();
             let progress = kept.changes.entry(key.clone()).or_insert_with(|| ChangeProgress {
                 from,
                 to,
@@ -503,7 +535,8 @@ impl Motn {
                 ..ChangeProgress::default()
             });
             if progress.quarantined && progress.catalogs != requested_catalogs {
-                *progress = ChangeProgress { from, to, catalogs: requested_catalogs, ..ChangeProgress::default() };
+                *progress =
+                    ChangeProgress { from, to, catalogs: requested_catalogs, ..ChangeProgress::default() };
             }
             if progress.complete {
                 return Some(ChangeRead {
@@ -534,7 +567,7 @@ impl Motn {
             if let Some(cursor) = cursor {
                 query.push(("cursor", cursor));
             }
-            let Some(page) = self.ask_query("/changes", &query).await else { return None };
+            let page = self.ask_query("/changes", &query).await?;
             let page_read = changed(&page, country);
             let mut finished = None;
             {
@@ -564,7 +597,9 @@ impl Motn {
                     }
                 } else {
                     progress.quarantined = true;
-                    eprintln!("motn: {slot}: hasMore without nextCursor — quarantining this changes snapshot");
+                    eprintln!(
+                        "motn: {slot}: hasMore without nextCursor — quarantining this changes snapshot"
+                    );
                 }
             }
             if !self.checkpoint() {
@@ -601,13 +636,8 @@ impl Motn {
             }
             return None;
         }
-        let answer = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .query(query)
-            .header("X-API-Key", key)
-            .send()
-            .await;
+        let answer =
+            self.http.get(format!("{}{path}", self.base)).query(query).header("X-API-Key", key).send().await;
         let response = match answer {
             Ok(response) => response,
             Err(e) => {
@@ -963,7 +993,10 @@ mod tests {
             .collect();
         let shows: serde_json::Map<String, serde_json::Value> = (first..first + count)
             .map(|id| {
-                (id.to_string(), serde_json::json!({"tmdbId": format!("movie/{id}"), "title": format!("Show {id}")}))
+                (
+                    id.to_string(),
+                    serde_json::json!({"tmdbId": format!("movie/{id}"), "title": format!("Show {id}")}),
+                )
             })
             .collect();
         serde_json::json!({"changes": changes, "shows": shows, "hasMore": next.is_some(), "nextCursor": next})
@@ -1236,12 +1269,16 @@ mod tests {
         let asked = lock(&requests).clone();
         assert_eq!(asked.len(), 2, "one catch-up and one current country read: {asked:?}");
         assert!(
-            asked[0].contains(&format!("change_type=new&item_type=show&catalogs=netflix&from={covered}&to={country_until}")),
+            asked[0].contains(&format!(
+                "change_type=new&item_type=show&catalogs=netflix&from={covered}&to={country_until}"
+            )),
             "the first call covers exactly the inactive interval: {}",
             asked[0]
         );
         assert!(
-            asked[1].contains(&format!("change_type=new&item_type=show&catalogs=netflix&from={country_until}&to={at}")),
+            asked[1].contains(&format!(
+                "change_type=new&item_type=show&catalogs=netflix&from={country_until}&to={at}"
+            )),
             "only after catch-up does the market join the current read: {}",
             asked[1]
         );
@@ -1260,20 +1297,36 @@ mod tests {
         .await;
         let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
         motn.base.clone_from(&base);
-        assert!(motn.changes("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES).await.is_none());
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+            .await
+            .is_none());
         for _ in 0..100 {
-            assert!(motn.changes("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES).await.is_none());
+            assert!(motn
+                .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+                .await
+                .is_none());
         }
-        assert_eq!(lock(&requests).len(), 1, "arbitrarily many passes spend nothing on the quarantined snapshot");
+        assert_eq!(
+            lock(&requests).len(),
+            1,
+            "arbitrarily many passes spend nothing on the quarantined snapshot"
+        );
 
         let mut restarted = Motn::new(Some("test-key".into()), Some(&dir));
         restarted.base.clone_from(&base);
         for _ in 0..100 {
-            assert!(restarted.changes("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES).await.is_none());
+            assert!(restarted
+                .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+                .await
+                .is_none());
         }
         assert_eq!(lock(&requests).len(), 1, "restarts do not revive the quarantined snapshot");
 
-        let recovered = restarted.changes("test", "US", "new", &["hbo"], 1, 2, ADDED_PAGES).await.unwrap();
+        let recovered = restarted
+            .changes(ChangeRequest::new("test", "US", "new", &["hbo"], 1, 2, ADDED_PAGES))
+            .await
+            .unwrap();
         assert_eq!(recovered.catalogs, vec!["hbo"]);
         assert_eq!(lock(&requests).len(), 2, "a materially different catalog set starts one new operation");
         let _ = std::fs::remove_dir_all(dir);
@@ -1290,9 +1343,15 @@ mod tests {
         .await;
         let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
         motn.base = base;
-        assert!(motn.changes("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES).await.is_none());
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .is_none());
         assert_eq!(lock(&requests).len(), 3);
-        assert!(motn.changes("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES).await.is_none());
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .is_none());
         assert_eq!(lock(&requests).len(), 3, "A must not be requested a second time");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1307,12 +1366,23 @@ mod tests {
         let mut motn = Motn::new(Some("test-key".into()), None);
         motn.base = base;
 
-        let done = motn.changes("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES).await.unwrap();
+        let done = motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .unwrap();
         assert_eq!(done.read.len(), 2);
         let asked = lock(&requests);
         assert_eq!(asked.len(), 2);
-        assert!(asked[1].contains("cursor=A%3Fpart%3Done%26part%3Dtwo"), "cursor was not encoded: {}", asked[1]);
-        assert!(!asked[1].contains("&part=two"), "cursor escaped into a second query parameter: {}", asked[1]);
+        assert!(
+            asked[1].contains("cursor=A%3Fpart%3Done%26part%3Dtwo"),
+            "cursor was not encoded: {}",
+            asked[1]
+        );
+        assert!(
+            !asked[1].contains("&part=two"),
+            "cursor escaped into a second query parameter: {}",
+            asked[1]
+        );
     }
 
     #[tokio::test]
@@ -1329,13 +1399,16 @@ mod tests {
         .await;
         let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
         motn.base.clone_from(&base);
-        assert!(motn.changes("test", "US", "new", &["netflix"], 1, 2000, ADDED_PAGES).await.is_none());
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2000, ADDED_PAGES))
+            .await
+            .is_none());
         assert_eq!(lock(&requests).len(), 4, "one pass observes its page ceiling");
 
         let mut restarted = Motn::new(Some("test-key".into()), Some(&dir));
         restarted.base = base;
         let done = restarted
-            .changes("test", "US", "new", &["hbo", "netflix"], 20, 3000, ADDED_PAGES)
+            .changes(ChangeRequest::new("test", "US", "new", &["hbo", "netflix"], 20, 3000, ADDED_PAGES))
             .await
             .unwrap();
         assert_eq!(lock(&requests).len(), 5, "the restart resumes at cursor D");
