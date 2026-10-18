@@ -5,9 +5,9 @@
 //! own, which JustWatch has no list for.
 //!
 //! The free plan allows 1,000 requests a month, so nothing here is asked on a request's behalf. A request only says
-//! which service in which country a household wants (`Motn::want`). A background pass (`refresh_forever`) fetches
-//! those at most once a day, within `DAILY_REQUESTS`, and keeps the answers in `CACHE_DIR`; rows and billboards read
-//! what is kept. A market nobody has asked for in a month is no longer fetched.
+//! which list for which service and country a household wants (`Motn::want*`). A background pass (`refresh_forever`)
+//! fetches those on their own schedules, within `DAILY_REQUESTS`, and keeps the answers in `CACHE_DIR`; rows and
+//! billboards read what is kept. A market/list nobody has asked for in a month is no longer fetched.
 
 use crate::catalog::Provider;
 use crate::justwatch::TrendingItem;
@@ -95,17 +95,89 @@ struct Kept {
     added: BTreeMap<String, Vec<Show>>,
     /// Each country's additions are read up to this moment: one read covers every service wanted there.
     added_until: BTreeMap<String, i64>,
+    /// How far each individual market's additions have been read. A country's cursor may advance while a service is
+    /// inactive, so this is the source of truth for whether that service needs a catch-up read when it returns.
+    added_covered_until: BTreeMap<String, i64>,
     /// The services each country offers, by the API's lowercase country code, and when they were read.
     services: BTreeMap<String, Vec<String>>,
     services_at: i64,
-    /// When each market was last asked for.
+    /// When each market's Top 10 was last asked for.
     wanted: BTreeMap<String, i64>,
+    /// When each market's additions row was last asked for. Top 10 and additions have separate demand so the global
+    /// Netflix chart used by recommendations does not also buy an unread US additions feed every day.
+    added_wanted: BTreeMap<String, i64>,
+    /// When each market's leaving/coming rows were last asked for. These are separate from Top 10/additions wants:
+    /// reading an ordinary service row must not spend two more requests every three days warming rows nobody reads.
+    soon_wanted: BTreeMap<String, i64>,
+    /// Markets included in the last successful leaving/coming read for their country. Empty answers need an explicit
+    /// marker too; absence means the row has not been read yet and must keep falling back until the next pass.
+    soon_markets: BTreeSet<String>,
+    /// Old v1 files had one `wanted` map for Top 10 and additions. Migrate it once, then keep those interests split.
+    /// The filename remains v1 because all new fields have serde defaults and old readers ignore them.
+    wants_split: bool,
+    /// Migration marker kept separate because an intermediate v1 writer split Top/additions but not soon demand.
+    soon_wants_split: bool,
+    /// Migration marker for the per-market additions cursor, likewise independent of the demand migration.
+    added_coverage_split: bool,
+    /// In-progress `/changes` reads. Exact bounds, accumulated pages and cursor history are durable so a page limit
+    /// or restart resumes the same snapshot rather than approximating progress with timestamps.
+    changes: BTreeMap<String, ChangeProgress>,
     /// The day requests are counted for, and how many were spent on it.
     spent: (i64, u32),
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ChangeProgress {
+    from: i64,
+    to: i64,
+    catalogs: Vec<String>,
+    cursor: Option<String>,
+    seen: BTreeSet<String>,
+    read: Vec<(String, Show)>,
+    /// A malformed cursor chain can never make progress safely. Keep that exact snapshot inert across passes and
+    /// restarts rather than spending one more request every day. A materially different catalog set replaces it.
+    quarantined: bool,
+    /// Kept for migration from the short-lived daily-backoff format. Any non-zero value is promoted to `quarantined`
+    /// on load, so an already observed bad chain does not get one more paid retry after upgrading.
+    blocked_until: i64,
+    complete: bool,
+}
+
+struct ChangeRead {
+    key: String,
+    to: i64,
+    catalogs: Vec<String>,
+    read: Vec<(String, Show)>,
+}
+
+struct ChangeRequest<'a> {
+    slot: &'a str,
+    country: &'a str,
+    kind: &'a str,
+    catalogs: &'a [&'a str],
+    from: i64,
+    to: i64,
+    pages: u32,
+}
+
+impl<'a> ChangeRequest<'a> {
+    fn new(
+        slot: &'a str,
+        country: &'a str,
+        kind: &'a str,
+        catalogs: &'a [&'a str],
+        from: i64,
+        to: i64,
+        pages: u32,
+    ) -> Self {
+        Self { slot, country, kind, catalogs, from, to, pages }
+    }
+}
+
 pub struct Motn {
     key: Option<String>,
+    base: String,
     http: reqwest::Client,
     kept: Mutex<Kept>,
     file: Option<PathBuf>,
@@ -122,7 +194,7 @@ impl Motn {
     /// With no key it fetches nothing and every list is `None`, so rows and billboards read JustWatch alone.
     pub fn new(key: Option<String>, dir: Option<&Path>) -> Motn {
         let file = dir.map(|dir| dir.join(FILE));
-        let loaded = file.as_ref().and_then(|file| match std::fs::read(file) {
+        let loaded: Option<Kept> = file.as_ref().and_then(|file| match std::fs::read(file) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| eprintln!("motn: {} is unreadable ({e}) — starting empty", file.display()))
                 .ok(),
@@ -135,10 +207,45 @@ impl Motn {
         // Compare logical state, not the original spelling: an older valid file with omitted default fields or the
         // old `added` alias does not need a normalization-only rewrite.
         let persisted = loaded.as_ref().and_then(|kept| serde_json::to_vec(kept).ok());
-        let kept = loaded.unwrap_or_default();
+        let mut kept = loaded.unwrap_or_default();
+        if !kept.wants_split {
+            kept.added_wanted.clone_from(&kept.wanted);
+            kept.wants_split = true;
+        }
+        if !kept.soon_wants_split {
+            kept.soon_wanted.clone_from(&kept.wanted);
+            // A legacy country-wide soon read covered every wanted market, including markets with an empty answer
+            // that consequently have no entry in `leaving` or `coming`.
+            for market in kept.wanted.keys() {
+                if kept.soon_at.contains_key(market_country(market)) {
+                    kept.soon_markets.insert(market.clone());
+                }
+            }
+            let cached_soon: Vec<String> = kept.leaving.keys().chain(kept.coming.keys()).cloned().collect();
+            kept.soon_markets.extend(cached_soon);
+            kept.soon_wants_split = true;
+        }
+        if !kept.added_coverage_split {
+            // `keep_added` created an entry even for an empty answer, so a legacy entry proves this market took part
+            // in the country read. Markets without one deliberately backfill on first demand.
+            let cached_added: Vec<String> = kept.added.keys().cloned().collect();
+            for market in cached_added {
+                if let Some(until) = kept.added_until.get(market_country(&market)) {
+                    kept.added_covered_until.insert(market, *until);
+                }
+            }
+            kept.added_coverage_split = true;
+        }
+        for progress in kept.changes.values_mut() {
+            if progress.blocked_until != 0 {
+                progress.quarantined = true;
+                progress.blocked_until = 0;
+            }
+        }
         let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap_or_default();
         Motn {
             key: key.filter(|k| !k.is_empty()),
+            base: BASE.to_owned(),
             http,
             kept: Mutex::new(kept),
             file,
@@ -152,11 +259,37 @@ impl Motn {
         self.key.is_some()
     }
 
-    /// Note that a household wants `provider` in `country`, so the next pass fetches its lists.
-    pub fn want(&self, provider: &Provider, country: &str) {
+    /// Note demand for only the service's Top 10.
+    pub fn want_top(&self, provider: &Provider, country: &str) {
         if let (true, Some(market)) = (self.enabled(), market(provider, country)) {
             lock(&self.kept).wanted.insert(market, now());
         }
+    }
+
+    /// Note demand for only the service's additions.
+    pub fn want_added(&self, provider: &Provider, country: &str) {
+        if let (true, Some(market)) = (self.enabled(), market(provider, country)) {
+            lock(&self.kept).added_wanted.insert(market, now());
+        }
+    }
+
+    /// Note that a household wants the provider's leaving/coming rows. Kept separately so ordinary Top 10 and
+    /// additions traffic does not implicitly subscribe every country to two unrelated change feeds.
+    pub fn want_soon(&self, provider: &Provider, country: &str) {
+        if let (true, Some(market)) = (self.enabled(), market(provider, country)) {
+            lock(&self.kept).soon_wanted.insert(market, now());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wanted_lists(&self, provider: &Provider, country: &str) -> (bool, bool, bool) {
+        let Some(market) = market(provider, country) else { return (false, false, false) };
+        let kept = lock(&self.kept);
+        (
+            kept.wanted.contains_key(&market),
+            kept.added_wanted.contains_key(&market),
+            kept.soon_wanted.contains_key(&market),
+        )
     }
 
     /// The service's Top 10 in the country, best first; `None` when none is kept, or the one kept is too old.
@@ -172,7 +305,7 @@ impl Motn {
     pub fn added(&self, provider: &Provider, country: &str) -> Option<Vec<Show>> {
         let market = market(provider, country)?;
         let kept = lock(&self.kept);
-        let until = kept.added_until.get(market_country(&market))?;
+        let until = kept.added_covered_until.get(&market)?;
         (now() - until < SERVE_FOR).then(|| kept.added.get(&market).cloned()).flatten()
     }
 
@@ -195,6 +328,9 @@ impl Motn {
     ) -> Option<Vec<Show>> {
         let market = market(provider, country)?;
         let kept = lock(&self.kept);
+        if !kept.soon_markets.contains(&market) {
+            return None;
+        }
         let at = kept.soon_at.get(market_country(&market))?;
         (now() - at < SERVE_FOR).then(|| lists(&kept).get(&market).cloned().unwrap_or_default())
     }
@@ -211,12 +347,17 @@ impl Motn {
         if !self.enabled() {
             return false;
         }
-        let (wanted, services_due) = {
+        let (wanted, added_wanted, soon_wanted, services_due) = {
             let mut kept = lock(&self.kept);
             kept.wanted.retain(|_, at| now - *at < WANTED_FOR);
-            (kept.wanted.keys().cloned().collect::<Vec<_>>(), now - kept.services_at >= SERVICES_AFTER)
+            kept.added_wanted.retain(|_, at| now - *at < WANTED_FOR);
+            kept.soon_wanted.retain(|_, at| now - *at < WANTED_FOR);
+            let wanted = kept.wanted.keys().cloned().collect::<Vec<_>>();
+            let added_wanted = kept.added_wanted.keys().cloned().collect::<Vec<_>>();
+            let soon_wanted = kept.soon_wanted.keys().cloned().collect::<Vec<_>>();
+            (wanted, added_wanted, soon_wanted, now - kept.services_at >= SERVICES_AFTER)
         };
-        if wanted.is_empty() {
+        if wanted.is_empty() && added_wanted.is_empty() && soon_wanted.is_empty() {
             // `retain` may have removed the last expired market. Persist that real state change rather than
             // resurrecting it after a restart; an unchanged empty pass compares equal and writes nothing.
             return self.save();
@@ -233,6 +374,8 @@ impl Motn {
         }
         let services = lock(&self.kept).services.clone();
         let wanted: Vec<String> = wanted.into_iter().filter(|m| offered(&services, m)).collect();
+        let added_wanted: Vec<String> = added_wanted.into_iter().filter(|m| offered(&services, m)).collect();
+        let soon_wanted: Vec<String> = soon_wanted.into_iter().filter(|m| offered(&services, m)).collect();
 
         for market in wanted.iter().filter(|m| CHARTED.contains(&market_service(m))) {
             if lock(&self.kept).top.get(market).is_some_and(|(at, _)| now - at < REFRESH_AFTER) {
@@ -251,107 +394,241 @@ impl Motn {
             lock(&self.kept).top.insert(market.clone(), (now, shows));
         }
 
-        let countries: BTreeSet<&str> = wanted.iter().map(|m| market_country(m)).collect();
+        let countries: BTreeSet<&str> = added_wanted.iter().map(|m| market_country(m)).collect();
         for &country in &countries {
-            let catalogs = services_in(&wanted, country, None);
+            let catalogs = services_in(&added_wanted, country, None);
             let until = lock(&self.kept).added_until.get(country).copied();
-            // A service newly wanted in a country that is already being read has missed that country's earlier reads:
-            // its own week is read once, up to where the country's reads stand, rather than the country's again.
+            // A returning service may have missed reads while the country's cursor advanced. Catch only that market
+            // up to the country cursor first. An unfinished paginated read advances its own cursor and resumes there.
             if let Some(until) = until {
                 for &service in &catalogs {
                     let market = format!("{service}@{country}");
-                    if lock(&self.kept).added.contains_key(&market) {
+                    let covered = lock(&self.kept).added_covered_until.get(&market).copied();
+                    if covered.is_some_and(|covered| covered >= until) {
                         continue;
                     }
-                    let from = (now - FIRST_LOOK_BACK).min(until);
-                    if let Some((read, _)) =
-                        self.changes(country, "new", &[service], from, until, ADDED_PAGES).await
+                    let from = covered.unwrap_or((now - FIRST_LOOK_BACK).min(until));
+                    let slot = format!("added-market:{market}");
+                    if let Some(done) = self
+                        .changes(ChangeRequest::new(
+                            &slot,
+                            country,
+                            "new",
+                            &[service],
+                            from,
+                            until,
+                            ADDED_PAGES,
+                        ))
+                        .await
                     {
-                        keep_added(&mut lock(&self.kept), &[market], read, now);
+                        let mut kept = lock(&self.kept);
+                        keep_added(&mut kept, std::slice::from_ref(&market), done.read, now);
+                        kept.added_covered_until.insert(market, done.to);
+                        kept.changes.remove(&done.key);
                     }
                 }
             }
+            let catalogs: Vec<&str> = catalogs
+                .into_iter()
+                .filter(|service| {
+                    let market = format!("{service}@{country}");
+                    until.is_none_or(|until| {
+                        lock(&self.kept)
+                            .added_covered_until
+                            .get(&market)
+                            .is_some_and(|covered| *covered >= until)
+                    })
+                })
+                .collect();
             let since = until.unwrap_or(0).max(now - FIRST_LOOK_BACK);
-            if now - since < REFRESH_AFTER {
+            if catalogs.is_empty() || now - since < REFRESH_AFTER {
                 continue;
             }
-            if let Some((read, complete)) =
-                self.changes(country, "new", &catalogs, since, now, ADDED_PAGES).await
+            let slot = format!("added-country:{country}");
+            if let Some(done) = self
+                .changes(ChangeRequest::new(&slot, country, "new", &catalogs, since, now, ADDED_PAGES))
+                .await
             {
-                let reached = read_until(&read, complete, since, now);
                 let markets: Vec<String> =
-                    catalogs.iter().map(|service| format!("{service}@{country}")).collect();
+                    done.catalogs.iter().map(|service| format!("{service}@{country}")).collect();
                 let mut kept = lock(&self.kept);
-                keep_added(&mut kept, &markets, read, now);
-                kept.added_until.insert(country.to_owned(), reached);
+                keep_added(&mut kept, &markets, done.read, now);
+                kept.added_until.insert(country.to_owned(), done.to);
+                for market in markets {
+                    kept.added_covered_until.insert(market, done.to);
+                }
+                kept.changes.remove(&done.key);
             }
         }
-        for &country in &countries {
-            if lock(&self.kept).soon_at.get(country).is_some_and(|at| now - at < SOON_AFTER) {
+        let soon_countries: BTreeSet<&str> = soon_wanted.iter().map(|m| market_country(m)).collect();
+        for &country in &soon_countries {
+            let all = services_in(&soon_wanted, country, None);
+            let fresh = {
+                let kept = lock(&self.kept);
+                kept.soon_at.get(country).is_some_and(|at| now - at < SOON_AFTER)
+                    && all.iter().all(|service| kept.soon_markets.contains(&format!("{service}@{country}")))
+            };
+            if fresh {
                 continue;
             }
-            let all = services_in(&wanted, country, None);
             let leaving = self
-                .changes(country, "expiring", &all, now, now + SOON_AHEAD, SOON_PAGES)
-                .await
-                .map(|(read, _)| read);
-            let upcoming = services_in(&wanted, country, Some(UPCOMING));
+                .changes(ChangeRequest::new(
+                    &format!("soon-expiring:{country}"),
+                    country,
+                    "expiring",
+                    &all,
+                    now,
+                    now + SOON_AHEAD,
+                    SOON_PAGES,
+                ))
+                .await;
+            let upcoming = services_in(&soon_wanted, country, Some(UPCOMING));
             let coming = if upcoming.is_empty() {
-                Some(Vec::new())
+                Some(ChangeRead {
+                    key: String::new(),
+                    to: now + SOON_AHEAD,
+                    catalogs: Vec::new(),
+                    read: Vec::new(),
+                })
             } else {
-                self.changes(country, "upcoming", &upcoming, now, now + SOON_AHEAD, SOON_PAGES)
-                    .await
-                    .map(|(read, _)| read)
+                self.changes(ChangeRequest::new(
+                    &format!("soon-upcoming:{country}"),
+                    country,
+                    "upcoming",
+                    &upcoming,
+                    now,
+                    now + SOON_AHEAD,
+                    SOON_PAGES,
+                ))
+                .await
             };
             let (Some(leaving), Some(coming)) = (leaving, coming) else { continue };
             let mut kept = lock(&self.kept);
+            let ChangeRead { key: leaving_key, catalogs: read_catalogs, read: leaving, .. } = leaving;
+            let ChangeRead { key: coming_key, read: coming, .. } = coming;
             keep_soon(&mut kept.leaving, country, leaving);
             keep_soon(&mut kept.coming, country, coming);
+            kept.soon_markets.retain(|market| market_country(market) != country);
+            kept.soon_markets.extend(read_catalogs.iter().map(|service| format!("{service}@{country}")));
             kept.soon_at.insert(country.to_owned(), now);
+            kept.changes.remove(&leaving_key);
+            if !coming_key.is_empty() {
+                kept.changes.remove(&coming_key);
+            }
         }
         self.save()
     }
 
-    /// A country's changes of one kind to `catalogs` between `from` and `to`, by market and oldest first, over at most
-    /// `pages` pages, and whether that was all of them; `None` when not even the first page could be had.
-    async fn changes(
-        &self,
-        country: &str,
-        kind: &str,
-        catalogs: &[&str],
-        from: i64,
-        to: i64,
-        pages: u32,
-    ) -> Option<(Vec<(String, Show)>, bool)> {
-        let mut read = Vec::new();
-        let mut cursor: Option<String> = None;
-        for page_at in 0..pages {
-            let path = format!(
-                "/changes?country={}&change_type={kind}&item_type=show&catalogs={}&from={from}&to={to}{}",
-                country.to_ascii_lowercase(),
-                catalogs.join(","),
-                cursor.as_deref().map(|c| format!("&cursor={c}")).unwrap_or_default()
-            );
-            let Some(page) = self.ask(&path).await else { return (page_at > 0).then_some((read, false)) };
-            read.extend(changed(&page, country));
-            if page["hasMore"].as_bool() != Some(true) {
-                return Some((read, true));
+    /// A country's complete changes snapshot. At most `pages` are bought by one pass; an unfinished query, its pages,
+    /// cursor and every cursor already seen remain in `Kept` and resume on the next pass or after a restart.
+    async fn changes(&self, request: ChangeRequest<'_>) -> Option<ChangeRead> {
+        let ChangeRequest { slot, country, kind, catalogs, from, to, pages } = request;
+        let key = slot.to_owned();
+        {
+            let mut kept = lock(&self.kept);
+            let requested_catalogs: Vec<String> =
+                catalogs.iter().map(|catalog| (*catalog).to_owned()).collect();
+            let progress = kept.changes.entry(key.clone()).or_insert_with(|| ChangeProgress {
+                from,
+                to,
+                catalogs: requested_catalogs.clone(),
+                ..ChangeProgress::default()
+            });
+            if progress.quarantined && progress.catalogs != requested_catalogs {
+                *progress =
+                    ChangeProgress { from, to, catalogs: requested_catalogs, ..ChangeProgress::default() };
             }
-            cursor = page["nextCursor"].as_str().map(str::to_owned);
+            if progress.complete {
+                return Some(ChangeRead {
+                    key,
+                    to: progress.to,
+                    catalogs: progress.catalogs.clone(),
+                    read: progress.read.clone(),
+                });
+            }
+            if progress.quarantined {
+                return None;
+            }
         }
-        Some((read, false))
+        for _ in 0..pages {
+            let (query_from, query_to, catalogs, cursor) = {
+                let kept = lock(&self.kept);
+                let progress = kept.changes.get(&key)?;
+                (progress.from, progress.to, progress.catalogs.clone(), progress.cursor.clone())
+            };
+            let mut query = vec![
+                ("country", country.to_ascii_lowercase()),
+                ("change_type", kind.to_owned()),
+                ("item_type", "show".to_owned()),
+                ("catalogs", catalogs.join(",")),
+                ("from", query_from.to_string()),
+                ("to", query_to.to_string()),
+            ];
+            if let Some(cursor) = cursor {
+                query.push(("cursor", cursor));
+            }
+            let page = self.ask_query("/changes", &query).await?;
+            let page_read = changed(&page, country);
+            let mut finished = None;
+            {
+                let mut kept = lock(&self.kept);
+                let progress = kept.changes.get_mut(&key)?;
+                for (market, show) in page_read {
+                    if !progress.read.iter().any(|(held_market, held)| {
+                        held_market == &market && held.series == show.series && held.tmdb == show.tmdb
+                    }) {
+                        progress.read.push((market, show));
+                    }
+                }
+                if page["hasMore"].as_bool() != Some(true) {
+                    progress.complete = true;
+                    finished = Some(ChangeRead {
+                        key: key.clone(),
+                        to: progress.to,
+                        catalogs: progress.catalogs.clone(),
+                        read: progress.read.clone(),
+                    });
+                } else if let Some(next) = page["nextCursor"].as_str().filter(|next| !next.is_empty()) {
+                    if progress.seen.insert(next.to_owned()) {
+                        progress.cursor = Some(next.to_owned());
+                    } else {
+                        progress.quarantined = true;
+                        eprintln!("motn: {slot}: cursor cycle — quarantining this changes snapshot");
+                    }
+                } else {
+                    progress.quarantined = true;
+                    eprintln!(
+                        "motn: {slot}: hasMore without nextCursor — quarantining this changes snapshot"
+                    );
+                }
+            }
+            if !self.checkpoint() {
+                return None;
+            }
+            if let Some(done) = finished {
+                return Some(done);
+            }
+            if lock(&self.kept).changes.get(&key).is_some_and(|progress| progress.quarantined) {
+                return None;
+            }
+        }
+        None
     }
 
     /// One request, if the day's budget allows it and the API isn't being left alone; `None` on any failure, which is
     /// logged.
     async fn ask(&self, path: &str) -> Option<serde_json::Value> {
+        self.ask_query(path, &[]).await
+    }
+
+    async fn ask_query(&self, path: &str, query: &[(&str, String)]) -> Option<serde_json::Value> {
         let key = self.key.as_deref()?;
         // Before the budget: a request never sent spends nothing, and the rest of a pass falls through here at once.
         if self.backoff.paused().is_some() {
             return None;
         }
         let now = now();
-        if !spend(&mut lock(&self.kept), now) {
+        if !self.reserve(now) {
             // Once a day: every pass until midnight is refused the same way.
             let day = now.div_euclid(DAY);
             if self.refused_on.swap(day, Ordering::Relaxed) != day {
@@ -359,7 +636,8 @@ impl Motn {
             }
             return None;
         }
-        let answer = self.http.get(format!("{BASE}{path}")).header("X-API-Key", key).send().await;
+        let answer =
+            self.http.get(format!("{}{path}", self.base)).query(query).header("X-API-Key", key).send().await;
         let response = match answer {
             Ok(response) => response,
             Err(e) => {
@@ -391,6 +669,21 @@ impl Motn {
             None => self.backoff.answered(),
         }
         serde_json::from_str(&body).map_err(|e| eprintln!("motn: {path}: unreadable answer ({e})")).ok()
+    }
+
+    /// Reserve one paid request and durably advance the daily counter before putting it on the wire. Without this
+    /// checkpoint, a crash halfway through a pass restores the counter from the preceding pass and can buy the same
+    /// work again after restart. With no configured cache this is an in-memory per-process ceiling. With a configured
+    /// cache, inability to persist the reservation fails closed before network I/O.
+    fn reserve(&self, now: i64) -> bool {
+        if !spend(&mut lock(&self.kept), now) {
+            return false;
+        }
+        self.file.is_none() || self.save()
+    }
+
+    fn checkpoint(&self) -> bool {
+        self.file.is_none() || self.save()
     }
 
     /// Persist a changed logical snapshot. Returns whether the file was replaced.
@@ -589,16 +882,6 @@ fn keep_added(kept: &mut Kept, markets: &[String], read: Vec<(String, Show)>, no
     }
 }
 
-/// How far a read of additions from `since` got: all the way to `now` when it finished, else to the last change it
-/// read — changes come oldest first, so the next read starts there instead of reading the same pages again. A second
-/// past `since` at least, so a page of changes sharing one timestamp can't hold the read in place.
-fn read_until(read: &[(String, Show)], complete: bool, since: i64, now: i64) -> i64 {
-    if complete {
-        return now;
-    }
-    read.iter().filter_map(|(_, show)| show.at).max().map_or(since, |last| last.max(since + 1)).min(now)
-}
-
 /// Replace a country's leaving or coming lists with what was just read: each title once per market, soonest first,
 /// and one the API gave no date last.
 fn keep_soon(lists: &mut BTreeMap<String, Vec<Show>>, country: &str, read: Vec<(String, Show)>) {
@@ -619,6 +902,7 @@ fn keep_soon(lists: &mut BTreeMap<String, Vec<Show>>, country: &str, read: Vec<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("den-atlas-motn-{name}-{}", std::process::id()));
@@ -641,6 +925,81 @@ mod tests {
             rating: None,
             at: Some(when),
         }
+    }
+
+    async fn counting_motn_with_changes(changes: &'static str) -> (Motn, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&requests);
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let counted = Arc::clone(&counted);
+            async move {
+                let uri = request.uri();
+                lock(&counted).push(uri.to_string());
+                let body = if uri.path() == "/countries" {
+                    r#"{"us":{"services":[{"id":"netflix"},{"id":"hbo"}]}}"#
+                } else if uri.path() == "/shows/top" {
+                    "[]"
+                } else {
+                    changes
+                };
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut motn = Motn::new(Some("test-key".into()), None);
+        motn.base = format!("http://{address}");
+        (motn, requests)
+    }
+
+    async fn counting_motn() -> (Motn, Arc<Mutex<Vec<String>>>) {
+        counting_motn_with_changes(r#"{"changes":[],"shows":{},"hasMore":false}"#).await
+    }
+
+    async fn scripted_server(pages: Vec<serde_json::Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&requests);
+        let pages = Arc::new(pages);
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let counted = Arc::clone(&counted);
+            let pages = Arc::clone(&pages);
+            async move {
+                let mut requests = lock(&counted);
+                let at = requests.len().min(pages.len().saturating_sub(1));
+                requests.push(request.uri().to_string());
+                let body = serde_json::to_vec(&pages[at]).unwrap();
+                axum::response::Response::builder()
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), requests)
+    }
+
+    fn change_page(first: u32, count: u32, timestamp: i64, next: Option<&str>) -> serde_json::Value {
+        let changes: Vec<_> = (first..first + count)
+            .map(|id| {
+                serde_json::json!({"showId": id.to_string(), "service": {"id": "netflix"},
+                    "streamingOptionType": "subscription", "timestamp": timestamp})
+            })
+            .collect();
+        let shows: serde_json::Map<String, serde_json::Value> = (first..first + count)
+            .map(|id| {
+                (
+                    id.to_string(),
+                    serde_json::json!({"tmdbId": format!("movie/{id}"), "title": format!("Show {id}")}),
+                )
+            })
+            .collect();
+        serde_json::json!({"changes": changes, "shows": shows, "hasMore": next.is_some(), "nextCursor": next})
     }
 
     #[test]
@@ -674,6 +1033,37 @@ mod tests {
         .unwrap();
         assert_eq!(kept.added["hbo@FI"][0].at, Some(7));
         assert!(kept.leaving.is_empty());
+    }
+
+    #[test]
+    fn legacy_single_demand_is_migrated_without_hiding_cached_empty_lists() {
+        let dir = temp("legacy-demand");
+        let at = now();
+        let body = serde_json::json!({
+            "leaving": {},
+            "coming": {},
+            "soon_at": {"US": at},
+            "top": {},
+            "added": {"netflix@US": []},
+            "added_until": {"US": at},
+            "services": {"us": ["netflix"]},
+            "services_at": at,
+            "wanted": {"netflix@US": at},
+            "spent": [at.div_euclid(DAY), 0]
+        });
+        std::fs::write(dir.join(FILE), serde_json::to_vec(&body).unwrap()).unwrap();
+
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        let kept = lock(&motn.kept);
+        assert_eq!(kept.added_wanted.get("netflix@US"), Some(&at));
+        assert_eq!(kept.soon_wanted.get("netflix@US"), Some(&at));
+        assert!(kept.changes.is_empty(), "old files default to no in-progress pagination state");
+        assert!(kept.soon_markets.contains("netflix@US"), "a cached empty soon answer remains an answer");
+        assert_eq!(kept.added_covered_until.get("netflix@US"), Some(&at));
+        drop(kept);
+        assert_eq!(motn.leaving(&provider("netflix"), "US"), Some(Vec::new()));
+        assert_eq!(motn.added(&provider("netflix"), "US"), Some(Vec::new()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -739,30 +1129,12 @@ mod tests {
     }
 
     #[test]
-    fn a_read_the_pages_did_not_finish_resumes_from_its_last_change() {
-        let now = 100 * DAY;
-        let since = now - DAY;
-        let read = vec![
-            ("netflix@US".to_owned(), at("A", 1, since + 50)),
-            ("hulu@US".to_owned(), at("B", 2, since + 90)),
-        ];
-        assert_eq!(read_until(&read, true, since, now), now, "a finished read is read up to now");
-        assert_eq!(
-            read_until(&read, false, since, now),
-            since + 90,
-            "an unfinished one from its last change"
-        );
-        assert_eq!(read_until(&[], false, since, now), since, "nothing read, nothing gained");
-        let stuck = vec![("netflix@US".to_owned(), at("A", 1, since))];
-        assert_eq!(read_until(&stuck, false, since, now), since + 1, "a page all at `since` still moves on");
-    }
-
-    #[test]
     fn a_service_is_served_its_additions_only_once_they_have_been_read() {
         let motn = Motn::new(None, None);
         {
             let mut kept = lock(&motn.kept);
             kept.added_until.insert("FI".into(), now());
+            kept.added_covered_until.insert("netflix@FI".into(), now());
             kept.added.insert("netflix@FI".into(), vec![at("New", 1, now())]);
         }
         assert_eq!(motn.added(&provider("netflix"), "fi").map(|a| a.len()), Some(1));
@@ -776,6 +1148,31 @@ mod tests {
         assert!((0..DAILY_REQUESTS).all(|_| spend(&mut kept, day)));
         assert!(!spend(&mut kept, day + 60));
         assert!(spend(&mut kept, day + DAY), "a new day starts a new budget");
+    }
+
+    #[test]
+    fn each_reserved_call_survives_a_restart_before_the_pass_finishes() {
+        let dir = temp("reserved-budget");
+        let at = 10 * DAY;
+        let motn = Motn::new(Some("unused".into()), Some(&dir));
+        assert!(motn.reserve(at));
+        assert_eq!(lock(&motn.kept).spent, (10, 1));
+        let restarted = Motn::new(Some("unused".into()), Some(&dir));
+        assert_eq!(lock(&restarted.kept).spent, (10, 1), "a restart cannot buy that call a second time");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_configured_cache_refuses_before_network_io() {
+        let (mut motn, requests) = counting_motn().await;
+        let dir = temp("unwritable-reservation");
+        motn.file = Some(dir.join(FILE));
+        std::fs::create_dir(motn.file.as_ref().unwrap().with_extension("json.partial")).unwrap();
+
+        assert_eq!(motn.ask("/countries").await, None);
+        assert!(lock(&requests).is_empty(), "a failed durable reservation must not reach the server");
+        assert_eq!(lock(&motn.kept).spent.1, 1, "the failed attempt remains conservatively spent in memory");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -807,9 +1204,259 @@ mod tests {
     #[test]
     fn without_a_key_nothing_is_wanted_or_kept() {
         let motn = Motn::new(None, None);
-        motn.want(&provider("netflix"), "US");
-        assert!(lock(&motn.kept).wanted.is_empty());
+        let netflix = provider("netflix");
+        motn.want_top(&netflix, "US");
+        motn.want_added(&netflix, "US");
+        motn.want_soon(&netflix, "US");
+        assert_eq!(motn.wanted_lists(&netflix, "US"), (false, false, false));
         assert_eq!(motn.top(&provider("netflix"), "US"), None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_rows_call_once_per_chart_and_once_per_country_not_the_unread_soon_feeds() {
+        let (motn, requests) = counting_motn().await;
+        let at = 100 * DAY;
+        {
+            let mut kept = lock(&motn.kept);
+            kept.wanted.insert("netflix@US".into(), at);
+            kept.wanted.insert("hbo@US".into(), at);
+            kept.added_wanted.insert("netflix@US".into(), at);
+            kept.added_wanted.insert("hbo@US".into(), at);
+        }
+
+        motn.pass(at).await;
+        let asked = lock(&requests).clone();
+        assert_eq!(asked.len(), 4, "countries + two Top 10s + one country-wide additions read");
+        assert_eq!(asked.iter().filter(|path| path.starts_with("/shows/top?")).count(), 2);
+        assert_eq!(asked.iter().filter(|path| path.contains("change_type=new")).count(), 1);
+        assert_eq!(asked.iter().filter(|path| path.contains("change_type=expiring")).count(), 0);
+        assert_eq!(asked.iter().filter(|path| path.contains("change_type=upcoming")).count(), 0);
+
+        motn.pass(at + DAY).await;
+        assert_eq!(lock(&requests).len(), 7, "the next day adds only two Top 10s and one additions read");
+    }
+
+    #[tokio::test]
+    async fn a_top_only_market_never_calls_the_additions_feed() {
+        let (motn, requests) = counting_motn().await;
+        let at = 100 * DAY;
+        lock(&motn.kept).wanted.insert("netflix@US".into(), at);
+
+        motn.pass(at).await;
+        let asked = lock(&requests).clone();
+        assert_eq!(asked.len(), 2, "countries + Top 10 only: {asked:?}");
+        assert_eq!(asked.iter().filter(|path| path.starts_with("/shows/top?")).count(), 1);
+        assert_eq!(asked.iter().filter(|path| path.contains("/changes?")).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reactivated_market_reads_only_its_missing_additions_interval_before_joining_the_country() {
+        let (motn, requests) = counting_motn().await;
+        let at = 100 * DAY;
+        let covered = at - 3 * DAY;
+        let country_until = at - DAY;
+        {
+            let mut kept = lock(&motn.kept);
+            kept.services.insert("us".into(), vec!["netflix".into()]);
+            kept.services_at = at;
+            kept.added_wanted.insert("netflix@US".into(), at);
+            kept.added.insert("netflix@US".into(), Vec::new());
+            kept.added_covered_until.insert("netflix@US".into(), covered);
+            kept.added_until.insert("US".into(), country_until);
+        }
+
+        motn.pass(at).await;
+        let asked = lock(&requests).clone();
+        assert_eq!(asked.len(), 2, "one catch-up and one current country read: {asked:?}");
+        assert!(
+            asked[0].contains(&format!(
+                "change_type=new&item_type=show&catalogs=netflix&from={covered}&to={country_until}"
+            )),
+            "the first call covers exactly the inactive interval: {}",
+            asked[0]
+        );
+        assert!(
+            asked[1].contains(&format!(
+                "change_type=new&item_type=show&catalogs=netflix&from={country_until}&to={at}"
+            )),
+            "only after catch-up does the market join the current read: {}",
+            asked[1]
+        );
+        let kept = lock(&motn.kept);
+        assert_eq!(kept.added_covered_until.get("netflix@US"), Some(&at));
+        assert_eq!(kept.added_until.get("US"), Some(&at));
+    }
+
+    #[tokio::test]
+    async fn a_page_claiming_more_without_a_cursor_is_quarantined_until_the_operation_changes() {
+        let dir = temp("missing-cursor");
+        let (base, requests) = scripted_server(vec![
+            serde_json::json!({"changes": [], "shows": {}, "hasMore": true}),
+            serde_json::json!({"changes": [], "shows": {}, "hasMore": false}),
+        ])
+        .await;
+        let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
+        motn.base.clone_from(&base);
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+            .await
+            .is_none());
+        for _ in 0..100 {
+            assert!(motn
+                .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+                .await
+                .is_none());
+        }
+        assert_eq!(
+            lock(&requests).len(),
+            1,
+            "arbitrarily many passes spend nothing on the quarantined snapshot"
+        );
+
+        let mut restarted = Motn::new(Some("test-key".into()), Some(&dir));
+        restarted.base.clone_from(&base);
+        for _ in 0..100 {
+            assert!(restarted
+                .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2, ADDED_PAGES))
+                .await
+                .is_none());
+        }
+        assert_eq!(lock(&requests).len(), 1, "restarts do not revive the quarantined snapshot");
+
+        let recovered = restarted
+            .changes(ChangeRequest::new("test", "US", "new", &["hbo"], 1, 2, ADDED_PAGES))
+            .await
+            .unwrap();
+        assert_eq!(recovered.catalogs, vec!["hbo"]);
+        assert_eq!(lock(&requests).len(), 2, "a materially different catalog set starts one new operation");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_non_adjacent_cursor_cycle_stops_before_rebuying_a_page_and_stays_quarantined() {
+        let dir = temp("cursor-cycle");
+        let (base, requests) = scripted_server(vec![
+            change_page(1, 1, 10, Some("A")),
+            change_page(2, 1, 10, Some("B")),
+            change_page(3, 1, 10, Some("A")),
+        ])
+        .await;
+        let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
+        motn.base = base;
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .is_none());
+        assert_eq!(lock(&requests).len(), 3);
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .is_none());
+        assert_eq!(lock(&requests).len(), 3, "A must not be requested a second time");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_is_encoded_as_one_query_value() {
+        let (base, requests) = scripted_server(vec![
+            change_page(1, 1, 10, Some("A?part=one&part=two")),
+            change_page(2, 1, 10, None),
+        ])
+        .await;
+        let mut motn = Motn::new(Some("test-key".into()), None);
+        motn.base = base;
+
+        let done = motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 20, ADDED_PAGES))
+            .await
+            .unwrap();
+        assert_eq!(done.read.len(), 2);
+        let asked = lock(&requests);
+        assert_eq!(asked.len(), 2);
+        assert!(
+            asked[1].contains("cursor=A%3Fpart%3Done%26part%3Dtwo"),
+            "cursor was not encoded: {}",
+            asked[1]
+        );
+        assert!(
+            !asked[1].contains("&part=two"),
+            "cursor escaped into a second query parameter: {}",
+            asked[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_limited_same_timestamp_read_resumes_by_cursor_after_restart_without_losing_titles() {
+        let dir = temp("cursor-restart");
+        let timestamp = 1234;
+        let (base, requests) = scripted_server(vec![
+            change_page(1, 25, timestamp, Some("A")),
+            change_page(26, 25, timestamp, Some("B")),
+            change_page(51, 25, timestamp, Some("C")),
+            change_page(76, 25, timestamp, Some("D")),
+            change_page(101, 25, timestamp, None),
+        ])
+        .await;
+        let mut motn = Motn::new(Some("test-key".into()), Some(&dir));
+        motn.base.clone_from(&base);
+        assert!(motn
+            .changes(ChangeRequest::new("test", "US", "new", &["netflix"], 1, 2000, ADDED_PAGES))
+            .await
+            .is_none());
+        assert_eq!(lock(&requests).len(), 4, "one pass observes its page ceiling");
+
+        let mut restarted = Motn::new(Some("test-key".into()), Some(&dir));
+        restarted.base = base;
+        let done = restarted
+            .changes(ChangeRequest::new("test", "US", "new", &["hbo", "netflix"], 20, 3000, ADDED_PAGES))
+            .await
+            .unwrap();
+        assert_eq!(lock(&requests).len(), 5, "the restart resumes at cursor D");
+        assert!(lock(&requests)[4].contains("cursor=D"));
+        assert!(lock(&requests)[4].contains("catalogs=netflix&from=1&to=2000"));
+        assert_eq!(done.catalogs, vec!["netflix"]);
+        assert_eq!(done.read.len(), 125);
+        assert!(done.read.iter().all(|(_, show)| show.at == Some(timestamp)));
+        assert_eq!(done.to, 2000, "coverage advances only when the exact snapshot completes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn soon_rows_make_exactly_two_country_wide_calls_every_three_days() {
+        let (motn, requests) = counting_motn().await;
+        let at = 100 * DAY;
+        {
+            let mut kept = lock(&motn.kept);
+            kept.soon_wanted.insert("netflix@US".into(), at);
+            kept.soon_wanted.insert("hbo@US".into(), at);
+        }
+
+        motn.pass(at).await;
+        let asked = lock(&requests).clone();
+        assert_eq!(
+            asked.len(),
+            3,
+            "countries + one expiring + one upcoming read for both providers: {asked:?}"
+        );
+        assert_eq!(asked.iter().filter(|path| path.contains("change_type=expiring")).count(), 1);
+        assert_eq!(asked.iter().filter(|path| path.contains("change_type=upcoming")).count(), 1);
+        assert!(asked.iter().filter(|path| path.contains("catalogs=hbo%2Cnetflix")).count() >= 1);
+
+        motn.pass(at + SOON_AFTER).await;
+        assert_eq!(lock(&requests).len(), 5, "the next due pass adds the same two country-wide calls");
+    }
+
+    #[test]
+    fn a_new_soon_market_is_unknown_until_a_pass_has_read_it() {
+        let motn = Motn::new(Some("unused".into()), None);
+        let at = now();
+        {
+            let mut kept = lock(&motn.kept);
+            kept.soon_at.insert("US".into(), at);
+            kept.soon_markets.insert("netflix@US".into());
+        }
+        assert_eq!(motn.leaving(&provider("netflix"), "US"), Some(Vec::new()));
+        assert_eq!(motn.leaving(&provider("hbo"), "US"), None, "an unread service keeps its fallback");
     }
 
     #[tokio::test]

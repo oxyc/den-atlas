@@ -532,7 +532,7 @@ impl CatalogState {
         // Leaving and coming rows are Movie of the Night's alone: read straight from what it keeps, soonest first.
         if let Some((provider, soon)) = resolve_soon(catalog_id, providers) {
             let motn = self.motn.as_ref().filter(|motn| motn.enabled())?;
-            motn.want(provider, country);
+            motn.want_soon(provider, country);
             let shows = match soon {
                 Soon::Leaving => motn.leaving(provider, country),
                 Soon::Coming => motn.coming(provider, country),
@@ -545,8 +545,12 @@ impl CatalogState {
         let resolved = resolve_catalog(catalog_id, providers);
         // None: an unknown id, or not one of this install's selected providers.
         let key = row_key(catalog_id, stremio_type, country, providers)?;
-        if let (Some((provider, _)), Some(motn)) = (resolved, &self.motn) {
-            motn.want(provider, country);
+        if let (Some((provider, is_new)), Some(motn)) = (resolved, &self.motn) {
+            if is_new {
+                motn.want_added(provider, country);
+            } else {
+                motn.want_top(provider, country);
+            }
         }
         if let (false, Lookup::Fresh(v)) = (force, self.cache.get(&key)) {
             return Some(CatalogResponse { body: v, fresh: true, upstream: None, stale: false });
