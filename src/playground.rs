@@ -158,12 +158,12 @@ impl den_index::Audience for Viewers<'_> {
     }
 }
 
-/// One seed's row with everything `tuning` asks for: its knobs, TMDB's numbers and popularity, its filters, and
-/// — when it names watched titles — without them and in den-core's tilted order. Whether it was tilted.
+/// One seed's row with everything `tuning` asks for: its knobs, TMDB's numbers and popularity, its filters,
+/// and without titles already watched.
 ///
 /// At production's `Tuning` this is `Indexes::more_like_this_scored` exactly: no filter is consulted, no
 /// title is dropped and nothing is reordered.
-fn tuned_row(sources: &Sources<'_>, media: MediaType, tmdb_id: u32, tuning: &Tuning) -> (Vec<Scored>, bool) {
+fn tuned_row(sources: &Sources<'_>, media: MediaType, tmdb_id: u32, tuning: &Tuning) -> Vec<Scored> {
     type Key = (MediaType, u32);
     let indexes = sources.indexes;
     let viewers = Viewers { sources };
@@ -183,26 +183,7 @@ fn tuned_row(sources: &Sources<'_>, media: MediaType, tmdb_id: u32, tuning: &Tun
         keep: filtering.then_some(&keep as &dyn Fn(Key) -> bool),
         ..den_index::Extras::default()
     };
-    let row = indexes.more_like_this_with(tmdb_id, media, &tuning.params, extras);
-    let Some(tilt) = watched_tilt(&tuning.watched) else { return (row, false) };
-    let Some(cards) = indexes.cards.as_ref() else { return (row, false) };
-    let order: Vec<Key> = row.iter().map(Scored::key).collect();
-    let tilted = tilt.applied(indexes, &order, cards);
-    let mut by_key: std::collections::HashMap<Key, Scored> = row.into_iter().map(|s| (s.key(), s)).collect();
-    (tilted.iter().filter_map(|key| by_key.remove(key)).collect(), true)
-}
-
-/// den-core's household tilt with the watched titles as what the household liked — the `tilt.liked` a
-/// browse row reads — at den-core's default weights and with no era curve. `None` for an empty list.
-fn watched_tilt(watched: &[(MediaType, u32)]) -> Option<crate::plotrows::Tilt> {
-    if watched.is_empty() {
-        return None;
-    }
-    let liked: Vec<String> = watched
-        .iter()
-        .map(|&(media, id)| format!("{}{id}", if media == MediaType::Tv { 't' } else { 'm' }))
-        .collect();
-    crate::plotrows::Tilt::parse(&format!("{}liked={}", crate::plotrows::TILT_PREFIX, liked.join(",")))
+    indexes.more_like_this_with(tmdb_id, media, &tuning.params, extras)
 }
 
 /// `GET /playground/rows.json?seeds=…&suggest=…&inspect=…&<tuning>` — every seed's tuned row in one answer,
@@ -334,8 +315,7 @@ pub fn params_json() -> String {
     .to_string()
 }
 
-/// The most titles a `watched` list may name: the same cap a browse row's `tilt.liked` has, for the same
-/// reason — a centroid over more is not a better centroid, and the list travels in a URL.
+/// The most titles a `watched` list may name; the list travels in a URL.
 pub const MAX_WATCHED: usize = 500;
 
 /// The prefix a facet filter carries: `filter.tone=bleak`, `filter.mood=Feel-good`.
@@ -346,8 +326,7 @@ const FILTER_PREFIX: &str = "filter.";
 pub struct Tuning {
     pub params: SimilarParams,
     pub limit: usize,
-    /// Titles already watched: dropped from every row, and each row ordered for someone who watched them —
-    /// den-core's tilt, exactly as a browse row's `tilt.liked` orders it.
+    /// Titles already watched: dropped from every row.
     pub watched: Vec<(MediaType, u32)>,
     /// Constraints every candidate must carry, as `/index/plot` reads them: a plot facet (`tone=bleak`) or a
     /// label (`mood=Feel-good`, `subgenre=Heist`). Several combine.
@@ -405,7 +384,7 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
     let indexes = sources.indexes;
     let (params, limit) = (&tuning.params, tuning.limit);
     let production = indexes.more_like_this_mixed(tmdb_id, media_type);
-    let (row, tilted) = tuned_row(sources, media_type, tmdb_id, tuning);
+    let row = tuned_row(sources, media_type, tmdb_id, tuning);
     let card = |key: (MediaType, u32)| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key));
         (card.map(|c| c.title.clone()), card.and_then(|c| c.year))
@@ -448,7 +427,6 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
     json!({
         "seed": { "id": tmdb_id, "title": title, "year": year },
         "changed": changed(params),
-        "tilted": tilted,
         "total": row.len(),
         "productionTotal": production.len(),
         "spread": row.first().map(|s| s.spread),
@@ -549,7 +527,7 @@ fn inspection(
 ///     "seeds": ["series:1438", …],      // More Like This seeds, in order
 ///     "suggestSeeds": ["movie:278", …], // You Might Also Like seeds
 ///     "inspect": "series:2004",          // arbitrary candidate explained in every row, or null
-///     "watched": ["movie:5723", …],     // excluded, and the rows tilted towards them
+///     "watched": ["movie:5723", …],     // excluded from the rows
 ///     "filters": [{ "axis": "tone", "value": "bleak" }]
 ///   },
 ///   "snapshot": {                       // read-only, for whoever debugs the file; import ignores it
@@ -815,7 +793,7 @@ pub fn judged(sources: &Sources<'_>, tuning: &Tuning) -> Value {
         let production = score(&indexes.more_like_this_mixed(c.id, c.media), &c.grades, crate::raileval::K);
         let mine = if tuned {
             let row: Vec<(MediaType, u32)> =
-                tuned_row(sources, c.media, c.id, tuning).0.iter().map(Scored::key).collect();
+                tuned_row(sources, c.media, c.id, tuning).iter().map(Scored::key).collect();
             score(&row, &c.grades, crate::raileval::K)
         } else {
             production
@@ -1172,14 +1150,13 @@ mod tests {
         for anchor in golden["anchors"].as_array().unwrap() {
             let media = if anchor["type"] == "movie" { MediaType::Movie } else { MediaType::Tv };
             let id = anchor["id"].as_u64().unwrap() as u32;
-            let (row, tilted) = tuned_row(&sources, media, id, &Tuning::default());
+            let row = tuned_row(&sources, media, id, &Tuning::default());
             let row: Vec<(MediaType, u32)> = row.iter().map(Scored::key).collect();
             assert_eq!(row.as_slice(), &*indexes.more_like_this_mixed(id, media), "{}", anchor["name"]);
-            assert!(!tilted);
         }
         let wire = |query: &str| -> Vec<u32> {
             let tuning = parse(query).unwrap();
-            tuned_row(&sources, MediaType::Tv, 1438, &tuning).0.iter().take(20).map(|s| s.tmdb_id).collect()
+            tuned_row(&sources, MediaType::Tv, 1438, &tuning).iter().take(20).map(|s| s.tmdb_id).collect()
         };
         // Read with Jev's rerank off: its head is ordered by Jev's scores, which neither knob reaches, and on
         // The Wire it hides what `holds` moves in the first twenty.

@@ -978,8 +978,7 @@ function redraw(el, html) {
 function card(key, a, error) {
   const kind = kindName(key);
   const sub = a?.total ? `${kind} · top ${a.titles.length} of ${a.total}` +
-    (a.total !== a.productionTotal ? ` (production ${a.productionTotal})` : "") +
-    (a.tilted ? " · leaning toward what you watched" : "") : "";
+    (a.total !== a.productionTotal ? ` (production ${a.productionTotal})` : "") : "";
   let html = `<section class="prow" aria-label="More like ${esc(plainName(key))}">` +
     `<div class="prow-head"><h3>${nameOf(key)}</h3>${sub ? `<span class="sub">${sub}</span>` : ""}</div>`;
   if (error) {
