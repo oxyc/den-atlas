@@ -3414,7 +3414,7 @@ mod tests {
         let row = |constraints: &[(&str, &str)]| {
             let owned: Vec<(String, String)> =
                 constraints.iter().map(|(a, v)| ((*a).to_owned(), (*v).to_owned())).collect();
-            crate::plotrows::row(&indexes, None, Movie, &owned, None, 0, 20)
+            crate::plotrows::row(&indexes, None, Movie, &owned, 0, 20)
         };
         let bittersweet = row(&[("ending", "bittersweet")]);
         assert_eq!(ids(&bittersweet), vec![1, 2, 3]);
@@ -3443,7 +3443,6 @@ mod tests {
             None,
             Movie,
             &[("ending".to_owned(), "bittersweet".to_owned())],
-            None,
             0,
             20,
         );

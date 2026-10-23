@@ -104,11 +104,6 @@ type SimilarKey = (Key, bool, crate::maturity::Policy, u64);
 
 /// More Like This answers and row orders kept at most: bounded, and simply started over when full. Both are small
 /// (a row order is at most a few thousand titles, an answer at most `den_index::MAX_ROW` ids).
-///
-/// `ROW_MEMO` covers each row twice over: once untilted, and once per (household taste x weights) asking for
-/// it. 128 was a row per key; a tilt forks that key space, so a household browsing thirty rows would clear
-/// the memo on its own and pay every other household's order again.
-///
 /// The bound is on ENTRIES, not bytes, and the entries vary enormously: on the shipped corpus `tone=bleak`
 /// is 1,599 titles and `chronology=linear` is 31,627, at 8 bytes each. 256 of the largest would be 65 MB,
 /// but a handful of axis values are that broad and the ordinary row is a few hundred titles, and a full map
