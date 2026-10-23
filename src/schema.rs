@@ -476,11 +476,6 @@ fn routes() -> Value {
                 with(param("mood", "string", "a mood label"), json!({ "field": "mood" })),
                 row_skip.clone(),
                 row_limit.clone(),
-                param("tilt.liked", "string", "reorders for a household: comma-separated m<id>/t<id>, at most \
-                                               500 (tilt.w.embedding, tilt.w.dislike, tilt.w.era and \
-                                               tilt.w.square weigh it); never changes total"),
-                param("tilt.disliked", "string", "as tilt.liked"),
-                param("tilt.era", "string", "<center>,<spread> in calendar years"),
             ],
             "returns": "{titles, total, likely?, coverage}",
             "counts": {
