@@ -36,6 +36,16 @@ den-dataset's committed byte-exact canary on both the native homelab Intel CPU a
 Actions AMD EPYC 7763 runner. The dataset workflow now pins that immutable digest. This proves it belongs to
 the existing corpus space; it does not require a corpus rebuild or vector-epoch change.
 
+The optional images pin native ONNX Runtime 1.28.0 by archive SHA independently of the Rust `ort`
+wrapper. Upgrading the wrapper to rc.15 otherwise downloads native ORT 1.31.0; release 0.96.17 failed
+all seven corpus canaries on an allowed native EPYC 7763 runner despite unchanged model/tokenizer hashes.
+Keep native-runtime updates separate from wrapper safety fixes and validate each resulting image.
+The wrapper selects its supported `api-28` interface; no version checks are bypassed.
+
+For a compatibility change, manually dispatch Atlas `ci` on the proposed branch. Its optional candidate
+artifact names the immutable image to pass to den-dataset's `embed image parity` workflow before merging.
+After release, validate the exact released digest again before changing the dataset pin or live service.
+
 The compatibility service deployment is a separate operation in the den repository. Keep its unattended
 update hold, verify the Atlas release signature and exact digest, then explicitly update and run the same
 canary against the live service. Do not archive the standalone repository until that switch is live and
