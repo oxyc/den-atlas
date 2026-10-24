@@ -958,7 +958,10 @@ fn init_ort() -> anyhow::Result<&'static ort::environment::Environment> {
     static ENVIRONMENT: std::sync::OnceLock<Result<ort::environment::Environment, ort::Error>> =
         std::sync::OnceLock::new();
     ENVIRONMENT
-        .get_or_init(|| ort::init().with_name("den-embed").build())
+        .get_or_init(|| {
+            tracing::info!(onnx_runtime = ort::info(), "initializing embedding runtime");
+            ort::init().with_name("den-embed").build()
+        })
         .as_ref()
         .map_err(|error| anyhow::anyhow!("initializing ONNX Runtime: {error}"))
 }

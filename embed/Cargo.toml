@@ -13,10 +13,12 @@ path = "src/main.rs"
 [dependencies]
 # ONNX Runtime — the SAME native engine the Python service used via fastembed, so
 # the same model_int8.onnx on the same CPU provider yields identical tensors.
+# The image pins the original native ORT 1.28.0 archive independently of the wrapper; api-28
+# declares that supported C API baseline. Native upgrades require the dataset byte-exact canary.
 # `tls-rustls` is required from rc.13 on: `download-binaries` fetches the ONNX Runtime archive at
 # BUILD time and now insists a TLS provider be named explicitly. rustls/ring rather than native,
 # so the build needs no OpenSSL. It is a build-dependency only — nothing TLS ships in the binary.
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "api-28", "download-binaries", "tls-rustls"] }
 ndarray = "0.17"
 # HuggingFace tokenizers — the SAME Rust crate fastembed wraps, so loading the
 # same tokenizer.json gives byte-identical token ids.

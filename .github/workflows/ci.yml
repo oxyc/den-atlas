@@ -259,8 +259,9 @@ jobs:
   # These images are published beside the normal candidate, but they do not replace it and no deploy reads
   # them. The compatibility service lets den-dataset move to the Atlas-owned engine first; the integrated
   # image is an explicit later-rollout artifact. Both share one bake so the model and glibc build are reused.
+  # Manual branch builds publish immutable candidates for dataset parity before merging an engine change.
   optional-candidate:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -49,7 +49,23 @@ FROM embedded-chef AS embedded-planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# Keep the corpus inference runtime independent of the Rust ort wrapper. rc.15's automatic
+# download advances ORT from 1.28.0 to 1.31.0 and fails the committed byte-exact canary.
+# This is the same CPU archive (and hash) shipped by ort-sys rc.13, not a rebuilt approximation.
+FROM embedded-chef AS embedded-ort
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cdn.pyke.io/0/pyke:ort-rs/ms@1.28.0/x86_64-unknown-linux-gnu.tar.lzma2 -o /tmp/ort.tar.lzma2 \
+    && echo 'e454f710f8a49f53aa5b4ff51e3454ae1835777e431c6c35c5255ce6f205fd68  /tmp/ort.tar.lzma2' | sha256sum -c - \
+    && mkdir /opt/ort \
+    && xz --decompress --stdout --format=raw --lzma2=dict=64MiB /tmp/ort.tar.lzma2 > /tmp/ort.tar \
+    && tar -xf /tmp/ort.tar -C /opt/ort \
+    && rm /tmp/ort.tar.lzma2 /tmp/ort.tar
+
 FROM embedded-chef AS embedded-build
+COPY --from=embedded-ort /opt/ort /opt/ort
+# Both cargo-chef and the application must link the pinned archive; no automatic runtime download.
+ENV ORT_LIB_PATH=/opt/ort ORT_SKIP_DOWNLOAD=1
 COPY --from=embedded-planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
       -p den-atlas -p den-embed --features den-atlas/embedded-model
