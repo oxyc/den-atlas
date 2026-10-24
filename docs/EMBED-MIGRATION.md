@@ -48,8 +48,8 @@ After release, validate the exact released digest again before changing the data
 
 The compatibility service deployment is a separate operation in the den repository. Keep its unattended
 update hold, verify the Atlas release signature and exact digest, then explicitly update and run the same
-canary against the live service. Do not archive the standalone repository until that switch is live and
-verified. None of this enables `EMBED_LOCAL`.
+canary against the live service. The standalone repository is already archived after that switch was verified.
+Future compatibility-service updates still require the same gates. None of this enables `EMBED_LOCAL`.
 
 ## Rollout blockers
 
@@ -70,9 +70,8 @@ Before setting `EMBED_LOCAL=1` in production:
 5. Publish a corpus whose manifest carries `embedderVectorEpoch` and `embedderMaxTokens`. Local mode compares
    those with `embeddingModel` and `dims` against the engine and remains unavailable if any field is absent or
    different; existing manifests intentionally fail closed.
-6. Keep den-dataset pinned to the exact validated Atlas-owned compatibility digest. Retire the standalone
-   den-embed release workflow/repository only after the compatibility service is deployed and its live
-   canary passes. A fresh dataset publication carrying the complete comparable identity (model, dimensions,
+6. Keep den-dataset pinned to the exact validated Atlas-owned compatibility digest. The standalone den-embed repository is already archived; future releases
+   come from Atlas and must pass the same native and live canaries. A fresh dataset publication carrying the complete comparable identity (model, dimensions,
    vector epoch, and token cap) is still required before enabling local mode, but byte-identical image
    ownership migration does not require rebuilding the existing corpus. `embedderRuntime` is provenance for
    the build that created the rows and is deliberately not compared.
