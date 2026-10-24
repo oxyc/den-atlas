@@ -234,7 +234,7 @@ struct Model {
 impl Model {
     fn load(cfg: &Config) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let mut builder = Session::builder()
+        let mut builder = Session::builder(init_ort()?)
             .map_err(ort_err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(ort_err)?;
@@ -952,22 +952,19 @@ fn spawn_idle_unloader(state: Arc<AppState>, idle: Duration) {
     });
 }
 
-fn init_ort() {
-    static INITIALIZED: std::sync::Once = std::sync::Once::new();
-    INITIALIZED.call_once(|| {
-        // rc.13 returns bool, not Result: false means an environment was already committed, so this
-        // config simply does not take effect. Another embedding service in this process may legitimately
-        // have committed it first; the model contract is still pinned by this crate.
-        if !ort::init().with_name("den-embed").commit() {
-            tracing::warn!(
-                "ort environment was already committed; den-embed's configuration is not in effect"
-            );
-        }
-    });
+fn init_ort() -> anyhow::Result<&'static ort::environment::Environment> {
+    // rc.15 requires an explicit environment, and only permits one per process. Keep it alive
+    // across idle unloads and share it between the compatibility service and integrated callers.
+    static ENVIRONMENT: std::sync::OnceLock<Result<ort::environment::Environment, ort::Error>> =
+        std::sync::OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| ort::init().with_name("den-embed").build())
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("initializing ONNX Runtime: {error}"))
 }
 
 fn build_state(cfg: Config) -> anyhow::Result<Arc<AppState>> {
-    init_ort();
+    init_ort()?;
     let idle = cfg.idle_unload;
     let cache_max = cfg.cache_max;
     let state = Arc::new(AppState {
@@ -1297,6 +1294,14 @@ async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ort_environment_survives_session_builder_recreation() {
+        // Idle unload drops the session. A later load must reuse the process environment: rc.15
+        // refuses a second environment even after the previous session has gone away.
+        drop(Session::builder(init_ort().unwrap()).unwrap());
+        drop(Session::builder(init_ort().unwrap()).unwrap());
+    }
 
     #[tokio::test]
     async fn blocking_admission_outlives_a_cancelled_request() {
