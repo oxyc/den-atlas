@@ -2,7 +2,7 @@
 # `scratch` → a ~few-MB, dependency-free image. The server speaks plain HTTP, and its outbound HTTPS
 # (JustWatch) uses rustls with bundled roots, so scratch needs no CA bundle. CI builds this with an empty
 # data/ (blobs gitignored) → the published image is the SERVER ONLY; mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
-FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS chef
+FROM rust:1.99.0-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS chef
 RUN apk add --no-cache musl-dev \
     && cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /app
@@ -30,7 +30,7 @@ RUN cargo build --release --locked -p den-atlas
 # The release version reaches only the final image configuration (and this marker), never the Rust build above,
 # so a release commit that changes only VERSION reuses the cached compile. A missing or malformed value fails
 # here, before an image can be pushed.
-FROM rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS release-metadata
+FROM rust:1.99.0-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS release-metadata
 ARG DEN_VERSION
 RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
     || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
@@ -39,7 +39,7 @@ RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
 # Optional migration targets. Neither is the Dockerfile's final/default target, so the published Atlas image
 # remains the same static-musl server. Select `--target den-atlas-embedded` or `--target den-embed` explicitly.
 # ORT's archive needs Debian trixie's newer libstdc++; this cannot reuse the normal Alpine/musl builder.
-FROM rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS embedded-chef
+FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS embedded-chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/* \
