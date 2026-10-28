@@ -839,36 +839,36 @@ impl Index {
     /// `None` means `K` or `others` is empty, or the retained weights sum to zero. Row numbers have
     /// the same precondition as [`similarity`](Self::similarity).
     pub fn weighted_nearest<const K: usize>(&self, row: u32, others: &[(u32, f64)]) -> Option<f64> {
+        self.weighted_nearest_each::<K>(&[row], others)[0]
+    }
+
+    /// [`weighted_nearest`](Self::weighted_nearest) for each of `rows`, in order. Every row meets `others` in
+    /// the same order as it would alone, so each answer is exactly that call's. The rows are taken
+    /// `NEAREST_TILE` at a time and each of `others` is read once per tile: one at a time, a household's liked
+    /// vectors (a KiB each, thousands of them) were streamed from memory again for every row, since they
+    /// outgrow the cache close to the core.
+    pub fn weighted_nearest_each<const K: usize>(
+        &self,
+        rows: &[u32],
+        others: &[(u32, f64)],
+    ) -> Vec<Option<f64>> {
         if K == 0 || others.is_empty() {
-            return None;
+            return vec![None; rows.len()];
         }
         let matrix = self.matrix();
-        let candidate = matrix.row(row as usize);
-        let mut nearest: [Option<(i32, f64)>; K] = [None; K];
-        let mut held = 0usize;
-        for &(other, weight) in others {
-            let score = dot(candidate, matrix.row(other as usize));
-            // Strictly greater puts an equal score after the one seen first, matching stable sort.
-            let at = (0..held).find(|&at| score > nearest[at].unwrap().0).unwrap_or(held);
-            if at < K {
-                for move_to in (at + 1..=held.min(K.saturating_sub(1))).rev() {
-                    nearest[move_to] = nearest[move_to - 1];
+        let mut answers = Vec::with_capacity(rows.len());
+        for tile in rows.chunks(NEAREST_TILE) {
+            let candidates: Vec<&[u8]> = tile.iter().map(|&row| matrix.row(row as usize)).collect();
+            let mut nearest = vec![([None; K], 0usize); tile.len()];
+            for &(other, weight) in others {
+                let other = matrix.row(other as usize);
+                for (candidate, (nearest, held)) in candidates.iter().zip(nearest.iter_mut()) {
+                    keep_nearest(nearest, held, dot(candidate, other), weight);
                 }
-                nearest[at] = Some((score, weight));
-                held = (held + 1).min(K);
             }
+            answers.extend(nearest.iter().map(|(nearest, held)| weighted_mean(&nearest[..*held])));
         }
-        let nearest = nearest[..held].iter().flatten();
-        let weight: f64 = nearest.clone().map(|&(_, weight)| weight).sum();
-        (weight != 0.0).then(|| {
-            nearest
-                .map(|&(score, weight)| {
-                    let similarity = f64::from(score) / (QUANTUM * QUANTUM);
-                    weight * similarity
-                })
-                .sum::<f64>()
-                / weight
-        })
+        answers
     }
 
     /// The mean of every row's vector, in `similarity`'s units: a row's `projection` on it is how close that title
@@ -1160,6 +1160,43 @@ impl ScanStats {
         let variance = scored.iter().map(|&(s, _)| (f64::from(s) - mean).powi(2)).sum::<f64>() / n;
         ScanStats { mean, sd: variance.sqrt() }
     }
+}
+
+/// Rows `weighted_nearest_each` scores together: eight 1 KiB rows stay in the first-level cache beside the row
+/// they are all compared with.
+const NEAREST_TILE: usize = 8;
+
+/// Hold `score` among the best `K` seen so far, best first. Strictly greater puts an equal score after the one
+/// seen first, matching stable sort.
+fn keep_nearest<const K: usize>(
+    nearest: &mut [Option<(i32, f64)>; K],
+    held: &mut usize,
+    score: i32,
+    weight: f64,
+) {
+    let at = (0..*held).find(|&at| score > nearest[at].unwrap().0).unwrap_or(*held);
+    if at < K {
+        for move_to in (at + 1..=(*held).min(K.saturating_sub(1))).rev() {
+            nearest[move_to] = nearest[move_to - 1];
+        }
+        nearest[at] = Some((score, weight));
+        *held = (*held + 1).min(K);
+    }
+}
+
+/// The weighted mean similarity of the scores held; `None` when their weights sum to zero.
+fn weighted_mean(nearest: &[Option<(i32, f64)>]) -> Option<f64> {
+    let nearest = nearest.iter().flatten();
+    let weight: f64 = nearest.clone().map(|&(_, weight)| weight).sum();
+    (weight != 0.0).then(|| {
+        nearest
+            .map(|&(score, weight)| {
+                let similarity = f64::from(score) / (QUANTUM * QUANTUM);
+                weight * similarity
+            })
+            .sum::<f64>()
+            / weight
+    })
 }
 
 /// int8 · int8, accumulated in i32 (1024 dims × 128² fits with room to spare). The bytes are int8 stored as
@@ -1461,6 +1498,36 @@ pub(crate) mod tests {
         assert_eq!(idx.weighted_nearest::<2>(row, &others), Some(expected));
         assert_eq!(idx.weighted_nearest::<0>(row, &others), None);
         assert_eq!(idx.weighted_nearest::<2>(row, &[]), None);
+    }
+
+    /// Rows scored together, across more than one tile and with repeats, each answer as the stable full sort gives it.
+    #[test]
+    fn weighted_nearest_each_matches_the_stable_full_sort_for_every_row() {
+        let idx = sample();
+        let all: Vec<u32> = (0..idx.len() as u32).collect();
+        let rows: Vec<u32> = all.iter().cycle().take(NEAREST_TILE * 2 + 3).copied().collect();
+        let others: Vec<(u32, f64)> = all
+            .iter()
+            .rev()
+            .chain(&all)
+            .zip([1.0, 2.0, 0.5].iter().cycle())
+            .map(|(&row, &weight)| (row, weight))
+            .collect();
+        let oracle = |row: u32| {
+            let mut scored: Vec<(f64, f64)> =
+                others.iter().map(|&(o, w)| (idx.similarity(row, o), w)).collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let best = &scored[..2];
+            let weight: f64 = best.iter().map(|s| s.1).sum();
+            Some(best.iter().map(|s| s.0 * s.1).sum::<f64>() / weight)
+        };
+        let batch = idx.weighted_nearest_each::<2>(&rows, &others);
+        assert_eq!(batch.len(), rows.len());
+        for (&row, answer) in rows.iter().zip(batch) {
+            assert_eq!(answer, oracle(row), "row {row}");
+            assert_eq!(answer, idx.weighted_nearest::<2>(row, &others));
+        }
+        assert_eq!(idx.weighted_nearest_each::<2>(&rows, &[]), vec![None; rows.len()]);
     }
 
     #[test]

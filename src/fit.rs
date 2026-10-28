@@ -364,7 +364,8 @@ impl<'a> Fit<'a> {
             similar: (0.0, 1.0),
             profile: (0.0, 1.0),
         };
-        let similar: Vec<f64> = corpus.sample.iter().filter_map(|f| fit.nearest(f.row?)).collect();
+        let rows: Vec<u32> = corpus.sample.iter().filter_map(|f| f.row).collect();
+        let similar: Vec<f64> = fit.nearest_each(&rows).into_iter().flatten().collect();
         let profile: Vec<f64> = corpus.sample.iter().map(|f| fit.lifted(f)).collect();
         fit.similar = spread(&similar);
         fit.profile = spread(&profile);
@@ -372,9 +373,22 @@ impl<'a> Fit<'a> {
     }
 
     pub fn of(&self, features: &Features) -> Fitted {
+        self.fitted(features, features.row.and_then(|row| self.nearest(row)))
+    }
+
+    /// `of` for each of `features`, in order, their plots compared with the liked titles together
+    /// (`nearest_each`).
+    pub fn of_each(&self, features: &[Features]) -> Vec<Fitted> {
+        let rows: Vec<u32> = features.iter().filter_map(|f| f.row).collect();
+        let mut nearest = self.nearest_each(&rows).into_iter();
+        features.iter().map(|f| self.fitted(f, f.row.and_then(|_| nearest.next().flatten()))).collect()
+    }
+
+    /// `of`, given the title's `nearest`.
+    fn fitted(&self, features: &Features, nearest: Option<f64>) -> Fitted {
         let profile = z(self.lifted(features), self.profile);
         let people = self.following(features);
-        let similar = features.row.and_then(|row| self.nearest(row)).map(|s| z(s, self.similar));
+        let similar = nearest.map(|s| z(s, self.similar));
         let confidence = if similar.is_some() {
             1.0
         } else {
@@ -467,6 +481,17 @@ impl<'a> Fit<'a> {
         let near = near[..held].iter().flatten();
         let weight: f64 = near.clone().map(|&(_, weight)| weight).sum();
         (weight != 0.0).then(|| near.map(|&(score, weight)| weight * score).sum::<f64>() / weight - hub)
+    }
+
+    /// `nearest` for each of `rows`, in order. With every liked title indexed, the rows are scored together
+    /// (`weighted_nearest_each`), each exactly as `nearest` scores it alone.
+    fn nearest_each(&self, rows: &[u32]) -> Vec<Option<f64>> {
+        let Some(liked) = self.liked_rows.as_ref().filter(|_| !self.liked.is_empty()) else {
+            return rows.iter().map(|&row| self.nearest(row)).collect();
+        };
+        let hubs = &self.corpus.centre_projection;
+        let nearest = self.indexes.plot.weighted_nearest_each::<NEAREST>(rows, liked);
+        rows.iter().zip(nearest).map(|(&row, nearest)| Some(nearest? - *hubs.get(row as usize)?)).collect()
     }
 
     /// A row's closeness to the nearest disliked title, less its closeness to the index as a whole.
