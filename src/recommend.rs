@@ -1408,8 +1408,10 @@ fn personal<'a>(
         .collect();
     sketched.sort_by(|a, b| b.0.total_cmp(&a.0));
     sketched.truncate(PERSONAL_SKETCHED);
+    let (candidates, features): (Vec<Candidate<'a>>, Vec<Features>) =
+        sketched.into_iter().map(|(_, candidate, features)| (candidate, features)).unzip();
     let mut fitted: Vec<(f64, Candidate<'a>)> =
-        sketched.into_iter().map(|(_, candidate, features)| (taste.of(&features).fit, candidate)).collect();
+        taste.of_each(&features).into_iter().zip(candidates).map(|(fitted, c)| (fitted.fit, c)).collect();
     fitted.sort_by(|a, b| b.0.total_cmp(&a.0));
     fitted.into_iter().take(PERSONAL).take_while(|(fit, _)| *fit >= LEAD_FIT).map(|(_, c)| c).collect()
 }
