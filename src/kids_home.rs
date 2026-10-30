@@ -63,6 +63,13 @@ struct Row {
     source: Source,
 }
 
+#[derive(Serialize)]
+struct WireRow<'a> {
+    #[serde(flatten)]
+    row: &'a Row,
+    heading: crate::heading::Heading,
+}
+
 const ROWS: &[Row] = &[
     Row {
         id: "bluey",
@@ -418,5 +425,38 @@ const ROWS: &[Row] = &[
 ];
 
 pub fn json() -> serde_json::Value {
-    serde_json::json!({ "rows": ROWS })
+    let rows: Vec<WireRow<'_>> = ROWS
+        .iter()
+        .map(|row| WireRow {
+            row,
+            heading: crate::heading::Heading::fixed(format!("shelf.kids.{}", row.id), row.title),
+        })
+        .collect();
+    serde_json::json!({ "rows": rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_keep_the_legacy_title_and_publish_a_stable_heading() {
+        let answer = json();
+        let bluey = &answer["rows"][0];
+        assert_eq!(bluey["id"], "bluey");
+        assert_eq!(bluey["title"], "Bluey Time!");
+        assert_eq!(bluey["heading"]["id"], "shelf.kids.bluey");
+        assert_eq!(bluey["heading"]["args"], serde_json::json!({}));
+        assert_eq!(bluey["heading"]["fallback"], bluey["title"]);
+    }
+
+    #[test]
+    fn every_row_has_a_unique_heading_identity_and_matching_fallback() {
+        let answer = json();
+        let rows = answer["rows"].as_array().unwrap();
+        let ids: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row["heading"]["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), rows.len());
+        assert!(rows.iter().all(|row| row["heading"]["fallback"] == row["title"]));
+    }
 }

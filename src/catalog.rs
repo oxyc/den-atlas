@@ -151,6 +151,8 @@ pub struct CatalogEntry {
     pub type_: &'static str,
     pub id: String,
     pub name: String,
+    /// Locale-neutral row heading, additive to Stremio's required English `name`.
+    pub heading: crate::heading::Heading,
     /// Every JustWatch package id this row's service is known by — identical to the TMDB watch-provider ids.
     /// Published on the manifest so a client can associate the row with its own provider directory instead of
     /// parsing the display name. Empty for the aggregate "Trending Everywhere" row, which spans providers.
@@ -171,13 +173,20 @@ pub fn catalog_entries(providers: &[&'static Provider], soon: bool) -> Vec<Catal
             type_: t,
             id: TRENDING_ID.to_owned(),
             name: TRENDING_NAME.to_owned(),
+            heading: crate::heading::Heading::fixed("atlas.catalog.trending_everywhere", TRENDING_NAME),
             package_ids: &[],
         });
         for p in providers {
+            let service = p.name.trim_start_matches("Popular on ");
             out.push(CatalogEntry {
                 type_: t,
                 id: p.id.to_owned(),
                 name: p.name.to_owned(),
+                heading: crate::heading::Heading::with_args(
+                    "atlas.catalog.popular_on",
+                    [("service", service)],
+                    p.name,
+                ),
                 package_ids: p.package_ids,
             });
             // "New on <service>" sits next to "Popular on <service>". `name` is derived from the provider's
@@ -185,21 +194,35 @@ pub fn catalog_entries(providers: &[&'static Provider], soon: bool) -> Vec<Catal
             out.push(CatalogEntry {
                 type_: t,
                 id: new_catalog_id(p),
-                name: format!("New on {}", p.name.trim_start_matches("Popular on ")),
+                name: format!("New on {service}"),
+                heading: crate::heading::Heading::with_args(
+                    "atlas.catalog.new_on",
+                    [("service", service)],
+                    format!("New on {service}"),
+                ),
                 package_ids: p.package_ids,
             });
             if soon && !p.motn.is_empty() {
-                let service = p.name.trim_start_matches("Popular on ");
                 out.push(CatalogEntry {
                     type_: t,
                     id: format!("{}{LEAVING_SUFFIX}", p.id),
                     name: format!("Leaving {service} Soon"),
+                    heading: crate::heading::Heading::with_args(
+                        "atlas.catalog.leaving_soon",
+                        [("service", service)],
+                        format!("Leaving {service} Soon"),
+                    ),
                     package_ids: p.package_ids,
                 });
                 out.push(CatalogEntry {
                     type_: t,
                     id: format!("{}{COMING_SUFFIX}", p.id),
                     name: format!("Coming to {service}"),
+                    heading: crate::heading::Heading::with_args(
+                        "atlas.catalog.coming_to",
+                        [("service", service)],
+                        format!("Coming to {service}"),
+                    ),
                     package_ids: p.package_ids,
                 });
             }
@@ -1236,6 +1259,30 @@ mod tests {
         // per type: N providers × (popular + new) + 1 trending
         let per_type = selected_providers().len() * 2 + 1;
         assert_eq!(entries.len(), per_type * 2);
+    }
+
+    #[test]
+    fn every_catalog_entry_keeps_english_and_publishes_semantic_heading_data() {
+        let entries = catalog_entries(selected_providers(), true);
+        assert!(entries.iter().all(|entry| entry.heading.fallback == entry.name));
+        let by = |id: &str, type_: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.id == id && entry.type_ == type_)
+                .unwrap_or_else(|| panic!("missing {type_} {id}"))
+        };
+        assert_eq!(by(TRENDING_ID, "movie").heading.id, "atlas.catalog.trending_everywhere");
+        assert!(by(TRENDING_ID, "movie").heading.args.is_empty());
+        for (id, heading_id) in [
+            ("jw-nfx", "atlas.catalog.popular_on"),
+            ("jw-nfx-new", "atlas.catalog.new_on"),
+            ("jw-nfx-leaving", "atlas.catalog.leaving_soon"),
+            ("jw-nfx-coming", "atlas.catalog.coming_to"),
+        ] {
+            let entry = by(id, "series");
+            assert_eq!(entry.heading.id, heading_id);
+            assert_eq!(entry.heading.args.get("service").map(String::as_str), Some("Netflix"));
+        }
     }
 
     #[test]

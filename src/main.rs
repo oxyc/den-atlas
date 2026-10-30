@@ -18,6 +18,7 @@ mod fit;
 mod franchisecheck;
 mod franchises;
 mod handler;
+mod heading;
 mod http;
 mod justwatch;
 mod kids_home;
