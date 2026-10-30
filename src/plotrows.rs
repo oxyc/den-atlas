@@ -67,6 +67,8 @@ const STRUCTURE_ALIAS: &[(&str, &str)] = &[("single-day", "timespan"), ("antholo
 pub struct MergedRow {
     pub axis: &'static str,
     pub value: &'static str,
+    /// Locale-neutral identity for the suggested display heading. Explicit so identity never comes from English.
+    pub heading_id: &'static str,
     /// What a client may call the row. Clients name their own rows; this is the suggestion.
     pub title: &'static str,
     pub members: &'static [&'static str],
@@ -76,18 +78,21 @@ pub const MERGED_ROWS: &[MergedRow] = &[
     MergedRow {
         axis: "ending",
         value: "unresolved",
+        heading_id: "atlas.taxonomy.ending.unresolved",
         title: "Endings that don't tie up",
         members: &["open", "ambiguous", "cyclical"],
     },
     MergedRow {
         axis: "ending",
         value: "unhappy",
+        heading_id: "atlas.taxonomy.ending.unhappy",
         title: "Not a happy ending",
         members: &["tragic", "bittersweet"],
     },
     MergedRow {
         axis: "chronology",
         value: "out-of-order",
+        heading_id: "atlas.taxonomy.chronology.out_of_order",
         title: "Told out of order",
         members: &["nonlinear", "framed", "parallel-strands"],
     },

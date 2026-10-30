@@ -190,6 +190,11 @@ pub fn document(indexes: &Indexes) -> Value {
                     json!({
                         "value": m.value,
                         "title": m.title,
+                        "heading": crate::heading::Heading::with_args(
+                            m.heading_id,
+                            [("axis", m.axis), ("value", m.value)],
+                            m.title,
+                        ),
                         "of": m.members,
                         "count": { "matched": matched, "known": facet.known, "population": population },
                     })
@@ -1030,6 +1035,9 @@ mod tests {
         assert_eq!(named, ["unresolved", "unhappy"]);
         let unhappy = &merged[1];
         assert_eq!(unhappy["title"], "Not a happy ending");
+        assert_eq!(unhappy["heading"]["id"], "atlas.taxonomy.ending.unhappy");
+        assert_eq!(unhappy["heading"]["args"], json!({ "axis": "ending", "value": "unhappy" }));
+        assert_eq!(unhappy["heading"]["fallback"], unhappy["title"]);
         assert_eq!(unhappy["of"], json!(["tragic", "bittersweet"]));
         assert_eq!(unhappy["count"], json!({ "matched": 4, "known": 4, "population": 12 }));
         assert_eq!(merged[0]["count"]["matched"], 0, "no open, ambiguous or cyclical ending in the fixture");

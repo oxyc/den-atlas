@@ -29,6 +29,9 @@ struct Catalog {
     type_: String,
     id: String,
     name: String,
+    /// Den superset field: locale-neutral identity + args, with the same English as `name` as fallback.
+    /// Stock Stremio clients ignore it and continue to read `name`.
+    heading: crate::heading::Heading,
     // Declared only when region is `auto`: tells the client it may forward a `country` extra (the Den
     // app sends the device region). Omitted for a fixed-country install (country is baked into the URL).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -100,6 +103,7 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
             type_: e.type_.to_owned(),
             id: e.id,
             name: e.name,
+            heading: e.heading,
             den_provider_id: e.package_ids.first().copied(),
             den_provider_ids: e.package_ids.to_vec(),
             extra: {
@@ -121,6 +125,7 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
                 type_: type_.to_owned(),
                 id: titles::CATALOG_ID.to_owned(),
                 name: titles::CATALOG_NAME.to_owned(),
+                heading: crate::heading::Heading::fixed("atlas.catalog.titles", titles::CATALOG_NAME),
                 extra: vec![CatalogExtra { name: "search", is_required: true }],
                 den_provider_id: None,
                 den_provider_ids: Vec::new(),
@@ -171,6 +176,27 @@ mod tests {
         assert_eq!(by("jw-nfx-new")["denProviderId"], 8);
         // The cross-provider aggregate has no single provider, so the field is absent (not null).
         assert!(by(catalog::TRENDING_ID).get("denProviderId").is_none());
+    }
+
+    #[test]
+    fn catalogs_publish_headings_beside_the_legacy_names() {
+        let value: serde_json::Value =
+            serde_json::from_str(&manifest_json(&Config::default_config(), true, true)).unwrap();
+        let catalogs = value["catalogs"].as_array().unwrap();
+        let by = |id: &str| {
+            catalogs.iter().find(|catalog| catalog["id"] == id).unwrap_or_else(|| panic!("missing {id}"))
+        };
+        for catalog in catalogs {
+            assert_eq!(catalog["heading"]["fallback"], catalog["name"]);
+            assert!(catalog["heading"]["id"].as_str().is_some_and(|id| id.starts_with("atlas.catalog.")));
+            assert!(catalog["heading"]["args"].is_object());
+        }
+        assert_eq!(by("jw-nfx")["heading"]["id"], "atlas.catalog.popular_on");
+        assert_eq!(by("jw-nfx")["heading"]["args"], serde_json::json!({ "service": "Netflix" }));
+        assert_eq!(by(titles::CATALOG_ID)["heading"]["id"], "atlas.catalog.titles");
+        // Compatibility is deliberate: Stremio's required field is still present and byte-for-byte English.
+        assert_eq!(by("jw-nfx")["name"], "Popular on Netflix");
+        assert_eq!(by(titles::CATALOG_ID)["name"], titles::CATALOG_NAME);
     }
 
     /// Wikipedia always; Movie of the Night only with its lists on, and JustWatch only with a provider configured —
