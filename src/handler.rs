@@ -359,7 +359,7 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return serve_json(
             &method,
             &headers,
-            manifest_json(&config, state.titles.is_some(), state.motn.enabled()),
+            manifest_json(&config, state.titles.is_some(), state.motn.enabled(), state.tvmaze.enabled()),
             "public, max-age=3600, stale-while-revalidate=600, stale-if-error=86400",
             None,
         )
@@ -396,10 +396,67 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(rest) = route.strip_prefix("/index/") {
         return handle_index(&method, &headers, rest, &query, &state).await;
     }
+    if let Some(id) = route.strip_prefix("/airing/tv/") {
+        return handle_airing(&method, &headers, &state, id, &query).await;
+    }
     if route == "/playground" || route.starts_with("/playground/") {
         return handle_playground(&method, &headers, route, &query, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+/// `GET /airing/tv/<tmdbId>[?imdb=tt…]` — one series' release schedule from TVmaze (`tvmaze.rs`): the same for
+/// every household, so it is cached publicly for `tvmaze::MAX_AGE` and revalidated by its ETag. TVmaze is asked by
+/// IMDb id: the dataset's own for the TMDB id, else the `imdb` hint. A hint never replaces the dataset's id, and
+/// the answer is kept by IMDb id, so a wrong hint can only shape the answer at its own URL.
+///
+/// A series atlas has never looked up waits briefly (`tvmaze::FIRST_WAIT`) for the background pass. Still pending
+/// after that, it is a `404` with `"pending": true` that no cache keeps; a series TVmaze has no show for is a
+/// cacheable `404`.
+async fn handle_airing(
+    method: &Method,
+    headers: &axum::http::HeaderMap,
+    state: &Arc<AppState>,
+    id: &str,
+    query: &str,
+) -> Response {
+    let cached = format!("public, max-age={}", crate::tvmaze::MAX_AGE);
+    let not_found = |body: &'static str, cache_control: &str| {
+        let mut resp = json_response(body, StatusCode::NOT_FOUND);
+        if let Ok(value) = header::HeaderValue::from_str(cache_control) {
+            resp.headers_mut().insert(header::CACHE_CONTROL, value);
+        }
+        resp
+    };
+    let tmdb = id.parse::<u32>().ok().filter(|id| *id > 0);
+    let (true, Some(tmdb)) = (state.tvmaze.enabled(), tmdb) else {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    };
+    let hint = query_param(query, "imdb").filter(|imdb| {
+        imdb.len() <= 12
+            && imdb.strip_prefix("tt").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
+    let Some(imdb) = dataset_imdb(state, tmdb).await.or(hint) else {
+        return not_found(r#"{"error":"not_found"}"#, &cached);
+    };
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    if state.tvmaze.want(&imdb, now) {
+        state.tvmaze.settle(&imdb, crate::tvmaze::FIRST_WAIT).await;
+    }
+    match state.tvmaze.airing(&imdb, now) {
+        crate::tvmaze::Airing::Show(answer) => {
+            serve_json(method, headers, answer.to_string(), &cached, None).await
+        }
+        crate::tvmaze::Airing::Unknown => not_found(r#"{"error":"not_found"}"#, &cached),
+        crate::tvmaze::Airing::Pending => not_found(r#"{"error":"not_found","pending":true}"#, "no-store"),
+    }
+}
+
+/// The IMDb id the dataset's facts give a series, once the indexes are loaded; `None` without them.
+async fn dataset_imdb(state: &Arc<AppState>, tmdb: u32) -> Option<String> {
+    let (indexes, _) = state.index.as_ref()?.get(|| ()).await.ok()?;
+    indexes.facts.as_ref()?.get(tmdb, den_index::MediaType::Tv)?.imdb_id.clone()
 }
 
 /// `POST /playground/import.json` — a playground file (`playground::FILE_FORMAT`) read back to the state it
@@ -5864,6 +5921,57 @@ mod tests {
             .unwrap();
         assert_eq!(handle(State(Arc::clone(&state)), matching).await.status(), 304);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/airing/tv/<tmdbId>` end to end: the first request waits for the background pass to fetch the recorded
+    /// show, the answer is shared-cacheable and revalidates, the manifest credits TVmaze, and a series that cannot
+    /// be resolved to an IMDb id is a cacheable 404.
+    #[tokio::test]
+    async fn airing_answers_one_series_publicly_and_revalidates() {
+        let (base, _) = crate::tvmaze::tests::fake_tvmaze(0, "{}").await;
+        let state = Arc::new(AppState {
+            tvmaze: Arc::new(crate::tvmaze::Tvmaze::at(&base)),
+            ..AppState::for_test(None)
+        });
+        tokio::spawn(crate::tvmaze::Tvmaze::refresh_forever(Arc::clone(&state.tvmaze)));
+
+        let resp = get(&state, "/airing/tv/259909?imdb=tt33043892").await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["cache-control"], "public, max-age=21600");
+        assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+        let etag = resp.headers()["etag"].to_str().unwrap().to_owned();
+        let body: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
+        assert_eq!(body["source"], "tvmaze");
+        assert_eq!(body["service"], "Paramount+");
+        assert_eq!(body["status"], "running");
+
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let matching = HttpRequest::builder()
+            .uri("/airing/tv/259909?imdb=tt33043892")
+            .header("if-none-match", etag.as_str())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(handle(State(Arc::clone(&state)), matching).await.status(), 304);
+
+        let unresolved = get(&state, "/airing/tv/259909").await;
+        assert_eq!(unresolved.status(), 404, "no dataset and no hint: no IMDb id to ask TVmaze by");
+        assert_eq!(unresolved.headers()["cache-control"], "public, max-age=21600");
+        assert_eq!(get(&state, "/airing/tv/abc?imdb=tt33043892").await.status(), 404);
+        assert_eq!(
+            get(&state, "/airing/tv/1?imdb=nm0000001").await.status(),
+            404,
+            "a hint must be an IMDb title"
+        );
+
+        let manifest = body_of(get(&state, "/manifest.json").await).await;
+        assert!(manifest.contains("https://www.tvmaze.com"), "{manifest}");
+        let off = Arc::new(AppState::for_test(None));
+        let resp = get(&off, "/airing/tv/259909?imdb=tt33043892").await;
+        assert_eq!(
+            (resp.status().as_u16(), &resp.headers()["cache-control"]),
+            (404, &"no-store".parse().unwrap())
+        );
     }
 
     /// The manifest is the contract the app reads first; dropping a resource or the country extra

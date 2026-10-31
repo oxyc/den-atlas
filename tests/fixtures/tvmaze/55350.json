@@ -1,0 +1,1042 @@
+{
+ "id": 55350,
+ "name": "Abbott Elementary",
+ "status": "Running",
+ "schedule": {
+  "time": "20:30",
+  "days": [
+   "Wednesday"
+  ]
+ },
+ "network": {
+  "id": 3,
+  "name": "ABC",
+  "country": {
+   "name": "United States",
+   "code": "US",
+   "timezone": "America/New_York"
+  },
+  "officialSite": "https://abc.com/"
+ },
+ "webChannel": null,
+ "externals": {
+  "tvrage": null,
+  "thetvdb": 402910,
+  "imdb": "tt14218830"
+ },
+ "updated": 1793270224,
+ "_embedded": {
+  "episodes": [
+   {
+    "id": 2207064,
+    "season": 1,
+    "number": 1,
+    "type": "regular",
+    "name": "Pilot",
+    "airdate": "2021-12-07",
+    "airtime": "21:30",
+    "airstamp": "2021-12-08T02:30:00+00:00"
+   },
+   {
+    "id": 2237736,
+    "season": 1,
+    "number": 2,
+    "type": "regular",
+    "name": "Light Bulb",
+    "airdate": "2022-01-04",
+    "airtime": "21:00",
+    "airstamp": "2022-01-05T02:00:00+00:00"
+   },
+   {
+    "id": 2237014,
+    "season": 1,
+    "number": 3,
+    "type": "regular",
+    "name": "Wishlist",
+    "airdate": "2022-01-11",
+    "airtime": "21:00",
+    "airstamp": "2022-01-12T02:00:00+00:00"
+   },
+   {
+    "id": 2237015,
+    "season": 1,
+    "number": 4,
+    "type": "regular",
+    "name": "New Tech",
+    "airdate": "2022-01-18",
+    "airtime": "21:00",
+    "airstamp": "2022-01-19T02:00:00+00:00"
+   },
+   {
+    "id": 2252040,
+    "season": 1,
+    "number": 5,
+    "type": "regular",
+    "name": "Student Transfer",
+    "airdate": "2022-01-25",
+    "airtime": "21:00",
+    "airstamp": "2022-01-26T02:00:00+00:00"
+   },
+   {
+    "id": 2256099,
+    "season": 1,
+    "number": 6,
+    "type": "regular",
+    "name": "Gifted Program",
+    "airdate": "2022-02-01",
+    "airtime": "21:00",
+    "airstamp": "2022-02-02T02:00:00+00:00"
+   },
+   {
+    "id": 2261623,
+    "season": 1,
+    "number": 7,
+    "type": "regular",
+    "name": "Art Teacher",
+    "airdate": "2022-02-08",
+    "airtime": "21:00",
+    "airstamp": "2022-02-09T02:00:00+00:00"
+   },
+   {
+    "id": 2266827,
+    "season": 1,
+    "number": 8,
+    "type": "regular",
+    "name": "Work Family",
+    "airdate": "2022-02-15",
+    "airtime": "21:00",
+    "airstamp": "2022-02-16T02:00:00+00:00"
+   },
+   {
+    "id": 2267386,
+    "season": 1,
+    "number": 9,
+    "type": "regular",
+    "name": "Step Class",
+    "airdate": "2022-02-22",
+    "airtime": "21:00",
+    "airstamp": "2022-02-23T02:00:00+00:00"
+   },
+   {
+    "id": 2283546,
+    "season": 1,
+    "number": 10,
+    "type": "regular",
+    "name": "Open House",
+    "airdate": "2022-03-22",
+    "airtime": "21:00",
+    "airstamp": "2022-03-23T01:00:00+00:00"
+   },
+   {
+    "id": 2293209,
+    "season": 1,
+    "number": 11,
+    "type": "regular",
+    "name": "Desking",
+    "airdate": "2022-03-29",
+    "airtime": "21:00",
+    "airstamp": "2022-03-30T01:00:00+00:00"
+   },
+   {
+    "id": 2297664,
+    "season": 1,
+    "number": 12,
+    "type": "regular",
+    "name": "Ava vs. Superintendent",
+    "airdate": "2022-04-05",
+    "airtime": "21:00",
+    "airstamp": "2022-04-06T01:00:00+00:00"
+   },
+   {
+    "id": 2301331,
+    "season": 1,
+    "number": 13,
+    "type": "regular",
+    "name": "Zoo Balloon",
+    "airdate": "2022-04-12",
+    "airtime": "21:00",
+    "airstamp": "2022-04-13T01:00:00+00:00"
+   },
+   {
+    "id": 2348028,
+    "season": 2,
+    "number": 1,
+    "type": "regular",
+    "name": "Development Day",
+    "airdate": "2022-09-21",
+    "airtime": "21:00",
+    "airstamp": "2022-09-22T01:00:00+00:00"
+   },
+   {
+    "id": 2371538,
+    "season": 2,
+    "number": 2,
+    "type": "regular",
+    "name": "Wrong Delivery",
+    "airdate": "2022-09-28",
+    "airtime": "21:00",
+    "airstamp": "2022-09-29T01:00:00+00:00"
+   },
+   {
+    "id": 2371539,
+    "season": 2,
+    "number": 3,
+    "type": "regular",
+    "name": "Story Samurai",
+    "airdate": "2022-10-05",
+    "airtime": "21:00",
+    "airstamp": "2022-10-06T01:00:00+00:00"
+   },
+   {
+    "id": 2371540,
+    "season": 2,
+    "number": 4,
+    "type": "regular",
+    "name": "The Principal's Office",
+    "airdate": "2022-10-12",
+    "airtime": "21:00",
+    "airstamp": "2022-10-13T01:00:00+00:00"
+   },
+   {
+    "id": 2371541,
+    "season": 2,
+    "number": 5,
+    "type": "regular",
+    "name": "Juice",
+    "airdate": "2022-10-19",
+    "airtime": "21:00",
+    "airstamp": "2022-10-20T01:00:00+00:00"
+   },
+   {
+    "id": 2371542,
+    "season": 2,
+    "number": 6,
+    "type": "regular",
+    "name": "Candy Zombies",
+    "airdate": "2022-10-26",
+    "airtime": "21:00",
+    "airstamp": "2022-10-27T01:00:00+00:00"
+   },
+   {
+    "id": 2373257,
+    "season": 2,
+    "number": 7,
+    "type": "regular",
+    "name": "Attack Ad",
+    "airdate": "2022-11-02",
+    "airtime": "21:00",
+    "airstamp": "2022-11-03T01:00:00+00:00"
+   },
+   {
+    "id": 2373258,
+    "season": 2,
+    "number": 8,
+    "type": "regular",
+    "name": "Egg Drop",
+    "airdate": "2022-11-16",
+    "airtime": "21:00",
+    "airstamp": "2022-11-17T02:00:00+00:00"
+   },
+   {
+    "id": 2373259,
+    "season": 2,
+    "number": 9,
+    "type": "regular",
+    "name": "Sick Day",
+    "airdate": "2022-11-30",
+    "airtime": "21:00",
+    "airstamp": "2022-12-01T02:00:00+00:00"
+   },
+   {
+    "id": 2373260,
+    "season": 2,
+    "number": 10,
+    "type": "regular",
+    "name": "Holiday Hookah",
+    "airdate": "2022-12-07",
+    "airtime": "21:00",
+    "airstamp": "2022-12-08T02:00:00+00:00"
+   },
+   {
+    "id": 2392016,
+    "season": 2,
+    "number": 11,
+    "type": "regular",
+    "name": "Read-A-Thon",
+    "airdate": "2023-01-04",
+    "airtime": "21:00",
+    "airstamp": "2023-01-05T02:00:00+00:00"
+   },
+   {
+    "id": 2392017,
+    "season": 2,
+    "number": 12,
+    "type": "regular",
+    "name": "Fight",
+    "airdate": "2023-01-11",
+    "airtime": "21:00",
+    "airstamp": "2023-01-12T02:00:00+00:00"
+   },
+   {
+    "id": 2392018,
+    "season": 2,
+    "number": 13,
+    "type": "regular",
+    "name": "Fundraiser",
+    "airdate": "2023-01-18",
+    "airtime": "21:00",
+    "airstamp": "2023-01-19T02:00:00+00:00"
+   },
+   {
+    "id": 2475808,
+    "season": 2,
+    "number": 14,
+    "type": "regular",
+    "name": "Valentine's Day",
+    "airdate": "2023-02-08",
+    "airtime": "21:00",
+    "airstamp": "2023-02-09T02:00:00+00:00"
+   },
+   {
+    "id": 2479241,
+    "season": 2,
+    "number": 15,
+    "type": "regular",
+    "name": "Fire",
+    "airdate": "2023-02-15",
+    "airtime": "21:00",
+    "airstamp": "2023-02-16T02:00:00+00:00"
+   },
+   {
+    "id": 2484066,
+    "season": 2,
+    "number": 16,
+    "type": "regular",
+    "name": "Teacher's Conference",
+    "airdate": "2023-02-22",
+    "airtime": "21:00",
+    "airstamp": "2023-02-23T02:00:00+00:00"
+   },
+   {
+    "id": 2487728,
+    "season": 2,
+    "number": 17,
+    "type": "regular",
+    "name": "Mural Arts",
+    "airdate": "2023-03-01",
+    "airtime": "21:00",
+    "airstamp": "2023-03-02T02:00:00+00:00"
+   },
+   {
+    "id": 2491564,
+    "season": 2,
+    "number": 18,
+    "type": "regular",
+    "name": "Teacher Appreciation",
+    "airdate": "2023-03-08",
+    "airtime": "21:00",
+    "airstamp": "2023-03-09T02:00:00+00:00"
+   },
+   {
+    "id": 2492741,
+    "season": 2,
+    "number": 19,
+    "type": "regular",
+    "name": "Festival",
+    "airdate": "2023-03-15",
+    "airtime": "21:00",
+    "airstamp": "2023-03-16T01:00:00+00:00"
+   },
+   {
+    "id": 2506931,
+    "season": 2,
+    "number": 20,
+    "type": "regular",
+    "name": "Educator of the Year",
+    "airdate": "2023-04-05",
+    "airtime": "21:00",
+    "airstamp": "2023-04-06T01:00:00+00:00"
+   },
+   {
+    "id": 2510117,
+    "season": 2,
+    "number": 21,
+    "type": "regular",
+    "name": "Mom",
+    "airdate": "2023-04-12",
+    "airtime": "21:00",
+    "airstamp": "2023-04-13T01:00:00+00:00"
+   },
+   {
+    "id": 2510546,
+    "season": 2,
+    "number": 22,
+    "type": "regular",
+    "name": "Franklin Institute",
+    "airdate": "2023-04-19",
+    "airtime": "21:00",
+    "airstamp": "2023-04-20T01:00:00+00:00"
+   },
+   {
+    "id": 2689295,
+    "season": 3,
+    "number": 1,
+    "type": "regular",
+    "name": "Career Day Part 1",
+    "airdate": "2024-02-07",
+    "airtime": "21:00",
+    "airstamp": "2024-02-08T02:00:00+00:00"
+   },
+   {
+    "id": 2744898,
+    "season": 3,
+    "number": 2,
+    "type": "regular",
+    "name": "Career Day Part 2",
+    "airdate": "2024-02-07",
+    "airtime": "21:33",
+    "airstamp": "2024-02-08T02:33:00+00:00"
+   },
+   {
+    "id": 2751771,
+    "season": 3,
+    "number": 3,
+    "type": "regular",
+    "name": "Gregory's Garden Goofballs",
+    "airdate": "2024-02-14",
+    "airtime": "21:00",
+    "airstamp": "2024-02-15T02:00:00+00:00"
+   },
+   {
+    "id": 2761248,
+    "season": 3,
+    "number": 4,
+    "type": "regular",
+    "name": "Smoking",
+    "airdate": "2024-02-21",
+    "airtime": "21:00",
+    "airstamp": "2024-02-22T02:00:00+00:00"
+   },
+   {
+    "id": 2765922,
+    "season": 3,
+    "number": 5,
+    "type": "regular",
+    "name": "Breakup",
+    "airdate": "2024-02-28",
+    "airtime": "21:00",
+    "airstamp": "2024-02-29T02:00:00+00:00"
+   },
+   {
+    "id": 2767859,
+    "season": 3,
+    "number": 6,
+    "type": "regular",
+    "name": "Willard R. Abbott",
+    "airdate": "2024-03-10",
+    "airtime": "22:30",
+    "airstamp": "2024-03-11T02:30:00+00:00"
+   },
+   {
+    "id": 2767860,
+    "season": 3,
+    "number": 7,
+    "type": "regular",
+    "name": "Librarian",
+    "airdate": "2024-03-13",
+    "airtime": "21:00",
+    "airstamp": "2024-03-14T01:00:00+00:00"
+   },
+   {
+    "id": 2767861,
+    "season": 3,
+    "number": 8,
+    "type": "regular",
+    "name": "Panel",
+    "airdate": "2024-03-20",
+    "airtime": "21:00",
+    "airstamp": "2024-03-21T01:00:00+00:00"
+   },
+   {
+    "id": 2783642,
+    "season": 3,
+    "number": 9,
+    "type": "regular",
+    "name": "Alex",
+    "airdate": "2024-04-10",
+    "airtime": "21:00",
+    "airstamp": "2024-04-11T01:00:00+00:00"
+   },
+   {
+    "id": 2783643,
+    "season": 3,
+    "number": 10,
+    "type": "regular",
+    "name": "2 Ava 2 Fest",
+    "airdate": "2024-04-17",
+    "airtime": "21:00",
+    "airstamp": "2024-04-18T01:00:00+00:00"
+   },
+   {
+    "id": 2783644,
+    "season": 3,
+    "number": 11,
+    "type": "regular",
+    "name": "Double Date",
+    "airdate": "2024-05-01",
+    "airtime": "21:00",
+    "airstamp": "2024-05-02T01:00:00+00:00"
+   },
+   {
+    "id": 2783721,
+    "season": 3,
+    "number": 12,
+    "type": "regular",
+    "name": "Mother's Day",
+    "airdate": "2024-05-08",
+    "airtime": "21:00",
+    "airstamp": "2024-05-09T01:00:00+00:00"
+   },
+   {
+    "id": 2810507,
+    "season": 3,
+    "number": 13,
+    "type": "regular",
+    "name": "Smith Playground",
+    "airdate": "2024-05-15",
+    "airtime": "21:00",
+    "airstamp": "2024-05-16T01:00:00+00:00"
+   },
+   {
+    "id": 2810508,
+    "season": 3,
+    "number": 14,
+    "type": "regular",
+    "name": "Party",
+    "airdate": "2024-05-22",
+    "airtime": "21:00",
+    "airstamp": "2024-05-23T01:00:00+00:00"
+   },
+   {
+    "id": 2939781,
+    "season": 4,
+    "number": 1,
+    "type": "regular",
+    "name": "Back to School",
+    "airdate": "2024-10-09",
+    "airtime": "21:30",
+    "airstamp": "2024-10-10T01:30:00+00:00"
+   },
+   {
+    "id": 3009191,
+    "season": 4,
+    "number": 2,
+    "type": "regular",
+    "name": "Ringworm",
+    "airdate": "2024-10-16",
+    "airtime": "21:30",
+    "airstamp": "2024-10-17T01:30:00+00:00"
+   },
+   {
+    "id": 3010075,
+    "season": 4,
+    "number": 3,
+    "type": "regular",
+    "name": "Class Pet",
+    "airdate": "2024-10-23",
+    "airtime": "21:30",
+    "airstamp": "2024-10-24T01:30:00+00:00"
+   },
+   {
+    "id": 3010076,
+    "season": 4,
+    "number": 4,
+    "type": "regular",
+    "name": "Costume Contest",
+    "airdate": "2024-10-30",
+    "airtime": "21:30",
+    "airstamp": "2024-10-31T01:30:00+00:00"
+   },
+   {
+    "id": 3024955,
+    "season": 4,
+    "number": 5,
+    "type": "regular",
+    "name": "Dad Fight",
+    "airdate": "2024-11-06",
+    "airtime": "21:30",
+    "airstamp": "2024-11-07T02:30:00+00:00"
+   },
+   {
+    "id": 3034813,
+    "season": 4,
+    "number": 6,
+    "type": "regular",
+    "name": "The Deli",
+    "airdate": "2024-11-13",
+    "airtime": "21:30",
+    "airstamp": "2024-11-14T02:30:00+00:00"
+   },
+   {
+    "id": 3041829,
+    "season": 4,
+    "number": 7,
+    "type": "regular",
+    "name": "Winter Show",
+    "airdate": "2024-12-04",
+    "airtime": "20:00",
+    "airstamp": "2024-12-05T01:00:00+00:00"
+   },
+   {
+    "id": 3041830,
+    "season": 4,
+    "number": 8,
+    "type": "regular",
+    "name": "Winter Break",
+    "airdate": "2024-12-04",
+    "airtime": "20:31",
+    "airstamp": "2024-12-05T01:31:00+00:00"
+   },
+   {
+    "id": 3049930,
+    "season": 4,
+    "number": 9,
+    "type": "regular",
+    "name": "Volunteers",
+    "airdate": "2025-01-08",
+    "airtime": "20:30",
+    "airstamp": "2025-01-09T01:30:00+00:00"
+   },
+   {
+    "id": 3087534,
+    "season": 4,
+    "number": 10,
+    "type": "regular",
+    "name": "Testing",
+    "airdate": "2025-01-15",
+    "airtime": "20:50",
+    "airstamp": "2025-01-16T01:50:00+00:00"
+   },
+   {
+    "id": 3087535,
+    "season": 4,
+    "number": 11,
+    "type": "regular",
+    "name": "Strike",
+    "airdate": "2025-01-22",
+    "airtime": "20:30",
+    "airstamp": "2025-01-23T01:30:00+00:00"
+   },
+   {
+    "id": 3087536,
+    "season": 4,
+    "number": 12,
+    "type": "regular",
+    "name": "Girard Creek",
+    "airdate": "2025-01-29",
+    "airtime": "20:30",
+    "airstamp": "2025-01-30T01:30:00+00:00"
+   },
+   {
+    "id": 3087537,
+    "season": 4,
+    "number": 13,
+    "type": "regular",
+    "name": "Science Fair",
+    "airdate": "2025-02-05",
+    "airtime": "20:30",
+    "airstamp": "2025-02-06T01:30:00+00:00"
+   },
+   {
+    "id": 3087538,
+    "season": 4,
+    "number": 14,
+    "type": "regular",
+    "name": "District Budget Meeting",
+    "airdate": "2025-02-12",
+    "airtime": "20:30",
+    "airstamp": "2025-02-13T01:30:00+00:00"
+   },
+   {
+    "id": 3087539,
+    "season": 4,
+    "number": 15,
+    "type": "regular",
+    "name": "100th Day of School",
+    "airdate": "2025-02-26",
+    "airtime": "20:30",
+    "airstamp": "2025-02-27T01:30:00+00:00"
+   },
+   {
+    "id": 3135690,
+    "season": 4,
+    "number": 16,
+    "type": "regular",
+    "name": "Books",
+    "airdate": "2025-03-05",
+    "airtime": "20:30",
+    "airstamp": "2025-03-06T01:30:00+00:00"
+   },
+   {
+    "id": 3144746,
+    "season": 4,
+    "number": 17,
+    "type": "regular",
+    "name": "Karaoke",
+    "airdate": "2025-03-12",
+    "airtime": "20:30",
+    "airstamp": "2025-03-13T00:30:00+00:00"
+   },
+   {
+    "id": 3154410,
+    "season": 4,
+    "number": 18,
+    "type": "regular",
+    "name": "Audit",
+    "airdate": "2025-03-19",
+    "airtime": "20:30",
+    "airstamp": "2025-03-20T00:30:00+00:00"
+   },
+   {
+    "id": 3154411,
+    "season": 4,
+    "number": 19,
+    "type": "regular",
+    "name": "Music Class",
+    "airdate": "2025-03-26",
+    "airtime": "20:30",
+    "airstamp": "2025-03-27T00:30:00+00:00"
+   },
+   {
+    "id": 3154412,
+    "season": 4,
+    "number": 20,
+    "type": "regular",
+    "name": "Ava Fest: Tokyo Drift",
+    "airdate": "2025-04-02",
+    "airtime": "20:30",
+    "airstamp": "2025-04-03T00:30:00+00:00"
+   },
+   {
+    "id": 3165914,
+    "season": 4,
+    "number": 21,
+    "type": "regular",
+    "name": "Rally",
+    "airdate": "2025-04-09",
+    "airtime": "20:30",
+    "airstamp": "2025-04-10T00:30:00+00:00"
+   },
+   {
+    "id": 3165915,
+    "season": 4,
+    "number": 22,
+    "type": "regular",
+    "name": "Please Touch Museum",
+    "airdate": "2025-04-16",
+    "airtime": "20:30",
+    "airstamp": "2025-04-17T00:30:00+00:00"
+   },
+   {
+    "id": 3305507,
+    "season": 5,
+    "number": 1,
+    "type": "regular",
+    "name": "Team Building",
+    "airdate": "2025-10-01",
+    "airtime": "20:30",
+    "airstamp": "2025-10-02T00:30:00+00:00"
+   },
+   {
+    "id": 3364392,
+    "season": 5,
+    "number": 2,
+    "type": "regular",
+    "name": "Cheating",
+    "airdate": "2025-10-08",
+    "airtime": "20:30",
+    "airstamp": "2025-10-09T00:30:00+00:00"
+   },
+   {
+    "id": 3368363,
+    "season": 5,
+    "number": 3,
+    "type": "regular",
+    "name": "Ballgame",
+    "airdate": "2025-10-15",
+    "airtime": "20:30",
+    "airstamp": "2025-10-16T00:30:00+00:00"
+   },
+   {
+    "id": 3383306,
+    "season": 5,
+    "number": 4,
+    "type": "regular",
+    "name": "Game Night",
+    "airdate": "2025-10-22",
+    "airtime": "20:30",
+    "airstamp": "2025-10-23T00:30:00+00:00"
+   },
+   {
+    "id": 3383307,
+    "season": 5,
+    "number": 5,
+    "type": "regular",
+    "name": "Camping",
+    "airdate": "2025-10-29",
+    "airtime": "20:30",
+    "airstamp": "2025-10-30T00:30:00+00:00"
+   },
+   {
+    "id": 3399711,
+    "season": 5,
+    "number": 6,
+    "type": "regular",
+    "name": "No Phones",
+    "airdate": "2025-11-05",
+    "airtime": "20:30",
+    "airstamp": "2025-11-06T01:30:00+00:00"
+   },
+   {
+    "id": 3399885,
+    "season": 5,
+    "number": 7,
+    "type": "regular",
+    "name": "Goofgirl",
+    "airdate": "2025-12-03",
+    "airtime": "20:30",
+    "airstamp": "2025-12-04T01:30:00+00:00"
+   },
+   {
+    "id": 3427944,
+    "season": 5,
+    "number": 8,
+    "type": "regular",
+    "name": "Birthday",
+    "airdate": "2025-12-10",
+    "airtime": "20:30",
+    "airstamp": "2025-12-11T01:30:00+00:00"
+   },
+   {
+    "id": 3427945,
+    "season": 5,
+    "number": 9,
+    "type": "regular",
+    "name": "Mall",
+    "airdate": "2026-01-07",
+    "airtime": "20:30",
+    "airstamp": "2026-01-08T01:30:00+00:00"
+   },
+   {
+    "id": 3427946,
+    "season": 5,
+    "number": 10,
+    "type": "regular",
+    "name": "Mall Part 2: Questions & Concerns",
+    "airdate": "2026-01-14",
+    "airtime": "20:30",
+    "airstamp": "2026-01-15T01:30:00+00:00"
+   },
+   {
+    "id": 3448775,
+    "season": 5,
+    "number": 11,
+    "type": "regular",
+    "name": "Mall Part 3: Heroes",
+    "airdate": "2026-01-21",
+    "airtime": "20:30",
+    "airstamp": "2026-01-22T01:30:00+00:00"
+   },
+   {
+    "id": 3451997,
+    "season": 5,
+    "number": 12,
+    "type": "regular",
+    "name": "Picture Day",
+    "airdate": "2026-01-28",
+    "airtime": "20:30",
+    "airstamp": "2026-01-29T01:30:00+00:00"
+   },
+   {
+    "id": 3509132,
+    "season": 5,
+    "number": 13,
+    "type": "regular",
+    "name": "Candygrams",
+    "airdate": "2026-02-04",
+    "airtime": "20:30",
+    "airstamp": "2026-02-05T01:30:00+00:00"
+   },
+   {
+    "id": 3544409,
+    "season": 5,
+    "number": 14,
+    "type": "regular",
+    "name": "Aide",
+    "airdate": "2026-03-04",
+    "airtime": "20:30",
+    "airstamp": "2026-03-05T01:30:00+00:00"
+   },
+   {
+    "id": 3552790,
+    "season": 5,
+    "number": 15,
+    "type": "regular",
+    "name": "Safety Day",
+    "airdate": "2026-03-11",
+    "airtime": "20:30",
+    "airstamp": "2026-03-12T00:30:00+00:00"
+   },
+   {
+    "id": 3555768,
+    "season": 5,
+    "number": 16,
+    "type": "regular",
+    "name": "Campaign",
+    "airdate": "2026-03-18",
+    "airtime": "20:30",
+    "airstamp": "2026-03-19T00:30:00+00:00"
+   },
+   {
+    "id": 3555769,
+    "season": 5,
+    "number": 17,
+    "type": "regular",
+    "name": "No Homework",
+    "airdate": "2026-03-25",
+    "airtime": "20:30",
+    "airstamp": "2026-03-26T00:30:00+00:00"
+   },
+   {
+    "id": 3555770,
+    "season": 5,
+    "number": 18,
+    "type": "regular",
+    "name": "April Fools",
+    "airdate": "2026-04-01",
+    "airtime": "20:30",
+    "airstamp": "2026-04-02T00:30:00+00:00"
+   },
+   {
+    "id": 3576786,
+    "season": 5,
+    "number": 19,
+    "type": "regular",
+    "name": "Trip",
+    "airdate": "2026-04-08",
+    "airtime": "20:30",
+    "airstamp": "2026-04-09T00:30:00+00:00"
+   },
+   {
+    "id": 3576787,
+    "season": 5,
+    "number": 20,
+    "type": "regular",
+    "name": "Night Out",
+    "airdate": "2026-04-15",
+    "airtime": "20:30",
+    "airstamp": "2026-04-16T00:30:00+00:00"
+   },
+   {
+    "id": 3576788,
+    "season": 5,
+    "number": 21,
+    "type": "regular",
+    "name": "Ava & Fest",
+    "airdate": "2026-04-22",
+    "airtime": "20:00",
+    "airstamp": "2026-04-23T00:00:00+00:00"
+   },
+   {
+    "id": 3576789,
+    "season": 5,
+    "number": 22,
+    "type": "regular",
+    "name": "Miami",
+    "airdate": "2026-04-22",
+    "airtime": "20:32",
+    "airstamp": "2026-04-23T00:32:00+00:00"
+   },
+   {
+    "id": 3684589,
+    "season": 6,
+    "number": 1,
+    "type": "regular",
+    "name": "Jungle Classroom",
+    "airdate": "2026-10-07",
+    "airtime": "20:30",
+    "airstamp": "2026-10-08T00:30:00+00:00"
+   },
+   {
+    "id": 3771314,
+    "season": 6,
+    "number": 2,
+    "type": "regular",
+    "name": "Check-Ins",
+    "airdate": "2026-10-14",
+    "airtime": "20:30",
+    "airstamp": "2026-10-15T00:30:00+00:00"
+   },
+   {
+    "id": 3778667,
+    "season": 6,
+    "number": 3,
+    "type": "regular",
+    "name": "Tryouts",
+    "airdate": "2026-10-21",
+    "airtime": "20:30",
+    "airstamp": "2026-10-22T00:30:00+00:00"
+   },
+   {
+    "id": 3784744,
+    "season": 6,
+    "number": 4,
+    "type": "regular",
+    "name": "Halloween Party",
+    "airdate": "2026-10-28",
+    "airtime": "20:30",
+    "airstamp": "2026-10-29T00:30:00+00:00"
+   },
+   {
+    "id": 3788361,
+    "season": 6,
+    "number": 5,
+    "type": "regular",
+    "name": "Courtney",
+    "airdate": "2026-11-04",
+    "airtime": "20:30",
+    "airstamp": "2026-11-05T01:30:00+00:00"
+   },
+   {
+    "id": 3788362,
+    "season": 6,
+    "number": 6,
+    "type": "regular",
+    "name": "Competition",
+    "airdate": "2026-11-11",
+    "airtime": "20:30",
+    "airstamp": "2026-11-12T01:30:00+00:00"
+   },
+   {
+    "id": 3796394,
+    "season": 6,
+    "number": 7,
+    "type": "regular",
+    "name": "TBA",
+    "airdate": "2026-12-02",
+    "airtime": "20:30",
+    "airstamp": "2026-12-03T01:30:00+00:00"
+   },
+   {
+    "id": 3797469,
+    "season": 6,
+    "number": 8,
+    "type": "regular",
+    "name": "Parents",
+    "airdate": "2026-12-09",
+    "airtime": "20:30",
+    "airstamp": "2026-12-10T01:30:00+00:00"
+   }
+  ]
+ }
+}

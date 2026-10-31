@@ -1,0 +1,228 @@
+{
+ "id": 78665,
+ "name": "Dexter: Resurrection",
+ "status": "Running",
+ "schedule": {
+  "time": "",
+  "days": [
+   "Friday"
+  ]
+ },
+ "network": null,
+ "webChannel": {
+  "id": 107,
+  "name": "Paramount+",
+  "country": null,
+  "officialSite": "https://www.paramountplus.com/"
+ },
+ "externals": {
+  "tvrage": null,
+  "thetvdb": 452595,
+  "imdb": "tt33043892"
+ },
+ "updated": 1793387167,
+ "_embedded": {
+  "episodes": [
+   {
+    "id": 3219795,
+    "season": 1,
+    "number": 1,
+    "type": "regular",
+    "name": "A Beating Heart…",
+    "airdate": "2025-07-11",
+    "airtime": "",
+    "airstamp": "2025-07-11T12:00:00+00:00"
+   },
+   {
+    "id": 3221095,
+    "season": 1,
+    "number": 2,
+    "type": "regular",
+    "name": "Camera Shy",
+    "airdate": "2025-07-11",
+    "airtime": "",
+    "airstamp": "2025-07-11T12:00:00+00:00"
+   },
+   {
+    "id": 3221120,
+    "season": 1,
+    "number": 3,
+    "type": "regular",
+    "name": "Backseat Driver",
+    "airdate": "2025-07-18",
+    "airtime": "",
+    "airstamp": "2025-07-18T12:00:00+00:00"
+   },
+   {
+    "id": 3221121,
+    "season": 1,
+    "number": 4,
+    "type": "regular",
+    "name": "Call Me Red",
+    "airdate": "2025-07-25",
+    "airtime": "",
+    "airstamp": "2025-07-25T12:00:00+00:00"
+   },
+   {
+    "id": 3221122,
+    "season": 1,
+    "number": 5,
+    "type": "regular",
+    "name": "Murder Horny",
+    "airdate": "2025-08-01",
+    "airtime": "",
+    "airstamp": "2025-08-01T12:00:00+00:00"
+   },
+   {
+    "id": 3221123,
+    "season": 1,
+    "number": 6,
+    "type": "regular",
+    "name": "Cats & Mouse",
+    "airdate": "2025-08-08",
+    "airtime": "",
+    "airstamp": "2025-08-08T12:00:00+00:00"
+   },
+   {
+    "id": 3221124,
+    "season": 1,
+    "number": 7,
+    "type": "regular",
+    "name": "Course Correction",
+    "airdate": "2025-08-15",
+    "airtime": "",
+    "airstamp": "2025-08-15T12:00:00+00:00"
+   },
+   {
+    "id": 3221125,
+    "season": 1,
+    "number": 8,
+    "type": "regular",
+    "name": "The Kill Room Where It Happens",
+    "airdate": "2025-08-22",
+    "airtime": "",
+    "airstamp": "2025-08-22T12:00:00+00:00"
+   },
+   {
+    "id": 3221126,
+    "season": 1,
+    "number": 9,
+    "type": "regular",
+    "name": "Touched By An Ángel",
+    "airdate": "2025-08-29",
+    "airtime": "",
+    "airstamp": "2025-08-29T12:00:00+00:00"
+   },
+   {
+    "id": 3221127,
+    "season": 1,
+    "number": 10,
+    "type": "regular",
+    "name": "And Justice For All...",
+    "airdate": "2025-09-05",
+    "airtime": "",
+    "airstamp": "2025-09-05T12:00:00+00:00"
+   },
+   {
+    "id": 3748281,
+    "season": 2,
+    "number": 1,
+    "type": "regular",
+    "name": "Risky Business",
+    "airdate": "2026-10-30",
+    "airtime": "",
+    "airstamp": "2026-10-30T12:00:00+00:00"
+   },
+   {
+    "id": 3786605,
+    "season": 2,
+    "number": 2,
+    "type": "regular",
+    "name": "Young Blood",
+    "airdate": "2026-11-06",
+    "airtime": "",
+    "airstamp": "2026-11-06T12:00:00+00:00"
+   },
+   {
+    "id": 3786606,
+    "season": 2,
+    "number": 3,
+    "type": "regular",
+    "name": "Fallen",
+    "airdate": "2026-11-13",
+    "airtime": "",
+    "airstamp": "2026-11-13T12:00:00+00:00"
+   },
+   {
+    "id": 3791165,
+    "season": 2,
+    "number": 4,
+    "type": "regular",
+    "name": "Live Free and Die",
+    "airdate": "2026-11-20",
+    "airtime": "",
+    "airstamp": "2026-11-20T12:00:00+00:00"
+   },
+   {
+    "id": 3791166,
+    "season": 2,
+    "number": 5,
+    "type": "regular",
+    "name": "Panick Attack",
+    "airdate": "2026-11-27",
+    "airtime": "",
+    "airstamp": "2026-11-27T12:00:00+00:00"
+   },
+   {
+    "id": 3791167,
+    "season": 2,
+    "number": 6,
+    "type": "regular",
+    "name": "Out of the Past",
+    "airdate": "2026-12-04",
+    "airtime": "",
+    "airstamp": "2026-12-04T12:00:00+00:00"
+   },
+   {
+    "id": 3791168,
+    "season": 2,
+    "number": 7,
+    "type": "regular",
+    "name": "Rule Number One",
+    "airdate": "2026-12-11",
+    "airtime": "",
+    "airstamp": "2026-12-11T12:00:00+00:00"
+   },
+   {
+    "id": 3791169,
+    "season": 2,
+    "number": 8,
+    "type": "regular",
+    "name": "Game On",
+    "airdate": "2026-12-18",
+    "airtime": "",
+    "airstamp": "2026-12-18T12:00:00+00:00"
+   },
+   {
+    "id": 3791170,
+    "season": 2,
+    "number": 9,
+    "type": "regular",
+    "name": "Credit Where Credit Is Due",
+    "airdate": "2026-12-25",
+    "airtime": "",
+    "airstamp": "2026-12-25T12:00:00+00:00"
+   },
+   {
+    "id": 3791179,
+    "season": 2,
+    "number": 10,
+    "type": "regular",
+    "name": "Now You See Me",
+    "airdate": "2027-01-01",
+    "airtime": "",
+    "airstamp": "2027-01-01T12:00:00+00:00"
+   }
+  ]
+ }
+}

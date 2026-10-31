@@ -73,6 +73,11 @@ const JUSTWATCH: Attribution = Attribution {
     link: "JustWatch",
     url: "https://www.justwatch.com",
 };
+const TVMAZE: Attribution = Attribution {
+    text: "TV schedule data from TVmaze, used under CC BY-SA 4.0.",
+    link: "TVmaze",
+    url: "https://www.tvmaze.com",
+};
 
 #[derive(Serialize)]
 struct Manifest {
@@ -94,7 +99,8 @@ struct Manifest {
 
 /// `title_search` adds the fuzzy title-search catalogs (one per type, `search` required, so a client that
 /// browses catalogs as rows skips them). `soon` adds each service's leaving and coming rows (Movie of the Night on).
-pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String {
+/// `airing` credits TVmaze, whose schedules `/airing/tv/<tmdbId>` serves.
+pub fn manifest_json(config: &Config, title_search: bool, soon: bool, airing: bool) -> String {
     // Region `auto` → each catalog accepts a `country` extra the app forwards; a fixed country needs none.
     let auto = config.region == Region::Auto;
     let mut catalogs: Vec<Catalog> = catalog::catalog_entries(&config.providers, soon)
@@ -141,6 +147,9 @@ pub fn manifest_json(config: &Config, title_search: bool, soon: bool) -> String 
     if !config.providers.is_empty() {
         den_attribution.push(JUSTWATCH);
     }
+    if airing {
+        den_attribution.push(TVMAZE);
+    }
     let m = Manifest {
         id: "com.den.atlas",
         version: crate::release_version(),
@@ -165,7 +174,7 @@ mod tests {
 
     #[test]
     fn catalogs_publish_the_tmdb_provider_id() {
-        let json = manifest_json(&Config::default_config(), false, false);
+        let json = manifest_json(&Config::default_config(), false, false, false);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let cats = v["catalogs"].as_array().unwrap();
         let by = |id: &str| cats.iter().find(|c| c["id"] == id).unwrap_or_else(|| panic!("missing {id}"));
@@ -181,7 +190,7 @@ mod tests {
     #[test]
     fn catalogs_publish_headings_beside_the_legacy_names() {
         let value: serde_json::Value =
-            serde_json::from_str(&manifest_json(&Config::default_config(), true, true)).unwrap();
+            serde_json::from_str(&manifest_json(&Config::default_config(), true, true, false)).unwrap();
         let catalogs = value["catalogs"].as_array().unwrap();
         let by = |id: &str| {
             catalogs.iter().find(|catalog| catalog["id"] == id).unwrap_or_else(|| panic!("missing {id}"))
@@ -212,18 +221,21 @@ mod tests {
                 .map(|a| a["text"].as_str().unwrap().to_owned())
                 .collect()
         };
-        let with_motn = texts(manifest_json(&Config::default_config(), false, true));
+        let with_motn = texts(manifest_json(&Config::default_config(), false, true, false));
         assert_eq!(with_motn.len(), 3);
         assert!(with_motn[0].contains("Wikipedia"));
         assert!(with_motn[1].contains("Movie of the Night"));
         assert!(with_motn[2].contains("JustWatch"));
-        let without = texts(manifest_json(&Config::default_config(), false, false));
+        let without = texts(manifest_json(&Config::default_config(), false, false, false));
         assert!(!without.iter().any(|t| t.contains("Movie of the Night")), "{without:?}");
         let none = Config { providers: Vec::new(), ..Config::default_config() };
-        assert_eq!(texts(manifest_json(&none, false, false)).len(), 1, "Wikipedia alone");
+        assert_eq!(texts(manifest_json(&none, false, false, false)).len(), 1, "Wikipedia alone");
+        let airing = texts(manifest_json(&none, false, false, true));
+        assert_eq!(airing.len(), 2);
+        assert!(airing[1].contains("TVmaze") && airing[1].contains("CC BY-SA 4.0"), "{airing:?}");
         // Each link is a part of its statement, so a client can find it there.
         let v: serde_json::Value =
-            serde_json::from_str(&manifest_json(&Config::default_config(), false, true)).unwrap();
+            serde_json::from_str(&manifest_json(&Config::default_config(), false, true, true)).unwrap();
         for a in v["denAttribution"].as_array().unwrap() {
             assert!(a["text"].as_str().unwrap().contains(a["link"].as_str().unwrap()), "{a}");
         }
@@ -233,10 +245,10 @@ mod tests {
     /// client that shows catalogs as rows (the tvOS app's Browse) never tries to render it as one.
     #[test]
     fn title_search_catalogs_are_declared_only_when_on() {
-        let off = manifest_json(&Config::default_config(), false, false);
+        let off = manifest_json(&Config::default_config(), false, false, false);
         assert!(!off.contains(titles::CATALOG_ID));
         let on: serde_json::Value =
-            serde_json::from_str(&manifest_json(&Config::default_config(), true, false)).unwrap();
+            serde_json::from_str(&manifest_json(&Config::default_config(), true, false, false)).unwrap();
         let search: Vec<&serde_json::Value> =
             on["catalogs"].as_array().unwrap().iter().filter(|c| c["id"] == titles::CATALOG_ID).collect();
         assert_eq!(search.len(), 2);

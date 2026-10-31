@@ -719,7 +719,7 @@ impl Motn {
 
 /// Write beside the current state, sync the complete replacement, then atomically publish it. Syncing the parent
 /// makes the rename durable across a host crash, matching the stronger persistent-cache path used by maturity data.
-fn write_atomically(path: &Path, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, body: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

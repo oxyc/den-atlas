@@ -1,0 +1,652 @@
+{
+ "id": 169,
+ "name": "Breaking Bad",
+ "status": "Ended",
+ "schedule": {
+  "time": "22:00",
+  "days": [
+   "Sunday"
+  ]
+ },
+ "network": {
+  "id": 20,
+  "name": "AMC",
+  "country": {
+   "name": "United States",
+   "code": "US",
+   "timezone": "America/New_York"
+  },
+  "officialSite": null
+ },
+ "webChannel": null,
+ "externals": {
+  "tvrage": 18164,
+  "thetvdb": 81189,
+  "imdb": "tt0903747"
+ },
+ "updated": 1792795009,
+ "_embedded": {
+  "episodes": [
+   {
+    "id": 12192,
+    "season": 1,
+    "number": 1,
+    "type": "regular",
+    "name": "Pilot",
+    "airdate": "2008-01-20",
+    "airtime": "22:00",
+    "airstamp": "2008-01-21T03:00:00+00:00"
+   },
+   {
+    "id": 12193,
+    "season": 1,
+    "number": 2,
+    "type": "regular",
+    "name": "Cat's in the Bag...",
+    "airdate": "2008-01-27",
+    "airtime": "22:00",
+    "airstamp": "2008-01-28T03:00:00+00:00"
+   },
+   {
+    "id": 12194,
+    "season": 1,
+    "number": 3,
+    "type": "regular",
+    "name": "...and the Bag's in the River",
+    "airdate": "2008-02-10",
+    "airtime": "22:00",
+    "airstamp": "2008-02-11T03:00:00+00:00"
+   },
+   {
+    "id": 12195,
+    "season": 1,
+    "number": 4,
+    "type": "regular",
+    "name": "Cancer Man",
+    "airdate": "2008-02-17",
+    "airtime": "22:00",
+    "airstamp": "2008-02-18T03:00:00+00:00"
+   },
+   {
+    "id": 12196,
+    "season": 1,
+    "number": 5,
+    "type": "regular",
+    "name": "Gray Matter",
+    "airdate": "2008-02-24",
+    "airtime": "22:00",
+    "airstamp": "2008-02-25T03:00:00+00:00"
+   },
+   {
+    "id": 12197,
+    "season": 1,
+    "number": 6,
+    "type": "regular",
+    "name": "Crazy Handful of Nothin'",
+    "airdate": "2008-03-02",
+    "airtime": "22:00",
+    "airstamp": "2008-03-03T03:00:00+00:00"
+   },
+   {
+    "id": 12198,
+    "season": 1,
+    "number": 7,
+    "type": "regular",
+    "name": "A No-Rough-Stuff-Type Deal",
+    "airdate": "2008-03-09",
+    "airtime": "22:00",
+    "airstamp": "2008-03-10T02:00:00+00:00"
+   },
+   {
+    "id": 12199,
+    "season": 2,
+    "number": 1,
+    "type": "regular",
+    "name": "Seven Thirty-Seven",
+    "airdate": "2009-03-08",
+    "airtime": "22:00",
+    "airstamp": "2009-03-09T02:00:00+00:00"
+   },
+   {
+    "id": 12200,
+    "season": 2,
+    "number": 2,
+    "type": "regular",
+    "name": "Grilled",
+    "airdate": "2009-03-15",
+    "airtime": "22:00",
+    "airstamp": "2009-03-16T02:00:00+00:00"
+   },
+   {
+    "id": 12201,
+    "season": 2,
+    "number": 3,
+    "type": "regular",
+    "name": "Bit by a Dead Bee",
+    "airdate": "2009-03-22",
+    "airtime": "22:00",
+    "airstamp": "2009-03-23T02:00:00+00:00"
+   },
+   {
+    "id": 12202,
+    "season": 2,
+    "number": 4,
+    "type": "regular",
+    "name": "Down",
+    "airdate": "2009-03-29",
+    "airtime": "22:00",
+    "airstamp": "2009-03-30T02:00:00+00:00"
+   },
+   {
+    "id": 12203,
+    "season": 2,
+    "number": 5,
+    "type": "regular",
+    "name": "Breakage",
+    "airdate": "2009-04-05",
+    "airtime": "22:00",
+    "airstamp": "2009-04-06T02:00:00+00:00"
+   },
+   {
+    "id": 12204,
+    "season": 2,
+    "number": 6,
+    "type": "regular",
+    "name": "Peekaboo",
+    "airdate": "2009-04-12",
+    "airtime": "22:00",
+    "airstamp": "2009-04-13T02:00:00+00:00"
+   },
+   {
+    "id": 12205,
+    "season": 2,
+    "number": 7,
+    "type": "regular",
+    "name": "Negro Y Azul",
+    "airdate": "2009-04-19",
+    "airtime": "22:00",
+    "airstamp": "2009-04-20T02:00:00+00:00"
+   },
+   {
+    "id": 12206,
+    "season": 2,
+    "number": 8,
+    "type": "regular",
+    "name": "Better Call Saul",
+    "airdate": "2009-04-26",
+    "airtime": "22:00",
+    "airstamp": "2009-04-27T02:00:00+00:00"
+   },
+   {
+    "id": 12207,
+    "season": 2,
+    "number": 9,
+    "type": "regular",
+    "name": "4 Days Out",
+    "airdate": "2009-05-03",
+    "airtime": "22:00",
+    "airstamp": "2009-05-04T02:00:00+00:00"
+   },
+   {
+    "id": 12208,
+    "season": 2,
+    "number": 10,
+    "type": "regular",
+    "name": "Over",
+    "airdate": "2009-05-10",
+    "airtime": "22:00",
+    "airstamp": "2009-05-11T02:00:00+00:00"
+   },
+   {
+    "id": 12209,
+    "season": 2,
+    "number": 11,
+    "type": "regular",
+    "name": "Mandala",
+    "airdate": "2009-05-17",
+    "airtime": "22:00",
+    "airstamp": "2009-05-18T02:00:00+00:00"
+   },
+   {
+    "id": 12210,
+    "season": 2,
+    "number": 12,
+    "type": "regular",
+    "name": "Phoenix",
+    "airdate": "2009-05-24",
+    "airtime": "22:00",
+    "airstamp": "2009-05-25T02:00:00+00:00"
+   },
+   {
+    "id": 12211,
+    "season": 2,
+    "number": 13,
+    "type": "regular",
+    "name": "ABQ",
+    "airdate": "2009-05-31",
+    "airtime": "22:00",
+    "airstamp": "2009-06-01T02:00:00+00:00"
+   },
+   {
+    "id": 12212,
+    "season": 3,
+    "number": 1,
+    "type": "regular",
+    "name": "No Más",
+    "airdate": "2010-03-21",
+    "airtime": "22:00",
+    "airstamp": "2010-03-22T02:00:00+00:00"
+   },
+   {
+    "id": 12213,
+    "season": 3,
+    "number": 2,
+    "type": "regular",
+    "name": "Caballo sin Nombre",
+    "airdate": "2010-03-28",
+    "airtime": "22:00",
+    "airstamp": "2010-03-29T02:00:00+00:00"
+   },
+   {
+    "id": 12214,
+    "season": 3,
+    "number": 3,
+    "type": "regular",
+    "name": "I.F.T.",
+    "airdate": "2010-04-04",
+    "airtime": "22:00",
+    "airstamp": "2010-04-05T02:00:00+00:00"
+   },
+   {
+    "id": 12215,
+    "season": 3,
+    "number": 4,
+    "type": "regular",
+    "name": "Green Light",
+    "airdate": "2010-04-11",
+    "airtime": "22:00",
+    "airstamp": "2010-04-12T02:00:00+00:00"
+   },
+   {
+    "id": 12216,
+    "season": 3,
+    "number": 5,
+    "type": "regular",
+    "name": "Más",
+    "airdate": "2010-04-18",
+    "airtime": "22:00",
+    "airstamp": "2010-04-19T02:00:00+00:00"
+   },
+   {
+    "id": 12217,
+    "season": 3,
+    "number": 6,
+    "type": "regular",
+    "name": "Sunset",
+    "airdate": "2010-04-25",
+    "airtime": "22:00",
+    "airstamp": "2010-04-26T02:00:00+00:00"
+   },
+   {
+    "id": 12218,
+    "season": 3,
+    "number": 7,
+    "type": "regular",
+    "name": "One Minute",
+    "airdate": "2010-05-02",
+    "airtime": "22:00",
+    "airstamp": "2010-05-03T02:00:00+00:00"
+   },
+   {
+    "id": 12219,
+    "season": 3,
+    "number": 8,
+    "type": "regular",
+    "name": "I See You",
+    "airdate": "2010-05-09",
+    "airtime": "22:00",
+    "airstamp": "2010-05-10T02:00:00+00:00"
+   },
+   {
+    "id": 12220,
+    "season": 3,
+    "number": 9,
+    "type": "regular",
+    "name": "Kafkaesque",
+    "airdate": "2010-05-16",
+    "airtime": "22:00",
+    "airstamp": "2010-05-17T02:00:00+00:00"
+   },
+   {
+    "id": 12221,
+    "season": 3,
+    "number": 10,
+    "type": "regular",
+    "name": "Fly",
+    "airdate": "2010-05-23",
+    "airtime": "22:00",
+    "airstamp": "2010-05-24T02:00:00+00:00"
+   },
+   {
+    "id": 12222,
+    "season": 3,
+    "number": 11,
+    "type": "regular",
+    "name": "Abiquiu",
+    "airdate": "2010-05-30",
+    "airtime": "22:00",
+    "airstamp": "2010-05-31T02:00:00+00:00"
+   },
+   {
+    "id": 12223,
+    "season": 3,
+    "number": 12,
+    "type": "regular",
+    "name": "Half Measures",
+    "airdate": "2010-06-06",
+    "airtime": "22:00",
+    "airstamp": "2010-06-07T02:00:00+00:00"
+   },
+   {
+    "id": 12224,
+    "season": 3,
+    "number": 13,
+    "type": "regular",
+    "name": "Full Measure",
+    "airdate": "2010-06-13",
+    "airtime": "22:00",
+    "airstamp": "2010-06-14T02:00:00+00:00"
+   },
+   {
+    "id": 12225,
+    "season": 4,
+    "number": 1,
+    "type": "regular",
+    "name": "Box Cutter",
+    "airdate": "2011-07-17",
+    "airtime": "22:00",
+    "airstamp": "2011-07-18T02:00:00+00:00"
+   },
+   {
+    "id": 12226,
+    "season": 4,
+    "number": 2,
+    "type": "regular",
+    "name": "Thirty-Eight Snub",
+    "airdate": "2011-07-24",
+    "airtime": "22:00",
+    "airstamp": "2011-07-25T02:00:00+00:00"
+   },
+   {
+    "id": 12227,
+    "season": 4,
+    "number": 3,
+    "type": "regular",
+    "name": "Open House",
+    "airdate": "2011-07-31",
+    "airtime": "22:00",
+    "airstamp": "2011-08-01T02:00:00+00:00"
+   },
+   {
+    "id": 12228,
+    "season": 4,
+    "number": 4,
+    "type": "regular",
+    "name": "Bullet Points",
+    "airdate": "2011-08-07",
+    "airtime": "22:00",
+    "airstamp": "2011-08-08T02:00:00+00:00"
+   },
+   {
+    "id": 12229,
+    "season": 4,
+    "number": 5,
+    "type": "regular",
+    "name": "Shotgun",
+    "airdate": "2011-08-14",
+    "airtime": "22:00",
+    "airstamp": "2011-08-15T02:00:00+00:00"
+   },
+   {
+    "id": 12230,
+    "season": 4,
+    "number": 6,
+    "type": "regular",
+    "name": "Cornered",
+    "airdate": "2011-08-21",
+    "airtime": "22:00",
+    "airstamp": "2011-08-22T02:00:00+00:00"
+   },
+   {
+    "id": 12231,
+    "season": 4,
+    "number": 7,
+    "type": "regular",
+    "name": "Problem Dog",
+    "airdate": "2011-08-28",
+    "airtime": "22:00",
+    "airstamp": "2011-08-29T02:00:00+00:00"
+   },
+   {
+    "id": 12232,
+    "season": 4,
+    "number": 8,
+    "type": "regular",
+    "name": "Hermanos",
+    "airdate": "2011-09-04",
+    "airtime": "22:00",
+    "airstamp": "2011-09-05T02:00:00+00:00"
+   },
+   {
+    "id": 12233,
+    "season": 4,
+    "number": 9,
+    "type": "regular",
+    "name": "Bug",
+    "airdate": "2011-09-11",
+    "airtime": "22:00",
+    "airstamp": "2011-09-12T02:00:00+00:00"
+   },
+   {
+    "id": 12234,
+    "season": 4,
+    "number": 10,
+    "type": "regular",
+    "name": "Salud",
+    "airdate": "2011-09-18",
+    "airtime": "22:00",
+    "airstamp": "2011-09-19T02:00:00+00:00"
+   },
+   {
+    "id": 12235,
+    "season": 4,
+    "number": 11,
+    "type": "regular",
+    "name": "Crawl Space",
+    "airdate": "2011-09-25",
+    "airtime": "22:00",
+    "airstamp": "2011-09-26T02:00:00+00:00"
+   },
+   {
+    "id": 12236,
+    "season": 4,
+    "number": 12,
+    "type": "regular",
+    "name": "End Times",
+    "airdate": "2011-10-02",
+    "airtime": "22:00",
+    "airstamp": "2011-10-03T02:00:00+00:00"
+   },
+   {
+    "id": 12237,
+    "season": 4,
+    "number": 13,
+    "type": "regular",
+    "name": "Face Off",
+    "airdate": "2011-10-09",
+    "airtime": "22:00",
+    "airstamp": "2011-10-10T02:00:00+00:00"
+   },
+   {
+    "id": 12238,
+    "season": 5,
+    "number": 1,
+    "type": "regular",
+    "name": "Live Free or Die",
+    "airdate": "2012-07-15",
+    "airtime": "22:00",
+    "airstamp": "2012-07-16T02:00:00+00:00"
+   },
+   {
+    "id": 12239,
+    "season": 5,
+    "number": 2,
+    "type": "regular",
+    "name": "Madrigal",
+    "airdate": "2012-07-22",
+    "airtime": "22:00",
+    "airstamp": "2012-07-23T02:00:00+00:00"
+   },
+   {
+    "id": 12240,
+    "season": 5,
+    "number": 3,
+    "type": "regular",
+    "name": "Hazard Pay",
+    "airdate": "2012-07-29",
+    "airtime": "22:00",
+    "airstamp": "2012-07-30T02:00:00+00:00"
+   },
+   {
+    "id": 12241,
+    "season": 5,
+    "number": 4,
+    "type": "regular",
+    "name": "Fifty-One",
+    "airdate": "2012-08-05",
+    "airtime": "22:00",
+    "airstamp": "2012-08-06T02:00:00+00:00"
+   },
+   {
+    "id": 12242,
+    "season": 5,
+    "number": 5,
+    "type": "regular",
+    "name": "Dead Freight",
+    "airdate": "2012-08-12",
+    "airtime": "22:00",
+    "airstamp": "2012-08-13T02:00:00+00:00"
+   },
+   {
+    "id": 12243,
+    "season": 5,
+    "number": 6,
+    "type": "regular",
+    "name": "Buyout",
+    "airdate": "2012-08-19",
+    "airtime": "22:00",
+    "airstamp": "2012-08-20T02:00:00+00:00"
+   },
+   {
+    "id": 12244,
+    "season": 5,
+    "number": 7,
+    "type": "regular",
+    "name": "Say My Name",
+    "airdate": "2012-08-26",
+    "airtime": "22:00",
+    "airstamp": "2012-08-27T02:00:00+00:00"
+   },
+   {
+    "id": 12245,
+    "season": 5,
+    "number": 8,
+    "type": "regular",
+    "name": "Gliding Over All",
+    "airdate": "2012-09-02",
+    "airtime": "22:00",
+    "airstamp": "2012-09-03T02:00:00+00:00"
+   },
+   {
+    "id": 12246,
+    "season": 5,
+    "number": 9,
+    "type": "regular",
+    "name": "Blood Money",
+    "airdate": "2013-08-11",
+    "airtime": "22:00",
+    "airstamp": "2013-08-12T02:00:00+00:00"
+   },
+   {
+    "id": 12247,
+    "season": 5,
+    "number": 10,
+    "type": "regular",
+    "name": "Buried",
+    "airdate": "2013-08-18",
+    "airtime": "22:00",
+    "airstamp": "2013-08-19T02:00:00+00:00"
+   },
+   {
+    "id": 12248,
+    "season": 5,
+    "number": 11,
+    "type": "regular",
+    "name": "Confessions",
+    "airdate": "2013-08-25",
+    "airtime": "22:00",
+    "airstamp": "2013-08-26T02:00:00+00:00"
+   },
+   {
+    "id": 12249,
+    "season": 5,
+    "number": 12,
+    "type": "regular",
+    "name": "Rabid Dog",
+    "airdate": "2013-09-01",
+    "airtime": "22:00",
+    "airstamp": "2013-09-02T02:00:00+00:00"
+   },
+   {
+    "id": 12250,
+    "season": 5,
+    "number": 13,
+    "type": "regular",
+    "name": "To'hajiilee",
+    "airdate": "2013-09-08",
+    "airtime": "22:00",
+    "airstamp": "2013-09-09T02:00:00+00:00"
+   },
+   {
+    "id": 12251,
+    "season": 5,
+    "number": 14,
+    "type": "regular",
+    "name": "Ozymandias",
+    "airdate": "2013-09-15",
+    "airtime": "22:00",
+    "airstamp": "2013-09-16T02:00:00+00:00"
+   },
+   {
+    "id": 12252,
+    "season": 5,
+    "number": 15,
+    "type": "regular",
+    "name": "Granite State",
+    "airdate": "2013-09-22",
+    "airtime": "22:00",
+    "airstamp": "2013-09-23T02:00:00+00:00"
+   },
+   {
+    "id": 12253,
+    "season": 5,
+    "number": 16,
+    "type": "regular",
+    "name": "Felina",
+    "airdate": "2013-09-29",
+    "airtime": "22:00",
+    "airstamp": "2013-09-30T02:00:00+00:00"
+   }
+  ]
+ }
+}

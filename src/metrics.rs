@@ -250,6 +250,17 @@ pub fn render(state: &AppState) -> String {
         "atlas_catalog_cache_writes_total {}\natlas_catalog_cache_write_bytes_total {}\natlas_catalog_cache_write_errors_total {}\natlas_catalog_cache_last_write_milliseconds {}\n",
         catalog_cache.writes, catalog_cache.bytes, catalog_cache.errors, catalog_cache.last_write_ms
     ));
+    if state.tvmaze.enabled() {
+        let (wanted, shows, requests, refusals) = state.tvmaze.counts();
+        gauge(&mut b, "atlas_tvmaze_series_wanted", "Series asked about in the last month.", "", wanted);
+        gauge(&mut b, "atlas_tvmaze_shows_kept", "TVmaze shows kept with their episodes.", "", shows);
+        b.push_str(&format!(
+            "# HELP atlas_tvmaze_requests_total Requests made to TVmaze since process start.\n\
+             # TYPE atlas_tvmaze_requests_total counter\natlas_tvmaze_requests_total {requests}\n\
+             # HELP atlas_tvmaze_refusals_total TVmaze requests that failed or were refused.\n\
+             # TYPE atlas_tvmaze_refusals_total counter\natlas_tvmaze_refusals_total {refusals}\n"
+        ));
+    }
     b
 }
 

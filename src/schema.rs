@@ -919,6 +919,15 @@ fn routes() -> Value {
                       as the den-titles catalog (/catalog/{type}/den-titles/search={q}.json).",
             "returns": "{metas}",
         },
+        {
+            "method": "GET",
+            "path": "/airing/tv/{tmdbId}",
+            "about": "One series' episode release dates from TVmaze (CC BY-SA 4.0): next, previous, the next \
+                      14 days and the current season's premiere, each a calendar date where it is released. \
+                      404 when TVmaze has no show for it.",
+            "query": "imdb?=tt… (used when the dataset has no IMDb id for the series)",
+            "returns": "{source, status, service, next, previous, upcoming, seasonPremiere}",
+        },
         { "method": "GET", "path": "/dataset.json", "about": "What the dataset is: versions, model, count." },
         { "method": "GET", "path": "/health", "about": "Always 200; status ok, or degraded with a reason." },
         { "method": "GET", "path": "/ready", "about": "503 when a whole feature is off." },

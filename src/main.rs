@@ -42,6 +42,7 @@ mod studios;
 mod titles;
 mod tmdb;
 mod tos;
+mod tvmaze;
 mod util;
 mod versions;
 
@@ -94,6 +95,9 @@ pub struct AppState {
     /// Movie of the Night's lists (env `MOTN_KEY`): each service's Top 10 and additions, per country. Without a key
     /// it keeps nothing, and rows and billboards read JustWatch alone.
     pub motn: Arc<motn::Motn>,
+    /// TVmaze's episode dates for the series households follow (env `TVMAZE`, on unless `0`), served by
+    /// `GET /airing/tv/<tmdbId>`.
+    pub tvmaze: Arc<tvmaze::Tvmaze>,
     /// Bearer token for `/metrics` (env `METRICS_TOKEN`). `None` — unset or empty — turns the route off.
     pub metrics_token: Option<String>,
     /// One stderr line per request (env `LOG_REQUESTS`: off when unset, empty or `0`, on for anything
@@ -168,6 +172,7 @@ impl AppState {
             index: None,
             maturity_providers: maturity_providers::Providers::disabled(),
             motn: std::sync::Arc::new(motn::Motn::new(None, None)),
+            tvmaze: std::sync::Arc::new(tvmaze::Tvmaze::off()),
             metrics_token: None,
             log_requests: false,
             log_identity: true,
@@ -564,6 +569,11 @@ async fn main() {
         index,
         maturity_providers: Arc::clone(&maturity_providers),
         motn,
+        tvmaze: Arc::new(if std::env::var("TVMAZE").is_ok_and(|v| v == "0") {
+            tvmaze::Tvmaze::off()
+        } else {
+            tvmaze::Tvmaze::new(cache_dir.as_deref().map(std::path::Path::new))
+        }),
         metrics_token: std::env::var("METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
         log_requests: std::env::var("LOG_REQUESTS").is_ok_and(|v| !v.is_empty() && v != "0"),
         log_identity: log_identity_on(std::env::var("LOG_IDENTITY").ok().as_deref()),
@@ -616,6 +626,9 @@ async fn main() {
     if state.motn.enabled() {
         tokio::spawn(motn::Motn::refresh_forever(Arc::clone(&state.motn)));
     }
+    if state.tvmaze.enabled() {
+        tokio::spawn(tvmaze::Tvmaze::refresh_forever(Arc::clone(&state.tvmaze)));
+    }
     // JustWatch rows anyone asked for in the last day are refreshed before they expire, so no request waits on
     // JustWatch for one: rows and billboards read what is kept.
     tokio::spawn({
@@ -656,7 +669,7 @@ async fn main() {
     eprintln!(
         "den-atlas {} listening on :{port} — metrics={} log_requests={} log_identity={} {dataset} country={} \
          providers={} catalog_ttl={}s catalog_cache={} embed={} title_search={} index_queries={} tmdb={} \
-         motn={} maturity_providers={} playground={} admission={}",
+         motn={} tvmaze={} maturity_providers={} playground={} admission={}",
         release_version(),
         on(state.metrics_token.is_some()),
         on(state.log_requests),
@@ -674,6 +687,7 @@ async fn main() {
             None => "off",
         },
         on(state.motn.enabled()),
+        on(state.tvmaze.enabled()),
         on(state.maturity_providers.enabled()),
         on(state.playground && state.index.is_some()),
         state.admission.description(),
