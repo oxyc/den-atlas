@@ -987,6 +987,33 @@ pub fn defaults_from_env() -> (u32, Duration) {
     (daily, Duration::from_millis(pace))
 }
 
+/// Test-only: a configured provider that applies to every viewer and never reaches the network, so a
+/// test can turn on the runtime-authority generation without any I/O.
+#[cfg(test)]
+pub fn global_test_provider(generation: u64) -> Arc<Providers> {
+    struct Fake;
+    #[async_trait]
+    impl Backend for Fake {
+        fn authority(&self) -> &'static str {
+            "TEST"
+        }
+        fn media_types(&self) -> &'static [MediaType] {
+            &[MediaType::Tv]
+        }
+        fn applies_to(&self, _viewer_region: Option<Region>) -> bool {
+            true
+        }
+        async fn lookup(&self, _identity: &Identity, _budget: &mut Budget) -> Result<Lookup, String> {
+            Err("no network permitted in the provider test".into())
+        }
+    }
+    let mut providers = Providers::disabled();
+    let provider = Arc::get_mut(&mut providers).expect("the disabled providers are uniquely owned");
+    provider.configured = vec![Configured::new(Arc::new(Fake), 1, Duration::ZERO)];
+    provider.generation.store(generation, Ordering::Relaxed);
+    providers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -563,8 +563,12 @@ impl Indexes {
             memo.clear();
         }
         let policy = crate::maturity::Policy::default();
-        memo.insert((seed, false, policy, self.maturity_generation(policy)), Arc::clone(&one));
-        memo.insert((seed, true, policy, self.maturity_generation(policy)), Arc::clone(&mixed));
+        // Unrestricted: no eligibility filter, so the row is a pure function of the dataset and never of the
+        // runtime-authority generation. Key it at generation 0 — the same key the `held` check above and the
+        // two siblings (`more_like_this`/`_mixed`) read — so the warm memo is found. Keying it at the provider
+        // generation wrote at 1+ but read at 0, so every request re-ranked the index.
+        memo.insert((seed, false, policy, 0), Arc::clone(&one));
+        memo.insert((seed, true, policy, 0), Arc::clone(&mixed));
         (one.iter().map(|&(_, id)| id).collect(), mixed)
     }
 
@@ -2289,6 +2293,33 @@ mod tests {
             }
             eprintln!("{seeds} seeds: both rows over one scan are the rows ranked apart");
         }
+    }
+
+    /// `/index/similar`'s unrestricted two rows rank the whole dataset, so they never depend on a runtime
+    /// maturity authority — yet the warm memo must still be reused when one applies. Before the fix the rows
+    /// were written under the provider's generation but read back at 0, so a globally-applicable provider
+    /// (KAVI, IMDA, KMRB) made every unrestricted request re-rank the index.
+    #[tokio::test]
+    async fn unrestricted_similar_reuses_the_memo_when_a_maturity_provider_applies() {
+        let dir = std::env::temp_dir().join(format!("den-atlas-similar-memo-{}", std::process::id()));
+        let fixture = write_fixture(&dir);
+        // A provider that applies to every viewer and never touches the network: its generation is 1, the
+        // exact condition that made the unrestricted memo read at 0 what it wrote at 1.
+        let provider = crate::maturity_providers::global_test_provider(1);
+        assert!(provider.applies_to(None), "the test provider must apply to the unrestricted viewer");
+        let (indexes, _) =
+            IndexQueries::new(&fixture).with_maturity(provider).get(|| ()).await.expect("indexes");
+        let (media, id) = indexes.plot.titles().next().expect("the fixture has titles");
+        // Cold: ranked over both indexes, and the mixed row is the Arc the memo now holds.
+        let (_, first) = indexes.more_like_this_rows(id, media);
+        // Warm: the same request must take the memo, not re-rank. A fresh recompute is a different Arc; the
+        // memoized row comes back as the very allocation the first call published.
+        let (_, second) = indexes.more_like_this_rows(id, media);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "warm unrestricted request re-ranked instead of reusing the memo"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An index reads its vectors in place, in the bytes it was handed, and answers what an index over a copy
