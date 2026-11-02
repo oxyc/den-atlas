@@ -521,6 +521,10 @@ pub struct SeedAuthorship<'a> {
     series: Vec<(Key, f64)>,
     /// The candidates Jev weighed for the seed, with its overall Noul (`Store::jev_more_like`).
     jev: Vec<(Key, f64)>,
+    /// `nominate`'s answer when the caller worked it out from an inverted index (`with_nominations`).
+    nominated: Option<Vec<Key>>,
+    /// The seed's own `makers_*` entry, as entity indices.
+    seed_makers: &'a [u32],
 }
 
 impl<'a> SeedAuthorship<'a> {
@@ -537,8 +541,11 @@ impl<'a> SeedAuthorship<'a> {
             characters: Vec::new(),
             series: Vec::new(),
             jev: Vec::new(),
+            nominated: None,
+            seed_makers: &[],
         };
         if let Some(row) = row_in(out.keys, out.media, tmdb_id) {
+            out.seed_makers = out.makers.get(row);
             out.mine_makers = out.qids(out.makers.get(row)).collect();
             out.mine_homes = out.qids(out.broadcasters.get(row)).collect();
             let keys = out.keys;
@@ -562,6 +569,19 @@ impl<'a> SeedAuthorship<'a> {
     /// A series' strength is measured over the whole corpus, which the caller holds.
     pub fn with_series(mut self, series: Vec<(Key, f64)>) -> Self {
         self.series = series;
+        self
+    }
+
+    /// The seed's makers as entity indices, for a caller that inverts the `makers_*` list itself.
+    pub fn maker_entities(&self) -> &'a [u32] {
+        self.seed_makers
+    }
+
+    /// `nominate`'s answer, worked out by the caller from the `makers_*` list inverted: every title crediting
+    /// one of `maker_entities`, ascending by store row, each once. Scanning every row's makers for the seed's
+    /// was a fifth of a More Like This, and a ranked row asks twice.
+    pub fn with_nominations(mut self, nominated: Vec<Key>) -> Self {
+        self.nominated = Some(nominated);
         self
     }
 
@@ -595,6 +615,9 @@ impl crate::Authorship for SeedAuthorship<'_> {
     fn nominate(&self) -> Vec<Key> {
         if self.mine_makers.is_empty() {
             return Vec::new();
+        }
+        if let Some(nominated) = &self.nominated {
+            return nominated.clone();
         }
         // Keys are sorted, so each type's ids come out ascending, films first.
         self.keys

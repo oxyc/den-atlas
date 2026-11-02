@@ -53,6 +53,12 @@ pub struct MappedStore {
     kid_veto: Box<[bool]>,
     /// Validated official observations, owned once at load so a detail request never rescans all observations.
     maturity_ratings: Box<[Vec<PublicMaturityRating>]>,
+    /// The `keys` column, copied once (~0.5 MB): the one (type, TMDB id) → row lookup. Through a view, every
+    /// lookup first found the section by name — a linear scan of the section table, decoding each name —
+    /// and that, not the binary search, was most of what a per-title lookup cost.
+    keys: Box<[u64]>,
+    /// The store's `votes` column, when it carries one, held for the same reason.
+    votes: Option<Box<[u32]>>,
     #[cfg(test)]
     minimum_age_view_builds: AtomicUsize,
     #[cfg(test)]
@@ -109,8 +115,11 @@ impl MappedStore {
         if map.len() != verified {
             return Err(format!("{}: changed size while it was being opened", path.display()));
         }
-        let (minimum_ages, kid_audience, kid_veto, maturity_ratings) = {
+        let (minimum_ages, kid_audience, kid_veto, maturity_ratings, keys, votes) = {
             let view = table.view(&map);
+            // Absent, every lookup answers "not held", as `Store::row_of` did.
+            let keys: Box<[u64]> = view.per_row::<u64>("keys").unwrap_or(&[]).into();
+            let votes = view.per_row::<u32>("votes").ok().map(Box::from);
             let ages = view.minimum_ages().map_err(|e| format!("{}: {e}", path.display()))?;
             let minimum_ages = (0..table.rows()).map(|row| ages.get(den_store::Row(row))).collect();
             let kid_audience = kid_audience_rows(&view, table.rows());
@@ -132,7 +141,7 @@ impl MappedStore {
                         .collect()
                 })
                 .collect();
-            (minimum_ages, kid_audience, kid_veto, maturity_ratings)
+            (minimum_ages, kid_audience, kid_veto, maturity_ratings, keys, votes)
         };
         Ok(Self {
             path: path.to_owned(),
@@ -142,6 +151,8 @@ impl MappedStore {
             kid_audience,
             kid_veto,
             maturity_ratings,
+            keys,
+            votes,
             #[cfg(test)]
             minimum_age_view_builds: AtomicUsize::new(1),
             #[cfg(test)]
@@ -172,14 +183,23 @@ impl MappedStore {
         self.map.len()
     }
 
+    /// A title's store row: the one place a (type, TMDB id) becomes the row every column is read by.
+    pub fn row_of(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<usize> {
+        let want = (u64::from(media_type == den_index::MediaType::Tv) << 32) | u64::from(tmdb_id);
+        self.keys.binary_search(&want).ok()
+    }
+
+    /// The store's own vote count for a row; `None` when the store carries no `votes` column.
+    pub fn votes(&self, row: usize) -> Option<u32> {
+        self.votes.as_ref()?.get(row).copied()
+    }
+
     /// The public-authority minimum age for one TMDB title, or unknown when the title or rating is absent.
     pub fn minimum_age(&self, media_type: den_index::MediaType, tmdb_id: u32) -> Option<u8> {
         #[cfg(test)]
         self.minimum_age_lookups.fetch_add(1, Ordering::Relaxed);
-        let media = u8::from(media_type == den_index::MediaType::Tv);
-        let view = self.view();
-        let row = view.row_of(media, tmdb_id).ok().flatten()?;
-        self.minimum_ages.get(row.0).copied().flatten()
+        let row = self.row_of(media_type, tmdb_id)?;
+        self.minimum_ages.get(row).copied().flatten()
     }
 
     /// Whether the store has affirmative audience-intent evidence for this Kid catalogue band, and the title is
@@ -190,18 +210,16 @@ impl MappedStore {
         tmdb_id: u32,
         band: crate::maturity::KidAudience,
     ) -> bool {
-        let media = u8::from(media_type == den_index::MediaType::Tv);
-        let Some(row) = self.view().row_of(media, tmdb_id).ok().flatten() else { return false };
-        let (child, teen) = self.kid_audience.get(row.0).copied().unwrap_or_default();
-        !self.kid_veto.get(row.0).copied().unwrap_or(false)
+        let Some(row) = self.row_of(media_type, tmdb_id) else { return false };
+        let (child, teen) = self.kid_audience.get(row).copied().unwrap_or_default();
+        !self.kid_veto.get(row).copied().unwrap_or(false)
             && (child || (band == crate::maturity::KidAudience::ChildOrTeen && teen))
     }
 
     /// Whether a Kid may not open this title whatever its age (`kid_veto`).
     pub fn kid_vetoed(&self, media_type: den_index::MediaType, tmdb_id: u32) -> bool {
-        let media = u8::from(media_type == den_index::MediaType::Tv);
-        let row = self.view().row_of(media, tmdb_id).ok().flatten();
-        row.and_then(|row| self.kid_veto.get(row.0)).copied().unwrap_or(false)
+        let row = self.row_of(media_type, tmdb_id);
+        row.and_then(|row| self.kid_veto.get(row)).copied().unwrap_or(false)
     }
 
     pub fn maturity_ratings(
@@ -209,12 +227,8 @@ impl MappedStore {
         media_type: den_index::MediaType,
         tmdb_id: u32,
     ) -> &[PublicMaturityRating] {
-        let media = u8::from(media_type == den_index::MediaType::Tv);
-        self.view()
-            .row_of(media, tmdb_id)
-            .ok()
-            .flatten()
-            .and_then(|row| self.maturity_ratings.get(row.0))
+        self.row_of(media_type, tmdb_id)
+            .and_then(|row| self.maturity_ratings.get(row))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }

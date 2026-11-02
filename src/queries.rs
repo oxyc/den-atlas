@@ -83,6 +83,10 @@ pub struct Indexes {
     /// You Might Also Like's structural-affinity rows, keyed like `similar` but kept separately because
     /// the two rails make different promises.
     affinity: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
+    /// Each restricted policy's eligible store rows, by policy and maturity generation (`Indexes::admission`).
+    admission: Mutex<HashMap<AdmissionKey, Arc<[u64]>>>,
+    /// `schema::known`'s answers, by field and scope: each is fixed for the life of these indexes.
+    known: Mutex<HashMap<(String, Option<den_index::MediaType>), usize>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -99,6 +103,33 @@ pub struct Indexes {
 }
 
 type Key = (den_index::MediaType, u32);
+
+/// The store's fan picks read straight off their sections. `Store::fan_picks` validates every row on each
+/// call — most of a You Might Also Like's time — and `MappedStore::check` already ran it at load.
+struct FanPicks<'a> {
+    picks: den_store::List<'a, u32>,
+    asked: &'a [u8],
+}
+
+impl<'a> FanPicks<'a> {
+    fn of(view: &den_store::Store<'a>) -> Option<Self> {
+        Some(FanPicks {
+            picks: view.list::<u32>("fan_picks_v", "fan_picks_o").ok()?,
+            asked: view.per_row::<u8>("fan_picks_a").ok()?,
+        })
+    }
+
+    /// As `den_store::FanPicks::asked`.
+    fn asked(&self, row: den_store::Row) -> bool {
+        self.asked.get(row.0) == Some(&1)
+    }
+
+    /// As `den_store::FanPicks::get`: the row's picks in rank order, none for a row out of range.
+    fn get(&self, row: den_store::Row) -> impl Iterator<Item = den_store::Row> + 'a {
+        self.picks.get(row).iter().map(|&pick| den_store::Row(pick as usize))
+    }
+}
+
 /// A More Like This row in the memo: the title, and whether the row mixes films and series.
 type SimilarKey = (Key, bool, crate::maturity::Policy, u64);
 
@@ -110,6 +141,10 @@ type SimilarKey = (Key, bool, crate::maturity::Policy, u64);
 /// starts over.
 const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 256;
+/// Admission bitsets kept at most: ~7.5 KB each, and a household has a handful of profiles.
+const ADMISSION_MEMO: usize = 32;
+/// An admission bitset's memo key: the policy, and the maturity generation it was worked out under.
+type AdmissionKey = (crate::maturity::Policy, u64);
 /// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
 const AGGREGATES_MEMO: usize = 8;
 
@@ -147,6 +182,13 @@ impl Indexes {
         )
     }
 
+    /// Forget every More Like This and You Might Also Like answer, so a benchmark round ranks each seed.
+    #[cfg(test)]
+    pub(crate) fn clear_memos(&self) {
+        lock(&self.similar).clear();
+        lock(&self.affinity).clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn minimum_age_accesses(&self) -> (usize, usize) {
         (self.store.store.minimum_age_view_builds(), self.store.store.minimum_age_lookups())
@@ -176,6 +218,50 @@ impl Indexes {
             self.maturity.generation()
         } else {
             0
+        }
+    }
+
+    /// `eligible` for every store row at once, as a bitset (bit `r` of word `r / 64`), worked out once per
+    /// policy and maturity generation. A restricted More Like This scans ~92k vectors; asking `eligible` of
+    /// each — two binary searches and the box-local ratings — cost more than ranking the pool.
+    pub fn admission(&self, policy: crate::maturity::Policy) -> Arc<[u64]> {
+        let key = (policy, self.maturity_generation(policy));
+        memoised(&self.admission, key, ADMISSION_MEMO, || {
+            let view = self.store.view();
+            let keys = view.per_row::<u64>("keys").unwrap_or(&[]);
+            let mut bits = vec![0u64; keys.len().div_ceil(64)];
+            for (row, &packed) in keys.iter().enumerate() {
+                let media =
+                    if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
+                if self.eligible(policy, (media, packed as u32)) {
+                    bits[row / 64] |= 1 << (row % 64);
+                }
+            }
+            bits.into()
+        })
+    }
+
+    /// `schema::known` for a field and scope, counted by `count` the first time it is asked. The field set
+    /// is the schema's own, so this holds a few dozen numbers at most.
+    pub fn known(
+        &self,
+        field: &str,
+        scope: Option<den_index::MediaType>,
+        count: impl FnOnce() -> usize,
+    ) -> usize {
+        if let Some(&n) = lock(&self.known).get(&(field.to_owned(), scope)) {
+            return n;
+        }
+        let n = count();
+        lock(&self.known).insert((field.to_owned(), scope), n);
+        n
+    }
+
+    /// `eligible` read off an `admission` bitset; a title the store does not hold is asked directly.
+    fn admitted(&self, bits: &[u64], policy: crate::maturity::Policy, key: Key) -> bool {
+        match row_of(&self.store, key.0, key.1) {
+            Some(row) => bits[row / 64] & (1 << (row % 64)) != 0,
+            None => self.eligible(policy, key),
         }
     }
 
@@ -249,17 +335,18 @@ impl Indexes {
                     row.truncate(den_index::MAX_ROW);
                     return row.into();
                 }
-                let keep = |key| self.eligible(maturity, key);
+                let admission = self.admission(maturity);
+                let keep = |key| self.admitted(&admission, maturity, key);
                 let params =
                     den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
                 let seed = self.suggestion_profile((media_type, tmdb_id));
+                let extras = den_index::Extras {
+                    keep: Some(&keep),
+                    admit: Some(&admission),
+                    ..den_index::Extras::default()
+                };
                 let mut row: Vec<Key> = self
-                    .more_like_this_with(
-                        tmdb_id,
-                        media_type,
-                        &params,
-                        den_index::Extras { keep: Some(&keep), ..den_index::Extras::default() },
-                    )
+                    .more_like_this_with(tmdb_id, media_type, &params, extras)
                     .into_iter()
                     .map(|scored| scored.key())
                     .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
@@ -286,8 +373,8 @@ impl Indexes {
             return None;
         }
         let view = self.store.view();
-        // `MappedStore::check` read the sections at load, so an error here is only their absence.
-        let fan = view.fan_picks().ok()?;
+        // `MappedStore::check` validated the sections at load, so an error here is only their absence.
+        let fan = FanPicks::of(&view)?;
         let row = den_store::Row(row_of(&self.store, media_type, tmdb_id)?);
         if !fan.asked(row) {
             return None;
@@ -343,7 +430,7 @@ impl Indexes {
     /// 0.73 (#121). Requiring two paths raised it again (0.868 to 0.872) and MovieLens hit@20 (1.470 to
     /// 1.494). On the ten seeds already judged at positions 101–120, the deep band rose from 0.662 to
     /// 0.748; median length is 77 and 1.7% of rows have fewer than 40 titles (#127).
-    fn fan_tail(&self, fan: &den_store::FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
+    fn fan_tail(&self, fan: &FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
         // Nearer the top of a list counts more: 1 for its first title, 0.63 for its second, 0.5 for its third.
         let weight = |rank: usize| 1.0 / ((rank + 2) as f64).log2();
         let links = self.fan_links(fan);
@@ -375,7 +462,7 @@ impl Indexes {
     }
 
     /// Per store row, the titles whose fan picks name it (`Indexes::fan_links`), worked out on first use.
-    fn fan_links(&self, fan: &den_store::FanPicks) -> &[Vec<(u32, u32)>] {
+    fn fan_links(&self, fan: &FanPicks) -> &[Vec<(u32, u32)>] {
         self.fan_links.get_or_init(|| {
             let mut links = vec![Vec::new(); self.population];
             for from in 0..self.population {
@@ -592,9 +679,11 @@ impl Indexes {
         let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
-        let keep = |key| self.eligible(maturity, key);
+        let admission = self.admission(maturity);
+        let keep = |key| self.admitted(&admission, maturity, key);
         let extras = den_index::Extras {
             keep: Some(&keep),
+            admit: Some(&admission),
             primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
             ..den_index::Extras::default()
         };
@@ -644,9 +733,13 @@ impl Indexes {
         // store missing them also reaches `/health` as `facts_unusable`.
         let characters = self.character_links(media_type, tmdb_id);
         let series = self.series_members(media_type, tmdb_id);
-        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
-            .ok()
-            .map(|authorship| authorship.with_characters(characters).with_series(series));
+        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id).ok().map(|authorship| {
+            let authorship = authorship.with_characters(characters).with_series(series);
+            match self.filter().made_by(authorship.maker_entities()) {
+                Some(nominated) => authorship.with_nominations(nominated),
+                None => authorship,
+            }
+        });
         work(authorship.as_ref().map(|a| a as &dyn den_index::Authorship), &facets)
     }
 
@@ -853,8 +946,7 @@ fn row_of(
     media_type: den_index::MediaType,
     tmdb_id: u32,
 ) -> Option<usize> {
-    let media = u8::from(media_type == den_index::MediaType::Tv);
-    loaded.view().row_of(media, tmdb_id).ok().flatten().map(|row| row.0)
+    loaded.store.row_of(media_type, tmdb_id)
 }
 
 /// A title's vote count: TMDB's kept `vote_count` first, the store's `votes` column after it. Shared by
@@ -875,7 +967,7 @@ fn votes_of(
     if let Some(votes) = ratings.and_then(|index| index.votes(row)) {
         return votes;
     }
-    loaded.view().per_row::<u32>("votes").ok().and_then(|votes| votes.get(row).copied()).unwrap_or(0)
+    loaded.store.votes(row).unwrap_or(0)
 }
 
 /// The facet index from the store's own columns, so attribute search covers the whole corpus.
@@ -1396,6 +1488,8 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         display,
         similar: Mutex::new(HashMap::new()),
         affinity: Mutex::new(HashMap::new()),
+        admission: Mutex::new(HashMap::new()),
+        known: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
@@ -1868,6 +1962,36 @@ mod tests {
         // What is not known does not count against a title.
         let unknown = SuggestionProfile { votes: 7000, ..SuggestionProfile::default() };
         assert!(worth_suggesting(&dune, &unknown));
+    }
+
+    /// A person's titles come off the filter index's posting lists, made apart from appeared in, and a policy's
+    /// admission bitset admits exactly what `eligible` does, row for row.
+    #[test]
+    fn credits_and_admission_read_by_store_row() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-rows-{}", std::process::id()));
+        let indexes = load_for_tools(&write_fixture_maturity(&dir)).expect("the fixture loads");
+        let view = indexes.store.view();
+        assert_eq!(indexes.filter().credits(&view, 1), vec![((Movie, 1), true)], "a maker made it");
+        assert_eq!(indexes.filter().credits(&view, 2), vec![((Movie, 1), false)], "cast didn't make it");
+        assert!(indexes.filter().credits(&view, 424_242).is_empty(), "nobody credited, nothing");
+
+        let policy = crate::maturity::Policy {
+            maximum_age: Some(12),
+            unknown_ratings: crate::maturity::UnknownRatings::Block,
+            ..crate::maturity::Policy::default()
+        };
+        let bits = indexes.admission(policy);
+        let keys = view.per_row::<u64>("keys").unwrap();
+        let mut admitted = 0;
+        for (row, &packed) in keys.iter().enumerate() {
+            let key = (if packed >> 32 == 1 { den_index::MediaType::Tv } else { Movie }, packed as u32);
+            let bit = bits[row / 64] & (1 << (row % 64)) != 0;
+            assert_eq!(bit, indexes.eligible(policy, key), "{key:?}");
+            admitted += usize::from(bit);
+        }
+        assert!(admitted > 0 && admitted < keys.len(), "the policy admits some titles and not others");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

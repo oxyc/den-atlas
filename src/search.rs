@@ -516,11 +516,11 @@ pub fn parse(text: &str, indexes: &Indexes) -> Parsed {
     // Paris, the plot text says which films are about being there.
     rest.extend(place_words);
     let excluded = read_excluded(&negation.excluded, indexes, &label_names);
-    let credits: HashMap<u32, Vec<(Key, bool)>> = indexes
-        .facts
-        .as_ref()
-        .map(|facts| people.iter().map(|&qid| (qid, facts.credits(qid))).collect())
-        .unwrap_or_default();
+    // Off the filter index's posting lists: walking every facts record per named person was nearly all of
+    // `parse`. `people` is empty without the facts, so this asks nothing of a store that has none.
+    let view = indexes.store.view();
+    let credits: HashMap<u32, Vec<(Key, bool)>> =
+        people.iter().map(|&qid| (qid, indexes.filter().credits(&view, qid))).collect();
     let makers = people
         .iter()
         .copied()

@@ -1505,6 +1505,37 @@ impl FilterIndex {
         row.is_some_and(|row| has(&entity.known, row.0))
     }
 
+    /// A person's titles by their Q-id, each with whether they made it (directed, created or wrote it) rather
+    /// than only appeared in it: the `person` kind's two posting lists, makers then cast, merged by row.
+    /// Empty when the store does not credit them.
+    pub fn credits(&self, view: &den_store::Store<'_>, qid: u32) -> Vec<(Key, bool)> {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == "person");
+        let Some(person) = at.and_then(|at| self.entities[at].as_ref()) else { return Vec::new() };
+        let Some(entity) = view.column::<u32>("ent_qid").ok().and_then(|qids| qids.binary_search(&qid).ok())
+        else {
+            return Vec::new();
+        };
+        let [made, _cast] = person.postings.as_slice() else { return Vec::new() };
+        let made = made.of(entity as u32);
+        let mut out = Vec::new();
+        person.each_title(entity as u32, |row| {
+            out.push((self.keys[row as usize], made.binary_search(&row).is_ok()));
+        });
+        out
+    }
+
+    /// Every title crediting one of `entities` (entity-table indices) as a maker, ascending by store row and
+    /// each once: `SeedAuthorship::nominate`'s answer off the inverted `makers_*` list. `None` when the store
+    /// does not carry the list, and the caller scans it as before.
+    pub fn made_by(&self, entities: &[u32]) -> Option<Vec<Key>> {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == "made")?;
+        let [made] = self.entities[at].as_ref()?.postings.as_slice() else { return None };
+        let mut rows: Vec<u32> = entities.iter().flat_map(|&e| made.of(e).iter().copied()).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some(rows.into_iter().map(|row| self.keys[row as usize]).collect())
+    }
+
     /// Every title carrying one value of a bitset kind (`warning:graphic_violence`); `None` when the kind is
     /// not offered or holds no such value, which is not the same as no title carrying it.
     pub fn titles_with(&self, kind: &str, value: &str) -> Option<Vec<Key>> {
@@ -1863,17 +1894,8 @@ impl<'a> Context<'a> {
         policy: crate::maturity::Policy,
     ) -> Context<'a> {
         let filter = indexes.filter();
-        let maturity = if policy.restricted() {
-            let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
-            for (row, &key) in filter.keys.iter().enumerate() {
-                if indexes.eligible(policy, key) {
-                    set(&mut maturity, row);
-                }
-            }
-            Some(maturity)
-        } else {
-            None
-        };
+        // The filter's rows are the store's rows, so the policy's memoised admission bitset is this mask.
+        let maturity = policy.restricted().then(|| indexes.admission(policy).to_vec());
         Context {
             filter,
             indexes,

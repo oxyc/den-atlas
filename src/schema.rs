@@ -57,7 +57,14 @@ fn genre_keys(indexes: &Indexes, scope: Option<MediaType>) -> HashSet<Key> {
 /// How many titles of `scope` have `field` on record — the one definition of "known" behind every coverage figure
 /// atlas reports, in the schema, on a browse row and on a search. A title without it is unknown, never a
 /// mismatch, so this is the most any count over the field can reach.
+///
+/// Fixed for a load — every input is built with the indexes — and asked on every search, so each answer is
+/// worked out once (`Indexes::known`). Worked out per search, `genre` alone was most of a person search.
 pub fn known(indexes: &Indexes, field: &str, scope: Option<MediaType>) -> usize {
+    indexes.known(field, scope, || count_known(indexes, field, scope))
+}
+
+fn count_known(indexes: &Indexes, field: &str, scope: Option<MediaType>) -> usize {
     let floor = DISPLAY_CONFIDENCE_FLOOR;
     match field {
         "mediaType" => population(indexes, scope),

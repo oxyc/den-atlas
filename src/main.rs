@@ -3,6 +3,8 @@
 
 mod admission;
 mod awards;
+#[cfg(test)]
+mod bench;
 mod billboardcheck;
 mod billboardeval;
 mod billing;
