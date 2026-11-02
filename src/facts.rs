@@ -325,21 +325,6 @@ impl Facts {
         self.named[start..].iter().take_while(|&&(h, _)| h == hash).map(|&(_, qid)| qid).collect()
     }
 
-    /// A person's titles, each with whether they made it (directed or created) rather than only appeared in it.
-    /// Read off the records rather than kept, since a query asks about a person or two.
-    pub fn credits(&self, qid: u32) -> Vec<((MediaType, u32), bool)> {
-        self.records
-            .iter()
-            .filter_map(|(&key, r)| {
-                if r.makers.contains(&qid) {
-                    Some((key, true))
-                } else {
-                    r.cast.contains(&qid).then_some((key, false))
-                }
-            })
-            .collect()
-    }
-
     /// Every title's other names, handed over once: the display title index keeps them, so the facts don't.
     pub fn take_titles(&mut self) -> Titles {
         std::mem::take(&mut self.titles)
@@ -1045,8 +1030,6 @@ pub(crate) mod tests {
     fn reads_titles_and_the_people_credited_by_any_name() {
         let mut facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
         assert_eq!(facts.person(1), Some(&Person { name: "A Director".into(), tmdb_id: Some(11) }));
-        assert_eq!(facts.credits(1), vec![((MediaType::Movie, 1), true)]);
-        assert_eq!(facts.credits(2), vec![((MediaType::Movie, 1), false)], "a cast member didn't make it");
         assert_eq!(facts.people_named("a director"), vec![1]);
         assert_eq!(facts.people_named(&name_key("Bong Joon-ho")), vec![2], "an alias, however it is spelled");
         assert_eq!(

@@ -85,6 +85,8 @@ pub struct Indexes {
     affinity: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
     /// Each restricted policy's eligible store rows, by policy and maturity generation (`Indexes::admission`).
     admission: Mutex<HashMap<AdmissionKey, Arc<[u64]>>>,
+    /// `schema::known`'s answers, by field and scope: each is fixed for the life of these indexes.
+    known: Mutex<HashMap<(String, Option<den_index::MediaType>), usize>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -210,6 +212,22 @@ impl Indexes {
             }
             bits.into()
         })
+    }
+
+    /// `schema::known` for a field and scope, counted by `count` the first time it is asked. The field set
+    /// is the schema's own, so this holds a few dozen numbers at most.
+    pub fn known(
+        &self,
+        field: &str,
+        scope: Option<den_index::MediaType>,
+        count: impl FnOnce() -> usize,
+    ) -> usize {
+        if let Some(&n) = lock(&self.known).get(&(field.to_owned(), scope)) {
+            return n;
+        }
+        let n = count();
+        lock(&self.known).insert((field.to_owned(), scope), n);
+        n
     }
 
     /// `eligible` read off an `admission` bitset; a title the store does not hold is asked directly.
@@ -1441,6 +1459,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         similar: Mutex::new(HashMap::new()),
         affinity: Mutex::new(HashMap::new()),
         admission: Mutex::new(HashMap::new()),
+        known: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),
@@ -1913,6 +1932,36 @@ mod tests {
         // What is not known does not count against a title.
         let unknown = SuggestionProfile { votes: 7000, ..SuggestionProfile::default() };
         assert!(worth_suggesting(&dune, &unknown));
+    }
+
+    /// A person's titles come off the filter index's posting lists, made apart from appeared in, and a policy's
+    /// admission bitset admits exactly what `eligible` does, row for row.
+    #[test]
+    fn credits_and_admission_read_by_store_row() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-rows-{}", std::process::id()));
+        let indexes = load_for_tools(&write_fixture_maturity(&dir)).expect("the fixture loads");
+        let view = indexes.store.view();
+        assert_eq!(indexes.filter().credits(&view, 1), vec![((Movie, 1), true)], "a maker made it");
+        assert_eq!(indexes.filter().credits(&view, 2), vec![((Movie, 1), false)], "cast didn't make it");
+        assert!(indexes.filter().credits(&view, 424_242).is_empty(), "nobody credited, nothing");
+
+        let policy = crate::maturity::Policy {
+            maximum_age: Some(12),
+            unknown_ratings: crate::maturity::UnknownRatings::Block,
+            ..crate::maturity::Policy::default()
+        };
+        let bits = indexes.admission(policy);
+        let keys = view.per_row::<u64>("keys").unwrap();
+        let mut admitted = 0;
+        for (row, &packed) in keys.iter().enumerate() {
+            let key = (if packed >> 32 == 1 { den_index::MediaType::Tv } else { Movie }, packed as u32);
+            let bit = bits[row / 64] & (1 << (row % 64)) != 0;
+            assert_eq!(bit, indexes.eligible(policy, key), "{key:?}");
+            admitted += usize::from(bit);
+        }
+        assert!(admitted > 0 && admitted < keys.len(), "the policy admits some titles and not others");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
