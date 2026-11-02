@@ -210,10 +210,10 @@ impl Config {
                 64 * 1024,
                 16 * 1024 * 1024,
             ),
-            // Each entry is ~4.2 KB, so this is the cache's memory bound too. The ceiling has to
-            // hold ALONGSIDE the model, not instead of it: max_tokens at its own ceiling of 1024
-            // measures 1219 MB peak, and 65536 entries is ~275 MB — 1494 MB against a 1536 MB
-            // cgroup, i.e. both ceilings set at once was an OOM. 32768 is ~137 MB, leaving ~180 MB.
+            // Each entry is ~1.1 KB (`Lru`), so this is the cache's memory bound too, and 32768 is
+            // ~36 MB. The ceiling has to hold ALONGSIDE the model, not instead of it: max_tokens at
+            // its own ceiling of 1024 measures 1219 MB peak against a 1536 MB cgroup. (At the old
+            // ~4.2 KB per entry, 65536 entries were ~275 MB and both ceilings at once an OOM.)
             cache_max: env_clamped_with(get, "CACHE_MAX_ENTRIES", 8192, 0, 32_768),
             idle_unload: (idle > 0).then(|| Duration::from_secs(idle as u64)),
             // ONNX intra-op threads. Default to all cores (fastembed/ORT default).
@@ -350,55 +350,79 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // --- tiny LRU: cache is a pure optimization, so its eviction policy does not
 // affect output vectors. Counter-recency LRU; evict the least-recent when full.
+//
+// Slots in flat columns: the vectors as int8 in one arena (`DIMS` bytes per slot), and each slot's
+// key and last-use tick beside it. ~1.1 KB per entry, where a `HashMap<String, (Vec<i32>, u64)>`
+// cost ~4.2 KB (the int8 values stored as i32, plus a hex-string key), and eviction scans one
+// contiguous tick column instead of walking the map.
 struct Lru {
-    map: HashMap<String, (Vec<i32>, u64)>,
+    slots: HashMap<u128, usize>,
+    keys: Vec<u128>,
+    ticks: Vec<u64>,
+    vectors: Vec<i8>,
     tick: u64,
     cap: usize,
 }
 
 impl Lru {
     fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), tick: 0, cap }
+        Self { slots: HashMap::new(), keys: Vec::new(), ticks: Vec::new(), vectors: Vec::new(), tick: 0, cap }
     }
-    fn get(&mut self, key: &str) -> Option<Vec<i32>> {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+    fn get(&mut self, key: u128) -> Option<Vec<i32>> {
         if self.cap == 0 {
             return None;
         }
         self.tick += 1;
-        let tick = self.tick;
-        if let Some(entry) = self.map.get_mut(key) {
-            entry.1 = tick;
-            Some(entry.0.clone())
-        } else {
-            None
-        }
+        let slot = *self.slots.get(&key)?;
+        self.ticks[slot] = self.tick;
+        Some(self.vectors[slot * DIMS..(slot + 1) * DIMS].iter().map(|&x| x as i32).collect())
     }
-    fn put(&mut self, key: String, val: Vec<i32>) {
+    fn put(&mut self, key: u128, val: &[i32]) {
         if self.cap == 0 {
             return;
         }
         self.tick += 1;
-        self.map.insert(key, (val, self.tick));
-        while self.map.len() > self.cap {
-            if let Some(oldest) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
-                self.map.remove(&oldest);
-            } else {
-                break;
+        let slot = match self.slots.get(&key) {
+            Some(&slot) => slot,
+            None if self.keys.len() < self.cap => {
+                // Reserved whole, once: growing by doubling could leave up to twice the arena
+                // allocated. Pages are only resident once a slot is written.
+                self.vectors.reserve_exact(self.cap * DIMS - self.vectors.len());
+                self.keys.push(key);
+                self.ticks.push(0);
+                self.vectors.resize(self.keys.len() * DIMS, 0);
+                self.keys.len() - 1
             }
+            None => {
+                // Full: reuse the least-recently-used slot.
+                let (slot, _) = self.ticks.iter().enumerate().min_by_key(|(_, t)| **t).unwrap();
+                self.slots.remove(&self.keys[slot]);
+                self.keys[slot] = key;
+                slot
+            }
+        };
+        self.slots.insert(key, slot);
+        self.ticks[slot] = self.tick;
+        // Quantized vectors are clamped to -127..=127, so each value fits an i8.
+        for (dst, &v) in self.vectors[slot * DIMS..(slot + 1) * DIMS].iter_mut().zip(val) {
+            *dst = v as i8;
         }
     }
 }
 
 // --- the canonical embedding path ------------------------------------------
 
-/// blake2b-128 hex of `"{MODEL_LABEL}\x00{text}"`, matching server.py's
-/// `hashlib.blake2b(..., digest_size=16).hexdigest()`. `text` is already truncated.
-fn cache_key(text: &str) -> String {
+/// blake2b-128 of `"{MODEL_LABEL}\x00{text}"`, the digest server.py keyed its cache with. `text` is
+/// already truncated.
+fn cache_key(text: &str) -> u128 {
     let mut h = Blake2b::<U16>::new();
     h.update(MODEL_LABEL.as_bytes());
     h.update(b"\x00");
     h.update(text.as_bytes());
-    hex::encode(h.finalize())
+    u128::from_be_bytes(h.finalize().into())
 }
 
 fn is_blank(text: &str) -> bool {
@@ -489,7 +513,7 @@ fn embed_one(
     }
     let truncated: String = text.chars().take(state.cfg.max_chars).collect();
     let key = cache_key(&truncated);
-    if let Some(hit) = lock(&state.cache).get(&key) {
+    if let Some(hit) = lock(&state.cache).get(key) {
         phases.cache_hits += 1;
         return Ok(hit);
     }
@@ -497,7 +521,7 @@ fn embed_one(
         Some(tokens) => infer_tokens(state, tokens, phases)?,
         None => infer(state, &truncated, phases)?,
     };
-    lock(&state.cache).put(key, vector.clone());
+    lock(&state.cache).put(key, &vector);
     Ok(vector)
 }
 
@@ -530,7 +554,7 @@ fn cached_batch(state: &AppState, texts: &[String], phases: &mut Phases) -> Opti
                 return Some(zero_vector());
             }
             let truncated: String = text.chars().take(state.cfg.max_chars).collect();
-            let vector = cache.get(&cache_key(&truncated))?;
+            let vector = cache.get(cache_key(&truncated))?;
             hits += 1;
             Some(vector)
         })
@@ -861,7 +885,7 @@ fn render_metrics(state: &AppState) -> String {
     };
     let (entries, capacity) = {
         let cache = lock(&state.cache);
-        (cache.map.len(), cache.cap)
+        (cache.len(), cache.cap)
     };
     // The same arithmetic the unloader does, so this is the number it compares against its limit.
     let now_ms = state.started.elapsed().as_millis() as u64;
@@ -1523,12 +1547,12 @@ mod tests {
         assert_eq!(raised, 1024, "an operator could raise the token cap back into the OOM");
 
         // The ceilings have to hold TOGETHER, not one at a time. Measured: 1219 MB peak at 1024
-        // tokens, ~4.2 KB per cache entry, against a 1536 MB cgroup — so both at maximum has to
+        // tokens, ~1.1 KB per cache entry, against a 1536 MB cgroup — so both at maximum has to
         // still leave room. Setting each ceiling against the OTHER's default is how 1494 MB got
         // signed off as safe.
         let peak_at_max_tokens_mb = 1219.0;
         let cache_ceiling = env_clamped("CACHE_MAX_ENTRIES", 8192, 0, 32_768);
-        let cache_mb = cache_ceiling as f64 * 4.2 / 1024.0;
+        let cache_mb = cache_ceiling as f64 * 1.1 / 1024.0;
         assert!(
             peak_at_max_tokens_mb + cache_mb < 1400.0,
             "both ceilings at once is {:.0} MB against a 1536 MB cgroup",
@@ -1645,7 +1669,7 @@ mod tests {
         st.cfg.max_request_tokens = 1;
         *lock(&st.cache) = Lru::new(1);
         let cached = vec![7; DIMS];
-        lock(&st.cache).put(cache_key("hola"), cached.clone());
+        lock(&st.cache).put(cache_key("hola"), &cached);
         for (texts, expected) in [
             (serde_json::json!([]), vec![]),
             (serde_json::json!(["", " \t\n"]), vec![zero_vector(), zero_vector()]),
@@ -1670,7 +1694,7 @@ mod tests {
         let st = Arc::get_mut(&mut state).unwrap();
         st.cfg.onnx_path = "/missing-den-embed-test-model.onnx".into();
         st.cfg.tokenizer_path = "/missing-den-embed-test-tokenizer.json".into();
-        lock(&st.cache).put(cache_key("cached"), zero_vector());
+        lock(&st.cache).put(cache_key("cached"), &zero_vector());
         let resp = send(
             state.clone(),
             Method::POST,
@@ -1931,7 +1955,26 @@ mod tests {
         let a = cache_key("hola");
         assert_eq!(a, cache_key("hola"));
         assert_ne!(a, cache_key("adios"));
-        // blake2b-128 -> 32 hex chars.
-        assert_eq!(a.len(), 32);
+    }
+
+    #[test]
+    fn lru_evicts_the_least_recently_used_and_round_trips_int8() {
+        let wide: Vec<i32> = (0..DIMS as i32).map(|i| i % 255 - 127).collect();
+        let mut lru = Lru::new(2);
+        let (a, b, c) = (cache_key("a"), cache_key("b"), cache_key("c"));
+        lru.put(a, &wide);
+        lru.put(b, &vec![1; DIMS]);
+        assert_eq!(lru.get(a), Some(wide), "-127..=127 must survive the i8 arena");
+        lru.put(c, &vec![2; DIMS]); // b is least recent now
+        assert_eq!(lru.get(b), None);
+        assert_eq!(lru.get(c), Some(vec![2; DIMS]));
+        lru.put(a, &vec![3; DIMS]); // overwrite in place, no eviction
+        assert_eq!(lru.len(), 2);
+        assert_eq!(lru.get(a), Some(vec![3; DIMS]));
+        assert_eq!(lru.get(c), Some(vec![2; DIMS]));
+
+        let mut off = Lru::new(0);
+        off.put(a, &vec![1; DIMS]);
+        assert_eq!((off.get(a), off.len()), (None, 0));
     }
 }
