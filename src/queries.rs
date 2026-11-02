@@ -103,6 +103,33 @@ pub struct Indexes {
 }
 
 type Key = (den_index::MediaType, u32);
+
+/// The store's fan picks read straight off their sections. `Store::fan_picks` validates every row on each
+/// call — most of a You Might Also Like's time — and `MappedStore::check` already ran it at load.
+struct FanPicks<'a> {
+    picks: den_store::List<'a, u32>,
+    asked: &'a [u8],
+}
+
+impl<'a> FanPicks<'a> {
+    fn of(view: &den_store::Store<'a>) -> Option<Self> {
+        Some(FanPicks {
+            picks: view.list::<u32>("fan_picks_v", "fan_picks_o").ok()?,
+            asked: view.per_row::<u8>("fan_picks_a").ok()?,
+        })
+    }
+
+    /// As `den_store::FanPicks::asked`.
+    fn asked(&self, row: den_store::Row) -> bool {
+        self.asked.get(row.0) == Some(&1)
+    }
+
+    /// As `den_store::FanPicks::get`: the row's picks in rank order, none for a row out of range.
+    fn get(&self, row: den_store::Row) -> impl Iterator<Item = den_store::Row> + 'a {
+        self.picks.get(row).iter().map(|&pick| den_store::Row(pick as usize))
+    }
+}
+
 /// A More Like This row in the memo: the title, and whether the row mixes films and series.
 type SimilarKey = (Key, bool, crate::maturity::Policy, u64);
 
@@ -346,8 +373,8 @@ impl Indexes {
             return None;
         }
         let view = self.store.view();
-        // `MappedStore::check` read the sections at load, so an error here is only their absence.
-        let fan = view.fan_picks().ok()?;
+        // `MappedStore::check` validated the sections at load, so an error here is only their absence.
+        let fan = FanPicks::of(&view)?;
         let row = den_store::Row(row_of(&self.store, media_type, tmdb_id)?);
         if !fan.asked(row) {
             return None;
@@ -403,7 +430,7 @@ impl Indexes {
     /// 0.73 (#121). Requiring two paths raised it again (0.868 to 0.872) and MovieLens hit@20 (1.470 to
     /// 1.494). On the ten seeds already judged at positions 101–120, the deep band rose from 0.662 to
     /// 0.748; median length is 77 and 1.7% of rows have fewer than 40 titles (#127).
-    fn fan_tail(&self, fan: &den_store::FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
+    fn fan_tail(&self, fan: &FanPicks, seed: den_store::Row) -> HashMap<usize, f64> {
         // Nearer the top of a list counts more: 1 for its first title, 0.63 for its second, 0.5 for its third.
         let weight = |rank: usize| 1.0 / ((rank + 2) as f64).log2();
         let links = self.fan_links(fan);
@@ -435,7 +462,7 @@ impl Indexes {
     }
 
     /// Per store row, the titles whose fan picks name it (`Indexes::fan_links`), worked out on first use.
-    fn fan_links(&self, fan: &den_store::FanPicks) -> &[Vec<(u32, u32)>] {
+    fn fan_links(&self, fan: &FanPicks) -> &[Vec<(u32, u32)>] {
         self.fan_links.get_or_init(|| {
             let mut links = vec![Vec::new(); self.population];
             for from in 0..self.population {
