@@ -221,6 +221,13 @@ impl Indexes {
         }
     }
 
+    /// The `similar` memo key of the unrestricted More Like This row. Every reader and writer of that row
+    /// builds its key here, so a lookup can never miss what an insert stored.
+    fn unrestricted_similar_key(&self, seed: Key, mix: bool) -> SimilarKey {
+        let policy = crate::maturity::Policy::default();
+        (seed, mix, policy, self.maturity_generation(policy))
+    }
+
     /// `eligible` for every store row at once, as a bitset (bit `r` of word `r / 64`), worked out once per
     /// policy and maturity generation. A restricted More Like This scans ~92k vectors; asking `eligible` of
     /// each — two binary searches and the box-local ratings — cost more than ranking the pool.
@@ -504,7 +511,7 @@ impl Indexes {
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
         let row = memoised(
             &self.similar,
-            ((media_type, tmdb_id), false, crate::maturity::Policy::default(), 0),
+            self.unrestricted_similar_key((media_type, tmdb_id), false),
             SIMILAR_MEMO,
             || {
                 let one_type =
@@ -522,7 +529,7 @@ impl Indexes {
     pub fn more_like_this_mixed(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
         memoised(
             &self.similar,
-            ((media_type, tmdb_id), true, crate::maturity::Policy::default(), 0),
+            self.unrestricted_similar_key((media_type, tmdb_id), true),
             SIMILAR_MEMO,
             || {
                 let production = den_index::SimilarParams::default();
@@ -617,8 +624,8 @@ impl Indexes {
         let seed = (media_type, tmdb_id);
         let held = {
             let memo = lock(&self.similar);
-            let policy = crate::maturity::Policy::default();
-            memo.contains_key(&(seed, false, policy, 0)) || memo.contains_key(&(seed, true, policy, 0))
+            memo.contains_key(&self.unrestricted_similar_key(seed, false))
+                || memo.contains_key(&self.unrestricted_similar_key(seed, true))
         };
         if held {
             let one = self.more_like_this(tmdb_id, media_type);
@@ -649,9 +656,8 @@ impl Indexes {
         if memo.len() + 2 > SIMILAR_MEMO {
             memo.clear();
         }
-        let policy = crate::maturity::Policy::default();
-        memo.insert((seed, false, policy, self.maturity_generation(policy)), Arc::clone(&one));
-        memo.insert((seed, true, policy, self.maturity_generation(policy)), Arc::clone(&mixed));
+        memo.insert(self.unrestricted_similar_key(seed, false), Arc::clone(&one));
+        memo.insert(self.unrestricted_similar_key(seed, true), Arc::clone(&mixed));
         (one.iter().map(|&(_, id)| id).collect(), mixed)
     }
 
@@ -2415,6 +2421,34 @@ mod tests {
             }
             eprintln!("{seeds} seeds: both rows over one scan are the rows ranked apart");
         }
+    }
+
+    /// With a live maturity generation (any box that runs a provider), the unrestricted rows are stored under
+    /// that generation, so every reader must look them up under it. Planting a sentinel where the rows were
+    /// stored proves the next ask is served from the memo rather than ranked again.
+    #[tokio::test]
+    async fn unrestricted_more_like_this_is_served_from_the_memo_under_a_live_generation() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-queries-mlt-memo-{}", std::process::id()));
+        let queries = IndexQueries::new(&write_fixture(&dir))
+            .with_maturity(crate::maturity_providers::Providers::applying_for_test());
+        let (indexes, _) = queries.get(|| ()).await.expect("indexes");
+        let default = crate::maturity::Policy::default();
+        assert_ne!(indexes.maturity_generation(default), 0, "the generation must be live for this test");
+
+        let (one, mixed) = indexes.more_like_this_rows(1, Movie);
+        assert!(!one.is_empty() && !mixed.is_empty(), "the fixture seed must have rows to memoise");
+
+        let sentinel: Arc<[Key]> = Arc::from([(Movie, 999_999)]);
+        for mix in [false, true] {
+            let key = indexes.unrestricted_similar_key((Movie, 1), mix);
+            let mut memo = lock(&indexes.similar);
+            assert!(memo.contains_key(&key), "the rows are stored under the live generation");
+            memo.insert(key, Arc::clone(&sentinel));
+        }
+        assert_eq!(&*indexes.more_like_this_rows(1, Movie).0, &[999_999]);
+        assert_eq!(&*indexes.more_like_this(1, Movie), &[999_999]);
+        assert_eq!(&*indexes.more_like_this_mixed(1, Movie), &*sentinel);
     }
 
     /// An index reads its vectors in place, in the bytes it was handed, and answers what an index over a copy
