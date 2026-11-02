@@ -157,6 +157,29 @@ fn bench_real_dataset() {
     let indexes = kept.expect("loaded");
     eprintln!("bench: load median {} CPU · heap kept {:.1} MB", ms(median(loads)), heap as f64 / 1e6);
 
+    // Who holds that heap: each part built again on its own, its live bytes measured while it is held.
+    {
+        let view = indexes.store.view();
+        let mapped =
+            || std::sync::Arc::clone(&indexes.store.store) as std::sync::Arc<dyn den_index::StoreBytes>;
+        let held = |name: &str, build: &dyn Fn() -> Box<dyn std::any::Any>| {
+            let before = LIVE.load(Ordering::Relaxed);
+            let part = build();
+            eprintln!("bench: heap {name} {:.1} MB", (LIVE.load(Ordering::Relaxed) - before) as f64 / 1e6);
+            drop(part);
+        };
+        held("facts", &|| Box::new(crate::facts::Facts::from_store(&view)));
+        held("plot index", &|| Box::new(den_index::Index::from_store_plot(&view, mapped())));
+        held("premise index", &|| Box::new(den_index::Index::from_store_premise(&view, mapped())));
+        held("cards", &|| Box::new(crate::plotrows::cards_from_store(&view)));
+        held("plot facets", &|| Box::new(crate::plotrows::PlotFacets::from_store(&view)));
+        held("filter index", &|| Box::new(crate::filter::FilterIndex::build(&indexes)));
+        eprintln!(
+            "bench: heap display index ~{:.1} MB (approx_bytes)",
+            indexes.display.as_ref().map_or(0, |d| d.approx_bytes()) as f64 / 1e6
+        );
+    }
+
     let seeds = seeds(&indexes);
     eprintln!("bench: {} seeds", seeds.len());
 

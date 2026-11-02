@@ -942,8 +942,7 @@ fn row_of(
     media_type: den_index::MediaType,
     tmdb_id: u32,
 ) -> Option<usize> {
-    let media = u8::from(media_type == den_index::MediaType::Tv);
-    loaded.view().row_of(media, tmdb_id).ok().flatten().map(|row| row.0)
+    loaded.store.row_of(media_type, tmdb_id)
 }
 
 /// A title's vote count: TMDB's kept `vote_count` first, the store's `votes` column after it. Shared by
@@ -964,7 +963,7 @@ fn votes_of(
     if let Some(votes) = ratings.and_then(|index| index.votes(row)) {
         return votes;
     }
-    loaded.view().per_row::<u32>("votes").ok().and_then(|votes| votes.get(row).copied()).unwrap_or(0)
+    loaded.store.votes(row).unwrap_or(0)
 }
 
 /// The facet index from the store's own columns, so attribute search covers the whole corpus.
