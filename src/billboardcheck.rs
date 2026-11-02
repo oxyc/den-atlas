@@ -135,7 +135,7 @@ fn plots_near(indexes: &Indexes, a: &serde_json::Value, b: &serde_json::Value) -
 
 fn name(indexes: &Indexes, slide: &serde_json::Value) -> String {
     let card = key(slide).and_then(|key| indexes.cards.as_ref()?.get(&key));
-    card.map_or_else(|| slide["id"].to_string(), |c| c.title.clone())
+    card.map_or_else(|| slide["id"].to_string(), |c| c.title.to_owned())
 }
 
 /// Exit code, as the other subcommands return one.

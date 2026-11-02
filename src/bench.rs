@@ -171,7 +171,7 @@ fn bench_real_dataset() {
         held("facts", &|| Box::new(crate::facts::Facts::from_store(&view)));
         held("plot index", &|| Box::new(den_index::Index::from_store_plot(&view, mapped())));
         held("premise index", &|| Box::new(den_index::Index::from_store_premise(&view, mapped())));
-        held("cards", &|| Box::new(crate::plotrows::cards_from_store(&view)));
+        held("cards", &|| Box::new(crate::plotrows::cards_from_store(&indexes.store.store)));
         held("plot facets", &|| Box::new(crate::plotrows::PlotFacets::from_store(&view)));
         held("filter index", &|| Box::new(crate::filter::FilterIndex::build(&indexes)));
         eprintln!(

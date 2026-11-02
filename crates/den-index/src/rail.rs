@@ -17,7 +17,8 @@
 //! into a mapped column, and the only owned state is the aggregates below, which cannot be columns
 //! because they are corpus-wide statistics.
 
-use crate::{Axis, Key, MediaType, SimilarParams, ValueId, Weighted};
+use crate::similar::{critique_coverage, noul_cosine};
+use crate::{Axis, Key, MediaType, Profile, SimilarParams, ValueId, Weighted};
 use den_store::{Row, Store, StoreError};
 use std::collections::{HashMap, HashSet};
 
@@ -176,6 +177,9 @@ pub struct SeedFacets<'a> {
     facet_c: &'a [u8],
     critique_names: &'a [u32],
     critique: &'a [u8],
+    /// The seed type's corpus mean on each critique axis, in `critique_names` order: `critique`'s centering,
+    /// looked up once per seed rather than per candidate axis.
+    critique_mean: Vec<f64>,
     world: &'a [u8],
     noul_names: &'a [u32],
     noul_k: den_store::List<'a, u8>,
@@ -219,18 +223,24 @@ impl<'a> SeedFacets<'a> {
     /// column here and forget to require it there.
     pub fn new(store: &Store<'a>, agg: &'a RailAggregates, media: MediaType) -> Result<Self, StoreError> {
         let production = SimilarParams::default();
+        let media = media_code(media);
+        let critique_names = store.column::<u32>("critique_names")?;
         Ok(SeedFacets {
             noul_floor: production.noul_floor,
             world_floor: production.world_floor,
             defining: production.defining,
             critique_floor: production.critique_floor,
             agg,
-            media: media_code(media),
+            media,
             keys: store.per_row::<u64>("keys")?,
             facet_v: store.column::<u32>("facet_v")?,
             facet_c: store.column::<u8>("facet_c")?,
-            critique_names: store.column::<u32>("critique_names")?,
+            critique_names,
             critique: store.column::<u8>("critique")?,
+            critique_mean: critique_names
+                .iter()
+                .map(|&name| agg.critique_mean.get(&(media, name)).copied().unwrap_or(0.0))
+                .collect(),
             world: store.per_row::<u8>("world")?,
             noul_names: store.column::<u32>("noul_names")?,
             noul_k: store.list::<u8>("noul_k_v", "noul_k_o")?,
@@ -286,15 +296,25 @@ impl<'a> SeedFacets<'a> {
     /// scorer is built on, and a blank row that returned seventeen zeros scored a real negative cosine
     /// against the centered mean instead of contributing nothing.
     fn critique_at(&self, row: Row) -> Vec<Weighted> {
+        self.critique_axes(row).map(|(_, name, p)| (name, p)).collect()
+    }
+
+    /// `critique_at`'s entries, each with its axis index.
+    fn critique_axes(&self, row: Row) -> impl Iterator<Item = (usize, ValueId, f64)> + '_ {
         let axes = self.critique_names.len();
-        self.critique_names
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &name)| {
-                let p = f64::from(*self.critique.get(row.0 * axes + i)?) / 100.0;
-                (p >= self.critique_floor).then_some((name, p))
-            })
-            .collect()
+        self.critique_names.iter().enumerate().filter_map(move |(i, &name)| {
+            let p = f64::from(*self.critique.get(row.0 * axes + i)?) / 100.0;
+            (p >= self.critique_floor).then_some((i, name, p))
+        })
+    }
+
+    /// A row's nouls at or above the floor, as (name id, probability).
+    fn nouls_at(&self, row: Row) -> impl Iterator<Item = Weighted> + '_ {
+        let (ks, vs) = (self.noul_k.get(row), self.noul_v.get(row));
+        ks.iter().zip(vs).filter_map(|(&k, &v)| {
+            let p = f64::from(v) / 100.0;
+            (p >= self.noul_floor).then(|| self.noul_names.get(k as usize).map(|&name| (name, p)))?
+        })
     }
 
     fn structural_at(&self, row: Row) -> Option<Vec<f64>> {
@@ -353,14 +373,23 @@ impl crate::Facets for SeedFacets<'_> {
 
     fn nouls(&self, key: Key) -> Vec<Weighted> {
         let Some(row) = self.row(key) else { return Vec::new() };
-        let (ks, vs) = (self.noul_k.get(row), self.noul_v.get(row));
-        ks.iter()
-            .zip(vs)
-            .filter_map(|(&k, &v)| {
-                let p = f64::from(v) / 100.0;
-                (p >= self.noul_floor).then(|| self.noul_names.get(k as usize).map(|&name| (name, p)))?
-            })
-            .collect()
+        self.nouls_at(row).collect()
+    }
+
+    fn profile_terms(&self, seed: &Profile, key: Key, scratch: &mut Vec<Weighted>) -> (f64, f64, f64) {
+        let Some(row) = self.row(key) else { return (0.0, 0.0, 0.0) };
+        scratch.clear();
+        scratch.extend(self.nouls_at(row));
+        let noul = noul_cosine(&seed.nouls, scratch).unwrap_or(0.0);
+        // `critique_raw`, then centered in place into `critique`: the same entries, in the same order.
+        scratch.clear();
+        scratch.extend(self.critique_axes(row).map(|(_, name, p)| (name, p)));
+        let coverage = critique_coverage(&seed.defining, scratch).unwrap_or(0.0);
+        for ((axis, _, p), entry) in self.critique_axes(row).zip(scratch.iter_mut()) {
+            entry.1 = p - self.critique_mean[axis];
+        }
+        let critique = noul_cosine(&seed.critique, scratch).unwrap_or(0.0);
+        (noul, critique, coverage)
     }
 
     fn structural(&self, key: Key) -> Option<Vec<f64>> {

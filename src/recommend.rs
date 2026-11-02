@@ -1470,7 +1470,7 @@ pub fn describe(indexes: &Indexes, slide: &serde_json::Value, log_identity: bool
         .zip(slide["id"].as_u64().and_then(|id| id.try_into().ok()));
     let name = if log_identity {
         key.and_then(|key| indexes.cards.as_ref()?.get(&key))
-            .map(|card| card.title.clone())
+            .map(|card| card.title.to_owned())
             .or_else(|| slide["imdbId"].as_str().map(str::to_owned))
             .unwrap_or_else(|| slide["id"].to_string())
     } else {

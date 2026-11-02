@@ -1016,7 +1016,7 @@ const W_CRITIQUE: f64 = 1.40;
 const W_COVERAGE: f64 = 1.40;
 
 /// Idf-weighted coverage of the seed's defining arguments by a candidate.
-fn critique_coverage(defining: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
+pub(crate) fn critique_coverage(defining: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
     if defining.is_empty() || theirs.is_empty() {
         return None;
     }
@@ -1032,7 +1032,7 @@ fn critique_coverage(defining: &[Weighted], theirs: &[Weighted]) -> Option<f64> 
 }
 
 /// Cosine between two titles' noul vectors, over the union of the dimensions either one carries.
-fn noul_cosine(seed: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
+pub(crate) fn noul_cosine(seed: &[Weighted], theirs: &[Weighted]) -> Option<f64> {
     if seed.is_empty() || theirs.is_empty() {
         return None;
     }
@@ -1054,6 +1054,17 @@ pub type Axis = u8;
 pub type ValueId = u32;
 /// A named probability — a noul, a critique axis — as (name id, value).
 pub type Weighted = (ValueId, f64);
+
+/// The seed's side of the noul and critique terms (`Facets::profile_terms`), read once per seed.
+#[derive(Default)]
+pub struct Profile {
+    /// `Facets::nouls`.
+    pub nouls: Vec<Weighted>,
+    /// `Facets::critique`, centered.
+    pub critique: Vec<Weighted>,
+    /// `Facets::critique_defining`.
+    pub defining: Vec<Weighted>,
+}
 
 /// One title's facet choices: axis -> (value, confidence). Supplied by the caller for the same reason as
 /// `Authorship` — `den-index` does not know where a facet comes from.
@@ -1086,6 +1097,18 @@ pub trait Facets {
     fn nouls(&self, key: Key) -> Vec<Weighted> {
         let _ = key;
         Vec::new()
+    }
+    /// A candidate's noul cosine, critique cosine and critique coverage against the seed's `Profile`, each 0
+    /// where it brings no evidence: `noul_cosine` over `nouls` and over `critique`, `critique_coverage` over
+    /// `critique_raw`. Called once per candidate, so an implementor may read the row once into `scratch`
+    /// rather than build three lists; it must answer exactly what this does.
+    fn profile_terms(&self, seed: &Profile, key: Key, scratch: &mut Vec<Weighted>) -> (f64, f64, f64) {
+        let _ = scratch;
+        (
+            noul_cosine(&seed.nouls, &self.nouls(key)).unwrap_or(0.0),
+            noul_cosine(&seed.critique, &self.critique(key)).unwrap_or(0.0),
+            critique_coverage(&seed.defining, &self.critique_raw(key)).unwrap_or(0.0),
+        )
     }
     /// The answered 18-axis structural-affinity profile. `None` means the pass did not cover this title,
     /// not an all-zero answer.
@@ -1801,9 +1824,11 @@ fn rank_pool_inner<'l>(
     let seed_facets: Vec<(Axis, ValueId, f64)> = facets.map(|f| f.facets(seed_key)).unwrap_or_default();
     let seed_world = facets.map_or(0.0, |f| f.world(seed_key));
     let seed_year = facets.and_then(|f| f.year(seed_key));
-    let seed_nouls: Vec<Weighted> = facets.map(|f| f.nouls(seed_key)).unwrap_or_default();
-    let seed_critique: Vec<Weighted> = facets.map(|f| f.critique(seed_key)).unwrap_or_default();
-    let seed_defining: Vec<Weighted> = facets.map(|f| f.critique_defining(seed_key)).unwrap_or_default();
+    let seed_profile = facets.map_or_else(Profile::default, |f| Profile {
+        nouls: f.nouls(seed_key),
+        critique: f.critique(seed_key),
+        defining: f.critique_defining(seed_key),
+    });
     let seed_structural = facets.and_then(|f| f.structural(seed_key));
     let characters: &[(Key, f64)] = authorship.map(Authorship::characters).unwrap_or_default();
     let character = |key: Key| characters.iter().find(|&&(c, _)| c == key).map_or(0.0, |&(_, s)| s);
@@ -1918,8 +1943,9 @@ fn rank_pool_inner<'l>(
     let premise_floor = floor(anchors.iter().filter_map(|c| c.premise).collect());
     let plot_floor = floor(anchors.iter().filter_map(|c| c.plot).collect());
 
-    // (key, base, dominant subgenre, premise cosine, plot cosine) of a candidate past the gates.
-    type Gated = (Key, f64, String, Option<f64>, Option<f64>);
+    // (key, base, dominant subgenre, premise cosine, plot cosine, tone, maker) of a candidate past the gates.
+    // The tone and maker the gates read are carried rather than read again, labels and all.
+    type Gated = (Key, f64, String, Option<f64>, Option<f64>, f64, f64);
     let mut scored: Vec<Gated> = Vec::new();
     for c in &raw {
         let (id, pc, l) = (c.key, c.premise, c.plot);
@@ -1971,7 +1997,7 @@ fn rank_pool_inner<'l>(
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(n, _)| (*n).to_string())
             .unwrap_or_default();
-        scored.push((id, base, dominant, pc, l));
+        scored.push((id, base, dominant, pc, l, t, maker));
     }
     if scored.is_empty() {
         return (Vec::new(), inspection);
@@ -1998,12 +2024,10 @@ fn rank_pool_inner<'l>(
             _ => 0.0,
         }
     };
+    let mut scratch: Vec<Weighted> = Vec::new();
     let mut final_scored: Vec<Scored> = scored
         .into_iter()
-        .map(|(id, base, dominant, pc, l)| {
-            let theirs = labels(id);
-            let t = theirs.as_ref().map_or(0.0, |th| tone(&seed, th, p.min_confidence));
-            let maker = authorship.map_or(0.0, |a| a.makers(id));
+        .map(|(id, base, dominant, pc, l, t, maker)| {
             let home = authorship.map_or(0.0, |a| a.home(id));
             // A candidate with no facets scores the term at 0 rather than being penalised or exempted: it
             // simply brings no facet evidence, which is different from bringing disagreeing evidence.
@@ -2021,12 +2045,10 @@ fn rank_pool_inner<'l>(
             let sr = series(id);
             let jv = jev(id);
             let region = origin(id);
-            let nc = facets.and_then(|f| noul_cosine(&seed_nouls, &f.nouls(id))).unwrap_or(0.0);
-            // Already centered, so this can be negative — arguing about different things is evidence
-            // against a pair, not merely absence of evidence for it.
-            let cr = facets.and_then(|f| noul_cosine(&seed_critique, &f.critique(id))).unwrap_or(0.0);
-            let cov =
-                facets.and_then(|f| critique_coverage(&seed_defining, &f.critique_raw(id))).unwrap_or(0.0);
+            // The critique cosine is over centered profiles, so it can be negative — arguing about different
+            // things is evidence against a pair, not merely absence of evidence for it.
+            let (nc, cr, cov) =
+                facets.map_or((0.0, 0.0, 0.0), |f| f.profile_terms(&seed_profile, id, &mut scratch));
             let structural = facets
                 .and_then(|f| f.structural(id))
                 .and_then(|theirs| {

@@ -220,7 +220,7 @@ pub fn document(indexes: &Indexes) -> Value {
         field(
             "string",
             true,
-            indexes.cards.as_ref().map_or(0, std::collections::HashMap::len),
+            indexes.cards.as_ref().map_or(0, crate::plotrows::Cards::len),
             population,
             vec![],
         ),
