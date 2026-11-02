@@ -147,6 +147,13 @@ impl Indexes {
         )
     }
 
+    /// Forget every More Like This and You Might Also Like answer, so a benchmark round ranks each seed.
+    #[cfg(test)]
+    pub(crate) fn clear_memos(&self) {
+        lock(&self.similar).clear();
+        lock(&self.affinity).clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn minimum_age_accesses(&self) -> (usize, usize) {
         (self.store.store.minimum_age_view_builds(), self.store.store.minimum_age_lookups())
