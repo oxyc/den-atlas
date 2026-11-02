@@ -251,6 +251,46 @@ impl Providers {
         })
     }
 
+    /// Providers with one backend that applies to every viewer, so `generation` is live (1) rather than the
+    /// 0 a disabled holder reports.
+    #[cfg(test)]
+    pub(crate) fn applying_for_test() -> Arc<Self> {
+        struct Applies;
+        #[async_trait]
+        impl Backend for Applies {
+            fn authority(&self) -> &'static str {
+                "TEST"
+            }
+            fn media_types(&self) -> &'static [MediaType] {
+                &[MediaType::Movie, MediaType::Tv]
+            }
+            fn applies_to(&self, _viewer_region: Option<Region>) -> bool {
+                true
+            }
+            async fn lookup(&self, _: &Identity, _: &mut Budget) -> Result<Lookup, String> {
+                unreachable!()
+            }
+        }
+        let cache = CacheFile::default();
+        let configured = vec![Configured::new(Arc::new(Applies), 1, Duration::ZERO)];
+        let view = build_view(&cache, &configured, &[]);
+        Arc::new(Self {
+            catalog: Arc::from([]),
+            configured,
+            init_failures: Vec::new(),
+            state: Mutex::new(cache),
+            view: ArcSwap::from_pointee(view),
+            file: None,
+            generation: AtomicU64::new(1),
+            dirty: AtomicBool::new(false),
+            cache_writes: AtomicU64::new(0),
+            cache_write_bytes: AtomicU64::new(0),
+            cache_write_errors: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(0),
+            last_cache_write_ms: AtomicU64::new(0),
+        })
+    }
+
     pub fn new(
         store: &MappedStore,
         cache_dir: Option<&Path>,
