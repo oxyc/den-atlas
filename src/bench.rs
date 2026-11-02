@@ -183,6 +183,18 @@ fn bench_real_dataset() {
     let seeds = seeds(&indexes);
     eprintln!("bench: {} seeds", seeds.len());
 
+    // Every seed's detail page as atlas draws it — card, facts, people — for the parity dump: it reads every
+    // facts field, where the rankings below read a few.
+    for &key in &seeds {
+        let title = indexes
+            .cards
+            .as_ref()
+            .and_then(|cards| cards.get(&key))
+            .map(|card| crate::plotrows::title_json(&indexes, key, card));
+        let facts = crate::plotrows::facts_json(&indexes, key);
+        let _ = writeln!(out, "title {key:?} {title:?} {facts:?}");
+    }
+
     // A restricted policy's admission bitset is worked out on its first request and kept; its one-off cost.
     for (name, policy) in [("kid", kid()), ("age15", age_only())] {
         let started = Clock::start();

@@ -85,8 +85,25 @@ struct Record {
     media_type: Option<MediaType>,
     primary_genre: u32,
     animated: bool,
-    subgenres: Box<[(u32, f64)]>,
-    moods: Box<[(u32, f64)]>,
+    /// Where the record's subgenres and moods sit in the index's one `pairs` buffer: `[start, end)`. Two
+    /// boxed slices per title used to be two allocations per title, twice over (plot and premise).
+    subgenres: Span,
+    moods: Span,
+}
+
+/// A record's run of (label, confidence) pairs in `Index::pairs`.
+type Span = (u32, u32);
+
+/// Append `items` to `pairs`, answering where they landed.
+#[cfg(test)]
+fn span(pairs: &mut Vec<(u32, f64)>, items: impl IntoIterator<Item = (u32, f64)>) -> Span {
+    let start = pairs.len() as u32;
+    pairs.extend(items);
+    (start, pairs.len() as u32)
+}
+
+fn pairs_of(pairs: &[(u32, f64)], (start, end): Span) -> &[(u32, f64)] {
+    &pairs[start as usize..end as usize]
 }
 
 #[derive(Clone, Copy)]
@@ -247,6 +264,8 @@ pub struct Index {
     taxonomy_version: String,
     dim: usize,
     records: Box<[Record]>,
+    /// Every record's (label, confidence) pairs, subgenres then moods, each record's run named by its spans.
+    pairs: Box<[(u32, f64)]>,
     names: Box<[Box<str>]>,
     /// (type, tmdb id) → row. Ids collide across the movie and tv namespaces (1399 is both a movie and Game
     /// of Thrones), so a title is always looked up with its type. The first row wins a duplicate.
@@ -284,19 +303,22 @@ impl Index {
             })
         };
         let mut records = Vec::with_capacity(artifact.records.len());
+        let mut pairs: Vec<(u32, f64)> = Vec::new();
         for raw in artifact.records {
-            let subgenres = raw.subgenres.into_iter().map(|l| (intern(l.label), l.confidence)).collect();
-            let moods = raw.moods.into_iter().map(|l| (intern(l.label), l.confidence)).collect();
+            let subgenres: Vec<(u32, f64)> =
+                raw.subgenres.into_iter().map(|l| (intern(l.label), l.confidence)).collect();
+            let moods: Vec<(u32, f64)> =
+                raw.moods.into_iter().map(|l| (intern(l.label), l.confidence)).collect();
             records.push(Record {
                 tmdb_id: raw.tmdb_id,
                 media_type: MediaType::parse(&raw.media_type),
                 primary_genre: intern(raw.primary_genre),
                 animated: raw.animated,
-                subgenres,
-                moods,
+                subgenres: span(&mut pairs, subgenres),
+                moods: span(&mut pairs, moods),
             });
         }
-        Ok(assemble(artifact.taxonomy_version, dim, records, names, Vectors::Owned(vectors)))
+        Ok(assemble(artifact.taxonomy_version, dim, records, pairs, names, Vectors::Owned(vectors)))
     }
 
     /// The plot index, out of the store — den-spec `wire/store-v1.md` — instead of the two blobs. Same
@@ -444,24 +466,28 @@ impl Index {
         };
         let kept = has_vector.iter().filter(|&&has| has != 0).count();
         let mut records = Vec::with_capacity(kept);
+        let mut pairs: Vec<(u32, f64)> = Vec::new();
         let mut store_rows: Vec<u32> = Vec::with_capacity(kept);
         for (i, &packed) in keys.iter().enumerate() {
             if has_vector[i] == 0 {
                 continue;
             }
             let labels = columns.labels(den_store::Row(i));
-            let mut interned = |pairs: &[(&str, f64)]| -> Box<[(u32, f64)]> {
-                pairs.iter().map(|&(name, confidence)| (intern(name.to_owned()), confidence)).collect()
-            };
-            let subgenres = interned(&labels.subgenres);
-            let moods = interned(&labels.moods);
+            let subgenres_from = pairs.len() as u32;
+            for &(name, confidence) in &labels.subgenres {
+                pairs.push((intern(name.to_owned()), confidence));
+            }
+            let moods_from = pairs.len() as u32;
+            for &(name, confidence) in &labels.moods {
+                pairs.push((intern(name.to_owned()), confidence));
+            }
             records.push(Record {
                 tmdb_id: packed as u32,
                 media_type: Some(if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie }),
                 primary_genre: intern(labels.primary_genre.to_owned()),
                 animated: labels.animated,
-                subgenres,
-                moods,
+                subgenres: (subgenres_from, moods_from),
+                moods: (moods_from, pairs.len() as u32),
             });
             store_rows.push(
                 u32::try_from(i)
@@ -469,7 +495,7 @@ impl Index {
             );
         }
         let vectors = Vectors::Stored { bytes, offset, rows: store_rows.into() };
-        Ok(assemble(String::new(), dim, records, names, vectors))
+        Ok(assemble(String::new(), dim, records, pairs, names, vectors))
     }
 
     /// Whether stored plot rows are already length-projected by the dataset producer.
@@ -555,11 +581,11 @@ impl Index {
     }
 
     pub fn subgenre_coverage_for(&self, media_type: Option<MediaType>, min_confidence: f64) -> usize {
-        self.family_coverage(|record| &record.subgenres, media_type, min_confidence)
+        self.family_coverage(|record| pairs_of(&self.pairs, record.subgenres), media_type, min_confidence)
     }
 
     pub fn mood_coverage_for(&self, media_type: Option<MediaType>, min_confidence: f64) -> usize {
-        self.family_coverage(|record| &record.moods, media_type, min_confidence)
+        self.family_coverage(|record| pairs_of(&self.pairs, record.moods), media_type, min_confidence)
     }
 
     /// Usable titles by media type. `Index::len()` includes malformed/unknown type rows so it is not an honest
@@ -645,8 +671,8 @@ impl Index {
         Some(Labels {
             primary_genre: self.name(record.primary_genre),
             animated: record.animated,
-            subgenres: named(&record.subgenres),
-            moods: named(&record.moods),
+            subgenres: named(pairs_of(&self.pairs, record.subgenres)),
+            moods: named(pairs_of(&self.pairs, record.moods)),
         })
     }
 
@@ -988,9 +1014,9 @@ impl Index {
         )
     }
 
-    fn family_coverage(
-        &self,
-        family: impl Fn(&Record) -> &[(u32, f64)],
+    fn family_coverage<'s>(
+        &'s self,
+        family: impl Fn(&Record) -> &'s [(u32, f64)],
         media_type: Option<MediaType>,
         min_confidence: f64,
     ) -> usize {
@@ -1278,6 +1304,7 @@ fn assemble(
     taxonomy_version: String,
     dim: usize,
     records: Vec<Record>,
+    pairs: Vec<(u32, f64)>,
     names: Vec<Box<str>>,
     vectors: Vectors,
 ) -> Index {
@@ -1287,12 +1314,13 @@ fn assemble(
             rows.entry((media_type, record.tmdb_id)).or_insert(row as u32);
         }
     }
-    let subgenres = buckets(&records, |r| &r.subgenres);
-    let moods = buckets(&records, |r| &r.moods);
+    let subgenres = buckets(&records, |r| pairs_of(&pairs, r.subgenres));
+    let moods = buckets(&records, |r| pairs_of(&pairs, r.moods));
     Index {
         taxonomy_version,
         dim,
         records: records.into(),
+        pairs: pairs.into(),
         names: names.into(),
         rows,
         vectors,
@@ -1327,7 +1355,7 @@ fn project_and_quantize(
 
 /// The label → titles buckets for one label family. A record joins each label once, with the confidence of
 /// its first occurrence; each bucket is stable-sorted by confidence, so ties keep record order.
-fn buckets(records: &[Record], family: impl Fn(&Record) -> &[(u32, f64)]) -> HashMap<u32, Vec<Entry>> {
+fn buckets<'p>(records: &[Record], family: impl Fn(&Record) -> &'p [(u32, f64)]) -> HashMap<u32, Vec<Entry>> {
     let mut buckets: HashMap<u32, Vec<Entry>> = HashMap::new();
     for (row, record) in records.iter().enumerate() {
         let mut seen = HashSet::new();

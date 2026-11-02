@@ -538,7 +538,7 @@ impl<'a> Knowledge<'a> {
         let mut title = Title::default();
 
         // Every genre anything named, for the hide rules.
-        let mut named: Vec<u16> = record.map(|r| r.genres.clone()).unwrap_or_default();
+        let mut named: Vec<u16> = record.map(|r| r.genres.to_vec()).unwrap_or_default();
         let from_facts = named.len();
         for &genre in hint.and_then(|h| h.genre_ids.as_deref()).unwrap_or_default() {
             for &folded in fold_genre(genre) {
@@ -582,11 +582,11 @@ impl<'a> Knowledge<'a> {
             .or_else(|| record.and_then(|r| r.languages.first().copied()));
         title.languages = match (facets.and_then(|f| f.language), record) {
             (Some(code), _) => vec![code],
-            (None, Some(r)) if !r.languages.is_empty() => r.languages.clone(),
+            (None, Some(r)) if !r.languages.is_empty() => r.languages.to_vec(),
             _ => title.original_language.into_iter().collect(),
         };
         title.countries = match (record, facets.and_then(|f| f.country)) {
-            (Some(r), _) if !r.countries.is_empty() => r.countries.clone(),
+            (Some(r), _) if !r.countries.is_empty() => r.countries.to_vec(),
             (_, Some(country)) => vec![country],
             _ => hint
                 .and_then(|h| h.countries.as_deref())
@@ -605,8 +605,8 @@ impl<'a> Knowledge<'a> {
             let each = if r.cast.is_empty() { 0.0 } else { (CAST_BILLED / r.cast.len() as f64).min(1.0) };
             title.people.extend(r.cast.iter().filter(|id| !r.makers.contains(*id)).map(|&id| (id, each)));
             // Every series: The Batman and The Hobbit match a followed franchise only through their second.
-            title.franchise = r.franchise.clone();
-            title.broadcasters = r.broadcasters.clone();
+            title.franchise = r.franchise.to_vec();
+            title.broadcasters = r.broadcasters.to_vec();
         }
         title.released = hint
             .and_then(|h| h.release_date.as_deref())
@@ -660,7 +660,7 @@ impl<'a> Knowledge<'a> {
         title.imdb_id = hint
             .and_then(|h| h.imdb_id.clone())
             .or_else(|| listed.and_then(|l| l.imdb_id.clone()))
-            .or_else(|| record.and_then(|r| r.imdb_id.clone()))
+            .or_else(|| record.and_then(|r| r.imdb_id.map(str::to_owned)))
             .filter(|id| id.starts_with("tt"));
         title.labels = labels.map(|l| LabelSet { subgenres: l.subgenres, moods: l.moods });
         title

@@ -37,7 +37,7 @@ fn on_record(indexes: &Indexes, scope: Option<MediaType>, on_record: impl Fn(&Re
         facts
             .keys()
             .filter(|(kind, _)| scope.is_none_or(|want| *kind == want))
-            .filter(|&(kind, id)| facts.get(id, kind).is_some_and(&on_record))
+            .filter(|&(kind, id)| facts.get(id, kind).is_some_and(|record| on_record(&record)))
             .count()
     })
 }

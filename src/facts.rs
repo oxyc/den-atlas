@@ -135,33 +135,155 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
-/// One title's facts, ready to rank on. Entities are Wikidata Q-ids as numbers (`Q42` → 42).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Record {
-    pub imdb_id: Option<String>,
+/// One title's facts, ready to rank on: a view of its row in the columns `Facts` keeps. Entities are Wikidata
+/// Q-ids as numbers (`Q42` → 42).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Record<'a> {
+    pub imdb_id: Option<&'a str>,
     pub released: Option<Released>,
     /// A series' last air date (P582 end time). Wikidata states it once a series has ended, so an ongoing
     /// series has none — and neither has one nobody dated: absent is unknown, not "still airing".
     pub ended: Option<Released>,
     /// TMDB genre ids through the file's `genreMap`, series' genres named as films' (see `recommend::fold_genre`).
-    pub genres: Vec<u16>,
+    pub genres: &'a [u16],
     /// Its country of origin (ISO 3166-1).
-    pub countries: Vec<[u8; 2]>,
+    pub countries: &'a [[u8; 2]],
     /// ISO 639-1, every original language Wikidata gives.
-    pub languages: Vec<[u8; 2]>,
+    pub languages: &'a [[u8; 2]],
     /// Who authored it: directors, creators and screenwriters.
-    pub makers: Vec<u32>,
+    pub makers: &'a [u32],
     /// Its cast, unordered: Wikidata rarely says who is billed first.
-    pub cast: Vec<u32>,
+    pub cast: &'a [u32],
     /// Every series of works it belongs to (P179), most specific first. Empty when it is in none.
-    pub franchise: Vec<u32>,
+    pub franchise: &'a [u32],
     /// Where a series first aired (P449): its network or service.
-    pub broadcasters: Vec<u32>,
+    pub broadcasters: &'a [u32],
     /// What it was adapted from, as kinds rather than ids — the fact "based on a book" needs.
     pub source_kinds: SourceKinds,
     /// Minutes (P2047). 91.4% of films carry one — but a SERIES' value is per EPISODE, not per series, so
     /// "under 90 minutes" means something quite different for each and a caller must not treat them alike.
     pub runtime_minutes: Option<u32>,
+}
+
+/// A variable-length column: row `i`'s values are `values[offsets[i]..offsets[i + 1]]`.
+struct Lists<T> {
+    offsets: Vec<u32>,
+    values: Vec<T>,
+}
+
+impl<T: Copy> Lists<T> {
+    fn new() -> Self {
+        Lists { offsets: vec![0], values: Vec::new() }
+    }
+
+    fn push(&mut self, row: impl IntoIterator<Item = T>) {
+        self.values.extend(row);
+        self.offsets.push(self.values.len() as u32);
+    }
+
+    fn get(&self, row: usize) -> &[T] {
+        &self.values[self.offsets[row] as usize..self.offsets[row + 1] as usize]
+    }
+
+    fn shrink(&mut self) {
+        self.offsets.shrink_to_fit();
+        self.values.shrink_to_fit();
+    }
+}
+
+/// Every title's facts as columns, one row per title, in ascending (type, TMDB id) order — the store's own
+/// row order. They used to be one `HashMap` of per-title structs, eight `Vec`s and a `String` each: most of
+/// the heap the index load kept.
+struct Columns {
+    /// (type, TMDB id) packed as the store packs them: type in the high 32 bits. Ascending.
+    keys: Vec<u64>,
+    imdb: Lists<u8>,
+    released: Vec<Option<Released>>,
+    ended: Vec<Option<Released>>,
+    genres: Lists<u16>,
+    countries: Lists<[u8; 2]>,
+    languages: Lists<[u8; 2]>,
+    makers: Lists<u32>,
+    cast: Lists<u32>,
+    franchise: Lists<u32>,
+    broadcasters: Lists<u32>,
+    source_kinds: Vec<SourceKinds>,
+    runtime_minutes: Vec<Option<u32>>,
+}
+
+fn pack((media_type, tmdb_id): (MediaType, u32)) -> u64 {
+    (u64::from(media_type == MediaType::Tv) << 32) | u64::from(tmdb_id)
+}
+
+fn unpack(packed: u64) -> (MediaType, u32) {
+    (if packed >> 32 == 1 { MediaType::Tv } else { MediaType::Movie }, packed as u32)
+}
+
+impl Columns {
+    fn with_capacity(rows: usize) -> Self {
+        Columns {
+            keys: Vec::with_capacity(rows),
+            imdb: Lists::new(),
+            released: Vec::with_capacity(rows),
+            ended: Vec::with_capacity(rows),
+            genres: Lists::new(),
+            countries: Lists::new(),
+            languages: Lists::new(),
+            makers: Lists::new(),
+            cast: Lists::new(),
+            franchise: Lists::new(),
+            broadcasters: Lists::new(),
+            source_kinds: Vec::with_capacity(rows),
+            runtime_minutes: Vec::with_capacity(rows),
+        }
+    }
+
+    /// Append a row; rows must arrive in ascending key order.
+    fn push(&mut self, key: (MediaType, u32), record: Record<'_>) {
+        debug_assert!(self.keys.last().is_none_or(|&last| last < pack(key)));
+        self.keys.push(pack(key));
+        self.imdb.push(record.imdb_id.unwrap_or_default().bytes());
+        self.released.push(record.released);
+        self.ended.push(record.ended);
+        self.genres.push(record.genres.iter().copied());
+        self.countries.push(record.countries.iter().copied());
+        self.languages.push(record.languages.iter().copied());
+        self.makers.push(record.makers.iter().copied());
+        self.cast.push(record.cast.iter().copied());
+        self.franchise.push(record.franchise.iter().copied());
+        self.broadcasters.push(record.broadcasters.iter().copied());
+        self.source_kinds.push(record.source_kinds);
+        self.runtime_minutes.push(record.runtime_minutes);
+    }
+
+    fn shrink(&mut self) {
+        for lists in [&mut self.makers, &mut self.cast, &mut self.franchise, &mut self.broadcasters] {
+            lists.shrink();
+        }
+        self.imdb.shrink();
+        self.genres.shrink();
+        self.countries.shrink();
+        self.languages.shrink();
+    }
+
+    fn row(&self, row: usize) -> Record<'_> {
+        let imdb = self.imdb.get(row);
+        Record {
+            // Written from a `&str`, so always UTF-8; empty is none.
+            imdb_id: (!imdb.is_empty()).then(|| std::str::from_utf8(imdb).unwrap_or_default()),
+            released: self.released[row],
+            ended: self.ended[row],
+            genres: self.genres.get(row),
+            countries: self.countries.get(row),
+            languages: self.languages.get(row),
+            makers: self.makers.get(row),
+            cast: self.cast.get(row),
+            franchise: self.franchise.get(row),
+            broadcasters: self.broadcasters.get(row),
+            source_kinds: self.source_kinds[row],
+            runtime_minutes: self.runtime_minutes[row],
+        }
+    }
 }
 
 /// What a title was adapted from, folded to a closed vocabulary by the dataset (`basedOnKind`).
@@ -239,11 +361,16 @@ impl Facts {
     /// *A Coffee in Berlin*. Films carry none at all, so this is a series-only fact and a caller asking for
     /// one is asking for series.
     pub fn titles_on_broadcaster(&self, qid: u32) -> Vec<(MediaType, u32)> {
-        self.records
-            .iter()
-            .filter(|(_, record)| record.broadcasters.contains(&qid))
-            .map(|(&key, _)| key)
-            .collect()
+        self.rows_where(|record| record.broadcasters.contains(&qid))
+    }
+
+    /// The keys of the rows `keep` admits, in row order.
+    fn rows_where(&self, keep: impl Fn(&Record<'_>) -> bool) -> Vec<(MediaType, u32)> {
+        (0..self.len()).filter(|&row| keep(&self.columns.row(row))).map(|row| self.key(row)).collect()
+    }
+
+    fn key(&self, row: usize) -> (MediaType, u32) {
+        unpack(self.columns.keys[row])
     }
 
     /// Every title adapted from any of the kinds in `mask`, and every title carrying `genre`.
@@ -257,19 +384,11 @@ impl Facts {
     /// than here. Measured at well under a millisecond, and it keeps this type free of a second index to
     /// hold consistent.
     pub fn titles_with_source_kind(&self, mask: u16) -> Vec<(MediaType, u32)> {
-        self.records
-            .iter()
-            .filter(|(_, record)| record.source_kinds.raw() & mask != 0)
-            .map(|(&key, _)| key)
-            .collect()
+        self.rows_where(|record| record.source_kinds.raw() & mask != 0)
     }
 
     pub fn titles_with_genre(&self, genre: u16) -> Vec<(MediaType, u32)> {
-        self.records
-            .iter()
-            .filter(|(_, record)| record.genres.contains(&genre))
-            .map(|(&key, _)| key)
-            .collect()
+        self.rows_where(|record| record.genres.contains(&genre))
     }
 }
 
@@ -286,7 +405,7 @@ pub struct Person {
 pub type Titles = HashMap<(MediaType, u32), Vec<Box<str>>>;
 
 pub struct Facts {
-    records: HashMap<(MediaType, u32), Record>,
+    columns: Columns,
     /// The credited people, sorted by Q-id.
     people: Vec<(u32, Person)>,
     /// Each name and alias, as a hash of its `name_key`, and who goes by it: sorted by hash, then most credited
@@ -309,8 +428,9 @@ pub fn name_key(name: &str) -> String {
 }
 
 impl Facts {
-    pub fn get(&self, tmdb_id: u32, media_type: MediaType) -> Option<&Record> {
-        self.records.get(&(media_type, tmdb_id))
+    pub fn get(&self, tmdb_id: u32, media_type: MediaType) -> Option<Record<'_>> {
+        let row = self.columns.keys.binary_search(&pack((media_type, tmdb_id))).ok()?;
+        Some(self.columns.row(row))
     }
 
     /// A credited person, by Q-id.
@@ -331,12 +451,12 @@ impl Facts {
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.columns.keys.len()
     }
 
-    /// Every title the facts describe, in no particular order.
+    /// Every title the facts describe, ascending by (type, TMDB id): films, then series.
     pub fn keys(&self) -> impl Iterator<Item = (MediaType, u32)> + '_ {
-        self.records.keys().copied()
+        self.columns.keys.iter().map(|&packed| unpack(packed))
     }
 
     /// Read a facts file, plain or gzipped. Parsed from memory rather than streamed: a stream parsed about three
@@ -348,9 +468,8 @@ impl Facts {
     /// 43 MB of the release and 1.04 s of a 1.6 s load, and it is read by atlas alone: nothing serves it
     /// and no client fetches it.
     ///
-    /// Still built into owned `HashMap`s rather than read from the mapping per call. That is deliberate
-    /// and temporary: it keeps this change to its input, where a zero-copy port would touch all six
-    /// consumers at once. The win here is the artifact and the parse, not the resident bytes.
+    /// Kept as columns in the store's row order, the entity indices resolved to Q-ids, the genres folded and
+    /// the codes cased once here rather than per read.
     pub fn from_store(store: &den_store::Store<'_>) -> Result<Facts, String> {
         let err = |e: den_store::StoreError| e.to_string();
         let keys = store.per_row::<u64>("keys").map_err(err)?;
@@ -407,7 +526,7 @@ impl Facts {
         let qid_of = |i: u32| -> Option<u32> { ent_qid.get(i as usize).copied() };
         let qids = |ids: &[u32]| -> Vec<u32> { ids.iter().filter_map(|&i| qid_of(i)).collect() };
 
-        let mut records: HashMap<(MediaType, u32), Record> = HashMap::with_capacity(keys.len());
+        let mut columns = Columns::with_capacity(keys.len());
         let mut titles: Titles = HashMap::new();
         let mut credited: HashMap<u32, u32> = HashMap::new();
         for (i, &packed) in keys.iter().enumerate() {
@@ -432,32 +551,33 @@ impl Facts {
                 titles.insert(key, names);
             }
 
-            records.insert(
+            // Folded HERE, not in the writer: `fold_genre` expands TMDB's series composites
+            // (10765 "Sci-Fi & Fantasy" → Sci-Fi and Fantasy) and lives in one language.
+            let mut genres_row: Vec<u16> = Vec::new();
+            for id in genres.get(row).iter().filter_map(|&g| u16::try_from(g).ok()) {
+                for &genre in crate::recommend::fold_genre(id) {
+                    if !genres_row.contains(&genre) {
+                        genres_row.push(genre);
+                    }
+                }
+            }
+            let countries_row = codes_of(countries.get(row), u8::to_ascii_uppercase);
+            let languages_row = codes_of(languages.get(row), u8::to_ascii_lowercase);
+            let broadcasters_row = qids(broadcasters.get(row));
+            columns.push(
                 key,
                 Record {
-                    imdb_id: strings.get(imdb[i]).map(str::to_owned).filter(|id| id.starts_with("tt")),
+                    imdb_id: strings.get(imdb[i]).filter(|id| id.starts_with("tt")),
                     released: Released::from_days(released[i], released_prec[i]),
                     ended: ended.and_then(|(days, prec)| Released::from_days(days[i], prec[i])),
-                    // Folded HERE, not in the writer: `fold_genre` expands TMDB's series composites
-                    // (10765 "Sci-Fi & Fantasy" → Sci-Fi and Fantasy) and lives in one language.
-                    genres: {
-                        let mut out: Vec<u16> = Vec::new();
-                        for id in genres.get(row).iter().filter_map(|&g| u16::try_from(g).ok()) {
-                            for &genre in crate::recommend::fold_genre(id) {
-                                if !out.contains(&genre) {
-                                    out.push(genre);
-                                }
-                            }
-                        }
-                        out
-                    },
-                    countries: codes_of(countries.get(row), u8::to_ascii_uppercase),
-                    languages: codes_of(languages.get(row), u8::to_ascii_lowercase),
-                    makers: makers_row,
-                    cast: cast_row,
+                    genres: &genres_row,
+                    countries: &countries_row,
+                    languages: &languages_row,
+                    makers: &makers_row,
+                    cast: &cast_row,
                     // Raw Q-ids, not entity indices: the entity table holds almost no franchises.
-                    franchise: franchises.get(row).to_vec(),
-                    broadcasters: qids(broadcasters.get(row)),
+                    franchise: franchises.get(row),
+                    broadcasters: &broadcasters_row,
                     source_kinds: SourceKinds(
                         based_kind
                             .get(row)
@@ -502,7 +622,8 @@ impl Facts {
         named.sort_unstable_by_key(|&(hash, qid)| (hash, std::cmp::Reverse(credited[&qid]), qid));
         named.dedup();
         named.shrink_to_fit();
-        Ok(Facts { records, people, named, titles })
+        columns.shrink();
+        Ok(Facts { columns, people, named, titles })
     }
 
     /// The `factsSlimFile`/`factsFile` sidecar.
@@ -533,7 +654,7 @@ impl Facts {
             .iter()
             .filter_map(|(q, genre)| Some((qid(q)?, genre.movie.or(genre.tv)?)))
             .collect();
-        let mut records = HashMap::with_capacity(file.records.len());
+        let mut records: std::collections::BTreeMap<u64, OwnedRecord> = std::collections::BTreeMap::new();
         let mut titles: Titles = HashMap::new();
         for raw in file.records {
             let media_type = match raw.media_type.as_str() {
@@ -581,7 +702,7 @@ impl Facts {
                     titles.entry((media_type, raw.tmdb_id)).or_insert(names);
                 }
             }
-            let record = Record {
+            let record = OwnedRecord {
                 imdb_id: raw.imdb_id.and_then(OneOrMany::first).filter(|id| id.starts_with("tt")),
                 // A film is released; a series starts.
                 released: raw.released.or(raw.started).and_then(|r| Released::parse(&r.date, &r.precision)),
@@ -606,7 +727,7 @@ impl Facts {
                 ),
             };
             // The first record wins a duplicate, as in the labels index.
-            records.entry((media_type, raw.tmdb_id)).or_insert(record);
+            records.entry(pack((media_type, raw.tmdb_id))).or_insert(record);
         }
         // Only the people a record credits are kept; the entities also name genres and franchises.
         let mut credited: HashMap<u32, u32> = HashMap::new();
@@ -625,7 +746,48 @@ impl Facts {
         named.sort_unstable_by_key(|&(hash, qid)| (hash, std::cmp::Reverse(credited[&qid]), qid));
         named.dedup();
         named.shrink_to_fit();
-        Ok(Facts { records, people, named, titles })
+        let mut columns = Columns::with_capacity(records.len());
+        for (&packed, record) in &records {
+            columns.push(unpack(packed), record.view());
+        }
+        Ok(Facts { columns, people, named, titles })
+    }
+}
+
+/// A title's facts as the JSON reader builds them, before they join the columns in key order.
+#[cfg(test)]
+struct OwnedRecord {
+    imdb_id: Option<String>,
+    released: Option<Released>,
+    ended: Option<Released>,
+    genres: Vec<u16>,
+    countries: Vec<[u8; 2]>,
+    languages: Vec<[u8; 2]>,
+    makers: Vec<u32>,
+    cast: Vec<u32>,
+    franchise: Vec<u32>,
+    broadcasters: Vec<u32>,
+    source_kinds: SourceKinds,
+    runtime_minutes: Option<u32>,
+}
+
+#[cfg(test)]
+impl OwnedRecord {
+    fn view(&self) -> Record<'_> {
+        Record {
+            imdb_id: self.imdb_id.as_deref(),
+            released: self.released,
+            ended: self.ended,
+            genres: &self.genres,
+            countries: &self.countries,
+            languages: &self.languages,
+            makers: &self.makers,
+            cast: &self.cast,
+            franchise: &self.franchise,
+            broadcasters: &self.broadcasters,
+            source_kinds: self.source_kinds,
+            runtime_minutes: self.runtime_minutes,
+        }
     }
 }
 
@@ -1004,7 +1166,7 @@ pub(crate) mod tests {
         let facts = Facts::from_bytes(SAMPLE.as_bytes()).unwrap();
         assert_eq!(facts.len(), 3);
         let film = facts.get(1, MediaType::Movie).unwrap();
-        assert_eq!(film.imdb_id.as_deref(), Some("tt0000001"));
+        assert_eq!(film.imdb_id, Some("tt0000001"));
         // An unmapped genre is simply not known; the map's own order is kept.
         assert_eq!(film.genres, vec![80, 18]);
         assert_eq!(film.makers, vec![1, 9], "a screenwriter is a maker, and one credited twice counts once");
@@ -1023,7 +1185,7 @@ pub(crate) mod tests {
         assert_eq!(series.released.unwrap().span_days, 365);
 
         // Nothing known is nothing known, not an error.
-        assert_eq!(facts.get(2, MediaType::Movie), Some(&Record::default()));
+        assert_eq!(facts.get(2, MediaType::Movie), Some(Record::default()));
     }
 
     #[test]

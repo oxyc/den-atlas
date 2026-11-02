@@ -676,9 +676,7 @@ pub(crate) fn title_json(indexes: &Indexes, key: Key, card: &Card) -> serde_json
     });
     // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
     // for it, a request a card.
-    if let Some(imdb) =
-        indexes.facts.as_ref().and_then(|f| f.get(id, media_type)).and_then(|r| r.imdb_id.as_deref())
-    {
+    if let Some(imdb) = indexes.facts.as_ref().and_then(|f| f.get(id, media_type)).and_then(|r| r.imdb_id) {
         title["imdbId"] = serde_json::json!(imdb);
     }
     if let Some(language) =
@@ -767,8 +765,8 @@ pub(crate) fn facts_json(indexes: &Indexes, key: Key) -> Option<serde_json::Valu
             title["languages"] = serde_json::json!(record.languages.iter().map(code).collect::<Vec<_>>());
             title["runtimeMinutes"] = serde_json::json!(record.runtime_minutes);
             title["basedOn"] = serde_json::json!(crate::facts::SourceKinds::names(record.source_kinds.raw()));
-            title["makers"] = serde_json::json!(people(&record.makers, usize::MAX));
-            title["cast"] = serde_json::json!(people(&record.cast, FACTS_CAST));
+            title["makers"] = serde_json::json!(people(record.makers, usize::MAX));
+            title["cast"] = serde_json::json!(people(record.cast, FACTS_CAST));
             title["castTotal"] = serde_json::json!(record.cast.len());
         }
     }
