@@ -109,7 +109,41 @@ pub(crate) fn resolve_axis(axis: &str, value: &str) -> String {
 }
 
 /// axis → value → the titles carrying it, each with a byte the tier gives meaning to.
-type Tier = HashMap<String, HashMap<String, Vec<(Key, u8)>>>;
+type Tier = HashMap<String, HashMap<String, Carrying>>;
+
+/// The titles carrying one value, in the order they were added, each with its byte. Kept as two columns of
+/// five bytes a title rather than a `(Key, u8)` of twelve: a key is its TMDB id with the type in the top bit.
+#[derive(Default)]
+pub struct Carrying {
+    keys: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+const TV_BIT: u32 = 1 << 31;
+
+impl Carrying {
+    fn push(&mut self, (media_type, id): Key, byte: u8) {
+        debug_assert!(id < TV_BIT, "a TMDB id past 2^31 does not fit beside the type bit");
+        self.keys.push(if media_type == MediaType::Tv { id | TV_BIT } else { id });
+        self.bytes.push(byte);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Key, u8)> + '_ {
+        self.keys.iter().zip(&self.bytes).map(|(&packed, &byte)| {
+            let media_type = if packed & TV_BIT != 0 { MediaType::Tv } else { MediaType::Movie };
+            ((media_type, packed & !TV_BIT), byte)
+        })
+    }
+
+    fn shrink(&mut self) {
+        self.keys.shrink_to_fit();
+        self.bytes.shrink_to_fit();
+    }
+}
+
+fn shrink(tier: &mut Tier) {
+    tier.values_mut().flat_map(HashMap::values_mut).for_each(Carrying::shrink);
+}
 
 pub struct PlotFacets {
     /// axis → value → the titles carrying it, each with its confidence: 3 high, 2 medium, 1 low.
@@ -150,12 +184,15 @@ impl PlotFacets {
 
         let tier = store.tentative_facets().map_err(|e| e.to_string())?;
         let floor = (FACET_FLOOR * 100.0).round() as u8;
-        let mut by_value: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
-        let mut tentative: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
+        let mut by_value: Tier = HashMap::new();
+        let mut tentative: Tier = HashMap::new();
         let mut described = 0usize;
         for (row, &packed) in keys.iter().enumerate() {
             let media = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
             let key = (media, packed as u32);
+            if key.1 >= TV_BIT {
+                return Err(format!("row {row} has TMDB id {}, past 2^31", key.1));
+            }
             let mut any = false;
             for (axis, name) in den_store::FACET_AXES.iter().enumerate() {
                 if let Some(guess) = tier.get(den_store::Row(row), axis) {
@@ -165,7 +202,7 @@ impl PlotFacets {
                             .or_default()
                             .entry(value.to_owned())
                             .or_default()
-                            .push((key, guess.probability));
+                            .push(key, guess.probability);
                     }
                 }
                 let at = row * axes + axis;
@@ -188,12 +225,14 @@ impl PlotFacets {
                     .or_default()
                     .entry(value.to_owned())
                     .or_default()
-                    .push((key, confidence));
+                    .push(key, confidence);
             }
             if any {
                 described += 1;
             }
         }
+        shrink(&mut by_value);
+        shrink(&mut tentative);
         Ok(PlotFacets { by_value, tentative, titles: described })
     }
 
@@ -208,7 +247,7 @@ impl PlotFacets {
         if file.schema != SCHEMA {
             return Err(format!("schema {} (this atlas reads {SCHEMA})", file.schema));
         }
-        let mut by_value: HashMap<String, HashMap<String, Vec<(Key, u8)>>> = HashMap::new();
+        let mut by_value: Tier = HashMap::new();
         let titles = file.facets.len();
         for (key, axes) in file.facets {
             let Some(key) = title_key(&key) else { continue };
@@ -219,7 +258,7 @@ impl PlotFacets {
                     Some("medium") => 2,
                     _ => 1,
                 };
-                by_value.entry(axis).or_default().entry(value).or_default().push((key, confidence));
+                by_value.entry(axis).or_default().entry(value).or_default().push(key, confidence);
             }
         }
         Ok(PlotFacets { by_value, tentative: HashMap::new(), titles })
@@ -240,7 +279,7 @@ impl PlotFacets {
                 let mut counts: Vec<(String, usize)> = values
                     .iter()
                     .map(|(value, rows)| {
-                        let keys: std::collections::HashSet<Key> = rows.iter().map(|(key, _)| *key).collect();
+                        let keys: std::collections::HashSet<Key> = rows.iter().map(|(key, _)| key).collect();
                         known.extend(keys.iter().copied());
                         (value.clone(), keys.len())
                     })
@@ -254,9 +293,9 @@ impl PlotFacets {
     }
 
     /// Every `(axis, value)` and the titles carrying it, for the filters (`filter.rs`).
-    pub fn values(&self) -> impl Iterator<Item = (&str, &str, &[(Key, u8)])> {
+    pub fn values(&self) -> impl Iterator<Item = (&str, &str, &Carrying)> {
         self.by_value.iter().flat_map(|(axis, values)| {
-            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles.as_slice()))
+            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles))
         })
     }
 
@@ -270,8 +309,8 @@ impl PlotFacets {
             .get(if axis == "structure" { "chronology" } else { axis })
             .into_iter()
             .flat_map(|values| values.values())
-            .flatten()
-            .map(|(key, _)| *key)
+            .flat_map(Carrying::iter)
+            .map(|(key, _)| key)
             .filter(|key| media_type.is_none() || Some(key.0) == media_type)
             .collect::<std::collections::HashSet<_>>()
             .len()
@@ -289,26 +328,29 @@ impl PlotFacets {
 
     /// Every `(axis, value)` of the tentative tier and the titles carrying it, each with its probability in
     /// hundredths, for the filters (`filter.rs`).
-    pub fn tentative_values(&self) -> impl Iterator<Item = (&str, &str, &[(Key, u8)])> {
+    pub fn tentative_values(&self) -> impl Iterator<Item = (&str, &str, &Carrying)> {
         self.tentative.iter().flat_map(|(axis, values)| {
-            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles.as_slice()))
+            values.iter().map(move |(value, titles)| (axis.as_str(), value.as_str(), titles))
         })
     }
 
     /// The titles one tier holds for `axis=value`, the merged display rows included; `None` for an axis or
     /// value the tier does not have.
-    fn titles_in<'s>(tier: &'s Tier, axis: &str, value: &str) -> Option<std::borrow::Cow<'s, [(Key, u8)]>> {
+    fn titles_in<'s>(
+        tier: &'s Tier,
+        axis: &str,
+        value: &str,
+    ) -> Option<impl Iterator<Item = (Key, u8)> + 's> {
         // `structure=…` is the old sidecar's spelling; resolve it to whichever axis answers it.
         let axis = &resolve_axis(axis, value);
         let values = tier.get(axis)?;
-        if let Some(merged) = MERGED_ROWS.iter().find(|m| m.axis == axis && m.value == value) {
+        let lists: Vec<&'s Carrying> = match MERGED_ROWS.iter().find(|m| m.axis == axis && m.value == value) {
             // A title holds one value per axis, so the members are disjoint and their concatenation is
             // the union, each title at the confidence it carries its one member with.
-            let union: Vec<(Key, u8)> =
-                merged.members.iter().filter_map(|m| values.get(*m)).flatten().copied().collect();
-            return Some(union.into());
-        }
-        values.get(value).map(|list| list.as_slice().into())
+            Some(merged) => merged.members.iter().filter_map(|m| values.get(*m)).collect(),
+            None => vec![values.get(value)?],
+        };
+        Some(lists.into_iter().flat_map(Carrying::iter))
     }
 
     /// The titles of `media_type` carrying every `(axis, value)` only once the tentative tier is read too:
@@ -324,8 +366,8 @@ impl PlotFacets {
             let sure = Self::titles_in(&self.by_value, axis, value);
             let guessed = Self::titles_in(&self.tentative, axis, value);
             let mut tier: HashMap<Key, Option<u8>> = HashMap::new();
-            tier.extend(guessed.iter().flat_map(|list| list.iter()).map(|&(key, p)| (key, Some(p))));
-            tier.extend(sure.iter().flat_map(|list| list.iter()).map(|&(key, _)| (key, None)));
+            tier.extend(guessed.into_iter().flatten().map(|(key, p)| (key, Some(p))));
+            tier.extend(sure.into_iter().flatten().map(|(key, _)| (key, None)));
             tiers.push(tier);
         }
         let Some((first, rest)) = tiers.split_first() else { return Vec::new() };
@@ -350,19 +392,19 @@ impl PlotFacets {
     /// The titles of `media_type` carrying every `(axis, value)`, each at the lowest confidence it carries any
     /// of them. Empty when a constraint names an axis or value the file doesn't have.
     pub fn matching(&self, media_type: MediaType, constraints: &[(String, String)]) -> Vec<(Key, u8)> {
-        let mut lists: Vec<std::borrow::Cow<'_, [(Key, u8)]>> = Vec::with_capacity(constraints.len());
+        let mut lists = Vec::with_capacity(constraints.len());
         for (axis, value) in constraints {
             match Self::titles_in(&self.by_value, axis, value) {
                 Some(list) => lists.push(list),
                 None => return Vec::new(),
             }
         }
-        let Some((first, rest)) = lists.split_first() else { return Vec::new() };
-        let rest: Vec<HashMap<Key, u8>> = rest.iter().map(|list| list.iter().copied().collect()).collect();
+        let mut lists = lists.into_iter();
+        let Some(first) = lists.next() else { return Vec::new() };
+        let rest: Vec<HashMap<Key, u8>> = lists.map(Iterator::collect).collect();
         first
-            .iter()
             .filter(|(key, _)| key.0 == media_type)
-            .filter_map(|&(key, confidence)| {
+            .filter_map(|(key, confidence)| {
                 rest.iter()
                     .try_fold(confidence, |lowest, other| other.get(&key).map(|&c| lowest.min(c)))
                     .map(|lowest| (key, lowest))

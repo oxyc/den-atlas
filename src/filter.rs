@@ -1307,8 +1307,8 @@ impl FilterIndex {
             }
             for (axis, value, titles) in plot_facets.values() {
                 let Some(axis) = den_store::FACET_AXES.iter().copied().find(|a| *a == axis) else { continue };
-                for (key, _) in titles {
-                    if let Some(&row) = row_of.get(key) {
+                for (key, _) in titles.iter() {
+                    if let Some(&row) = row_of.get(&key) {
                         add(&mut bits, axis, value.to_owned(), row);
                     }
                 }
@@ -1319,8 +1319,8 @@ impl FilterIndex {
             for (axis, value, titles) in plot_facets.tentative_values() {
                 let Some(axis) = den_store::FACET_AXES.iter().copied().find(|a| *a == axis) else { continue };
                 let tier = likely.entry(axis).or_default().entry(value.to_owned()).or_insert_with(zeros);
-                for (key, _) in titles {
-                    if let Some(&row) = row_of.get(key) {
+                for (key, _) in titles.iter() {
+                    if let Some(&row) = row_of.get(&key) {
                         set(tier, row);
                     }
                 }

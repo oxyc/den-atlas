@@ -35,13 +35,49 @@ pub struct TitleIndex {
     ids: Vec<u32>,
     kinds: Vec<MediaType>,
     popularity: Vec<f64>,
-    titles: Vec<Box<str>>,
+    /// Read only for the hits returned, so kept flat.
+    titles: Texts,
+    /// Read for every candidate scored, so kept one allocation each: read through `Texts` the trigram search
+    /// measured ~25% slower (0.024 against 0.019 ms per query on store 81e42839cd52).
     folded: Vec<Box<str>>,
     keys: Vec<u64>,
     key_ends: Vec<u32>,
     postings: Vec<u32>,
-    /// Each title's type, id and position, sorted by type and id.
-    positions: Vec<(MediaType, u32, u32)>,
+    /// Every position, sorted by type, id and position.
+    positions: Vec<u32>,
+}
+
+/// One string per position, end to end in one buffer: a `Box<str>` each costs a pointer, a length and an
+/// allocation per title. String `i` is `text[offsets[i]..offsets[i + 1]]`.
+struct Texts {
+    text: String,
+    offsets: Vec<u32>,
+}
+
+impl Default for Texts {
+    fn default() -> Self {
+        Texts { text: String::new(), offsets: vec![0] }
+    }
+}
+
+impl Texts {
+    fn push(&mut self, s: &str) {
+        self.text.push_str(s);
+        self.offsets.push(self.text.len() as u32);
+    }
+
+    fn get(&self, i: usize) -> &str {
+        &self.text[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+
+    fn shrink(&mut self) {
+        self.text.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+    }
+
+    fn bytes(&self) -> usize {
+        self.text.len() + self.offsets.len() * 4
+    }
 }
 
 impl TitleIndex {
@@ -54,6 +90,7 @@ impl TitleIndex {
         });
         let mut pairs: Vec<(u64, u32)> = Vec::new();
         let mut folded = Vec::with_capacity(records.len());
+        let mut titles = Texts::default();
         for (position, record) in records.iter().enumerate() {
             let f = fold(&record.title);
             let mut keys = trigram_keys(&f);
@@ -61,7 +98,9 @@ impl TitleIndex {
             keys.dedup();
             pairs.extend(keys.into_iter().map(|k| (k, position as u32)));
             folded.push(f.into_boxed_str());
+            titles.push(&record.title);
         }
+        titles.shrink();
         pairs.sort_unstable();
         let mut keys = Vec::new();
         let mut key_ends = Vec::new();
@@ -78,15 +117,16 @@ impl TitleIndex {
         if !keys.is_empty() {
             key_ends.push(postings.len() as u32);
         }
-        let mut positions: Vec<(MediaType, u32, u32)> =
-            records.iter().enumerate().map(|(i, r)| (r.media_type, r.tmdb_id, i as u32)).collect();
-        positions.sort_unstable();
+        keys.shrink_to_fit();
+        key_ends.shrink_to_fit();
+        let mut positions: Vec<u32> = (0..records.len() as u32).collect();
+        positions.sort_unstable_by_key(|&i| (records[i as usize].media_type, records[i as usize].tmdb_id, i));
         TitleIndex {
             positions,
             ids: records.iter().map(|r| r.tmdb_id).collect(),
             kinds: records.iter().map(|r| r.media_type).collect(),
             popularity: records.iter().map(|r| r.popularity).collect(),
-            titles: records.into_iter().map(|r| r.title.into_boxed_str()).collect(),
+            titles,
             folded,
             keys,
             key_ends,
@@ -104,22 +144,23 @@ impl TitleIndex {
 
     /// A title's popularity in the export, when the export has it.
     pub fn popularity_of(&self, media_type: MediaType, tmdb_id: u32) -> Option<f64> {
-        let at = self.positions.partition_point(|&(m, id, _)| (m, id) < (media_type, tmdb_id));
+        let key = |i: u32| (self.kinds[i as usize], self.ids[i as usize]);
+        let at = self.positions.partition_point(|&i| key(i) < (media_type, tmdb_id));
         match self.positions.get(at) {
-            Some(&(m, id, i)) if (m, id) == (media_type, tmdb_id) => Some(self.popularity[i as usize]),
+            Some(&i) if key(i) == (media_type, tmdb_id) => Some(self.popularity[i as usize]),
             _ => None,
         }
     }
 
     /// Roughly what the index holds in memory, for logs.
     pub fn approx_bytes(&self) -> usize {
-        let strings: usize = self.titles.iter().chain(&self.folded).map(|s| s.len() + 16).sum();
-        strings
+        self.titles.bytes()
+            + self.folded.iter().map(|s| s.len() + 16).sum::<usize>()
             + self.ids.len() * (4 + 1 + 8)
             + self.keys.len() * 8
             + self.key_ends.len() * 4
             + self.postings.len() * 4
-            + self.positions.len() * 12
+            + self.positions.len() * 4
     }
 
     /// The best `limit` titles for `query`, optionally of one media type, best first.
@@ -219,7 +260,7 @@ impl TitleIndex {
         Hit {
             tmdb_id: self.ids[i],
             media_type: self.kinds[i],
-            title: &self.titles[i],
+            title: self.titles.get(i),
             popularity: self.popularity[i],
         }
     }
