@@ -6,7 +6,6 @@
 
 use crate::fold::{fold, trigram_keys};
 use crate::{MediaType, TitleRecord};
-use std::collections::HashMap;
 
 const RELEVANCE_WEIGHT: f64 = 0.6;
 const POPULARITY_WEIGHT: f64 = 0.4;
@@ -164,17 +163,25 @@ impl TitleIndex {
                 .map(|i| self.hit(i))
                 .collect();
         }
-        let mut shared: HashMap<u32, u32> = HashMap::new();
+        // A count per title, dense, and the titles touched in the order first met: a short query's
+        // postings run to tens of thousands of entries, and a hash map per entry cost more than the scoring.
+        let mut shared: Vec<u32> = vec![0; self.len()];
+        let mut touched: Vec<u32> = Vec::new();
         for key in &query_keys {
             for &position in self.postings(*key) {
-                *shared.entry(position).or_insert(0) += 1;
+                let count = &mut shared[position as usize];
+                if *count == 0 {
+                    touched.push(position);
+                }
+                *count += 1;
             }
         }
         let denominator = query_keys.len() as f64;
         let typed_article = leading_article(&q).is_some();
-        let mut scored: Vec<(f64, u32)> = shared
+        let mut scored: Vec<(f64, u32)> = touched
             .into_iter()
-            .filter_map(|(position, count)| {
+            .filter_map(|position| {
+                let count = shared[position as usize];
                 let coverage = f64::from(count) / denominator;
                 let i = position as usize;
                 (coverage >= min_coverage && wanted(i))
