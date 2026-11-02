@@ -429,14 +429,40 @@ fn quantize_int8(cls: &[f32]) -> Vec<i32> {
 fn infer(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
     let mut guard = lock(&state.model);
     let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
+    let tokens = tokenize(model, text, phases)?;
+    let out = forward(model, &tokens, phases)?;
+    state.touch();
+    Ok(out)
+}
 
+/// `infer` for a text the batch's admission pass already tokenized.
+fn infer_tokens(state: &AppState, tokens: &Tokens, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
+    let mut guard = lock(&state.model);
+    let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
+    let out = forward(model, tokens, phases)?;
+    state.touch();
+    Ok(out)
+}
+
+/// What inference needs from an encoding, kept between a batch's admission pass and its inference
+/// so each text is tokenized once. Only ids and mask: the full `Encoding` also holds token strings
+/// and offsets, several times the size, for texts the budget check may still reject.
+struct Tokens {
+    ids: Vec<u32>,
+    mask: Vec<u32>,
+}
+
+fn tokenize(model: &Model, text: &str, phases: &mut Phases) -> anyhow::Result<Tokens> {
     let started = Instant::now();
     let enc = model.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!("{e}"))?;
     Phases::add(&mut phases.tokenize, started);
+    Ok(Tokens { ids: enc.get_ids().to_vec(), mask: enc.get_attention_mask().to_vec() })
+}
 
+fn forward(model: &mut Model, tokens: &Tokens, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
     let started = Instant::now();
-    let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
-    let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
+    let ids: Vec<i64> = tokens.ids.iter().map(|&x| x as i64).collect();
+    let mask: Vec<i64> = tokens.mask.iter().map(|&x| x as i64).collect();
     let seq = ids.len();
 
     let ids = Tensor::from_array(Array2::from_shape_vec((1, seq), ids)?).map_err(ort_err)?;
@@ -448,12 +474,16 @@ fn infer(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Ve
     let cls = &data[0..DIMS];
     let out = quantize_int8(cls);
     Phases::add(&mut phases.inference, started);
-
-    state.touch();
     Ok(out)
 }
 
-fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Result<Vec<i32>> {
+/// `tokens` is this text's encoding when the caller already has it, so it is not tokenized again.
+fn embed_one(
+    state: &AppState,
+    text: &str,
+    tokens: Option<&Tokens>,
+    phases: &mut Phases,
+) -> anyhow::Result<Vec<i32>> {
     if is_blank(text) {
         return Ok(zero_vector());
     }
@@ -463,12 +493,21 @@ fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Resul
         phases.cache_hits += 1;
         return Ok(hit);
     }
-    let vector = infer(state, &truncated, phases)?;
+    let vector = match tokens {
+        Some(tokens) => infer_tokens(state, tokens, phases)?,
+        None => infer(state, &truncated, phases)?,
+    };
     lock(&state.cache).put(key, vector.clone());
     Ok(vector)
 }
 
-fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<Vec<Vec<i32>>> {
+/// `tokens[i]` is `texts[i]`'s encoding from `tokenize_batch` (`None` for a blank text).
+fn embed_many(
+    state: &AppState,
+    texts: &[String],
+    tokens: &[Option<Tokens>],
+    phases: &mut Phases,
+) -> anyhow::Result<Vec<Vec<i32>>> {
     // One text per run, never a padded [B, seq] batch. model_int8.onnx quantizes activations with
     // DynamicQuantizeLinear, whose scale and zero point span the WHOLE input tensor: pad positions and
     // the other rows of a batch change every row's int8 activations, attention mask or not. Measured
@@ -476,7 +515,7 @@ fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow
     // and batching equal-length texts with no padding at all moves every row that shares a run
     // (cosine >= 0.961, up to 5/127). That is the size of the ORT 1.28 drift that reordered top-10s,
     // and it would break den-dataset's byte-exact canary. The content cache handles repeats.
-    texts.iter().map(|t| embed_one(state, t, phases)).collect()
+    texts.iter().zip(tokens).map(|(t, tokens)| embed_one(state, t, tokens.as_ref(), phases)).collect()
 }
 
 /// Snapshot a batch that needs no inference before loading the tokenizer/model for admission. Keeping
@@ -500,7 +539,8 @@ fn cached_batch(state: &AppState, texts: &[String], phases: &mut Phases) -> Opti
     Some(vectors)
 }
 
-/// The batch's real token count, capped per text exactly as inference will cap it.
+/// The batch's encodings (`None` for a blank text), which inference reuses, and its real token
+/// count, capped per text exactly as inference will cap it.
 ///
 /// Counting `min(chars, max_tokens)` instead was UNSOUND, and not marginally: the tokenizer's
 /// normalizer is SentencePiece's `Precompiled` NFKC charsmap, which EXPANDS a single scalar before
@@ -512,22 +552,27 @@ fn cached_batch(state: &AppState, texts: &[String], phases: &mut Phases) -> Opti
 /// Tokenizing costs microseconds against ~330ms of inference per 512 tokens, so measuring beats
 /// estimating. The lock is taken and released here, not held across the batch: `infer` locks per
 /// item, and holding it across a whole batch would block the idle-unloader for the batch's lifetime.
-fn count_tokens(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<usize> {
+fn tokenize_batch(
+    state: &AppState,
+    texts: &[String],
+    phases: &mut Phases,
+) -> anyhow::Result<(Vec<Option<Tokens>>, usize)> {
     let mut guard = lock(&state.model);
     let model = ensure_loaded(&mut guard, &state.cfg, &state.load_failing, phases)?;
     let mut total = 0usize;
+    let mut all = Vec::with_capacity(texts.len());
     for t in texts {
         if is_blank(t) {
-            continue; // short-circuited before inference, costs nothing
+            all.push(None); // short-circuited before inference, costs nothing
+            continue;
         }
         let truncated: String = t.chars().take(state.cfg.max_chars).collect();
-        let started = Instant::now();
-        let enc = model.tokenizer.encode(truncated, true).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Phases::add(&mut phases.tokenize, started);
+        let tokens = tokenize(model, &truncated, phases)?;
         // Truncation already caps this at max_tokens; the min is belt and braces.
-        total = total.saturating_add(enc.get_ids().len().min(state.cfg.max_tokens));
+        total = total.saturating_add(tokens.ids.len().min(state.cfg.max_tokens));
+        all.push(Some(tokens));
     }
-    Ok(total)
+    Ok((all, total))
 }
 
 // --- HTTP surface (same routes/shapes as server.py) ------------------------
@@ -867,7 +912,7 @@ async fn embed_single(state: Arc<AppState>, text: String) -> Result<Response, Ap
     let started = Instant::now();
     let (vector, phases) = run_blocking(&state, move |st| {
         let mut phases = Phases::default();
-        embed_one(st, &text, &mut phases).map(|v| (v, phases))
+        embed_one(st, &text, None, &mut phases).map(|v| (v, phases))
     })
     .await?;
     Ok(timed(started, &phases, Json(EmbedResp { vector, dims: DIMS, model: MODEL_LABEL })))
@@ -899,27 +944,31 @@ async fn embed_batch(
     // MEASURED, not estimated. Two earlier versions of this check were wrong: counting characters
     // rejected cheap work and admitted expensive work, and `min(chars, max_tokens)` looked sound but
     // is not — the SentencePiece normalizer expands some characters more than 5:1 (see
-    // `count_tokens`), which let 5x the budget through.
-    let texts_for_count = body.texts.clone();
-    let (cached, total, phases) = run_blocking(&state, move |st| {
+    // `tokenize_batch`), which let 5x the budget through. The encodings it measures are the ones
+    // inference runs on, so each text is tokenized once.
+    let count = body.texts.len();
+    let (texts, admitted, phases) = run_blocking(&state, move |st| {
         let mut phases = Phases::default();
-        if let Some(vectors) = cached_batch(st, &texts_for_count, &mut phases) {
-            return Ok((Some(vectors), 0, phases));
+        if let Some(vectors) = cached_batch(st, &body.texts, &mut phases) {
+            return Ok((body.texts, Err(vectors), phases));
         }
-        count_tokens(st, &texts_for_count, &mut phases).map(|n| (None, n, phases))
+        let admitted = tokenize_batch(st, &body.texts, &mut phases)?;
+        Ok((body.texts, Ok(admitted), phases))
     })
     .await?;
-    if let Some(vectors) = cached {
-        return Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })));
-    }
+    let (tokens, total) = match admitted {
+        Ok(admitted) => admitted,
+        Err(vectors) => {
+            return Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })))
+        }
+    };
     if total > state.cfg.max_request_tokens {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrResp {
                 error: "batch_too_large",
                 detail: Some(format!(
-                    "{total} tokens across {} texts (max {} in total)",
-                    body.texts.len(),
+                    "{total} tokens across {count} texts (max {} in total)",
                     state.cfg.max_request_tokens
                 )),
             }),
@@ -927,7 +976,7 @@ async fn embed_batch(
     }
     let (vectors, phases) = run_blocking(&state, move |st| {
         let mut phases = phases;
-        embed_many(st, &body.texts, &mut phases).map(|v| (v, phases))
+        embed_many(st, &texts, &tokens, &mut phases).map(|v| (v, phases))
     })
     .await?;
     Ok(timed(started, &phases, Json(BatchResp { vectors, dims: DIMS, model: MODEL_LABEL })))
