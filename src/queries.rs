@@ -733,9 +733,13 @@ impl Indexes {
         // store missing them also reaches `/health` as `facts_unusable`.
         let characters = self.character_links(media_type, tmdb_id);
         let series = self.series_members(media_type, tmdb_id);
-        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id)
-            .ok()
-            .map(|authorship| authorship.with_characters(characters).with_series(series));
+        let authorship = den_index::SeedAuthorship::of(&view, media_type, tmdb_id).ok().map(|authorship| {
+            let authorship = authorship.with_characters(characters).with_series(series);
+            match self.filter().made_by(authorship.maker_entities()) {
+                Some(nominated) => authorship.with_nominations(nominated),
+                None => authorship,
+            }
+        });
         work(authorship.as_ref().map(|a| a as &dyn den_index::Authorship), &facets)
     }
 

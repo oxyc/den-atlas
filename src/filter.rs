@@ -1524,6 +1524,18 @@ impl FilterIndex {
         out
     }
 
+    /// Every title crediting one of `entities` (entity-table indices) as a maker, ascending by store row and
+    /// each once: `SeedAuthorship::nominate`'s answer off the inverted `makers_*` list. `None` when the store
+    /// does not carry the list, and the caller scans it as before.
+    pub fn made_by(&self, entities: &[u32]) -> Option<Vec<Key>> {
+        let at = ENTITY_KINDS.iter().position(|e| e.name == "made")?;
+        let [made] = self.entities[at].as_ref()?.postings.as_slice() else { return None };
+        let mut rows: Vec<u32> = entities.iter().flat_map(|&e| made.of(e).iter().copied()).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Some(rows.into_iter().map(|row| self.keys[row as usize]).collect())
+    }
+
     /// Every title carrying one value of a bitset kind (`warning:graphic_violence`); `None` when the kind is
     /// not offered or holds no such value, which is not the same as no title carrying it.
     pub fn titles_with(&self, kind: &str, value: &str) -> Option<Vec<Key>> {
