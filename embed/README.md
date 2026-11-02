@@ -81,7 +81,7 @@ boot and stays. The measured rollout bounds are recorded in the migration docume
 | `MAX_REQUEST_TOKENS` | 8192 | Total tokens per request (512–12288). |
 | `MAX_BATCH` | 512 | Texts per batch (1–4096). A rejection threshold, not a micro-batch. |
 | `MAX_BODY_BYTES` | 4 MiB | Request body limit (64 KiB–16 MiB). |
-| `CACHE_MAX_ENTRIES` | 8192 | Cached vectors, ~4.2 KB each (0–32768); 0 turns the cache off. |
+| `CACHE_MAX_ENTRIES` | 8192 | Cached vectors, ~1.1 KB each (0–32768); 0 turns the cache off. |
 | `INTRA_THREADS` | 0 | ONNX Runtime intra-op threads (0–256); 0 uses all cores. |
 | `DRAIN_GRACE_SECS` | 8 | How long a SIGTERM waits for in-flight requests (1–9). |
 
