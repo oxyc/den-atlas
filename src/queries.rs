@@ -19,7 +19,7 @@ use crate::dataset::Dataset;
 use crate::facts::Facts;
 use crate::filter::FilterIndex;
 use crate::fit::Corpus;
-use crate::plotrows::{cards_from_store, Card, PlotFacets};
+use crate::plotrows::{cards_from_store, Cards, PlotFacets};
 use crate::ratings::{Ratings, RatingsIndex};
 use crate::store::MappedStore;
 use crate::util::lock;
@@ -69,7 +69,7 @@ pub struct Indexes {
     /// Region-scoped authority observations fetched and kept on this atlas box. Unlike the store's public
     /// baseline these are live: reads consult the shared holder, and policy memos include its generation.
     pub maturity: Arc<crate::maturity_providers::Providers>,
-    pub cards: Option<HashMap<(den_index::MediaType, u32), Card>>,
+    pub cards: Option<Cards>,
     /// The iconic studios (`studios.rs`); empty for a store without their sections.
     pub studios: crate::studios::Studios,
     /// The award ceremonies (`awards.rs`); empty for a store without their sections.
@@ -1345,9 +1345,10 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
                     .ok()
             })
         });
+        let shared = &store.store;
         let cards = scope.spawn(move || {
             timed(|| {
-                cards_from_store(&view())
+                cards_from_store(shared)
                     .map_err(|e| {
                         eprintln!("cards unusable ({e}) — plot rows are empty, search has no display titles")
                     })
@@ -1433,10 +1434,11 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
             TitleIndex::build(
                 cards
                     .iter()
-                    .flat_map(|(&(kind, id), card)| {
+                    .flat_map(|((kind, id), card)| {
                         let also = other_names.get(&(kind, id)).map_or(&[][..], Vec::as_slice);
-                        let names = std::iter::once(card.title.as_str())
-                            .chain(also.iter().map(|name| &**name).filter(|name| *name != card.title));
+                        let shown = card.title;
+                        let names = std::iter::once(shown)
+                            .chain(also.iter().map(|name| &**name).filter(move |name| *name != shown));
                         names.map(move |title| TitleRecord {
                             tmdb_id: id,
                             media_type: match kind {

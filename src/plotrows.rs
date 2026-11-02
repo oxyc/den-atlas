@@ -26,6 +26,7 @@
 //! so a client that still asks the old way keeps working.
 
 use crate::queries::Indexes;
+use crate::store::MappedStore;
 use den_index::MediaType;
 /// Only the sidecar readers below parse JSON, and only tests call them.
 #[cfg(test)]
@@ -35,6 +36,7 @@ use std::collections::HashMap;
 use std::io::Read;
 #[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
 
 type Key = (MediaType, u32);
 
@@ -369,16 +371,69 @@ impl PlotFacets {
     }
 }
 
-/// What a poster card needs, from the dataset's metadata sidecar.
-pub struct Card {
-    pub title: String,
-    pub poster_path: Option<String>,
+/// What a poster card needs: a view of one title's row in the store.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Card<'a> {
+    pub title: &'a str,
+    pub poster_path: Option<&'a str>,
     pub year: Option<i64>,
+}
+
+/// Every title's card, read in place from the store's `card_title`/`card_poster`/`card_year` columns.
+///
+/// It used to be a `HashMap` of cards, each with an owned title: ~10 MB of heap for strings the mapping
+/// already holds. The three id columns are copied (a few hundred KB) so a lookup resolves only the string
+/// dictionary rather than finding each section by name.
+pub struct Cards {
+    store: Arc<MappedStore>,
+    titles: Box<[u32]>,
+    /// Empty when the store carries no `card_poster` section.
+    posters: Box<[u32]>,
+    years: Box<[i16]>,
+    /// Rows with a card.
+    len: usize,
+}
+
+impl Cards {
+    fn row(&self, row: usize) -> Option<Card<'_>> {
+        let strings = self.store.view().strings().ok()?;
+        // `Strings::get` answers `None` for `NONE_U32` and for an id it cannot resolve, so the sentinel
+        // never becomes the string "4294967295" — and `NONE_I16` is absent, not the year -32768.
+        let title = strings.get(self.titles[row]).filter(|title| !title.is_empty())?;
+        let year = self.years[row];
+        Some(Card {
+            title,
+            poster_path: self.posters.get(row).and_then(|&id| strings.get(id)),
+            year: (year != den_store::NONE_I16).then(|| i64::from(year)),
+        })
+    }
+
+    pub fn get(&self, &(media_type, id): &Key) -> Option<Card<'_>> {
+        self.row(self.store.row_of(media_type, id)?)
+    }
+
+    pub fn contains_key(&self, key: &Key) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Every card, in store row order: ascending (type, TMDB id).
+    pub fn iter(&self) -> impl Iterator<Item = (Key, Card<'_>)> + '_ {
+        let view = self.store.view();
+        let keys = view.per_row::<u64>("keys").unwrap_or(&[]);
+        keys.iter().enumerate().filter_map(move |(row, &packed)| {
+            let media_type = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
+            Some(((media_type, packed as u32), self.row(row)?))
+        })
+    }
 }
 
 /// The cards, out of the store.
 ///
-/// Same map, same shape, different input — so plot rows and the search display titles keep working while
+/// Same lookups, different input — so plot rows and the search display titles keep working while
 /// `metadataFile` stops being read. The store carries `card_title`, `card_poster` and `card_year` for
 /// every row it holds, which is MORE rows than the sidecar has records: the writer falls back to the
 /// facts' `titles.en`/`titles.orig` for a title the sidecar does not name, so a row can have a card here
@@ -398,29 +453,19 @@ pub struct Card {
 /// cost the entire map: the producer is dropping the section (oxyc/den#118), and a store published
 /// against that version of this function would have emptied every plot row and left search with no
 /// display titles, while `/health` stayed green. A title and a name, by contrast, are what a card IS.
-pub fn cards_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Card>, String> {
+pub fn cards_from_store(store: &Arc<MappedStore>) -> Result<Cards, String> {
     let err = |e: den_store::StoreError| e.to_string();
-    let keys = store.per_row::<u64>("keys").map_err(err)?;
-    let titles = store.per_row::<u32>("card_title").map_err(err)?;
-    let posters = store.per_row::<u32>("card_poster").unwrap_or(&[]);
-    let years = store.per_row::<i16>("card_year").map_err(err)?;
-    let strings = store.strings().map_err(err)?;
-
-    let mut cards: HashMap<Key, Card> = HashMap::with_capacity(keys.len());
-    for (i, &packed) in keys.iter().enumerate() {
-        let media_type = if (packed >> 32) == 1 { MediaType::Tv } else { MediaType::Movie };
-        // `Strings::get` answers `None` for `NONE_U32` and for an id it cannot resolve, so the sentinel
-        // never becomes the string "4294967295" — and `NONE_I16` is absent, not the year -32768.
-        let Some(title) = strings.get(titles[i]).filter(|title| !title.is_empty()) else { continue };
-        cards.insert(
-            (media_type, packed as u32),
-            Card {
-                title: title.to_owned(),
-                poster_path: posters.get(i).and_then(|&id| strings.get(id)).map(str::to_owned),
-                year: (years[i] != den_store::NONE_I16).then(|| i64::from(years[i])),
-            },
-        );
-    }
+    let view = store.view();
+    view.per_row::<u64>("keys").map_err(err)?;
+    view.strings().map_err(err)?;
+    let mut cards = Cards {
+        store: Arc::clone(store),
+        titles: view.per_row::<u32>("card_title").map_err(err)?.into(),
+        posters: view.per_row::<u32>("card_poster").unwrap_or(&[]).into(),
+        years: view.per_row::<i16>("card_year").map_err(err)?.into(),
+        len: 0,
+    };
+    cards.len = (0..cards.titles.len()).filter(|&row| cards.row(row).is_some()).count();
     Ok(cards)
 }
 
@@ -430,7 +475,14 @@ pub fn cards_from_store(store: &den_store::Store<'_>) -> Result<HashMap<Key, Car
 /// It stays behind `#[cfg(test)]` so `the_store_answers_what_the_metadata_sidecar_did` still has the
 /// reader it compares against — a deleted reader cannot disagree with anything.
 #[cfg(test)]
-pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
+pub struct SidecarCard {
+    pub title: String,
+    pub poster_path: Option<String>,
+    pub year: Option<i64>,
+}
+
+#[cfg(test)]
+pub fn read_cards(path: &Path) -> Result<HashMap<Key, SidecarCard>, String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RawCard {
@@ -453,7 +505,7 @@ pub fn read_cards(path: &Path) -> Result<HashMap<Key, Card>, String> {
             };
             Some((
                 (media_type, c.tmdb_id),
-                Card { title: c.title?, poster_path: c.poster_path, year: c.year },
+                SidecarCard { title: c.title?, poster_path: c.poster_path, year: c.year },
             ))
         })
         .collect())
@@ -561,7 +613,7 @@ pub fn row_with_policy(
         .skip(skip)
         .take(limit)
         .map(|(&key, tentative)| {
-            let mut title = title_json(indexes, key, &cards[&key]);
+            let mut title = title_json(indexes, key, cards.get(&key).expect("a row lists carded titles"));
             if tentative {
                 title["likely"] = serde_json::json!(true);
             }
@@ -663,7 +715,7 @@ pub(crate) fn popularity(
 }
 
 /// One title of a row as the card a client draws, with what its hide rules read.
-pub(crate) fn title_json(indexes: &Indexes, key: Key, card: &Card) -> serde_json::Value {
+pub(crate) fn title_json(indexes: &Indexes, key: Key, card: Card<'_>) -> serde_json::Value {
     let (media_type, id) = key;
     let mut title = serde_json::json!({
         "type": if media_type == MediaType::Tv { "series" } else { "movie" },
@@ -1047,7 +1099,8 @@ pub(crate) mod tests {
         crate::store::fixture::write_omitting(&path, "v9", 2, &[title], &[], &["card_poster"]);
 
         let mapped = crate::store::MappedStore::open(&path).expect("a store without card_poster opens");
-        let cards = cards_from_store(&mapped.view()).expect("cards without a poster section");
+        let mapped = std::sync::Arc::new(mapped);
+        let cards = cards_from_store(&mapped).expect("cards without a poster section");
         let card = cards.get(&(MediaType::Movie, 7)).expect("the card is still there");
         assert_eq!(card.title, "Heat", "the title is what makes it a card");
         assert_eq!(card.year, Some(1995));
@@ -1079,7 +1132,8 @@ pub(crate) mod tests {
             return;
         };
         let mapped = crate::store::MappedStore::open(std::path::Path::new(&store_path)).expect("store");
-        let from_store = cards_from_store(&mapped.view()).expect("cards from the store");
+        let mapped = std::sync::Arc::new(mapped);
+        let from_store = cards_from_store(&mapped).expect("cards from the store");
         let from_json = read_cards(std::path::Path::new(&metadata_path)).expect("cards from the sidecar");
         eprintln!("cards: store {} · sidecar {}", from_store.len(), from_json.len());
 
@@ -1095,7 +1149,7 @@ pub(crate) mod tests {
             if got.title != want.title {
                 fields.push(format!("title {:?} vs {:?}", got.title, want.title));
             }
-            if got.poster_path != want.poster_path {
+            if got.poster_path != want.poster_path.as_deref() {
                 fields.push(format!("posterPath {:?} vs {:?}", got.poster_path, want.poster_path));
             }
             if got.year != want.year {
@@ -1128,14 +1182,14 @@ pub(crate) mod tests {
             })
             .collect();
         let (mut untitled, mut absent) = (Vec::new(), Vec::new());
-        for key in from_store.keys() {
-            if from_json.contains_key(key) {
+        for (key, _) in from_store.iter() {
+            if from_json.contains_key(&key) {
                 continue;
             }
-            if described.contains(key) {
-                untitled.push(*key);
+            if described.contains(&key) {
+                untitled.push(key);
             } else {
-                absent.push(*key);
+                absent.push(key);
             }
         }
         eprintln!(
@@ -1147,7 +1201,7 @@ pub(crate) mod tests {
             absent.len()
         );
         for key in absent.iter().take(20) {
-            eprintln!("  store-only {key:?}: {:?}", from_store[key].title);
+            eprintln!("  store-only {key:?}: {:?}", from_store.get(key).map(|card| card.title));
         }
 
         // And the other direction: store rows this can draw no card for at all. They are dropped, as the

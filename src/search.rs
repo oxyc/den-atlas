@@ -1127,14 +1127,14 @@ pub fn answer_with_policy(
             let (kind, id) = s.key;
             let card = indexes.cards.as_ref().and_then(|cards| cards.get(&s.key));
             let name = card
-                .map(|c| c.title.clone())
+                .map(|c| c.title.to_owned())
                 .or_else(|| found.get(&s.key).and_then(|f| f.export.clone()).map(|e| e.0));
             let mut hit = serde_json::json!({
                 "type": if kind == MediaType::Tv { "series" } else { "movie" },
                 "id": id,
                 "score": round(s.score),
                 "title": name,
-                "posterPath": card.and_then(|c| c.poster_path.clone()),
+                "posterPath": card.and_then(|c| c.poster_path),
                 "year": card.and_then(|c| c.year),
                 "genreIds": crate::plotrows::genres(indexes, s.key),
                 "primaryGenre": crate::plotrows::primary_genre(indexes, s.key),
@@ -1436,7 +1436,7 @@ fn features(
 
     // T is known before applying inferred facet penalties because an exact name resolves that ambiguity. A
     // caller-supplied constraint still filters below; only a facet guessed from these same words yields to it.
-    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title.as_str());
+    let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key)).map(|c| c.title);
     let mut near: f64 = 0.0;
     let mut exact = false;
     let also_named = found.names.iter().map(String::as_str);

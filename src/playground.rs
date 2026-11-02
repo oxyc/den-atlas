@@ -228,7 +228,7 @@ pub fn suggest(sources: &Sources<'_>, seeds: &[(MediaType, u32)], tuning: &Tunin
         });
     let card = |media: MediaType, id: u32| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&(media, id)));
-        (card.map(|c| c.title.clone()), card.and_then(|c| c.year))
+        (card.map(|c| c.title), card.and_then(|c| c.year))
     };
     let pooled: Vec<Value> = pooled
         .iter()
@@ -387,7 +387,7 @@ pub fn answer(sources: &Sources<'_>, media_type: MediaType, tmdb_id: u32, tuning
     let row = tuned_row(sources, media_type, tmdb_id, tuning);
     let card = |key: (MediaType, u32)| {
         let card = indexes.cards.as_ref().and_then(|cards| cards.get(&key));
-        (card.map(|c| c.title.clone()), card.and_then(|c| c.year))
+        (card.map(|c| c.title), card.and_then(|c| c.year))
     };
     let shown: Vec<&Scored> = row.iter().take(limit).collect();
     let titles: Vec<Value> = shown
@@ -495,7 +495,7 @@ fn inspection(
         .collect();
     let mut out = json!({
         "key": seed_key(candidate.0, candidate.1),
-        "title": card.map(|c| c.title.clone()),
+        "title": card.map(|c| c.title),
         "year": card.and_then(|c| c.year),
         "retrieved": inspected.retrieved,
         "position": inspected.position,

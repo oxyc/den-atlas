@@ -373,7 +373,7 @@ fn title(indexes: &Indexes, media: MediaType, id: u32) -> String {
     let card = indexes.cards.as_ref().and_then(|c| c.get(&(media, id)));
     card.map_or_else(
         || id.to_string(),
-        |c| c.year.map_or_else(|| c.title.clone(), |y| format!("{} ({y})", c.title)),
+        |c| c.year.map_or_else(|| c.title.to_owned(), |y| format!("{} ({y})", c.title)),
     )
 }
 
