@@ -469,8 +469,13 @@ fn embed_one(state: &AppState, text: &str, phases: &mut Phases) -> anyhow::Resul
 }
 
 fn embed_many(state: &AppState, texts: &[String], phases: &mut Phases) -> anyhow::Result<Vec<Vec<i32>>> {
-    // CLS pooling is padding-invariant, so per-item inference is byte-identical to
-    // fastembed's batched path; the content cache handles repeats.
+    // One text per run, never a padded [B, seq] batch. model_int8.onnx quantizes activations with
+    // DynamicQuantizeLinear, whose scale and zero point span the WHOLE input tensor: pad positions and
+    // the other rows of a batch change every row's int8 activations, attention mask or not. Measured
+    // over 126 texts: a single masked pad token moves every vector (cosine 0.962-0.979, up to 4/127),
+    // and batching equal-length texts with no padding at all moves every row that shares a run
+    // (cosine >= 0.961, up to 5/127). That is the size of the ORT 1.28 drift that reordered top-10s,
+    // and it would break den-dataset's byte-exact canary. The content cache handles repeats.
     texts.iter().map(|t| embed_one(state, t, phases)).collect()
 }
 
