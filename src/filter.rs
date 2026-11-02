@@ -1863,17 +1863,8 @@ impl<'a> Context<'a> {
         policy: crate::maturity::Policy,
     ) -> Context<'a> {
         let filter = indexes.filter();
-        let maturity = if policy.restricted() {
-            let mut maturity = vec![0u64; filter.keys.len().div_ceil(64)];
-            for (row, &key) in filter.keys.iter().enumerate() {
-                if indexes.eligible(policy, key) {
-                    set(&mut maturity, row);
-                }
-            }
-            Some(maturity)
-        } else {
-            None
-        };
+        // The filter's rows are the store's rows, so the policy's memoised admission bitset is this mask.
+        let maturity = policy.restricted().then(|| indexes.admission(policy).to_vec());
         Context {
             filter,
             indexes,

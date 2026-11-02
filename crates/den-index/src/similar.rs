@@ -1395,6 +1395,10 @@ pub struct Extras<'a> {
     /// already watched). Before, so the pool's own statistics — its floors and spread — are over what the
     /// row can actually hold.
     pub keep: Option<&'a dyn Fn(Key) -> bool>,
+    /// `keep` as a bitset over store rows (bit `r` of word `r / 64`), when the caller has one: the vector
+    /// scans read it by row rather than calling `keep` for every title they pass. It must admit exactly
+    /// what `keep` admits; `keep` still answers for the pool, which holds nominations from outside the scans.
+    pub admit: Option<&'a [u64]>,
     /// A candidate this answers `true` for belongs to the seed's curated primary franchise and is kept
     /// for the dedicated franchise row instead of More Like This. Separate from `keep` so inspection can
     /// tell a client exactly why it is absent.
@@ -1427,8 +1431,8 @@ pub fn more_like_this_with(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Vec<Scored> {
-    let scans =
-        [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep));
+    let scans = [premise, plot]
+        .map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep, extras.admit));
     ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p)
 }
 
@@ -1447,8 +1451,8 @@ pub fn inspect_more_like_this(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> Inspection {
-    let scans =
-        [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep));
+    let scans = [premise, plot]
+        .map(|index| scan(index, tmdb_id, media_type, p.pool_k, p.mix_types, extras.keep, extras.admit));
     let mut inspected = ranked_inspecting(
         &scans, plot, premise, tmdb_id, media_type, candidate, authorship, facets, extras, p,
     );
@@ -1467,8 +1471,8 @@ pub fn inspect_more_like_this(
             min_popularity: 0.0,
             ..*p
         };
-        let scans =
-            [premise, plot].map(|index| scan(index, tmdb_id, media_type, open.pool_k, open.mix_types, None));
+        let scans = [premise, plot]
+            .map(|index| scan(index, tmdb_id, media_type, open.pool_k, open.mix_types, None, None));
         let counterfactual = ranked_inspecting(
             &scans,
             plot,
@@ -1478,7 +1482,7 @@ pub fn inspect_more_like_this(
             candidate,
             authorship,
             facets,
-            Extras { audience: extras.audience, keep: None, primary_franchise: None },
+            Extras { audience: extras.audience, ..Extras::default() },
             &open,
         );
         inspected.position = counterfactual.position;
@@ -1504,7 +1508,8 @@ pub fn more_like_this_both(
     extras: Extras<'_>,
     p: &SimilarParams,
 ) -> (Vec<Scored>, Vec<Scored>) {
-    let scans = [premise, plot].map(|index| scan(index, tmdb_id, media_type, p.pool_k, true, extras.keep));
+    let scans = [premise, plot]
+        .map(|index| scan(index, tmdb_id, media_type, p.pool_k, true, extras.keep, extras.admit));
     let (one, mixed) = (SimilarParams { mix_types: false, ..*p }, SimilarParams { mix_types: true, ..*p });
     let rank =
         |p: &SimilarParams| ranked(&scans, plot, premise, tmdb_id, media_type, authorship, facets, extras, p);
@@ -1520,15 +1525,31 @@ fn scan(
     pool_k: usize,
     by_type: bool,
     keep: Option<&dyn Fn(Key) -> bool>,
+    admit: Option<&[u64]>,
 ) -> Option<Vec<TypeNeighbours>> {
     let index = index?;
-    let include = |id, kind| keep.is_none_or(|keep| keep((kind, id)));
+    let Some(admit) = admit else {
+        let include = |id, kind| keep.is_none_or(|keep| keep((kind, id)));
+        return Some(if by_type {
+            index.nearest_by_type_where(tmdb_id, media_type, pool_k, include)
+        } else {
+            vec![TypeNeighbours {
+                media_type,
+                nearest: index.nearest_where(tmdb_id, media_type, pool_k, include),
+                stats: ScanStats::default(),
+            }]
+        });
+    };
+    let admitted = |row: usize| {
+        let at = index.store_row(row);
+        admit.get(at / 64).is_some_and(|word| word & (1 << (at % 64)) != 0)
+    };
     Some(if by_type {
-        index.nearest_by_type_where(tmdb_id, media_type, pool_k, include)
+        index.nearest_by_type_admitted(tmdb_id, media_type, pool_k, admitted)
     } else {
         vec![TypeNeighbours {
             media_type,
-            nearest: index.nearest_where(tmdb_id, media_type, pool_k, include),
+            nearest: index.nearest_admitted(tmdb_id, media_type, pool_k, admitted),
             stats: ScanStats::default(),
         }]
     })

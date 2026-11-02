@@ -664,18 +664,37 @@ impl Index {
         k: usize,
         include: impl Fn(u32, MediaType) -> bool,
     ) -> Vec<Neighbor> {
+        self.nearest_admitted(tmdb_id, media_type, k, |row| {
+            let record = &self.records[row];
+            include(record.tmdb_id, media_type)
+        })
+    }
+
+    /// `nearest_where` admitting by this index's own row rather than by key: a caller holding an admission
+    /// bitset over store rows reads it with `store_row`, with no key lookup per scanned title.
+    pub fn nearest_admitted(
+        &self,
+        tmdb_id: u32,
+        media_type: MediaType,
+        k: usize,
+        admit: impl Fn(usize) -> bool,
+    ) -> Vec<Neighbor> {
         let Some(&query_row) = self.rows.get(&(media_type, tmdb_id)) else { return Vec::new() };
         let query = self.row_vector(query_row as usize);
         self.top_k(
             k,
-            |row| {
-                let record = &self.records[row];
-                row != query_row as usize
-                    && record.media_type == Some(media_type)
-                    && include(record.tmdb_id, media_type)
-            },
+            |row| row != query_row as usize && self.records[row].media_type == Some(media_type) && admit(row),
             query,
         )
+    }
+
+    /// The store row an index row was read from. The test blobs have no store, and their rows are their own.
+    pub fn store_row(&self, row: usize) -> usize {
+        match &self.vectors {
+            #[cfg(test)]
+            Vectors::Owned(_) => row,
+            Vectors::Stored { rows, .. } => rows[row] as usize,
+        }
     }
 
     /// `nearest` for each type in one scan: the title's own type first, then the other, each with its `k`
@@ -694,6 +713,20 @@ impl Index {
         k: usize,
         include: impl Fn(u32, MediaType) -> bool,
     ) -> Vec<TypeNeighbours> {
+        self.nearest_by_type_admitted(tmdb_id, media_type, k, |row| {
+            let record = &self.records[row];
+            record.media_type.is_some_and(|kind| include(record.tmdb_id, kind))
+        })
+    }
+
+    /// `nearest_by_type_where` admitting by index row (`nearest_admitted`).
+    pub fn nearest_by_type_admitted(
+        &self,
+        tmdb_id: u32,
+        media_type: MediaType,
+        k: usize,
+        admit: impl Fn(usize) -> bool,
+    ) -> Vec<TypeNeighbours> {
         let Some(&query_row) = self.rows.get(&(media_type, tmdb_id)) else { return Vec::new() };
         let query = self.row_vector(query_row as usize);
         let other = match media_type {
@@ -706,9 +739,7 @@ impl Index {
                 let scored = self.scores(
                     |row| {
                         let record = &self.records[row];
-                        row != query_row as usize
-                            && record.media_type == Some(kind)
-                            && include(record.tmdb_id, kind)
+                        row != query_row as usize && record.media_type == Some(kind) && admit(row)
                     },
                     query,
                 );

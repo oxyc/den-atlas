@@ -83,6 +83,8 @@ pub struct Indexes {
     /// You Might Also Like's structural-affinity rows, keyed like `similar` but kept separately because
     /// the two rails make different promises.
     affinity: Mutex<HashMap<SimilarKey, Arc<[Key]>>>,
+    /// Each restricted policy's eligible store rows, by policy and maturity generation (`Indexes::admission`).
+    admission: Mutex<HashMap<AdmissionKey, Arc<[u64]>>>,
     /// Row orders already worked out, by type and constraints (`Indexes::row_order`).
     rows: Mutex<HashMap<String, Arc<[Key]>>>,
     /// What a billboard's fit reads off the index as a whole (`Indexes::corpus`).
@@ -110,6 +112,10 @@ type SimilarKey = (Key, bool, crate::maturity::Policy, u64);
 /// starts over.
 const SIMILAR_MEMO: usize = 4096;
 const ROW_MEMO: usize = 256;
+/// Admission bitsets kept at most: ~7.5 KB each, and a household has a handful of profiles.
+const ADMISSION_MEMO: usize = 32;
+/// An admission bitset's memo key: the policy, and the maturity generation it was worked out under.
+type AdmissionKey = (crate::maturity::Policy, u64);
 /// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
 const AGGREGATES_MEMO: usize = 8;
 
@@ -186,6 +192,34 @@ impl Indexes {
         }
     }
 
+    /// `eligible` for every store row at once, as a bitset (bit `r` of word `r / 64`), worked out once per
+    /// policy and maturity generation. A restricted More Like This scans ~92k vectors; asking `eligible` of
+    /// each — two binary searches and the box-local ratings — cost more than ranking the pool.
+    pub fn admission(&self, policy: crate::maturity::Policy) -> Arc<[u64]> {
+        let key = (policy, self.maturity_generation(policy));
+        memoised(&self.admission, key, ADMISSION_MEMO, || {
+            let view = self.store.view();
+            let keys = view.per_row::<u64>("keys").unwrap_or(&[]);
+            let mut bits = vec![0u64; keys.len().div_ceil(64)];
+            for (row, &packed) in keys.iter().enumerate() {
+                let media =
+                    if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
+                if self.eligible(policy, (media, packed as u32)) {
+                    bits[row / 64] |= 1 << (row % 64);
+                }
+            }
+            bits.into()
+        })
+    }
+
+    /// `eligible` read off an `admission` bitset; a title the store does not hold is asked directly.
+    fn admitted(&self, bits: &[u64], policy: crate::maturity::Policy, key: Key) -> bool {
+        match row_of(&self.store, key.0, key.1) {
+            Some(row) => bits[row / 64] & (1 << (row % 64)) != 0,
+            None => self.eligible(policy, key),
+        }
+    }
+
     pub fn eligible(&self, policy: crate::maturity::Policy, key: Key) -> bool {
         policy.allows_title_with(
             || self.effective_minimum_age(policy, key),
@@ -256,17 +290,18 @@ impl Indexes {
                     row.truncate(den_index::MAX_ROW);
                     return row.into();
                 }
-                let keep = |key| self.eligible(maturity, key);
+                let admission = self.admission(maturity);
+                let keep = |key| self.admitted(&admission, maturity, key);
                 let params =
                     den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
                 let seed = self.suggestion_profile((media_type, tmdb_id));
+                let extras = den_index::Extras {
+                    keep: Some(&keep),
+                    admit: Some(&admission),
+                    ..den_index::Extras::default()
+                };
                 let mut row: Vec<Key> = self
-                    .more_like_this_with(
-                        tmdb_id,
-                        media_type,
-                        &params,
-                        den_index::Extras { keep: Some(&keep), ..den_index::Extras::default() },
-                    )
+                    .more_like_this_with(tmdb_id, media_type, &params, extras)
                     .into_iter()
                     .map(|scored| scored.key())
                     .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
@@ -599,9 +634,11 @@ impl Indexes {
         let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
-        let keep = |key| self.eligible(maturity, key);
+        let admission = self.admission(maturity);
+        let keep = |key| self.admitted(&admission, maturity, key);
         let extras = den_index::Extras {
             keep: Some(&keep),
+            admit: Some(&admission),
             primary_franchise: (!kept_out.is_empty()).then_some(&reserved as &dyn Fn(Key) -> bool),
             ..den_index::Extras::default()
         };
@@ -1403,6 +1440,7 @@ fn load(sources: &Sources) -> Result<(Indexes, String), String> {
         display,
         similar: Mutex::new(HashMap::new()),
         affinity: Mutex::new(HashMap::new()),
+        admission: Mutex::new(HashMap::new()),
         rows: Mutex::new(HashMap::new()),
         corpus: OnceLock::new(),
         aggregates: Mutex::new(HashMap::new()),

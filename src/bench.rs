@@ -160,6 +160,13 @@ fn bench_real_dataset() {
     let seeds = seeds(&indexes);
     eprintln!("bench: {} seeds", seeds.len());
 
+    // A restricted policy's admission bitset is worked out on its first request and kept; its one-off cost.
+    for (name, policy) in [("kid", kid()), ("age15", age_only())] {
+        let started = Clock::start();
+        let admitted: u32 = indexes.admission(policy).iter().map(|w| w.count_ones()).sum();
+        eprintln!("bench: admission ({name}) built in {}, {admitted} rows admitted", ms(started.elapsed()));
+    }
+
     // More Like This, both rows, per policy, the memo cleared before every round so each call ranks.
     for (name, policy) in [("unrestricted", Policy::default()), ("kid", kid()), ("age15", age_only())] {
         let mut calls = Vec::new();
