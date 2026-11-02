@@ -76,11 +76,11 @@ impl SeriesStrength {
     pub fn from_facts(plot: &Index, facts: &Facts) -> SeriesStrength {
         let titles = facts.keys().filter_map(|(media, id)| {
             let record = facts.get(id, media)?;
-            let series = record.franchise.as_slice();
+            let series = record.franchise;
             if series.is_empty() {
                 return None;
             }
-            let mut people: Vec<u32> = record.makers.iter().chain(&record.cast).copied().collect();
+            let mut people: Vec<u32> = record.makers.iter().chain(record.cast).copied().collect();
             people.sort_unstable();
             people.dedup();
             Some(Title { key: (media, id), row: plot.row_of(id, media), series, people })
@@ -359,7 +359,7 @@ mod tests {
 
         let mut members: HashMap<u32, usize> = HashMap::new();
         for (media, id) in facts.keys() {
-            for &f in facts.get(id, media).map_or(&[][..], |r| r.franchise.as_slice()) {
+            for &f in facts.get(id, media).map_or(&[][..], |r| r.franchise) {
                 *members.entry(f).or_default() += 1;
             }
         }

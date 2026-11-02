@@ -1149,9 +1149,7 @@ pub fn answer_with_policy(
             }
             // Its IMDb id, which a client's availability check keys streams by: without it the client asks TMDB
             // for it, a request a card.
-            if let Some(imdb) =
-                indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id.as_deref())
-            {
+            if let Some(imdb) = indexes.facts.as_ref().and_then(|f| f.get(id, kind)).and_then(|r| r.imdb_id) {
                 hit["imdbId"] = serde_json::json!(imdb);
             }
             if let Some(language) =
@@ -1366,7 +1364,7 @@ fn rules_out(indexes: &Indexes, parsed: &Parsed, ruled_out: &HashSet<Key>, key: 
     let record = indexes.facts.as_ref().and_then(|f| f.get(id, kind));
     let facets = indexes.facets.as_ref().and_then(|f| f.title(id, kind));
     if !excluded.countries.is_empty() {
-        let recorded = record.map(|r| r.countries.as_slice()).unwrap_or_default();
+        let recorded = record.map(|r| r.countries).unwrap_or_default();
         let mut known = facets.and_then(|f| f.country).into_iter().chain(recorded.iter().copied());
         if known.any(|code| excluded.countries.iter().any(|c| c.as_bytes() == code)) {
             return true;
@@ -1402,7 +1400,7 @@ fn rules_out(indexes: &Indexes, parsed: &Parsed, ruled_out: &HashSet<Key>, key: 
         if names.source_kinds != 0 && r.source_kinds.raw() & names.source_kinds != 0 {
             return true;
         }
-        if r.makers.iter().chain(&r.cast).any(|q| names.people.contains(q)) {
+        if r.makers.iter().chain(r.cast).any(|q| names.people.contains(q)) {
             return true;
         }
     }
@@ -1458,7 +1456,7 @@ fn features(
         let known: Vec<[u8; 2]> = facets
             .and_then(|f| f.country)
             .into_iter()
-            .chain(record.map(|r| r.countries.clone()).unwrap_or_default())
+            .chain(record.map(|r| r.countries).unwrap_or_default().iter().copied())
             .collect();
         if known.is_empty() {
             phi = UNKNOWN_FACET;
@@ -1618,8 +1616,8 @@ fn features(
         qids.iter().any(|q| parsed.people.contains(q) && parsed.makers.contains(q) == making)
     };
     let person = match record {
-        Some(r) if in_role(&r.makers, true) || in_role(&r.cast, false) => 1.0,
-        Some(r) if r.makers.iter().chain(&r.cast).any(|q| parsed.people.contains(q)) => OTHER_ROLE,
+        Some(r) if in_role(r.makers, true) || in_role(r.cast, false) => 1.0,
+        Some(r) if r.makers.iter().chain(r.cast).any(|q| parsed.people.contains(q)) => OTHER_ROLE,
         _ => 0.0,
     };
 

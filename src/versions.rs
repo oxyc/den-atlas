@@ -253,7 +253,7 @@ fn label(indexes: &Indexes, franchise: &Franchise) -> String {
         let Some(record) = indexes.facts.as_ref().and_then(|f| f.get(member.key.1, member.key.0)) else {
             continue;
         };
-        for &code in &record.countries {
+        for &code in record.countries {
             *counts.entry(code).or_default() += 1;
         }
     }

@@ -815,7 +815,7 @@ impl Indexes {
         let Some(row) = row_of(&self.store, media_type, tmdb_id) else { return Vec::new() };
         let Ok(keys) = self.store.view().per_row::<u64>("keys") else { return Vec::new() };
         let series = |(media, id): Key| {
-            self.facts.as_ref().and_then(|f| f.get(id, media)).map_or(&[][..], |r| r.franchise.as_slice())
+            self.facts.as_ref().and_then(|f| f.get(id, media)).map_or(&[][..], |r| r.franchise)
         };
         let mine = series((media_type, tmdb_id));
         index
@@ -838,7 +838,7 @@ impl Indexes {
         let Some(record) = self.facts.as_ref().and_then(|f| f.get(tmdb_id, media_type)) else {
             return Vec::new();
         };
-        self.series.members_of((media_type, tmdb_id), &record.franchise)
+        self.series.members_of((media_type, tmdb_id), record.franchise)
     }
 
     /// Whether the store's own `votes` column holds a count for any row — the fallback source for row
@@ -2328,7 +2328,7 @@ mod tests {
             }
             mine.iter().filter(|m| theirs.contains(m)).count() as f64 / mine.len() as f64
         };
-        let mut records: Vec<(den_index::MediaType, u32, &crate::facts::Record)> =
+        let mut records: Vec<(den_index::MediaType, u32, crate::facts::Record)> =
             facts.keys().map(|(m, id)| (m, id, facts.get(id, m).expect("a key the facts listed"))).collect();
         records.sort_unstable_by_key(|&(m, id, _)| (m, id));
         let (mut seeds, mut shares, mut nominated) = (0, 0, 0);
@@ -2344,15 +2344,15 @@ mod tests {
             let neighbours =
                 indexes.plot.nearest(id, media, 50).into_iter().map(|n| (n.media_type, n.tmdb_id));
             for other in siblings.iter().copied().chain(neighbours) {
-                let theirs = facts.get(other.1, other.0).cloned().unwrap_or_default();
+                let theirs = facts.get(other.1, other.0).unwrap_or_default();
                 assert_eq!(
                     columns.makers(other),
-                    share(&seed.makers, &theirs.makers),
+                    share(seed.makers, theirs.makers),
                     "{id} -> {other:?}: makers"
                 );
                 assert_eq!(
                     columns.home(other),
-                    share(&seed.broadcasters, &theirs.broadcasters),
+                    share(seed.broadcasters, theirs.broadcasters),
                     "{id} -> {other:?}: home"
                 );
                 shares += 2;

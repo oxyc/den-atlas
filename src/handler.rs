@@ -456,7 +456,7 @@ async fn handle_airing(
 /// The IMDb id the dataset's facts give a series, once the indexes are loaded; `None` without them.
 async fn dataset_imdb(state: &Arc<AppState>, tmdb: u32) -> Option<String> {
     let (indexes, _) = state.index.as_ref()?.get(|| ()).await.ok()?;
-    indexes.facts.as_ref()?.get(tmdb, den_index::MediaType::Tv)?.imdb_id.clone()
+    indexes.facts.as_ref()?.get(tmdb, den_index::MediaType::Tv)?.imdb_id.map(str::to_owned)
 }
 
 /// `POST /playground/import.json` — a playground file (`playground::FILE_FORMAT`) read back to the state it

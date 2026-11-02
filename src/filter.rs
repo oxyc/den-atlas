@@ -1204,10 +1204,10 @@ impl FilterIndex {
                 }
             }
             if let Some(record) = record {
-                for code in &record.countries {
+                for code in record.countries {
                     add(&mut bits, "country", String::from_utf8_lossy(code).to_ascii_uppercase(), row);
                 }
-                for code in &record.languages {
+                for code in record.languages {
                     add(&mut bits, "language", String::from_utf8_lossy(code).to_ascii_lowercase(), row);
                 }
                 for kind in crate::facts::SourceKinds::names(record.source_kinds.raw()) {
