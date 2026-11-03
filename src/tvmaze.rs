@@ -1,8 +1,9 @@
 //! When a series' episodes come out, from TVmaze (https://www.tvmaze.com, a community TV database whose data is
 //! CC BY-SA 4.0). TMDB dates an episode by its broadcaster's slot, so a streaming release that lands on a Friday
 //! can read as the following Sunday; TVmaze dates it by the service that releases it. `GET /airing/tv/<tmdbId>`
-//! answers from what is kept here, one series per request so every cache between atlas and a household can share
-//! it.
+//! answers from what is kept here for one series (a title page), cacheable by everything between atlas and a
+//! household; `POST /airing` answers a whole following at once (Home's sweep), each with the same freshness
+//! (`max_age`).
 //!
 //! Nothing is asked on a request's behalf. A request names the series it wants (`Tvmaze::want`), and a
 //! background pass (`refresh_forever`) resolves each IMDb id to a TVmaze show once (`/lookup/shows`, kept for
@@ -34,6 +35,13 @@ const MISS_FOR: i64 = 7 * DAY;
 const SAFETY_REFRESH: i64 = 30 * DAY;
 /// How long a client or shared cache may keep an answer: a day's updates can move a date.
 pub const MAX_AGE: i64 = 6 * HOUR;
+/// How long a settled answer may be kept at least (`max_age`): an ended series with nothing dated ahead, or
+/// one TVmaze has no show for (looked up again only after `MISS_FOR`). Neither has a date to move; a revival is
+/// announced weeks before its premiere, and Home's "Coming back soon" looks 30 days ahead.
+const SETTLED_MAX_AGE: i64 = 5 * DAY;
+/// The settled freshness is spread over this many hours past `SETTLED_MAX_AGE`, by series, so the answers a
+/// household fetched together do not all go stale on the same visit.
+const SETTLED_SPREAD_HOURS: u32 = 96;
 /// How often `/updates/shows?since=day` is read, to refresh the kept shows TVmaze changed: a moved date shows
 /// within a day whatever the show's own cadence (`cadence`).
 const UPDATES_EVERY: i64 = DAY;
@@ -157,7 +165,7 @@ pub struct Tvmaze {
 }
 
 impl Tvmaze {
-    /// Off: nothing is wanted, asked or kept, and `POST /airing` is a 404.
+    /// Off: nothing is wanted, asked or kept, and `GET /airing/tv/<tmdbId>` is a 404.
     pub fn off() -> Tvmaze {
         Tvmaze::with_base(false, BASE, None)
     }
@@ -585,6 +593,18 @@ fn summary(show: &Show, today: &str, horizon: &str) -> Value {
     })
 }
 
+/// Seconds a client or shared cache may keep `airing`'s answer for TMDB series `tmdb`. An ended series with nothing
+/// dated ahead, and one TVmaze has no show for, is settled: kept `SETTLED_MAX_AGE` plus up to `SETTLED_SPREAD_HOURS`
+/// by id. Anything still running, undecided or dated keeps `MAX_AGE`. `None` for a pending answer, which no cache keeps.
+pub fn max_age(airing: &Airing, tmdb: u32) -> Option<i64> {
+    let settled = match airing {
+        Airing::Pending => return None,
+        Airing::Unknown => true,
+        Airing::Show(answer) => answer["status"] == "ended" && answer["next"].is_null(),
+    };
+    Some(if settled { SETTLED_MAX_AGE + i64::from(tmdb % SETTLED_SPREAD_HOURS) * HOUR } else { MAX_AGE })
+}
+
 #[cfg(test)]
 impl Tvmaze {
     /// On, asking `base` with no pacing, keeping nothing on disk.
@@ -686,6 +706,24 @@ pub(crate) mod tests {
             Airing::Show(answer) => answer,
             other => panic!("{imdb}: {other:?}"),
         }
+    }
+
+    /// Only an answer with no date left to move is kept for days: an ended series whose final episode is still to
+    /// come keeps the short freshness until it is out, and a pending lookup is kept by nothing.
+    #[test]
+    fn only_a_settled_answer_is_kept_for_days() {
+        let ended = Airing::Show(json!({"status": "ended", "next": null}));
+        let finale = Airing::Show(
+            json!({"status": "ended", "next": {"season": 5, "episode": 8, "date": "2026-11-20"}}),
+        );
+        let running = Airing::Show(json!({"status": "running", "next": null}));
+        assert_eq!(max_age(&ended, 0), Some(SETTLED_MAX_AGE));
+        assert_eq!(max_age(&ended, 95), Some(SETTLED_MAX_AGE + 95 * HOUR));
+        assert_eq!(max_age(&ended, 96), Some(SETTLED_MAX_AGE), "spread wraps by id");
+        assert_eq!(max_age(&Airing::Unknown, 1), Some(SETTLED_MAX_AGE + HOUR));
+        assert_eq!(max_age(&finale, 0), Some(MAX_AGE));
+        assert_eq!(max_age(&running, 0), Some(MAX_AGE));
+        assert_eq!(max_age(&Airing::Pending, 0), None);
     }
 
     #[tokio::test]

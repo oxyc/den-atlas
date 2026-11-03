@@ -308,6 +308,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             handle_recommend(&state, config, req).await
         } else if route == "/playground/import.json" {
             handle_playground_import(&state, req).await
+        } else if route == "/airing" {
+            handle_airing_batch(&state, req).await
         } else {
             json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED)
         };
@@ -406,7 +408,8 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
 }
 
 /// `GET /airing/tv/<tmdbId>[?imdb=tt…]` — one series' release schedule from TVmaze (`tvmaze.rs`): the same for
-/// every household, so it is cached publicly for `tvmaze::MAX_AGE` and revalidated by its ETag. TVmaze is asked by
+/// every household, so it is cached publicly for `tvmaze::max_age` (hours while it can still move, days once it is
+/// settled) and revalidated by its ETag. TVmaze is asked by
 /// IMDb id: the dataset's own for the TMDB id, else the `imdb` hint. A hint never replaces the dataset's id, and
 /// the answer is kept by IMDb id, so a wrong hint can only shape the answer at its own URL.
 ///
@@ -432,10 +435,7 @@ async fn handle_airing(
     let (true, Some(tmdb)) = (state.tvmaze.enabled(), tmdb) else {
         return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
     };
-    let hint = query_param(query, "imdb").filter(|imdb| {
-        imdb.len() <= 12
-            && imdb.strip_prefix("tt").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-    });
+    let hint = query_param(query, "imdb").filter(|imdb| valid_imdb(imdb));
     let Some(imdb) = dataset_imdb(state, tmdb).await.or(hint) else {
         return not_found(r#"{"error":"not_found"}"#, &cached);
     };
@@ -444,13 +444,102 @@ async fn handle_airing(
     if state.tvmaze.want(&imdb, now) {
         state.tvmaze.settle(&imdb, crate::tvmaze::FIRST_WAIT).await;
     }
-    match state.tvmaze.airing(&imdb, now) {
-        crate::tvmaze::Airing::Show(answer) => {
-            serve_json(method, headers, answer.to_string(), &cached, None).await
+    let airing = state.tvmaze.airing(&imdb, now);
+    let kept = crate::tvmaze::max_age(&airing, tmdb).map(|seconds| format!("public, max-age={seconds}"));
+    match (airing, kept) {
+        (crate::tvmaze::Airing::Show(answer), Some(kept)) => {
+            serve_json(method, headers, answer.to_string(), &kept, None).await
         }
-        crate::tvmaze::Airing::Unknown => not_found(r#"{"error":"not_found"}"#, &cached),
-        crate::tvmaze::Airing::Pending => not_found(r#"{"error":"not_found","pending":true}"#, "no-store"),
+        (crate::tvmaze::Airing::Unknown, Some(kept)) => not_found(r#"{"error":"not_found"}"#, &kept),
+        _ => not_found(r#"{"error":"not_found","pending":true}"#, "no-store"),
     }
+}
+
+/// Series one `POST /airing` may name: a household's whole following, the web's content-wire title limit.
+const AIRING_BATCH: usize = 512;
+
+/// One series as `POST /airing` names it.
+#[derive(serde::Deserialize)]
+struct AiringAsk {
+    tmdb: u32,
+    #[serde(default)]
+    imdb: Option<String>,
+}
+
+/// `POST /airing` with `{"series":[{"tmdb","imdb"?}…]}` (at most `AIRING_BATCH`) — every followed series' schedule in
+/// one round trip, which is how a client sweeps a library: one `GET /airing/tv/<id>` per series cost a household of
+/// ~800 followed series ~800 round trips per Home visit, and past den-edge's per-member budget the rest were refused.
+/// The answer is the GET's for each series, in the order asked, with the freshness the GET would have sent:
+/// `{"airing":[{"tmdb","maxAge","airing"}…]}`, `airing` null where TVmaze has no show, and `{"tmdb","pending":true}`
+/// for a first lookup still running after one shared `tvmaze::FIRST_WAIT`. It differs per household, so no cache
+/// keeps it (`no-store`); a title page's single series stays the cacheable GET.
+async fn handle_airing_batch(state: &Arc<AppState>, req: Request) -> Response {
+    if !state.tvmaze.enabled() {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    }
+    let bad = || json_response(r#"{"error":"bad_request"}"#, StatusCode::BAD_REQUEST);
+    let body = match body_bytes_held(state, req, 64 * 1024).await {
+        Ok((body, permit)) => {
+            drop(permit);
+            body
+        }
+        Err(error) => return body_error(error, bad),
+    };
+    #[derive(serde::Deserialize)]
+    struct Body {
+        series: Vec<AiringAsk>,
+    }
+    let Ok(Body { series }) = serde_json::from_slice::<Body>(&body) else { return bad() };
+    if series.len() > AIRING_BATCH {
+        return bad();
+    }
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut asked: Vec<(u32, Option<String>)> = Vec::with_capacity(series.len());
+    let mut seen = std::collections::HashSet::new();
+    for one in series.into_iter().filter(|one| one.tmdb > 0) {
+        if !seen.insert(one.tmdb) {
+            continue;
+        }
+        let hint = one.imdb.filter(|imdb| valid_imdb(imdb));
+        asked.push((one.tmdb, dataset_imdb(state, one.tmdb).await.or(hint)));
+    }
+    let pending: Vec<&str> = asked
+        .iter()
+        .filter_map(|(_, imdb)| imdb.as_deref())
+        .filter(|imdb| state.tvmaze.want(imdb, now))
+        .collect();
+    let deadline = std::time::Instant::now() + crate::tvmaze::FIRST_WAIT;
+    for imdb in pending {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        state.tvmaze.settle(imdb, left).await;
+    }
+    let answers: Vec<serde_json::Value> = asked
+        .iter()
+        .map(|(tmdb, imdb)| {
+            let Some(imdb) = imdb else {
+                return serde_json::json!({ "tmdb": tmdb, "maxAge": crate::tvmaze::MAX_AGE, "airing": null });
+            };
+            let airing = state.tvmaze.airing(imdb, now);
+            match (crate::tvmaze::max_age(&airing, *tmdb), airing) {
+                (Some(max_age), crate::tvmaze::Airing::Show(answer)) => {
+                    serde_json::json!({ "tmdb": tmdb, "maxAge": max_age, "airing": answer })
+                }
+                (Some(max_age), _) => serde_json::json!({ "tmdb": tmdb, "maxAge": max_age, "airing": null }),
+                (None, _) => serde_json::json!({ "tmdb": tmdb, "pending": true }),
+            }
+        })
+        .collect();
+    json_response(serde_json::json!({ "airing": answers }).to_string(), StatusCode::OK)
+}
+
+/// Whether an `imdb` hint names an IMDb title: `tt` and digits, as TVmaze's lookup takes it.
+fn valid_imdb(imdb: &str) -> bool {
+    imdb.len() <= 12
+        && imdb.strip_prefix("tt").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The IMDb id the dataset's facts give a series, once the indexes are loaded; `None` without them.
@@ -5954,6 +6043,14 @@ mod tests {
             .unwrap();
         assert_eq!(handle(State(Arc::clone(&state)), matching).await.status(), 304);
 
+        // Settled answers are kept for days, spread by id: 5 days plus `1396 % 96` = 52 hours, and 5 days plus 2.
+        let ended = get(&state, "/airing/tv/1396?imdb=tt0903747").await;
+        assert_eq!(ended.status(), 200);
+        assert_eq!(ended.headers()["cache-control"], "public, max-age=619200", "ended, nothing dated ahead");
+        let unknown = get(&state, "/airing/tv/2?imdb=tt0000001").await;
+        assert_eq!(unknown.status(), 404);
+        assert_eq!(unknown.headers()["cache-control"], "public, max-age=439200", "TVmaze has no show");
+
         let unresolved = get(&state, "/airing/tv/259909").await;
         assert_eq!(unresolved.status(), 404, "no dataset and no hint: no IMDb id to ask TVmaze by");
         assert_eq!(unresolved.headers()["cache-control"], "public, max-age=21600");
@@ -5966,6 +6063,56 @@ mod tests {
 
         let manifest = body_of(get(&state, "/manifest.json").await).await;
         assert!(manifest.contains("https://www.tvmaze.com"), "{manifest}");
+
+        // The same answers for a whole following in one POST, in the order asked, each with the GET's freshness;
+        // a repeat and an invalid id are dropped, and the answer is kept by no cache.
+        let batch = post(
+            &state,
+            "/airing",
+            r#"{"series":[{"tmdb":259909,"imdb":"tt33043892"},{"tmdb":1396,"imdb":"tt0903747"},
+                {"tmdb":2,"imdb":"tt0000001"},{"tmdb":259909},{"tmdb":0},{"tmdb":7}]}"#,
+        )
+        .await;
+        assert_eq!(batch.status(), 200);
+        assert_eq!(batch.headers()["cache-control"], "no-store");
+        let batch: serde_json::Value = serde_json::from_str(&body_of(batch).await).unwrap();
+        let answers = batch["airing"].as_array().unwrap();
+        let shape: Vec<(u64, i64, bool)> = answers
+            .iter()
+            .map(|a| (a["tmdb"].as_u64().unwrap(), a["maxAge"].as_i64().unwrap(), a["airing"].is_object()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(259909, 21600, true), (1396, 619200, true), (2, 439200, false), (7, 21600, false)],
+            "running, ended, TVmaze has none, and no IMDb id to ask by"
+        );
+        assert_eq!(answers[0]["airing"], body, "the GET's own answer");
+        assert_eq!(post(&state, "/airing", "{}").await.status(), 400);
+        let too_many = format!(
+            r#"{{"series":[{}]}}"#,
+            (1..=513).map(|i| format!(r#"{{"tmdb":{i}}}"#)).collect::<Vec<_>>().join(",")
+        );
+        assert_eq!(post(&state, "/airing", &too_many).await.status(), 400);
+        // With no pass running, a first lookup is still pending after the one shared wait.
+        let idle = Arc::new(AppState {
+            tvmaze: Arc::new(crate::tvmaze::Tvmaze::at(&base)),
+            ..AppState::for_test(None)
+        });
+        let started = std::time::Instant::now();
+        let pending =
+            post(&idle, "/airing", r#"{"series":[{"tmdb":1,"imdb":"tt1"},{"tmdb":2,"imdb":"tt2"}]}"#).await;
+        assert!(
+            started.elapsed() < crate::tvmaze::FIRST_WAIT * 2,
+            "one wait for the batch, not one per series"
+        );
+        assert_eq!(
+            body_of(pending).await,
+            r#"{"airing":[{"pending":true,"tmdb":1},{"pending":true,"tmdb":2}]}"#
+        );
+        assert_eq!(
+            post(&Arc::new(AppState::for_test(None)), "/airing", r#"{"series":[]}"#).await.status(),
+            404
+        );
         let off = Arc::new(AppState::for_test(None));
         let resp = get(&off, "/airing/tv/259909?imdb=tt33043892").await;
         assert_eq!(

@@ -935,6 +935,14 @@ fn routes() -> Value {
             "query": "imdb?=tt… (used when the dataset has no IMDb id for the series)",
             "returns": "{source, status, service, next, previous, upcoming, seasonPremiere}",
         },
+        {
+            "method": "POST",
+            "path": "/airing",
+            "about": "Every followed series' release dates in one request: the GET's answer for each, with the \
+                      seconds a client may keep it. Not cacheable; a title page asks the GET.",
+            "body": "{series: [{tmdb, imdb?}], at most 512}",
+            "returns": "{airing: [{tmdb, maxAge, airing|null} | {tmdb, pending: true}]}",
+        },
         { "method": "GET", "path": "/dataset.json", "about": "What the dataset is: versions, model, count." },
         { "method": "GET", "path": "/health", "about": "Always 200; status ok, or degraded with a reason." },
         { "method": "GET", "path": "/ready", "about": "503 when a whole feature is off." },
