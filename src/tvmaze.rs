@@ -18,7 +18,7 @@
 use crate::util::{backs_off, lock, retry_after, Backoff};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,10 @@ const UPCOMING_DAYS: i64 = 14;
 const PASS_EVERY: Duration = Duration::from_secs(300);
 /// Between two requests: at most ~17 in TVmaze's 10 s window of 20.
 const PACE: Duration = Duration::from_millis(600);
+/// After this many first-answer series, give one stale lookup or due-show refresh a turn. A cold following still
+/// spends almost all of the upstream budget on useful first answers, while a continuously growing one cannot
+/// indefinitely hold back a changed show or the monthly safety net.
+const FOREGROUND_BEFORE_MAINTENANCE: usize = 8;
 /// How long a request naming a series atlas has never looked up waits for the pass to fetch it. Bounded, so a
 /// slow or refusing TVmaze costs the request at most this.
 pub const FIRST_WAIT: Duration = Duration::from_secs(2);
@@ -140,6 +144,114 @@ enum Job {
     Fetch(u32),
 }
 
+/// Request-time ordering is deliberately not persisted: `Kept::wanted` is the durable source of pending work and
+/// reconstructs it on a restart. This queue only gives live callers fair turns. Singles (title pages) alternate
+/// with batches; batches rotate after each series, so neither a 512-title household nor repeated title opens can
+/// monopolize the one paced upstream lane.
+#[derive(Default)]
+struct Foreground {
+    singles: VecDeque<Arc<str>>,
+    batches: VecDeque<VecDeque<Arc<str>>>,
+    queued: HashSet<Arc<str>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    Single,
+    Batch,
+}
+
+impl Foreground {
+    fn single(&mut self, imdb: &str) {
+        if self.singles.iter().any(|queued| &**queued == imdb) {
+            return;
+        }
+        // A title opened while its household sweep is queued gets the single-title turn. There is still one
+        // shared entry in `queued`; removing it from the batch prevents a duplicate lookup/fetch later.
+        for batch in &mut self.batches {
+            batch.retain(|queued| &**queued != imdb);
+        }
+        self.batches.retain(|batch| !batch.is_empty());
+        let imdb: Arc<str> = Arc::from(imdb);
+        self.queued.insert(Arc::clone(&imdb));
+        self.singles.push_back(imdb);
+    }
+
+    fn batch<'a>(&mut self, imdbs: impl IntoIterator<Item = &'a str>) {
+        let mut batch = VecDeque::new();
+        for imdb in imdbs {
+            if self.queued.contains(imdb) {
+                continue;
+            }
+            let imdb: Arc<str> = Arc::from(imdb);
+            self.queued.insert(Arc::clone(&imdb));
+            batch.push_back(imdb);
+        }
+        if !batch.is_empty() {
+            self.batches.push_back(batch);
+        }
+    }
+
+    fn depth(&self) -> usize {
+        self.queued.len()
+    }
+
+    #[cfg(test)]
+    fn storage_floor(&self) -> usize {
+        let queue_slots =
+            self.singles.capacity() + self.batches.iter().map(VecDeque::capacity).sum::<usize>();
+        let handles = queue_slots + self.queued.capacity();
+        handles * std::mem::size_of::<Arc<str>>()
+            + self.queued.iter().map(|imdb| imdb.len()).sum::<usize>()
+    }
+
+    /// The next live request's work in one lane. A series stays at the front after its lookup so the fetch can be
+    /// its immediate continuation; once answered, its batch rotates behind the other households.
+    fn job(&mut self, lane: Lane, kept: &Kept, tried: &HashSet<Job>) -> Option<Job> {
+        match lane {
+            Lane::Single => {
+                let turns = self.singles.len();
+                for _ in 0..turns {
+                    let imdb = self.singles.pop_front()?;
+                    match first_job(kept, &imdb) {
+                        None => {
+                            self.queued.remove(&imdb);
+                        }
+                        Some(job) if tried.contains(&job) => self.singles.push_back(imdb),
+                        Some(job) => {
+                            self.singles.push_front(imdb);
+                            return Some(job);
+                        }
+                    }
+                }
+                None
+            }
+            Lane::Batch => {
+                let turns = self.batches.len();
+                for _ in 0..turns {
+                    let mut batch = self.batches.pop_front()?;
+                    let Some(imdb) = batch.front().cloned() else { continue };
+                    match first_job(kept, &imdb) {
+                        None => {
+                            batch.pop_front();
+                            self.queued.remove(&imdb);
+                            if !batch.is_empty() {
+                                self.batches.push_back(batch);
+                            }
+                        }
+                        Some(job) if tried.contains(&job) => self.batches.push_back(batch),
+                        Some(job) => {
+                            self.batches.push_front(batch);
+                            return Some(job);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
 enum Answer {
     Json(Value),
     /// A lookup answers with a redirect to the show it found.
@@ -153,6 +265,7 @@ pub struct Tvmaze {
     pace: Duration,
     http: reqwest::Client,
     kept: Mutex<Kept>,
+    foreground: Mutex<Foreground>,
     file: Option<PathBuf>,
     persisted: Mutex<Option<Vec<u8>>>,
     backoff: Backoff,
@@ -162,6 +275,17 @@ pub struct Tvmaze {
     progress: tokio::sync::Notify,
     requests: AtomicU64,
     refusals: AtomicU64,
+}
+
+/// A pass can be cancelled while pacing or awaiting TVmaze (runtime shutdown, test/task ownership change). Keep
+/// every completed lookup/fetch before its future is dropped; the normal end calls `save` too, where unchanged
+/// bytes are free. This retains one batched write on an uninterrupted sweep without losing resolved ids on cancel.
+struct SavePass<'a>(&'a Tvmaze);
+
+impl Drop for SavePass<'_> {
+    fn drop(&mut self) {
+        self.0.save();
+    }
 }
 
 impl Tvmaze {
@@ -187,6 +311,11 @@ impl Tvmaze {
             }
         });
         let persisted = loaded.as_ref().and_then(|kept| serde_json::to_vec(kept).ok());
+        let kept = loaded.unwrap_or_default();
+        let pending: Vec<&str> =
+            kept.wanted.keys().filter(|imdb| kept.unanswered(imdb)).map(String::as_str).collect();
+        let mut foreground = Foreground::default();
+        foreground.batch(pending);
         // No redirects: a lookup's answer is the redirect, and its Location names the show without a second request.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -199,7 +328,8 @@ impl Tvmaze {
             base: base.to_owned(),
             pace: PACE,
             http,
-            kept: Mutex::new(loaded.unwrap_or_default()),
+            kept: Mutex::new(kept),
+            foreground: Mutex::new(foreground),
             file,
             persisted: Mutex::new(persisted),
             backoff: Backoff::new(REFUSED_PAUSE, MAX_REFUSED_PAUSE),
@@ -228,6 +358,35 @@ impl Tvmaze {
         let pending = kept.unanswered(imdb);
         drop(kept);
         if pending {
+            lock(&self.foreground).single(imdb);
+            self.wake.notify_one();
+        }
+        pending
+    }
+
+    /// Note one household's following as a group. Groups take turns one completed series at a time; repeated ids
+    /// are still one piece of upstream work, and the returned flags line up with `imdbs` for the batch's bounded
+    /// wait. Unlike `want`, this does not turn hundreds of series into hundreds of priority callers.
+    pub fn want_batch<'a>(&self, imdbs: impl IntoIterator<Item = &'a str>, now: i64) -> Vec<bool> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let imdbs: Vec<&str> = imdbs.into_iter().collect();
+        let mut kept = lock(&self.kept);
+        let mut pending = Vec::with_capacity(imdbs.len());
+        for imdb in &imdbs {
+            if kept.wanted.get(*imdb).is_none_or(|at| now - at >= DAY) {
+                kept.wanted.insert((*imdb).to_owned(), now);
+            }
+            pending.push(kept.unanswered(imdb));
+        }
+        drop(kept);
+        let waiting = imdbs.iter().zip(&pending).filter_map(|(imdb, pending)| pending.then_some(*imdb));
+        let mut foreground = lock(&self.foreground);
+        foreground.batch(waiting);
+        let wake = pending.iter().any(|pending| *pending);
+        drop(foreground);
+        if wake {
             self.wake.notify_one();
         }
         pending
@@ -278,6 +437,7 @@ impl Tvmaze {
         if !self.enabled {
             return;
         }
+        let _save_on_cancel = SavePass(self);
         let (read_updates, since) = {
             let mut kept = lock(&self.kept);
             prune(&mut kept, now);
@@ -308,8 +468,44 @@ impl Tvmaze {
             }
         }
         let mut tried = HashSet::new();
+        let mut prefer = Lane::Single;
+        let mut foreground_since_maintenance = 0;
+        let mut continuation = None;
         loop {
-            let job = next_job(&lock(&self.kept), now, &tried);
+            let mut is_foreground = false;
+            let mut is_maintenance = false;
+            let job = {
+                let kept = lock(&self.kept);
+                if let Some(job) = continuation.take().filter(|job| !tried.contains(job)) {
+                    Some(job)
+                } else {
+                    let due_maintenance = (foreground_since_maintenance >= FOREGROUND_BEFORE_MAINTENANCE)
+                        .then(|| maintenance_job(&kept, now, &tried))
+                        .flatten();
+                    if let Some(job) = due_maintenance {
+                        is_maintenance = true;
+                        Some(job)
+                    } else {
+                        let mut foreground = lock(&self.foreground);
+                        let other = if prefer == Lane::Single { Lane::Batch } else { Lane::Single };
+                        let selected = foreground
+                            .job(prefer, &kept, &tried)
+                            .map(|job| (job, prefer))
+                            .or_else(|| foreground.job(other, &kept, &tried).map(|job| (job, other)));
+                        drop(foreground);
+                        if let Some((job, lane)) = selected {
+                            prefer = if lane == Lane::Single { Lane::Batch } else { Lane::Single };
+                            is_foreground = true;
+                            Some(job)
+                        } else if let Some(job) = cold_job(&kept, &tried) {
+                            is_foreground = true;
+                            Some(job)
+                        } else {
+                            maintenance_job(&kept, now, &tried).inspect(|_| is_maintenance = true)
+                        }
+                    }
+                }
+            };
             let Some(job) = job else { break };
             if self.backoff.paused().is_some() {
                 break;
@@ -319,6 +515,11 @@ impl Tvmaze {
             }
             first = false;
             tried.insert(job.clone());
+            if is_foreground {
+                foreground_since_maintenance += 1;
+            } else if is_maintenance {
+                foreground_since_maintenance = 0;
+            }
             match job {
                 Job::Lookup(imdb) => {
                     lookups += 1;
@@ -328,7 +529,11 @@ impl Tvmaze {
                         Some(Answer::NotFound) => None,
                         None => continue,
                     };
-                    lock(&self.kept).ids.insert(imdb, Lookup { show: found, at: now });
+                    let mut kept = lock(&self.kept);
+                    kept.ids.insert(imdb, Lookup { show: found, at: now });
+                    // A first lookup is useful only after the show lands. Keep those two paced requests adjacent;
+                    // this is the direct fix for a 512-title sweep's previous five-minute wait for its first row.
+                    continuation = found.filter(|id| !kept.shows.contains_key(id)).map(Job::Fetch);
                 }
                 Job::Fetch(id) => {
                     fetches += 1;
@@ -426,12 +631,13 @@ impl Tvmaze {
         }
     }
 
-    /// `(series wanted, shows kept, requests made, refusals)` for `/metrics`.
-    pub fn counts(&self) -> (u64, u64, u64, u64) {
+    /// `(series wanted, shows kept, first-answer queue depth, requests made, refusals)` for `/metrics`.
+    pub fn counts(&self) -> (u64, u64, u64, u64, u64) {
         let kept = lock(&self.kept);
         (
             kept.wanted.len() as u64,
             kept.shows.len() as u64,
+            lock(&self.foreground).depth() as u64,
             self.requests.load(Ordering::Relaxed),
             self.refusals.load(Ordering::Relaxed),
         )
@@ -453,34 +659,50 @@ fn prune(kept: &mut Kept, now: i64) {
     shows.retain(|id, _| used.contains(id));
 }
 
-/// What to ask next: a series never looked up, then a found show never fetched, then a lookup past its time, then
-/// the most overdue show. Each at most once a pass.
-fn next_job(kept: &Kept, now: i64, tried: &HashSet<Job>) -> Option<Job> {
+/// The first-answer work for one series. A lookup that found an id is still pending until its show is fetched.
+fn first_job(kept: &Kept, imdb: &str) -> Option<Job> {
+    if !kept.wanted.contains_key(imdb) {
+        return None;
+    }
+    match kept.ids.get(imdb) {
+        None => Some(Job::Lookup(imdb.to_owned())),
+        Some(Lookup { show: Some(id), .. }) if !kept.shows.contains_key(id) => Some(Job::Fetch(*id)),
+        _ => None,
+    }
+}
+
+/// Durable fallback for work not represented by the live fair queue (principally a restart). Fetching a resolved
+/// id precedes another lookup, retaining the time-to-first-useful property even if runtime ordering was lost.
+fn cold_job(kept: &Kept, tried: &HashSet<Job>) -> Option<Job> {
     let untried = |job: &Job| !tried.contains(job);
     let lookup = |imdb: &String| Job::Lookup(imdb.clone());
-    if let Some(job) =
-        kept.wanted.keys().filter(|imdb| !kept.ids.contains_key(*imdb)).map(lookup).find(untried)
-    {
-        return Some(job);
-    }
     let found: Vec<u32> = kept.wanted.keys().filter_map(|imdb| kept.ids.get(imdb)?.show).collect();
     if let Some(job) =
         found.iter().filter(|id| !kept.shows.contains_key(*id)).map(|id| Job::Fetch(*id)).find(untried)
     {
         return Some(job);
     }
-    let stale = |l: &Lookup| now - l.at >= if l.show.is_some() { LOOKUP_FOR } else { MISS_FOR };
-    if let Some(job) =
-        kept.wanted.keys().filter(|imdb| kept.ids.get(*imdb).is_some_and(stale)).map(lookup).find(untried)
-    {
-        return Some(job);
-    }
-    found
+    kept.wanted.keys().filter(|imdb| !kept.ids.contains_key(*imdb)).map(lookup).find(untried)
+}
+
+/// Changed/monthly show reads and stale id checks share a bounded maintenance lane. Due shows go first so the
+/// daily feed's work and safety net are not held behind a large stale-id population; stale ids then drain whenever
+/// no show is due. Neither class can be starved by an unbounded stream of new households.
+fn maintenance_job(kept: &Kept, now: i64, tried: &HashSet<Job>) -> Option<Job> {
+    let untried = |job: &Job| !tried.contains(job);
+    let found: Vec<u32> = kept.wanted.keys().filter_map(|imdb| kept.ids.get(imdb)?.show).collect();
+    if let Some(job) = found
         .iter()
         .filter_map(|id| Some((*id, kept.shows.get(id)?)))
         .filter(|(id, show)| due(show, now) && untried(&Job::Fetch(*id)))
         .min_by_key(|(_, show)| show.fetched)
         .map(|(id, _)| Job::Fetch(id))
+    {
+        return Some(job);
+    }
+    let lookup = |imdb: &String| Job::Lookup(imdb.clone());
+    let stale = |l: &Lookup| now - l.at >= if l.show.is_some() { LOOKUP_FOR } else { MISS_FOR };
+    kept.wanted.keys().filter(|imdb| kept.ids.get(*imdb).is_some_and(stale)).map(lookup).find(untried)
 }
 
 /// Whether a kept show is fetched again: when the daily `/updates/shows` read marked it changed (`fetched` 0), or
@@ -701,6 +923,56 @@ pub(crate) mod tests {
         (tvmaze, requests)
     }
 
+    /// A controlled TVmaze that resolves any `tt<digits>` to the same numeric show and timestamps every request.
+    /// Its answers are immediate, so every interval below is Atlas's pacing/scheduling rather than server noise.
+    async fn measured_tvmaze() -> (String, Arc<Mutex<Vec<(String, Duration)>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&requests);
+        let started = tokio::time::Instant::now();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let counted = Arc::clone(&counted);
+            async move {
+                let uri = request.uri().to_string();
+                lock(&counted).push((uri.clone(), started.elapsed()));
+                let response = axum::response::Response::builder().header("content-type", "application/json");
+                if let Some(imdb) = uri.strip_prefix("/lookup/shows?imdb=tt") {
+                    return response
+                        .status(301)
+                        .header("location", format!("https://api.tvmaze.com/shows/{imdb}"))
+                        .body(axum::body::Body::from("null"))
+                        .unwrap();
+                }
+                if uri.starts_with("/updates/shows") {
+                    return response.body(axum::body::Body::from("{}")).unwrap();
+                }
+                let id = uri
+                    .strip_prefix("/shows/")
+                    .and_then(|tail| tail.split('?').next())
+                    .and_then(|id| id.parse::<u32>().ok());
+                match id {
+                    Some(id) => response
+                        .body(axum::body::Body::from(format!(
+                            r#"{{"id":{id},"status":"Running","updated":1,"_embedded":{{"episodes":[]}}}}"#
+                        )))
+                        .unwrap(),
+                    None => response.status(404).body(axum::body::Body::from("null")).unwrap(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), requests)
+    }
+
+    fn series(count: usize, offset: usize) -> Vec<String> {
+        (offset..offset + count).map(|id| format!("tt{id:07}")).collect()
+    }
+
+    fn millis(duration: Duration) -> u128 {
+        duration.as_millis()
+    }
+
     fn answer_for(tvmaze: &Tvmaze, imdb: &str, now: i64) -> Value {
         match tvmaze.airing(imdb, now) {
             Airing::Show(answer) => answer,
@@ -834,7 +1106,7 @@ pub(crate) mod tests {
             started.elapsed() < Duration::from_millis(500),
             "a request does not wait on a refusing TVmaze"
         );
-        assert_eq!(tvmaze.counts().3, 1);
+        assert_eq!(tvmaze.counts().4, 1);
     }
 
     #[tokio::test]
@@ -908,6 +1180,178 @@ pub(crate) mod tests {
         assert!(matches!(tvmaze.airing(DEXTER_IMDB, now()), Airing::Show(_)), "answered within the wait");
     }
 
+    /// Controlled 1/100/512/800-series evidence for the production scheduler. Before this change, first useful was
+    /// `count * PACE` (0.6s, 60s, 307.2s, 480s) because every lookup preceded every show. Interleaving fixes first
+    /// useful at one pace interval without changing the two requests per found series or the upstream interval.
+    #[tokio::test]
+    async fn cold_followings_record_first_median_tail_depth_and_rate() {
+        for count in [1, 100, 512, 800] {
+            let (base, requests) = measured_tvmaze().await;
+            let mut tvmaze = Tvmaze::with_base(true, &base, None);
+            let measured_pace = Duration::from_millis(1);
+            tvmaze.pace = measured_pace;
+            let ids = series(count, 1);
+            assert!(tvmaze.want_batch(ids.iter().map(String::as_str), NOW).into_iter().all(|p| p));
+            let peak_depth = tvmaze.counts().2;
+            let queue_storage_floor = lock(&tvmaze.foreground).storage_floor();
+            tvmaze.pass(NOW).await;
+
+            let requests = lock(&requests);
+            assert_eq!(requests.len(), count * 2, "one lookup and one show per series");
+            for pair in requests.windows(2) {
+                assert!(pair[1].1 - pair[0].1 >= measured_pace, "paced: {pair:?}");
+            }
+            let shows: Vec<(usize, Duration)> = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, (path, _))| path.starts_with("/shows/"))
+                .map(|(slot, (_, at))| (slot, *at))
+                .collect();
+            assert_eq!(shows.len(), count);
+            let first = shows[0].1;
+            let median = if count % 2 == 0 {
+                (shows[count / 2 - 1].1 + shows[count / 2].1) / 2
+            } else {
+                shows[count / 2].1
+            };
+            let tail = shows.last().unwrap().1;
+            let production_first = PACE * u32::try_from(shows[0].0).unwrap();
+            let production_median = if count % 2 == 0 {
+                (PACE * u32::try_from(shows[count / 2 - 1].0).unwrap()
+                    + PACE * u32::try_from(shows[count / 2].0).unwrap())
+                    / 2
+            } else {
+                PACE * u32::try_from(shows[count / 2].0).unwrap()
+            };
+            let production_tail = PACE * u32::try_from(shows.last().unwrap().0).unwrap();
+            assert_eq!(shows[0].0, 1, "the first lookup is immediately followed by its show");
+            assert_eq!(peak_depth, count as u64);
+            assert_eq!(tvmaze.counts().2, 0, "the live queue drains completely");
+            eprintln!(
+                "tvmaze cold {count}: measured@1ms first={}ms median={}ms tail={}ms; production@600ms first={}ms median={}ms tail={}ms; requests={} peak_queue={} queue_storage>={}B",
+                millis(first),
+                millis(median),
+                millis(tail),
+                millis(production_first),
+                millis(production_median),
+                millis(production_tail),
+                requests.len(),
+                peak_depth,
+                queue_storage_floor,
+            );
+        }
+    }
+
+    /// A title page alternates ahead of household groups, household groups rotate after one useful series, and a
+    /// due show gets the ninth turn. This is the bounded fairness contract under a continuously non-empty cold lane.
+    #[tokio::test]
+    async fn titles_households_and_maintenance_share_the_paced_lane() {
+        let (base, requests) = measured_tvmaze().await;
+        let mut tvmaze = Tvmaze::with_base(true, &base, None);
+        tvmaze.pace = Duration::ZERO;
+        let household_a = series(5, 100);
+        let household_b = series(5, 200);
+        tvmaze.want_batch(household_a.iter().map(String::as_str), NOW);
+        tvmaze.want_batch(household_b.iter().map(String::as_str), NOW);
+        assert!(tvmaze.want("tt0000999", NOW), "new title is cold");
+        {
+            let mut kept = lock(&tvmaze.kept);
+            kept.updates_at = NOW;
+            kept.wanted.insert("tt0000900".into(), NOW);
+            kept.ids.insert("tt0000900".into(), Lookup { show: Some(900), at: NOW });
+            kept.shows.insert(900, Show { fetched: 0, ..Show::default() });
+        }
+
+        tvmaze.pass(NOW).await;
+        let paths: Vec<String> = lock(&requests).iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            &paths[..6],
+            [
+                "/lookup/shows?imdb=tt0000999",
+                "/shows/999?embed[]=episodes",
+                "/lookup/shows?imdb=tt0000100",
+                "/shows/100?embed[]=episodes",
+                "/lookup/shows?imdb=tt0000200",
+                "/shows/200?embed[]=episodes",
+            ],
+            "single first, then one useful answer from each household"
+        );
+        let maintenance = paths.iter().position(|path| path == "/shows/900?embed[]=episodes").unwrap();
+        assert_eq!(maintenance, FOREGROUND_BEFORE_MAINTENANCE * 2, "after eight two-request cold series");
+        assert_eq!(paths.len(), 23, "eleven cold series plus one due refresh");
+    }
+
+    /// A title opened after a large following has started gets the next single-title turn: the current series may
+    /// finish, then the title's own lookup/fetch pair stays adjacent. No request jumps the common pace.
+    #[tokio::test]
+    async fn a_title_opened_during_a_cold_sweep_gets_bounded_service() {
+        let (base, requests) = measured_tvmaze().await;
+        let mut tvmaze = Tvmaze::with_base(true, &base, None);
+        let measured_pace = Duration::from_millis(5);
+        tvmaze.pace = measured_pace;
+        let tvmaze = Arc::new(tvmaze);
+        let household = series(100, 100);
+        tvmaze.want_batch(household.iter().map(String::as_str), NOW);
+        let running = {
+            let tvmaze = Arc::clone(&tvmaze);
+            tokio::spawn(async move { tvmaze.pass(NOW).await })
+        };
+        while lock(&requests).len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(tvmaze.want("tt0000999", NOW));
+        running.await.unwrap();
+
+        let requests = lock(&requests);
+        let opened =
+            requests.iter().position(|(path, _)| path == "/lookup/shows?imdb=tt0000999").unwrap();
+        assert!(opened <= 2, "at most the in-progress household series precedes the title: {opened}");
+        assert_eq!(requests[opened + 1].0, "/shows/999?embed[]=episodes");
+        for pair in requests.windows(2) {
+            assert!(pair[1].1 - pair[0].1 >= measured_pace, "paced: {pair:?}");
+        }
+    }
+
+    /// Dropping a running pass persists its completed lookup. The next owner fetches that id rather than repeating
+    /// it, then drains the untouched tail: cancellation loses and duplicates no series.
+    #[tokio::test]
+    async fn cancellation_persists_progress_for_restart_without_duplicate_lookup() {
+        let dir = temp("cancel-restart");
+        let (base, first_requests) = measured_tvmaze().await;
+        let mut first = Tvmaze::with_base(true, &base, Some(&dir));
+        first.pace = Duration::from_secs(30);
+        let tvmaze = Arc::new(first);
+        let ids = series(3, 300);
+        tvmaze.want_batch(ids.iter().map(String::as_str), NOW);
+        let running = {
+            let tvmaze = Arc::clone(&tvmaze);
+            tokio::spawn(async move { tvmaze.pass(NOW).await })
+        };
+        while !lock(&tvmaze.kept).ids.contains_key(&ids[0]) {
+            tokio::task::yield_now().await;
+        }
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            lock(&first_requests).len(),
+            1,
+            "cancelled while pacing after the first lookup"
+        );
+        drop(tvmaze);
+
+        let (restart_base, restart_requests) = measured_tvmaze().await;
+        let mut restarted = Tvmaze::with_base(true, &restart_base, Some(&dir));
+        restarted.pace = Duration::ZERO;
+        restarted.want_batch(ids.iter().map(String::as_str), NOW);
+        restarted.pass(NOW).await;
+        let paths: Vec<String> = lock(&restart_requests).iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(paths.len(), 5, "one kept lookup plus the two untouched lookup/show pairs");
+        assert_eq!(paths[0], "/shows/300?embed[]=episodes", "resolved id survived cancellation");
+        assert!(!paths.iter().any(|path| path == "/lookup/shows?imdb=tt0000300"));
+        assert!(ids.iter().all(|id| matches!(restarted.airing(id, NOW), Airing::Show(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_lookup_redirect_names_the_show() {
         assert_eq!(show_id("https://api.tvmaze.com/shows/78665"), Some(78665));
@@ -919,6 +1363,6 @@ pub(crate) mod tests {
     fn off_wants_nothing() {
         let tvmaze = Tvmaze::off();
         assert!(!tvmaze.want(DEXTER_IMDB, NOW));
-        assert_eq!(tvmaze.counts(), (0, 0, 0, 0));
+        assert_eq!(tvmaze.counts(), (0, 0, 0, 0, 0));
     }
 }

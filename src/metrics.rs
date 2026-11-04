@@ -251,9 +251,16 @@ pub fn render(state: &AppState) -> String {
         catalog_cache.writes, catalog_cache.bytes, catalog_cache.errors, catalog_cache.last_write_ms
     ));
     if state.tvmaze.enabled() {
-        let (wanted, shows, requests, refusals) = state.tvmaze.counts();
+        let (wanted, shows, queued, requests, refusals) = state.tvmaze.counts();
         gauge(&mut b, "atlas_tvmaze_series_wanted", "Series asked about in the last month.", "", wanted);
         gauge(&mut b, "atlas_tvmaze_shows_kept", "TVmaze shows kept with their episodes.", "", shows);
+        gauge(
+            &mut b,
+            "atlas_tvmaze_first_answers_queued",
+            "Series waiting for their first complete TVmaze answer.",
+            "",
+            queued,
+        );
         b.push_str(&format!(
             "# HELP atlas_tvmaze_requests_total Requests made to TVmaze since process start.\n\
              # TYPE atlas_tvmaze_requests_total counter\natlas_tvmaze_requests_total {requests}\n\
