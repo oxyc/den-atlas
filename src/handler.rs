@@ -504,10 +504,11 @@ async fn handle_airing_batch(state: &Arc<AppState>, req: Request) -> Response {
         let hint = one.imdb.filter(|imdb| valid_imdb(imdb));
         asked.push((one.tmdb, dataset_imdb(state, one.tmdb).await.or(hint)));
     }
-    let pending: Vec<&str> = asked
+    let named: Vec<&str> = asked.iter().filter_map(|(_, imdb)| imdb.as_deref()).collect();
+    let pending: Vec<&str> = named
         .iter()
-        .filter_map(|(_, imdb)| imdb.as_deref())
-        .filter(|imdb| state.tvmaze.want(imdb, now))
+        .zip(state.tvmaze.want_batch(named.iter().copied(), now))
+        .filter_map(|(imdb, pending)| pending.then_some(*imdb))
         .collect();
     let deadline = std::time::Instant::now() + crate::tvmaze::FIRST_WAIT;
     for imdb in pending {
