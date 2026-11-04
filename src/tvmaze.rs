@@ -201,8 +201,7 @@ impl Foreground {
         let queue_slots =
             self.singles.capacity() + self.batches.iter().map(VecDeque::capacity).sum::<usize>();
         let handles = queue_slots + self.queued.capacity();
-        handles * std::mem::size_of::<Arc<str>>()
-            + self.queued.iter().map(|imdb| imdb.len()).sum::<usize>()
+        handles * std::mem::size_of::<Arc<str>>() + self.queued.iter().map(|imdb| imdb.len()).sum::<usize>()
     }
 
     /// The next live request's work in one lane. A series stays at the front after its lookup so the fetch can be
@@ -1303,8 +1302,7 @@ pub(crate) mod tests {
         running.await.unwrap();
 
         let requests = lock(&requests);
-        let opened =
-            requests.iter().position(|(path, _)| path == "/lookup/shows?imdb=tt0000999").unwrap();
+        let opened = requests.iter().position(|(path, _)| path == "/lookup/shows?imdb=tt0000999").unwrap();
         assert!(opened <= 2, "at most the in-progress household series precedes the title: {opened}");
         assert_eq!(requests[opened + 1].0, "/shows/999?embed[]=episodes");
         for pair in requests.windows(2) {
@@ -1332,11 +1330,7 @@ pub(crate) mod tests {
         }
         running.abort();
         assert!(running.await.unwrap_err().is_cancelled());
-        assert_eq!(
-            lock(&first_requests).len(),
-            1,
-            "cancelled while pacing after the first lookup"
-        );
+        assert_eq!(lock(&first_requests).len(), 1, "cancelled while pacing after the first lookup");
         drop(tvmaze);
 
         let (restart_base, restart_requests) = measured_tvmaze().await;
