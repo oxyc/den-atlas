@@ -51,6 +51,9 @@ jobs:
       - name: Release helper
         run: scripts/release-test.sh
 
+      - name: Dataset fetch authentication
+        run: scripts/fetch-dataset.test.sh
+
       - name: Tests
         run: cargo test --locked --workspace
         env:

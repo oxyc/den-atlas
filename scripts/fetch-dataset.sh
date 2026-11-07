@@ -5,12 +5,16 @@
 #
 #   scripts/fetch-dataset.sh          # populates ./data for `cargo run` or a data-included `docker build`
 #
-# Anonymous (public repo) — needs curl, python3 and shasum, no `gh`/token. The server reads sha256/size/gzip
-# from dataset.meta.json and does NOT hash at startup, so this verifies every blob before it lands.
+# Anonymous (public repo) — needs curl, cosign, python3 and shasum, no `gh`/token. The server reads
+# sha256/size/gzip from dataset.meta.json and does NOT hash at startup, so this authenticates the manifest
+# and verifies every blob before it lands.
 set -euo pipefail
 
 REPO="${DATASET_REPO:-oxyc/den-dataset}"
-BASE="https://github.com/$REPO/releases/download/data-latest"
+BASE="${DEN_DATASET_BASE:-https://github.com/$REPO/releases/download/data-latest}"
+COSIGN="${DEN_COSIGN:-cosign}"
+KEYLESS_IDENTITY="https://github.com/oxyc/den-dataset/.github/workflows/daily.yml@refs/heads/main"
+KEYLESS_ISSUER="https://token.actions.githubusercontent.com"
 mkdir -p data
 
 # The meta names the blobs (version-agnostic), so fetch it first — but to a STAGING path, not into
@@ -24,6 +28,52 @@ mkdir -p data
 STAGE="$(mktemp -d data/.fetch.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 curl -fsSL "$BASE/dataset.meta.json" -o "$STAGE/dataset.meta.json"
+
+# AUTHENTICATE THE RAW MANIFEST BEFORE PARSING OR USING ANY VALUE FROM IT.
+#
+# The proof name is derived from the bytes it authenticates, so a moving release can retain proofs for
+# overlapping readers while its fixed-name manifest advances. During the publisher migration only, a 404
+# for that immutable asset may fall back to the old fixed proof name. Any other response is an interrupted
+# or failed fetch, not evidence that the immutable asset is absent, and must fail closed.
+meta_sha="$(shasum -a 256 "$STAGE/dataset.meta.json" | cut -d' ' -f1)"
+case "$meta_sha" in
+  *[!0-9a-f]* | "")
+    echo "could not compute the dataset manifest SHA-256 — refusing, ./data untouched" >&2
+    exit 1
+    ;;
+esac
+[ "${#meta_sha}" -eq 64 ] || {
+  echo "could not compute the dataset manifest SHA-256 — refusing, ./data untouched" >&2
+  exit 1
+}
+immutable_bundle="dataset.meta.json.sha256-$meta_sha.bundle"
+bundle="$STAGE/$immutable_bundle"
+proof_code="$(curl -sSL -o "$bundle" -w '%{http_code}' "$BASE/$immutable_bundle" 2>/dev/null || echo 000)"
+case "$proof_code" in
+  200) ;;
+  404)
+    bundle="$STAGE/dataset.meta.json.bundle"
+    curl -fsSL "$BASE/dataset.meta.json.bundle" -o "$bundle" || {
+      echo "release carries no proof for dataset manifest $meta_sha — refusing, ./data untouched" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "could not fetch immutable proof for dataset manifest $meta_sha (HTTP $proof_code) — refusing, ./data untouched" >&2
+    exit 1
+    ;;
+esac
+command -v "$COSIGN" >/dev/null 2>&1 || {
+  echo "cosign is required to authenticate dataset.meta.json (set DEN_COSIGN to its path)" >&2
+  exit 1
+}
+if ! "$COSIGN" verify-blob --bundle "$bundle" \
+    --certificate-identity "$KEYLESS_IDENTITY" \
+    --certificate-oidc-issuer "$KEYLESS_ISSUER" \
+    "$STAGE/dataset.meta.json" >/dev/null; then
+  echo "dataset manifest $meta_sha was not signed by $KEYLESS_IDENTITY — refusing, ./data untouched" >&2
+  exit 1
+fi
 # EVERY "<name>File" the meta declares, newline-delimited. A positional list had to be extended by
 # hand for each new artifact and silently skipped anything missed: metadataGzFile was added to the
 # server and never fetched here, so a dev's ./data had no gz variant and the server logged one

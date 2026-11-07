@@ -507,8 +507,13 @@ a shape rustfmt disagreed with: `docker-publish` never produced an image, and `d
 reported the box was already at the previous digest — a failure that reads as "nothing to deploy" rather
 than as a broken build. Checking line widths by hand does not substitute: rustfmt also JOINS short wrapped
 lines and SPLITS long array literals, neither of which a width check can predict.
-`fetch-dataset.sh` is anonymous (needs curl, python3 and shasum). It downloads every file
-`dataset.meta.json` declares and verifies each against the meta's sha256 before moving them into `./data`.
+`fetch-dataset.sh` is anonymous (needs curl, [cosign](https://docs.sigstore.dev/cosign/system_config/installation/),
+python3 and shasum; set `DEN_COSIGN` when cosign is not on `PATH`). It stages the raw manifest, fetches its
+digest-addressed Sigstore bundle, and verifies that exact manifest was signed by
+`oxyc/den-dataset/.github/workflows/daily.yml@refs/heads/main` before parsing it or downloading blobs. During
+the proof-name migration only, an absent digest-addressed bundle falls back to the fixed-name bundle; an
+invalid, mismatched or unavailable proof never does. It then downloads every file `dataset.meta.json`
+declares and verifies each against the authenticated meta's sha256 before moving them into `./data`.
 `storeFile` is the one it REFUSES a release without: the store is the only artifact the server reads, and
 a manifest that still names the retired sidecars simply fetches files nothing opens. To pick up a new
 release, re-run it and restart the server.
