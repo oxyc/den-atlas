@@ -607,6 +607,7 @@ pub fn row_with_policy(
     limit: usize,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
+    let maturity = indexes.maturity_snapshot(maturity);
     let coverage = crate::schema::row_coverage(indexes, media_type, constraints);
     let Some(cards) = indexes.cards.as_ref() else {
         return serde_json::json!({ "titles": [], "total": 0, "coverage": coverage });
@@ -645,8 +646,9 @@ pub fn row_with_policy(
     };
     // Maturity is policy, not part of the shared row-order memo. Filter the complete ordered tiers before
     // pagination so a blocked title cannot consume a slot or leak into `total`.
-    let order: Vec<Key> = order.iter().filter(|&&key| indexes.eligible(maturity, key)).copied().collect();
-    let likely: Vec<Key> = likely.iter().filter(|&&key| indexes.eligible(maturity, key)).copied().collect();
+    let order: Vec<Key> = order.iter().filter(|&&key| indexes.eligible_in(&maturity, key)).copied().collect();
+    let likely: Vec<Key> =
+        likely.iter().filter(|&&key| indexes.eligible_in(&maturity, key)).copied().collect();
     let total = order.len() + likely.len();
     let titles: Vec<serde_json::Value> = order
         .iter()

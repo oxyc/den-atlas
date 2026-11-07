@@ -202,7 +202,7 @@ impl Request {
         Ok(())
     }
 
-    fn maturity(&self) -> crate::maturity::Policy {
+    pub(crate) fn maturity(&self) -> crate::maturity::Policy {
         crate::maturity::Policy {
             maximum_age: self.maximum_age,
             unknown_ratings: self.unknown_ratings.unwrap_or(if self.maximum_age.is_some() {
@@ -1179,9 +1179,21 @@ pub fn answer(
     now: f64,
     library_embeddings: Option<&HashMap<Key, Vec<i8>>>,
 ) -> serde_json::Value {
+    let maturity = indexes.maturity_snapshot(request.maturity());
+    answer_in(indexes, export, request, lists, now, library_embeddings, &maturity)
+}
+
+pub(crate) fn answer_in(
+    indexes: &Indexes,
+    export: Option<&TitleIndex>,
+    request: &Request,
+    lists: &Lists,
+    now: f64,
+    library_embeddings: Option<&HashMap<Key, Vec<i8>>>,
+    maturity_snapshot: &crate::queries::MaturitySnapshot,
+) -> serde_json::Value {
     let known = Knowledge { indexes };
     let only = request.only();
-    let maturity = request.maturity();
     let slides = request.limit.unwrap_or(SLIDES).clamp(1, MAX_SLIDES);
 
     let weighed: Vec<(Key, &LibraryEntry)> = request
@@ -1247,7 +1259,7 @@ pub fn answer(
         push(key, known.title(key, Some(&offered.hint), None), rank, None);
     }
     // Policy is applied to the complete candidate pool before attention, fit and diversity ranking.
-    pool.retain(|candidate| indexes.eligible(maturity, candidate.key));
+    pool.retain(|candidate| indexes.eligible_in(maturity_snapshot, candidate.key));
     let owned: HashSet<Key> =
         request.owned.iter().filter_map(|r| Some((media_type(&r.type_)?, r.id))).collect();
     let on = on_service(request, lists);
@@ -1255,7 +1267,7 @@ pub fn answer(
         only.is_none_or(|t| t == c.key.0)
             && on.as_ref().is_none_or(|on| on.contains(&c.key))
             && !owned.contains(&c.key)
-            && indexes.eligible(maturity, c.key)
+            && indexes.eligible_in(maturity_snapshot, c.key)
             && !hidden(c, &request.hide)
     };
     // Then what no list knows to push: the catalogue's recent and coming titles nearest this household's taste.
