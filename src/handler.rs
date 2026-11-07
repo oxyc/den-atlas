@@ -115,6 +115,36 @@ const CACHE_TAG: &str = "atlas";
 /// answer that is still good is served at once while it is asked again, for a day after it goes stale.
 const DATASET_ANSWER: &str = "public, max-age=300, s-maxage=2592000, stale-while-revalidate=86400";
 
+/// An answer that consulted runtime maturity providers, which change without a dataset publish and so without the
+/// purge (`runtime_provider_cache_control`).
+const RUNTIME_PROVIDER_ANSWER: &str = "public, max-age=300, s-maxage=300, stale-while-revalidate=300";
+
+/// How long past its shared lifetime Cloudflare may hand out its copy of an answer while atlas cannot answer (a 5xx,
+/// the box or its uplink down). Only an answer atlas gave is repeated, and while it is down it cannot give a newer
+/// one; the alternative is Cloudflare's error page. A week covers an outage over a weekend away.
+const STALE_IF_ERROR: u64 = 604_800;
+
+/// The `CDN-Cache-Control` of a public answer whose shared lifetime is its `s-maxage`, so a shared cache may serve it
+/// stale on an error. `s-maxage` forbids exactly that in `Cache-Control` (RFC 9111 §5.2.2.10, and Cloudflare ignores
+/// `stale-if-error` beside it), and Cloudflare reads `CDN-Cache-Control` in its place, leaving the browser's
+/// `Cache-Control` as it is. None for any other answer, and for one shaped by runtime providers: a Kid's restricted
+/// answer stays no older than its five minutes, outage or not.
+fn edge_policy(cache_control: &str) -> Option<String> {
+    if cache_control == RUNTIME_PROVIDER_ANSWER || !cache_control.starts_with("public") {
+        return None;
+    }
+    let directive = |name: &str| {
+        cache_control.split(',').map(str::trim).find_map(|d| d.strip_prefix(name)?.strip_prefix('='))
+    };
+    let max_age = directive("s-maxage")?;
+    Some(match directive("stale-while-revalidate") {
+        Some(stale) => {
+            format!("max-age={max_age}, stale-while-revalidate={stale}, stale-if-error={STALE_IF_ERROR}")
+        }
+        None => format!("max-age={max_age}, stale-if-error={STALE_IF_ERROR}"),
+    })
+}
+
 /// Every response leaves through here, so every one carries `Access-Control-Allow-Origin: *` — the
 /// 404, a refused /metrics, a 304 and an /embed error included. Setting it per helper left out
 /// whatever was built outside those helpers (the /metrics body was), and a browser reports a missing
@@ -142,13 +172,13 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     // What a shared cache may keep is named, so the deploy that changes it can drop it by name: den's
     // `den-cloudflare-purge atlas` runs after every atlas release and every new dataset. Cloudflare reads
     // the header and removes it before a browser sees the answer.
-    if resp
-        .headers()
-        .get(header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|cc| cc.starts_with("public"))
-    {
+    let policy = resp.headers().get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok());
+    let edge = policy.and_then(edge_policy).and_then(|edge| header::HeaderValue::from_str(&edge).ok());
+    if policy.is_some_and(|cc| cc.starts_with("public")) {
         resp.headers_mut().insert("cache-tag", header::HeaderValue::from_static(CACHE_TAG));
+    }
+    if let Some(edge) = edge {
+        resp.headers_mut().insert("cdn-cache-control", edge);
     }
     if let Some((started, method, path, rid)) = log {
         let degraded = resp.headers().get(DEGRADED).and_then(|v| v.to_str().ok());
@@ -2919,7 +2949,7 @@ fn runtime_provider_cache_control(cache_control: &str, runtime_provider_applies:
         if cache_control.starts_with("private") {
             "private, max-age=300"
         } else {
-            "public, max-age=300, s-maxage=300, stale-while-revalidate=300"
+            RUNTIME_PROVIDER_ANSWER
         }
     } else {
         cache_control
@@ -3494,6 +3524,25 @@ mod tests {
         assert!(body.contains(r#""class":"cpu""#), "{body}");
     }
 
+    /// Cloudflare may serve a dataset answer stale while atlas is down only through `CDN-Cache-Control`: beside
+    /// `s-maxage` it ignores `stale-if-error`. A Kid's provider-shaped answer and anything not public get none.
+    #[test]
+    fn a_shared_lifetime_becomes_cloudflares_own_with_stale_if_error() {
+        assert_eq!(
+            edge_policy(DATASET_ANSWER).as_deref(),
+            Some("max-age=2592000, stale-while-revalidate=86400, stale-if-error=604800")
+        );
+        assert_eq!(
+            edge_policy("public, max-age=300, s-maxage=600").as_deref(),
+            Some("max-age=600, stale-if-error=604800")
+        );
+        assert_eq!(edge_policy(RUNTIME_PROVIDER_ANSWER), None);
+        assert_eq!(edge_policy(runtime_provider_cache_control(DATASET_ANSWER, true)), None);
+        assert_eq!(edge_policy("private, max-age=300, s-maxage=600"), None);
+        assert_eq!(edge_policy("public, max-age=300"), None, "no shared lifetime of its own");
+        assert_eq!(edge_policy("no-store"), None);
+    }
+
     fn title_state() -> Arc<AppState> {
         use den_titlesearch::{MediaType, TitleIndex, TitleRecord};
         let index = TitleIndex::build(vec![TitleRecord {
@@ -3515,6 +3564,10 @@ mod tests {
         let state = title_state();
         let hit = get(&state, "/catalog/movie/den-titles/search=the%20matrx.json").await;
         assert_eq!(hit.headers()["cache-control"], DATASET_ANSWER);
+        assert_eq!(
+            hit.headers()["cdn-cache-control"],
+            "max-age=2592000, stale-while-revalidate=86400, stale-if-error=604800"
+        );
         let hit = body_of(hit).await;
         assert!(hit.contains(r#""id":"tmdb:603""#), "{hit}");
         let kid =
@@ -5581,6 +5634,16 @@ mod tests {
                 && policy.ends_with("stale-while-revalidate=86400")
         );
         assert_eq!(resp.headers()["cache-tag"], "atlas");
+        // Cloudflare's lifetime is the same, and it may hand out yesterday's billboard while atlas is down.
+        let edge = resp.headers()["cdn-cache-control"].to_str().unwrap().to_owned();
+        let shared = policy.split(", ").find(|d| d.starts_with("s-maxage=")).unwrap();
+        assert_eq!(
+            edge,
+            format!(
+                "max-age={}, stale-while-revalidate=86400, stale-if-error=604800",
+                &shared["s-maxage=".len()..]
+            )
+        );
         let answer: serde_json::Value = serde_json::from_str(&body_of(resp).await).unwrap();
         assert_eq!(answer["day"], "1995-07-02");
         assert!(answer["slides"].is_array(), "{answer}");
