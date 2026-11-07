@@ -20,6 +20,8 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
@@ -177,13 +179,76 @@ impl Configured {
 
 #[derive(Default)]
 struct ReadView {
+    generation: u64,
     providers: Vec<ProviderView>,
     coverage: Vec<Coverage>,
+}
+
+/// One atomically published set of runtime authority facts and the generation that identifies them.
+/// A request keeps this handle while it builds policy memo keys and evaluates their contents.
+#[derive(Clone)]
+pub(crate) struct Snapshot(Arc<ReadView>);
+
+impl Snapshot {
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.generation
+    }
 }
 
 struct ProviderView {
     minimum_ages: HashMap<Key, u8>,
     ratings: HashMap<Key, Arc<[RuntimeRating]>>,
+}
+
+#[cfg(test)]
+pub(crate) struct PublicationPause {
+    armed: AtomicBool,
+    entered: Barrier,
+    release: Barrier,
+}
+
+#[cfg(test)]
+impl PublicationPause {
+    pub(crate) fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn wait_until_entered(&self) {
+        self.entered.wait();
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.wait();
+    }
+}
+
+#[cfg(test)]
+struct ChangingForTest {
+    pause: Arc<PublicationPause>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Backend for ChangingForTest {
+    fn authority(&self) -> &'static str {
+        if self.pause.armed.swap(false, Ordering::SeqCst) {
+            self.pause.entered.wait();
+            self.pause.release.wait();
+        }
+        "TEST"
+    }
+
+    fn media_types(&self) -> &'static [MediaType] {
+        &[MediaType::Movie, MediaType::Tv]
+    }
+
+    fn applies_to(&self, _viewer_region: Option<Region>) -> bool {
+        true
+    }
+
+    async fn lookup(&self, _: &Identity, _: &mut Budget) -> Result<Lookup, String> {
+        unreachable!()
+    }
 }
 
 pub struct Providers {
@@ -193,7 +258,6 @@ pub struct Providers {
     state: Mutex<CacheFile>,
     view: ArcSwap<ReadView>,
     file: Option<PathBuf>,
-    generation: AtomicU64,
     dirty: AtomicBool,
     cache_writes: AtomicU64,
     cache_write_bytes: AtomicU64,
@@ -241,7 +305,6 @@ impl Providers {
             state: Mutex::new(CacheFile::default()),
             view: ArcSwap::from_pointee(ReadView::default()),
             file: None,
-            generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             cache_writes: AtomicU64::new(0),
             cache_write_bytes: AtomicU64::new(0),
@@ -273,7 +336,7 @@ impl Providers {
         }
         let cache = CacheFile::default();
         let configured = vec![Configured::new(Arc::new(Applies), 1, Duration::ZERO)];
-        let view = build_view(&cache, &configured, &[]);
+        let view = build_view(&cache, &configured, &[], 1);
         Arc::new(Self {
             catalog: Arc::from([]),
             configured,
@@ -281,7 +344,6 @@ impl Providers {
             state: Mutex::new(cache),
             view: ArcSwap::from_pointee(view),
             file: None,
-            generation: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
             cache_writes: AtomicU64::new(0),
             cache_write_bytes: AtomicU64::new(0),
@@ -289,6 +351,59 @@ impl Providers {
             cache_bytes: AtomicU64::new(0),
             last_cache_write_ms: AtomicU64::new(0),
         })
+    }
+
+    /// A live provider whose next facts publication can be held inside production's view construction.
+    #[cfg(test)]
+    pub(crate) fn changing_for_test(key: Key, age: u8) -> (Arc<Self>, Arc<PublicationPause>) {
+        let pause = Arc::new(PublicationPause {
+            armed: AtomicBool::new(false),
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+        });
+        let configured =
+            vec![Configured::new(Arc::new(ChangingForTest { pause: Arc::clone(&pause) }), 1, Duration::ZERO)];
+        let mut cache = CacheFile::default();
+        cache.providers.insert(
+            "TEST".into(),
+            ProviderState {
+                entries: HashMap::from([(
+                    key_string(key),
+                    Cached { checked_at: 1, ratings: vec![rating_for_test(age)] },
+                )]),
+                ..ProviderState::default()
+            },
+        );
+        let view = build_view(&cache, &configured, &[], 1);
+        let providers = Arc::new(Self {
+            catalog: Arc::from([]),
+            configured,
+            init_failures: Vec::new(),
+            state: Mutex::new(cache),
+            view: ArcSwap::from_pointee(view),
+            file: None,
+            dirty: AtomicBool::new(false),
+            cache_writes: AtomicU64::new(0),
+            cache_write_bytes: AtomicU64::new(0),
+            cache_write_errors: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(0),
+            last_cache_write_ms: AtomicU64::new(0),
+        });
+        (providers, pause)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_age_for_test(&self, key: Key, age: u8) {
+        {
+            let mut state = crate::util::lock(&self.state);
+            state
+                .providers
+                .get_mut("TEST")
+                .expect("test provider")
+                .entries
+                .insert(key_string(key), Cached { checked_at: 1, ratings: vec![rating_for_test(age)] });
+        }
+        self.finish_refresh("TEST", 0, &Budget { left: 0, asked: 0, pace: Duration::ZERO }, true);
     }
 
     pub fn new(
@@ -360,7 +475,7 @@ impl Providers {
             .and_then(|path| std::fs::metadata(path).ok())
             .map_or(0, |metadata| metadata.len());
         let pruned = prune_cache(&mut state, &names, &catalog);
-        let view = build_view(&state, &configured, &catalog);
+        let view = build_view(&state, &configured, &catalog, 1);
         let providers = Arc::new(Self {
             catalog: catalog.into(),
             configured,
@@ -368,7 +483,6 @@ impl Providers {
             state: Mutex::new(state),
             view: ArcSwap::from_pointee(view),
             file,
-            generation: AtomicU64::new(1),
             dirty: AtomicBool::new(pruned),
             cache_writes: AtomicU64::new(0),
             cache_write_bytes: AtomicU64::new(0),
@@ -387,7 +501,11 @@ impl Providers {
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.snapshot().generation()
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot(self.view.load_full())
     }
 
     pub fn applies_to(&self, region: Option<Region>) -> bool {
@@ -395,8 +513,19 @@ impl Providers {
     }
 
     pub fn ratings(&self, key: Key, region: Option<Region>) -> Vec<RuntimeRating> {
-        let view = self.view.load();
-        view.providers
+        let snapshot = self.snapshot();
+        self.ratings_in(&snapshot, key, region)
+    }
+
+    pub(crate) fn ratings_in(
+        &self,
+        snapshot: &Snapshot,
+        key: Key,
+        region: Option<Region>,
+    ) -> Vec<RuntimeRating> {
+        snapshot
+            .0
+            .providers
             .iter()
             .zip(&self.configured)
             .filter(|(_, configured)| configured.backend.applies_to(region))
@@ -407,8 +536,14 @@ impl Providers {
     }
 
     pub fn minimum_age(&self, key: Key, region: Option<Region>) -> Option<u8> {
-        let view = self.view.load();
-        view.providers
+        let snapshot = self.snapshot();
+        self.minimum_age_in(&snapshot, key, region)
+    }
+
+    pub(crate) fn minimum_age_in(&self, snapshot: &Snapshot, key: Key, region: Option<Region>) -> Option<u8> {
+        snapshot
+            .0
+            .providers
             .iter()
             .zip(&self.configured)
             .filter(|(_, configured)| configured.backend.applies_to(region))
@@ -576,14 +711,13 @@ impl Providers {
             let provider = state.providers.entry(authority.to_owned()).or_default();
             provider.cursor = cursor;
             provider.spent = provider.spent.saturating_add(budget.asked);
+            if changed {
+                let generation = self.view.load().generation.wrapping_add(1);
+                self.view.store(Arc::new(build_view(&state, &self.configured, &self.catalog, generation)));
+            }
         }
         if budget.asked > 0 {
             self.dirty.store(true, Ordering::Relaxed);
-        }
-        if changed {
-            self.generation.fetch_add(1, Ordering::Relaxed);
-            let state = crate::util::lock(&self.state);
-            self.view.store(Arc::new(build_view(&state, &self.configured, &self.catalog)));
         }
     }
 
@@ -635,6 +769,20 @@ fn parse_key(value: &str) -> Option<Key> {
     Some((media, id.parse().ok()?))
 }
 
+#[cfg(test)]
+fn rating_for_test(age: u8) -> RuntimeRating {
+    RuntimeRating {
+        authority: "TEST".into(),
+        authority_id: "test:1".into(),
+        jurisdiction: "ZZ".into(),
+        rating: age.to_string(),
+        normalized_age: age,
+        warnings: Vec::new(),
+        source_url: "https://example.test/1".into(),
+        fetched_at: 1,
+    }
+}
+
 fn same_ratings(old: &[RuntimeRating], new: &[RuntimeRating]) -> bool {
     old.len() == new.len()
         && old.iter().zip(new).all(|(old, new)| {
@@ -648,7 +796,12 @@ fn same_ratings(old: &[RuntimeRating], new: &[RuntimeRating]) -> bool {
         })
 }
 
-fn build_view(state: &CacheFile, configured: &[Configured], catalog: &[Identity]) -> ReadView {
+fn build_view(
+    state: &CacheFile,
+    configured: &[Configured],
+    catalog: &[Identity],
+    generation: u64,
+) -> ReadView {
     let mut providers = Vec::with_capacity(configured.len());
     let mut coverage = Vec::new();
     for configured in configured {
@@ -688,7 +841,7 @@ fn build_view(state: &CacheFile, configured: &[Configured], catalog: &[Identity]
         }
         providers.push(ProviderView { minimum_ages, ratings });
     }
-    ReadView { providers, coverage }
+    ReadView { generation, providers, coverage }
 }
 
 fn prune_cache(state: &mut CacheFile, requested: &HashSet<String>, catalog: &[Identity]) -> bool {
@@ -1080,7 +1233,6 @@ mod tests {
             state: Mutex::new(CacheFile::default()),
             view: ArcSwap::from_pointee(ReadView::default()),
             file: Some(file.clone()),
-            generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             cache_writes: AtomicU64::new(0),
             cache_write_bytes: AtomicU64::new(0),
@@ -1193,7 +1345,7 @@ mod tests {
             },
         );
         let configured = vec![Configured::new(Arc::new(Fake), 1, Duration::ZERO)];
-        let view = build_view(&cache, &configured, &[]);
+        let view = build_view(&cache, &configured, &[], 1);
         let providers = Providers {
             catalog: Arc::from([]),
             configured,
@@ -1201,7 +1353,6 @@ mod tests {
             state: Mutex::new(cache),
             view: ArcSwap::from_pointee(view),
             file: None,
-            generation: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
             cache_writes: AtomicU64::new(0),
             cache_write_bytes: AtomicU64::new(0),

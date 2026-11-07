@@ -1873,7 +1873,7 @@ pub struct Context<'a> {
     /// The eligible store rows for a restrictive policy. `None` is the historical unrestricted universe,
     /// so ordinary traffic neither scans the maturity column nor allocates another corpus-sized bitset.
     maturity: Option<Bits>,
-    policy: crate::maturity::Policy,
+    maturity_snapshot: crate::queries::MaturitySnapshot,
     restricted: bool,
 }
 
@@ -1894,8 +1894,9 @@ impl<'a> Context<'a> {
         policy: crate::maturity::Policy,
     ) -> Context<'a> {
         let filter = indexes.filter();
+        let maturity_snapshot = indexes.maturity_snapshot(policy);
         // The filter's rows are the store's rows, so the policy's memoised admission bitset is this mask.
-        let maturity = policy.restricted().then(|| indexes.admission(policy).to_vec());
+        let maturity = policy.restricted().then(|| indexes.admission_in(&maturity_snapshot).to_vec());
         Context {
             filter,
             indexes,
@@ -1904,7 +1905,7 @@ impl<'a> Context<'a> {
             scope: scope.into(),
             view: indexes.store.view(),
             maturity,
-            policy,
+            maturity_snapshot,
             restricted: policy.restricted(),
         }
     }
@@ -1949,17 +1950,18 @@ impl<'a> Context<'a> {
         let keys: Vec<Key> = match (data, self.scope) {
             (Data::Fans, scope) => self
                 .indexes
-                .you_might_also_like_with_policy(tmdb_id, media_type, scope == Scope::All, self.policy)
+                .you_might_also_like_in(tmdb_id, media_type, scope == Scope::All, &self.maturity_snapshot)
                 .iter()
                 .copied()
                 .filter(|&key| key != (media_type, tmdb_id))
                 .collect(),
             (_, Scope::Type(_)) => {
-                let (one, _) = self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy);
+                let (one, _) =
+                    self.indexes.more_like_this_rows_in(tmdb_id, media_type, &self.maturity_snapshot);
                 one.into_iter().map(|id| (media_type, id)).collect()
             }
             (_, Scope::All) => {
-                self.indexes.more_like_this_rows_with_policy(tmdb_id, media_type, self.policy).1
+                self.indexes.more_like_this_rows_in(tmdb_id, media_type, &self.maturity_snapshot).1
             }
         };
         keys.into_iter()

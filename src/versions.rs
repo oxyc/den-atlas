@@ -283,15 +283,15 @@ fn country_name(indexes: &Indexes, code: &str) -> Option<String> {
 
 /// `/index/title`'s `otherVersions`: `[{type, id, kind}]` in the served order, or `None` for a title with none,
 /// so the field is left out exactly when a client shows no row.
-pub fn summary_json(
+pub(crate) fn summary_json_in(
     indexes: &Indexes,
     export: Option<&den_titlesearch::TitleIndex>,
     seed: Key,
-    maturity: crate::maturity::Policy,
+    maturity: &crate::queries::MaturitySnapshot,
 ) -> Option<serde_json::Value> {
     let found: Vec<_> = of_title(indexes, export, seed)
         .into_iter()
-        .filter(|version| indexes.eligible(maturity, version.key))
+        .filter(|version| indexes.eligible_in(maturity, version.key))
         .collect();
     (!found.is_empty()).then(|| {
         serde_json::json!(found
@@ -310,10 +310,11 @@ pub fn route_json_with_policy(
     seed: Key,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
+    let maturity = indexes.maturity_snapshot(maturity);
     let mut labels: HashMap<u32, String> = HashMap::new();
     let versions: Vec<serde_json::Value> = of_title(indexes, export, seed)
         .into_iter()
-        .filter(|version| indexes.eligible(maturity, version.key))
+        .filter(|version| indexes.eligible_in(&maturity, version.key))
         .map(|version| {
             let mut title = indexes
                 .cards

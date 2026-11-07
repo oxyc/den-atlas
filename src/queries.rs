@@ -145,6 +145,16 @@ const ROW_MEMO: usize = 256;
 const ADMISSION_MEMO: usize = 32;
 /// An admission bitset's memo key: the policy, and the maturity generation it was worked out under.
 type AdmissionKey = (crate::maturity::Policy, u64);
+
+/// One request's maturity policy and the atomically published runtime facts that evaluate it. Keeping this
+/// value through memo lookup, work, and insertion prevents a refresh from changing either facts or generation
+/// halfway through a result.
+#[derive(Clone)]
+pub(crate) struct MaturitySnapshot {
+    policy: crate::maturity::Policy,
+    runtime: crate::maturity_providers::Snapshot,
+    generation: u64,
+}
 /// Tuned aggregates kept at most: each is a few thousand floats, and a tuner tries a handful of values.
 const AGGREGATES_MEMO: usize = 8;
 
@@ -176,9 +186,10 @@ impl Indexes {
         mix: bool,
         policy: crate::maturity::Policy,
     ) -> (bool, bool) {
+        let snapshot = self.maturity_snapshot(policy);
         (
-            lock(&self.similar).contains_key(&(seed, mix, policy, self.maturity_generation(policy))),
-            lock(&self.affinity).contains_key(&(seed, mix, policy, self.maturity_generation(policy))),
+            lock(&self.similar).contains_key(&self.similar_key(seed, mix, &snapshot)),
+            lock(&self.affinity).contains_key(&self.similar_key(seed, mix, &snapshot)),
         )
     }
 
@@ -202,7 +213,15 @@ impl Indexes {
     /// The public baseline plus box-local authority data applicable to this viewer. Applicability is independent
     /// of jurisdiction: for example, a Finnish authority's observation may still protect a US viewer.
     pub fn effective_minimum_age(&self, policy: crate::maturity::Policy, key: Key) -> Option<u8> {
-        self.minimum_age(key).into_iter().chain(self.maturity.minimum_age(key, policy.region)).max()
+        let snapshot = self.maturity_snapshot(policy);
+        self.effective_minimum_age_in(&snapshot, key)
+    }
+
+    pub(crate) fn effective_minimum_age_in(&self, snapshot: &MaturitySnapshot, key: Key) -> Option<u8> {
+        self.minimum_age(key)
+            .into_iter()
+            .chain(self.maturity.minimum_age_in(&snapshot.runtime, key, snapshot.policy.region))
+            .max()
     }
 
     pub fn runtime_maturity_ratings(
@@ -210,29 +229,52 @@ impl Indexes {
         policy: crate::maturity::Policy,
         key: Key,
     ) -> Vec<crate::maturity_providers::RuntimeRating> {
-        self.maturity.ratings(key, policy.region)
+        let snapshot = self.maturity_snapshot(policy);
+        self.runtime_maturity_ratings_in(&snapshot, key)
     }
 
+    pub(crate) fn runtime_maturity_ratings_in(
+        &self,
+        snapshot: &MaturitySnapshot,
+        key: Key,
+    ) -> Vec<crate::maturity_providers::RuntimeRating> {
+        self.maturity.ratings_in(&snapshot.runtime, key, snapshot.policy.region)
+    }
+
+    pub(crate) fn maturity_snapshot(&self, policy: crate::maturity::Policy) -> MaturitySnapshot {
+        let runtime = self.maturity.snapshot();
+        self.maturity_snapshot_from(policy, runtime)
+    }
+
+    pub(crate) fn maturity_snapshot_from(
+        &self,
+        policy: crate::maturity::Policy,
+        runtime: crate::maturity_providers::Snapshot,
+    ) -> MaturitySnapshot {
+        let generation = if self.maturity.applies_to(policy.region) { runtime.generation() } else { 0 };
+        MaturitySnapshot { policy, runtime, generation }
+    }
+
+    #[cfg(test)]
     fn maturity_generation(&self, policy: crate::maturity::Policy) -> u64 {
-        if self.maturity.applies_to(policy.region) {
-            self.maturity.generation()
-        } else {
-            0
-        }
+        self.maturity_snapshot(policy).generation
     }
 
-    /// The `similar` memo key of the unrestricted More Like This row. Every reader and writer of that row
-    /// builds its key here, so a lookup can never miss what an insert stored.
-    fn unrestricted_similar_key(&self, seed: Key, mix: bool) -> SimilarKey {
-        let policy = crate::maturity::Policy::default();
-        (seed, mix, policy, self.maturity_generation(policy))
+    /// A policy-scoped discovery memo key from the exact facts snapshot used to build its value.
+    fn similar_key(&self, seed: Key, mix: bool, snapshot: &MaturitySnapshot) -> SimilarKey {
+        (seed, mix, snapshot.policy, snapshot.generation)
     }
 
     /// `eligible` for every store row at once, as a bitset (bit `r` of word `r / 64`), worked out once per
     /// policy and maturity generation. A restricted More Like This scans ~92k vectors; asking `eligible` of
     /// each — two binary searches and the box-local ratings — cost more than ranking the pool.
     pub fn admission(&self, policy: crate::maturity::Policy) -> Arc<[u64]> {
-        let key = (policy, self.maturity_generation(policy));
+        let snapshot = self.maturity_snapshot(policy);
+        self.admission_in(&snapshot)
+    }
+
+    pub(crate) fn admission_in(&self, snapshot: &MaturitySnapshot) -> Arc<[u64]> {
+        let key = (snapshot.policy, snapshot.generation);
         memoised(&self.admission, key, ADMISSION_MEMO, || {
             let view = self.store.view();
             let keys = view.per_row::<u64>("keys").unwrap_or(&[]);
@@ -240,7 +282,7 @@ impl Indexes {
             for (row, &packed) in keys.iter().enumerate() {
                 let media =
                     if packed >> 32 == 1 { den_index::MediaType::Tv } else { den_index::MediaType::Movie };
-                if self.eligible(policy, (media, packed as u32)) {
+                if self.eligible_in(snapshot, (media, packed as u32)) {
                     bits[row / 64] |= 1 << (row % 64);
                 }
             }
@@ -265,16 +307,21 @@ impl Indexes {
     }
 
     /// `eligible` read off an `admission` bitset; a title the store does not hold is asked directly.
-    fn admitted(&self, bits: &[u64], policy: crate::maturity::Policy, key: Key) -> bool {
+    fn admitted(&self, bits: &[u64], snapshot: &MaturitySnapshot, key: Key) -> bool {
         match row_of(&self.store, key.0, key.1) {
             Some(row) => bits[row / 64] & (1 << (row % 64)) != 0,
-            None => self.eligible(policy, key),
+            None => self.eligible_in(snapshot, key),
         }
     }
 
     pub fn eligible(&self, policy: crate::maturity::Policy, key: Key) -> bool {
-        policy.allows_title_with(
-            || self.effective_minimum_age(policy, key),
+        let snapshot = self.maturity_snapshot(policy);
+        self.eligible_in(&snapshot, key)
+    }
+
+    pub(crate) fn eligible_in(&self, snapshot: &MaturitySnapshot, key: Key) -> bool {
+        snapshot.policy.allows_title_with(
+            || self.effective_minimum_age_in(snapshot, key),
             |band| self.store.store.kid_audience_relevant(key.0, key.1, band),
         )
     }
@@ -314,54 +361,60 @@ impl Indexes {
         mix: bool,
         maturity: crate::maturity::Policy,
     ) -> Arc<[Key]> {
-        memoised(
-            &self.affinity,
-            ((media_type, tmdb_id), mix, maturity, self.maturity_generation(maturity)),
-            SIMILAR_MEMO,
-            || {
-                if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix, maturity) {
-                    return row.into();
-                }
-                if !maturity.restricted() {
-                    let params = den_index::SimilarParams::default();
-                    let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
-                        den_index::you_might_also_like(
-                            Some(facets),
-                            (media_type, tmdb_id),
-                            mix,
-                            den_index::MAX_ROW,
-                        )
-                    });
-                    let (one, mixed) = self.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
-                    let fallback: Vec<Key> =
-                        if mix { mixed } else { one.into_iter().map(|id| (media_type, id)).collect() };
-                    let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
-                    row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
-                    let seed = self.suggestion_profile((media_type, tmdb_id));
-                    row.retain(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)));
-                    row.truncate(den_index::MAX_ROW);
-                    return row.into();
-                }
-                let admission = self.admission(maturity);
-                let keep = |key| self.admitted(&admission, maturity, key);
-                let params =
-                    den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
+        let snapshot = self.maturity_snapshot(maturity);
+        self.you_might_also_like_in(tmdb_id, media_type, mix, &snapshot)
+    }
+
+    pub(crate) fn you_might_also_like_in(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        mix: bool,
+        snapshot: &MaturitySnapshot,
+    ) -> Arc<[Key]> {
+        let maturity = snapshot.policy;
+        memoised(&self.affinity, self.similar_key((media_type, tmdb_id), mix, snapshot), SIMILAR_MEMO, || {
+            if let Some(row) = self.fan_pick_row(tmdb_id, media_type, mix, snapshot) {
+                return row.into();
+            }
+            if !maturity.restricted() {
+                let params = den_index::SimilarParams::default();
+                let mut row = self.with_seed(tmdb_id, media_type, &params, |_, facets| {
+                    den_index::you_might_also_like(
+                        Some(facets),
+                        (media_type, tmdb_id),
+                        mix,
+                        den_index::MAX_ROW,
+                    )
+                });
+                let (one, mixed) = self.more_like_this_rows_in(tmdb_id, media_type, snapshot);
+                let fallback: Vec<Key> =
+                    if mix { mixed } else { one.into_iter().map(|id| (media_type, id)).collect() };
+                let mut seen: std::collections::HashSet<Key> = row.iter().copied().collect();
+                row.extend(fallback.into_iter().filter(|key| seen.insert(*key)));
                 let seed = self.suggestion_profile((media_type, tmdb_id));
-                let extras = den_index::Extras {
-                    keep: Some(&keep),
-                    admit: Some(&admission),
-                    ..den_index::Extras::default()
-                };
-                let mut row: Vec<Key> = self
-                    .more_like_this_with(tmdb_id, media_type, &params, extras)
-                    .into_iter()
-                    .map(|scored| scored.key())
-                    .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
-                    .collect();
+                row.retain(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)));
                 row.truncate(den_index::MAX_ROW);
-                row.into()
-            },
-        )
+                return row.into();
+            }
+            let admission = self.admission_in(snapshot);
+            let keep = |key| self.admitted(&admission, snapshot, key);
+            let params = den_index::SimilarParams { mix_types: mix, ..den_index::SimilarParams::default() };
+            let seed = self.suggestion_profile((media_type, tmdb_id));
+            let extras = den_index::Extras {
+                keep: Some(&keep),
+                admit: Some(&admission),
+                ..den_index::Extras::default()
+            };
+            let mut row: Vec<Key> = self
+                .more_like_this_with(tmdb_id, media_type, &params, extras)
+                .into_iter()
+                .map(|scored| scored.key())
+                .filter(|&key| worth_suggesting(&seed, &self.suggestion_profile(key)))
+                .collect();
+            row.truncate(den_index::MAX_ROW);
+            row.into()
+        })
     }
 
     /// The seed's fan picks, in the model's order, then the titles the fan-picks graph ties to it
@@ -374,7 +427,7 @@ impl Indexes {
         tmdb_id: u32,
         media_type: den_index::MediaType,
         mix: bool,
-        maturity: crate::maturity::Policy,
+        snapshot: &MaturitySnapshot,
     ) -> Option<Vec<Key>> {
         if !FAN_PICKS {
             return None;
@@ -388,7 +441,7 @@ impl Indexes {
         }
         let keys = view.per_row::<u64>("keys").ok()?;
         let kept_out = crate::versions::kept_out(self, (media_type, tmdb_id));
-        let (one, mixed) = self.more_like_this_rows_with_policy(tmdb_id, media_type, maturity);
+        let (one, mixed) = self.more_like_this_rows_in(tmdb_id, media_type, snapshot);
         let shown: std::collections::HashSet<Key> = if mix {
             mixed.iter().take(FAN_PICKS_SKIP_SIMILAR).copied().collect()
         } else {
@@ -423,7 +476,7 @@ impl Indexes {
             .chain(tail.into_iter().map(|(_, _, key)| key))
             .filter(|key| (mix || key.0 == media_type) && !kept_out.contains(key) && !shown.contains(key))
             .filter(|&key| key != (media_type, tmdb_id) && offered.insert(key))
-            .filter(|&key| self.eligible(maturity, key))
+            .filter(|&key| self.eligible_in(snapshot, key))
             .take(den_index::MAX_ROW)
             .collect();
         Some(if picks.len() >= FAN_PICKS_MIN { picks } else { Vec::new() })
@@ -509,9 +562,19 @@ impl Indexes {
     /// The seed's own type alone, as ids — the row `/index/similar`'s `ids` and `/index/suggest`'s have always
     /// carried, which every client reads. `more_like_this_mixed` is the row with the other type in it.
     pub fn more_like_this(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[u32]> {
+        let snapshot = self.maturity_snapshot(crate::maturity::Policy::default());
+        self.more_like_this_in(tmdb_id, media_type, &snapshot)
+    }
+
+    fn more_like_this_in(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        snapshot: &MaturitySnapshot,
+    ) -> Arc<[u32]> {
         let row = memoised(
             &self.similar,
-            self.unrestricted_similar_key((media_type, tmdb_id), false),
+            self.similar_key((media_type, tmdb_id), false, snapshot),
             SIMILAR_MEMO,
             || {
                 let one_type =
@@ -527,15 +590,20 @@ impl Indexes {
     /// `more_like_this`'s first ones, in its order; the rerank orders each row by its own top ten
     /// (`den_index::JevMode`), so a seed with Jev's scores can order them differently.
     pub fn more_like_this_mixed(&self, tmdb_id: u32, media_type: den_index::MediaType) -> Arc<[Key]> {
-        memoised(
-            &self.similar,
-            self.unrestricted_similar_key((media_type, tmdb_id), true),
-            SIMILAR_MEMO,
-            || {
-                let production = den_index::SimilarParams::default();
-                self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
-            },
-        )
+        let snapshot = self.maturity_snapshot(crate::maturity::Policy::default());
+        self.more_like_this_mixed_in(tmdb_id, media_type, &snapshot)
+    }
+
+    fn more_like_this_mixed_in(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        snapshot: &MaturitySnapshot,
+    ) -> Arc<[Key]> {
+        memoised(&self.similar, self.similar_key((media_type, tmdb_id), true, snapshot), SIMILAR_MEMO, || {
+            let production = den_index::SimilarParams::default();
+            self.more_like_this_scored(tmdb_id, media_type, &production).iter().map(|s| s.key()).collect()
+        })
     }
 
     /// More Like This ranked with `params`, every title's signals kept, and never memoised — the tuning
@@ -621,15 +689,25 @@ impl Indexes {
         tmdb_id: u32,
         media_type: den_index::MediaType,
     ) -> (Arc<[u32]>, Arc<[Key]>) {
+        let snapshot = self.maturity_snapshot(crate::maturity::Policy::default());
+        self.unrestricted_more_like_this_rows_in(tmdb_id, media_type, &snapshot)
+    }
+
+    fn unrestricted_more_like_this_rows_in(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        snapshot: &MaturitySnapshot,
+    ) -> (Arc<[u32]>, Arc<[Key]>) {
         let seed = (media_type, tmdb_id);
         let held = {
             let memo = lock(&self.similar);
-            memo.contains_key(&self.unrestricted_similar_key(seed, false))
-                || memo.contains_key(&self.unrestricted_similar_key(seed, true))
+            memo.contains_key(&self.similar_key(seed, false, snapshot))
+                || memo.contains_key(&self.similar_key(seed, true, snapshot))
         };
         if held {
-            let one = self.more_like_this(tmdb_id, media_type);
-            return (one, self.more_like_this_mixed(tmdb_id, media_type));
+            let one = self.more_like_this_in(tmdb_id, media_type, snapshot);
+            return (one, self.more_like_this_mixed_in(tmdb_id, media_type, snapshot));
         }
         let production = den_index::SimilarParams::default();
         let keys = |row: Vec<den_index::Scored>| -> Arc<[Key]> { row.iter().map(|s| s.key()).collect() };
@@ -656,8 +734,8 @@ impl Indexes {
         if memo.len() + 2 > SIMILAR_MEMO {
             memo.clear();
         }
-        memo.insert(self.unrestricted_similar_key(seed, false), Arc::clone(&one));
-        memo.insert(self.unrestricted_similar_key(seed, true), Arc::clone(&mixed));
+        memo.insert(self.similar_key(seed, false, snapshot), Arc::clone(&one));
+        memo.insert(self.similar_key(seed, true, snapshot), Arc::clone(&mixed));
         (one.iter().map(|&(_, id)| id).collect(), mixed)
     }
 
@@ -668,16 +746,27 @@ impl Indexes {
         media_type: den_index::MediaType,
         maturity: crate::maturity::Policy,
     ) -> (Vec<u32>, Vec<Key>) {
+        let snapshot = self.maturity_snapshot(maturity);
+        self.more_like_this_rows_in(tmdb_id, media_type, &snapshot)
+    }
+
+    pub(crate) fn more_like_this_rows_in(
+        &self,
+        tmdb_id: u32,
+        media_type: den_index::MediaType,
+        snapshot: &MaturitySnapshot,
+    ) -> (Vec<u32>, Vec<Key>) {
+        let maturity = snapshot.policy;
         if maturity == crate::maturity::Policy::default() {
-            let (one, mixed) = self.more_like_this_rows(tmdb_id, media_type);
+            let (one, mixed) = self.unrestricted_more_like_this_rows_in(tmdb_id, media_type, snapshot);
             return (one.to_vec(), mixed.to_vec());
         }
         let seed = (media_type, tmdb_id);
         {
             let memo = lock(&self.similar);
             if let (Some(one), Some(mixed)) = (
-                memo.get(&(seed, false, maturity, self.maturity_generation(maturity))),
-                memo.get(&(seed, true, maturity, self.maturity_generation(maturity))),
+                memo.get(&self.similar_key(seed, false, snapshot)),
+                memo.get(&self.similar_key(seed, true, snapshot)),
             ) {
                 return (one.iter().map(|&(_, id)| id).collect(), mixed.to_vec());
             }
@@ -685,8 +774,8 @@ impl Indexes {
         let production = den_index::SimilarParams::default();
         let kept_out = crate::versions::kept_out(self, seed);
         let reserved = |candidate| kept_out.contains(&candidate);
-        let admission = self.admission(maturity);
-        let keep = |key| self.admitted(&admission, maturity, key);
+        let admission = self.admission_in(snapshot);
+        let keep = |key| self.admitted(&admission, snapshot, key);
         let extras = den_index::Extras {
             keep: Some(&keep),
             admit: Some(&admission),
@@ -712,9 +801,8 @@ impl Indexes {
         if memo.len() + 2 > SIMILAR_MEMO {
             memo.clear();
         }
-        let generation = self.maturity_generation(maturity);
-        memo.insert((seed, false, maturity, generation), one);
-        memo.insert((seed, true, maturity, generation), mixed);
+        memo.insert(self.similar_key(seed, false, snapshot), one);
+        memo.insert(self.similar_key(seed, true, snapshot), mixed);
         answer
     }
 
@@ -2002,6 +2090,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A refresh held while it builds the next immutable provider view leaves both the old facts and their old
+    /// generation visible. Admission work during that hold may populate only the old key; after publication the
+    /// new key is built from the new facts. Repeat in both directions because tightening and loosening fail with
+    /// opposite stale bits when generation and facts are published separately.
+    #[tokio::test]
+    async fn maturity_refresh_never_memoises_old_admission_under_the_new_generation() {
+        use den_index::MediaType::Movie;
+        let dir = std::env::temp_dir().join(format!("den-atlas-maturity-publication-{}", std::process::id()));
+        let key = (Movie, 1);
+        let (providers, pause) = crate::maturity_providers::Providers::changing_for_test(key, 7);
+        let queries = IndexQueries::new(&write_fixture(&dir)).with_maturity(Arc::clone(&providers));
+        let (indexes, _) = queries.get(|| ()).await.expect("indexes");
+        let policy = crate::maturity::Policy {
+            maximum_age: Some(12),
+            unknown_ratings: crate::maturity::UnknownRatings::Block,
+            ..crate::maturity::Policy::default()
+        };
+        let row = row_of(&indexes.store, key.0, key.1).expect("fixture title row");
+        let admitted = |bits: &[u64]| bits[row / 64] & (1 << (row % 64)) != 0;
+        let mut old_age = 7;
+        let mut old_admitted = true;
+
+        for (new_age, new_admitted) in [(18, false), (7, true)] {
+            let old_generation = providers.generation();
+            pause.arm();
+            let refreshing = Arc::clone(&providers);
+            let publish = std::thread::spawn(move || refreshing.publish_age_for_test(key, new_age));
+            pause.wait_until_entered();
+
+            let observed_generation = providers.generation();
+            let observed_age = providers.minimum_age(key, None);
+            let during = indexes.admission(policy);
+            let observed_admission = admitted(&during);
+            let future_memo_exists = lock(&indexes.admission).contains_key(&(policy, old_generation + 1));
+
+            pause.release();
+            publish.join().expect("refresh publication");
+            assert_eq!(observed_generation, old_generation, "an unpublished view has no new generation");
+            assert_eq!(observed_age, Some(old_age), "the old snapshot stays complete");
+            assert_eq!(observed_admission, old_admitted, "work held the old snapshot");
+            assert!(
+                !future_memo_exists,
+                "old facts were retained under the generation that will identify the new facts"
+            );
+            assert_eq!(providers.generation(), old_generation + 1);
+            assert_eq!(providers.minimum_age(key, None), Some(new_age));
+            let after = indexes.admission(policy);
+            assert_eq!(admitted(&after), new_admitted, "the new generation evaluates its own facts");
+            let memo = lock(&indexes.admission);
+            let kept = memo.get(&(policy, old_generation + 1)).expect("new-generation admission memo");
+            assert_eq!(admitted(kept), new_admitted, "the new key cannot retain the old generation's bit");
+
+            old_age = new_age;
+            old_admitted = new_admitted;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_indexes_load_once_and_stay() {
         let dir = std::env::temp_dir().join(format!("den-atlas-queries-{}", std::process::id()));
@@ -2440,8 +2586,9 @@ mod tests {
         assert!(!one.is_empty() && !mixed.is_empty(), "the fixture seed must have rows to memoise");
 
         let sentinel: Arc<[Key]> = Arc::from([(Movie, 999_999)]);
+        let snapshot = indexes.maturity_snapshot(default);
         for mix in [false, true] {
-            let key = indexes.unrestricted_similar_key((Movie, 1), mix);
+            let key = indexes.similar_key((Movie, 1), mix, &snapshot);
             let mut memo = lock(&indexes.similar);
             assert!(memo.contains_key(&key), "the rows are stored under the live generation");
             memo.insert(key, Arc::clone(&sentinel));

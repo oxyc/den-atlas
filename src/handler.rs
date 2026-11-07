@@ -1240,12 +1240,13 @@ impl IndexQuestion {
             Self::Schema => return indexes.schema_json().to_owned(),
             Self::KidsHome => crate::kids_home::json(),
             Self::Rows { media_type, mood, label } => {
+                let maturity_snapshot = indexes.maturity_snapshot(maturity);
                 let number = |key: &str, default: usize| {
                     query_param(query, key).and_then(|v| v.parse().ok()).unwrap_or(default)
                 };
                 let (skip, limit) = (number("skip", 0), number("limit", ROW_PAGE).min(MAX_ROW_PAGE));
                 let floor = den_index::DISPLAY_CONFIDENCE_FLOOR;
-                let eligible = |id, kind| indexes.eligible(maturity, (kind, id));
+                let eligible = |id, kind| indexes.eligible_in(&maturity_snapshot, (kind, id));
                 let titles = if *mood {
                     plot.titles_with_mood_where(
                         label,
@@ -1284,12 +1285,16 @@ impl IndexQuestion {
             // on it, which is not the same as it not existing. Wikidata's name for it rides along where the store
             // carries one (`unindexed_title_json`).
             Self::Title { media_type, tmdb_id } => {
+                let maturity_snapshot = indexes.maturity_snapshot(maturity);
                 let mut title = match crate::plotrows::facts_json(indexes, (*media_type, *tmdb_id)) {
                     Some(mut title) => {
                         title["indexed"] = serde_json::json!(true);
-                        if let Some(versions) =
-                            crate::versions::summary_json(indexes, export, (*media_type, *tmdb_id), maturity)
-                        {
+                        if let Some(versions) = crate::versions::summary_json_in(
+                            indexes,
+                            export,
+                            (*media_type, *tmdb_id),
+                            &maturity_snapshot,
+                        ) {
                             title["otherVersions"] = versions;
                         }
                         title
@@ -1299,9 +1304,10 @@ impl IndexQuestion {
                 // Keep the published baseline and box-local provider observations distinguishable. The effective
                 // value is what eligibility used for this explicit region; `null` remains distinct from age 0.
                 let key = (*media_type, *tmdb_id);
-                title["minimumAge"] = serde_json::json!(indexes.effective_minimum_age(maturity, key));
+                title["minimumAge"] =
+                    serde_json::json!(indexes.effective_minimum_age_in(&maturity_snapshot, key));
                 title["maturityRatings"] = serde_json::json!(indexes.maturity_ratings(key));
-                let runtime = indexes.runtime_maturity_ratings(maturity, key);
+                let runtime = indexes.runtime_maturity_ratings_in(&maturity_snapshot, key);
                 if !runtime.is_empty() {
                     title["publicMinimumAge"] = serde_json::json!(indexes.minimum_age(key));
                     title["runtimeMaturityRatings"] = serde_json::json!(runtime);
@@ -1309,7 +1315,7 @@ impl IndexQuestion {
                 // Whether the request's policy may open this title directly (detail, play, download): every client
                 // asks this one answer rather than re-deriving it (den-spec profiles-v1 §5).
                 title["eligible"] = serde_json::json!(maturity.allows_direct(
-                    indexes.effective_minimum_age(maturity, key),
+                    indexes.effective_minimum_age_in(&maturity_snapshot, key),
                     |band| indexes.kid_audience_relevant(key, band),
                     || indexes.kid_vetoed(key),
                 ));
@@ -1323,13 +1329,14 @@ impl IndexQuestion {
             }
             // The plain plot neighbours the tvOS app splices in after an exact title match.
             Self::Neighbours { media_type, tmdb_id } => {
+                let maturity_snapshot = indexes.maturity_snapshot(maturity);
                 let k = query_param(query, "k")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(NEIGHBOUR_K)
                     .min(MAX_NEIGHBOUR_K);
                 let ids: Vec<u32> = plot
                     .nearest_where(*tmdb_id, *media_type, MAX_NEIGHBOUR_K, |id, kind| {
-                        indexes.eligible(maturity, (kind, id))
+                        indexes.eligible_in(&maturity_snapshot, (kind, id))
                     })
                     .iter()
                     .take(k)
@@ -1624,13 +1631,14 @@ async fn search_answer(
     }
     let media_type = query_param(query, "type").and_then(|t| index_media_type(&t));
     let vector = embed_query(state, &text).await.map_err(crate::admission::RunError::Failed)?;
+    let maturity = indexes.maturity_snapshot(maturity);
     state
         .admission
         .cpu(move || {
             let (neighbours, stats) = indexes.plot.scan_semantic_vector(
                 &vector,
                 |id, kind| {
-                    media_type.is_none_or(|want| want == kind) && indexes.eligible(maturity, (kind, id))
+                    media_type.is_none_or(|want| want == kind) && indexes.eligible_in(&maturity, (kind, id))
                 },
                 SEMANTIC_K,
             );
@@ -2081,7 +2089,16 @@ async fn handle_recommend(state: &Arc<AppState>, config: Config, req: Request) -
         .ok()
         .filter(|dir| !dir.is_empty())
         .and_then(|_| serde_json::from_slice(&body).ok());
-    match rank(state, queries, config, request, raw, &rid, Some(body_permit)).await {
+    match rank(
+        state,
+        queries,
+        config,
+        request,
+        raw,
+        RankContext { rid: &rid, body_permit: Some(body_permit), runtime_snapshot: None },
+    )
+    .await
+    {
         Ok((answer, timing)) => with_timing(
             json_response(answer.to_string(), StatusCode::OK),
             &format!("{timing}, total;dur={}", ms(started.elapsed())),
@@ -2156,6 +2173,11 @@ async fn handle_recommend_get(
         key.push('|');
         key.push_str(&identity);
     }
+    let runtime_snapshot = (maturity.restricted() && state.maturity_providers.applies_to(maturity.region))
+        .then(|| state.maturity_providers.snapshot());
+    if let Some(snapshot) = &runtime_snapshot {
+        key.push_str(&format!("|maturity:{}", snapshot.generation()));
+    }
     let kept = billboards().lock().ok().and_then(|kept| kept.get(&key).cloned());
     let (answer, timing) = match kept {
         Some(answer) => (answer, "kept;dur=0".to_owned()),
@@ -2183,7 +2205,16 @@ async fn handle_recommend_get(
             let Ok(request) = serde_json::from_value::<crate::recommend::Request>(body) else {
                 return json_response(r#"{"error":"recommend_failed"}"#, StatusCode::INTERNAL_SERVER_ERROR);
             };
-            let (answer, timing) = match rank(state, queries, config, request, None, "", None).await {
+            let (answer, timing) = match rank(
+                state,
+                queries,
+                config,
+                request,
+                None,
+                RankContext { rid: "", body_permit: None, runtime_snapshot },
+            )
+            .await
+            {
                 Ok(ranked) => ranked,
                 Err(resp) => return *resp,
             };
@@ -2268,15 +2299,21 @@ fn library_embedding_plan(
 ///
 /// The error is the response the handler sends, once per request, so boxing it would only add an allocation.
 #[allow(clippy::result_large_err)]
+struct RankContext<'a> {
+    rid: &'a str,
+    body_permit: Option<crate::admission::Permit>,
+    runtime_snapshot: Option<crate::maturity_providers::Snapshot>,
+}
+
 async fn rank(
     state: &Arc<AppState>,
     queries: &crate::queries::IndexQueries,
     config: Config,
     request: crate::recommend::Request,
     raw: Option<serde_json::Value>,
-    rid: &str,
-    body_permit: Option<crate::admission::Permit>,
+    context: RankContext<'_>,
 ) -> Result<(serde_json::Value, String), Box<Response>> {
+    let RankContext { rid, body_permit, runtime_snapshot } = context;
     let rid = rid.to_owned();
     let (indexes, loaded_in) = match queries.get(|| warm_embed(state)).await {
         Ok(got) => got,
@@ -2285,6 +2322,8 @@ async fn rank(
             return Err(Box::new(unavailable_response(r#"{"error":"index_unavailable"}"#, RELOAD_WAIT)));
         }
     };
+    let maturity_snapshot =
+        runtime_snapshot.map(|runtime| indexes.maturity_snapshot_from(request.maturity(), runtime));
     // Reserve the whole local recommendation job, not merely its final blocking closure. Building an embedding
     // plan and materialising cached catalogue lists also do synchronous work; letting an overload wave perform
     // those first made a nominal 100 ms admission refusal take seconds. Catalogue routes and catalogue refresh
@@ -2341,14 +2380,25 @@ async fn rank(
             .as_deref()
             .and_then(crate::recommend::parse_now)
             .unwrap_or_else(crate::recommend::today);
-        let mut answer = crate::recommend::answer(
-            &indexes,
-            export.as_deref(),
-            &request,
-            &lists,
-            now,
-            Some(&library_embeddings),
-        );
+        let mut answer = match &maturity_snapshot {
+            Some(maturity) => crate::recommend::answer_in(
+                &indexes,
+                export.as_deref(),
+                &request,
+                &lists,
+                now,
+                Some(&library_embeddings),
+                maturity,
+            ),
+            None => crate::recommend::answer(
+                &indexes,
+                export.as_deref(),
+                &request,
+                &lists,
+                now,
+                Some(&library_embeddings),
+            ),
+        };
         // One decision line per answer — surface, pool/library counts, slide count, and the top
         // slides' dominant signals — throttled like every other per-request line in this file
         // (`util::log_throttled!`): the POST path ranks fresh for every household on every call, so
@@ -2724,6 +2774,7 @@ fn filter_catalog_maturity(
     let Some(metas) = parsed.get_mut("metas").and_then(serde_json::Value::as_array_mut) else {
         return empty();
     };
+    let runtime = state.maturity_providers.snapshot();
     metas.retain(|meta| {
         let id =
             meta.get("moviedb_id").and_then(serde_json::Value::as_u64).and_then(|id| u32::try_from(id).ok());
@@ -2734,7 +2785,11 @@ fn filter_catalog_maturity(
                         .mapped
                         .minimum_age(media_type, id)
                         .into_iter()
-                        .chain(state.maturity_providers.minimum_age((media_type, id), maturity.region))
+                        .chain(state.maturity_providers.minimum_age_in(
+                            &runtime,
+                            (media_type, id),
+                            maturity.region,
+                        ))
                         .max()
                 })
             },
@@ -2776,13 +2831,14 @@ async fn handle_title_search(
     } else {
         den_index::MediaType::Movie
     };
+    let runtime = state.maturity_providers.snapshot();
     let body = titles::metas_json_with(&index, &query, media_type, |id| {
         maturity.allows_title_with(
             || {
                 store
                     .and_then(|store| store.minimum_age(kind, id))
                     .into_iter()
-                    .chain(state.maturity_providers.minimum_age((kind, id), maturity.region))
+                    .chain(state.maturity_providers.minimum_age_in(&runtime, (kind, id), maturity.region))
                     .max()
             },
             |band| store.is_some_and(|store| store.kid_audience_relevant(kind, id, band)),

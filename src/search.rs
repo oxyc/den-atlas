@@ -892,6 +892,7 @@ pub fn answer_with_policy(
     limit: usize,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
+    let maturity = indexes.maturity_snapshot(maturity);
     // A `type=` PARAMETER wins outright; the word "show" or "movie" in the query is only a default for when
     // none was given. ANDing the two let them annihilate — `?q=the show&type=movie` answered with nothing at
     // all, because the words said series and the caller said film.
@@ -917,7 +918,8 @@ pub fn answer_with_policy(
     }
     // Every lane drops what was ruled out BEFORE it truncates, or a lane of the 500 most-voted comedies is
     // mostly American and "comedies not american" is left with what the vectors happen to find.
-    let allowed = |key: Key| !rules_out(indexes, parsed, &ruled_out, key) && indexes.eligible(maturity, key);
+    let allowed =
+        |key: Key| !rules_out(indexes, parsed, &ruled_out, key) && indexes.eligible_in(&maturity, key);
     let mut found: HashMap<Key, Found> = HashMap::new();
 
     // Titles, by the name TMDB exports and the name atlas displays.

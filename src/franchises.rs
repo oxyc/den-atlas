@@ -198,6 +198,7 @@ pub fn route_json_with_policy(
     seed: Key,
     maturity: crate::maturity::Policy,
 ) -> serde_json::Value {
+    let maturity = indexes.maturity_snapshot(maturity);
     let Some(membership) = indexes.franchises.membership(seed) else {
         return serde_json::json!({
             "franchise": null,
@@ -213,7 +214,7 @@ pub fn route_json_with_policy(
     let members = indexes.franchises.members_for(seed, |key| title_facts(indexes, key)).unwrap_or_default();
     let titles: Vec<serde_json::Value> = members
         .iter()
-        .filter(|member| indexes.eligible(maturity, member.key))
+        .filter(|member| indexes.eligible_in(&maturity, member.key))
         .filter_map(|member| {
             let era = franchise.eras.get(member.era as usize)?;
             let mut title = indexes
