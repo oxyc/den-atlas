@@ -101,9 +101,12 @@ and it caches everything by URL with correct revalidation.
 |---|---|
 | `manifest.json` | `max-age=3600, stale-while-revalidate=600, stale-if-error=86400` |
 | `dataset.json` | `max-age=300, stale-while-revalidate=3600, stale-if-error=86400` |
-| `/index/…` GET | `max-age=3600, stale-while-revalidate=86400` (answers move only with the dataset); `max-age=300` when a search should have been ranked through den-embed and wasn't |
-| title search | `max-age=3600, stale-while-revalidate=3600` |
+| `/index/…` GET, title search | `max-age=300, s-maxage=2592000, stale-while-revalidate=86400` (answers move only with the dataset, and a deploy purges them); `max-age=300` when a search should have been ranked through den-embed and wasn't; `max-age=300, s-maxage=300, stale-while-revalidate=300` when runtime maturity providers shaped it |
 | a JustWatch row | `max-age=3600, stale-while-revalidate=86400, stale-if-error=86400`; `max-age=60` for a stale or empty fallback |
+
+A public answer with an `s-maxage` also carries `CDN-Cache-Control: max-age=<s-maxage>[, stale-while-revalidate=…],
+stale-if-error=604800`, so Cloudflare (which reads it in place of `Cache-Control`) may hand out its copy for a week
+while atlas cannot answer; `s-maxage` itself forbids that. A runtime-provider answer gets none.
 
 A search query's vector is remembered in memory (1,000 texts, least recently used first, 24 h), keyed by the
 dataset's embedding model and width, so a repeated search does not call den-embed again.
