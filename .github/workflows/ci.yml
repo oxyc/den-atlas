@@ -16,9 +16,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
   # Superseded PR revisions are disposable. A main SHA is a potential release and its candidate must finish even
   # when another merge follows it, otherwise a tag could name a commit whose exact image was cancelled midway.
+  # Main therefore gets one group per SHA: within a shared group GitHub keeps one running and one pending run and
+  # cancels the older pending run when a third queues, even with cancel-in-progress off.
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -31,7 +33,65 @@ env:
   INTEGRATED_IMAGE: ghcr.io/${{ github.repository_owner }}/den-atlas-integrated
 
 jobs:
+  # Test a source tree once. When a ci.yml run in this repository already passed every blocking test job on
+  # byte-identical source (the commit's tree without VERSION; see scripts/ci-verdict.sh), the tests are skipped.
+  # That covers a merge commit whose PR run tested the same merge result, and release.sh's version commit, whose
+  # predecessor tested the same source. The candidate jobs still build, probe and scan an image for every main SHA,
+  # so their version, revision label and digests are that commit's.
+  scope:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_changed: ${{ steps.diff.outputs.source_changed }}
+      tree: ${{ steps.diff.outputs.tree }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Look for a recorded pass on this source
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tree=$(scripts/ci-verdict.sh tree HEAD)
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "source_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Main SHAs run side by side, so a version commit's predecessor may still be testing the same source: wait
+          # for its verdict rather than test it a second time. Any other change looks once and otherwise runs in full.
+          before_tree=""
+          if [ "$EVENT" = push ]; then
+            before_tree=$(scripts/ci-verdict.sh tree "$BEFORE" 2>/dev/null || true)
+          fi
+          run=""
+          for _ in $(seq 1 90); do
+            run=$(scripts/ci-verdict.sh find "$REPO" "$tree")
+            [ -z "$run" ] && [ "$before_tree" = "$tree" ] || break
+            pending=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=push&head_sha=$BEFORE" \
+              --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            [ "$pending" -gt 0 ] || break
+            sleep 20
+          done
+          if [ -n "$run" ]; then
+            url="https://github.com/$REPO/actions/runs/$run"
+            echo "::notice title=Tests reused::source tree $tree already passed in $url"
+            echo "Tests skipped: source tree \`$tree\` already passed in $url" >> "$GITHUB_STEP_SUMMARY"
+            echo "source_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: scope
+    if: needs.scope.outputs.source_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -104,6 +164,8 @@ jobs:
   # (UniFFI) and the web app (Wasm), so they have to keep compiling for both. A check, not a build: nothing
   # links.
   portable:
+    needs: scope
+    if: needs.scope.outputs.source_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -115,6 +177,30 @@ jobs:
         run: |
           cargo check --locked -p den-index -p den-titlesearch --target wasm32-unknown-unknown
           cargo check --locked -p den-index -p den-titlesearch --target aarch64-apple-tvos
+
+  # Record that this exact source tree passed every blocking job, for a later run on byte-identical source. Only a
+  # run that actually tested it records one; a PR's verdict also needs its image build to have succeeded.
+  verdict:
+    needs: [scope, test, portable, build-pr]
+    if: >-
+      always() && needs.scope.outputs.source_changed == 'true' && needs.test.result == 'success'
+      && needs.portable.result == 'success'
+      && (needs.build-pr.result == 'success' || (github.event_name == 'push' && needs.build-pr.result == 'skipped'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the verdict
+        env:
+          TREE: ${{ needs.scope.outputs.tree }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          jq -n --arg tree "$TREE" --arg sha "$GITHUB_SHA" --arg event "$EVENT" --arg run "$GITHUB_RUN_ID" \
+            '{tree: $tree, sha: $sha, event: $event, run: $run}' > verdict.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-verdict-${{ needs.scope.outputs.tree }}
+          path: verdict.json
+          if-no-files-found: error
+          retention-days: 14
 
   # The image is what actually ships, and it builds differently from `cargo build` (musl target,
   # scratch base). Catching a Dockerfile break on the PR rather than at `git tag` time, without
