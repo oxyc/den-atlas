@@ -515,7 +515,10 @@ python3 and shasum; set `DEN_COSIGN` when cosign is not on `PATH`). It stages th
 digest-addressed Sigstore bundle, and verifies that exact manifest was signed by
 `oxyc/den-dataset/.github/workflows/daily.yml@refs/heads/main` before parsing it or downloading blobs. During
 the proof-name migration only, an absent digest-addressed bundle falls back to the fixed-name bundle; an
-invalid, mismatched or unavailable proof never does. It then downloads every file `dataset.meta.json`
+invalid, mismatched, timed-out or unavailable proof never does. Every request has a connect timeout and a
+total deadline: 60 s for the manifest and proofs (`DEN_PROOF_TIMEOUT_SECS`) and 300 s per blob
+(`DEN_BLOB_TIMEOUT_SECS`), matching the deployed sync; a timeout fails the fetch with `./data` untouched.
+Overrides must be positive integers: `0`, empty and non-numeric values are refused. It then downloads every file `dataset.meta.json`
 declares and verifies each against the authenticated meta's sha256 before moving them into `./data`.
 `storeFile` is the one it REFUSES a release without: the store is the only artifact the server reads, and
 a manifest that still names the retired sidecars simply fetches files nothing opens. To pick up a new

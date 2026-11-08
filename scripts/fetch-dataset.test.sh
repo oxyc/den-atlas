@@ -12,17 +12,42 @@ mkdir -p "$REL" "$WORK/data" "$SHIMS"
 SERVER_PID=""
 trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi; rm -rf "$ROOT"' EXIT
 
-python3 - "$REL" "$ROOT/port" <<'PY' &
-import http.server, os, socketserver, sys
+python3 - "$REL" "$ROOT/port" "$ROOT/requests.log" <<'PY' &
+import http.server, os, socketserver, sys, time
 os.chdir(sys.argv[1])
+LOG = sys.argv[3]
+# A `.stall-<kind>` marker makes that request accept the connection and then say nothing until the marker
+# is removed (or 15 s pass), which is the peer the fetch deadline exists for. Blobs stall only on the full
+# download, not on the pre-flight's one-byte range probe.
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args): pass
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client gave up at its deadline, which is the point
+    def stall(self, kind):
+        end = time.time() + 15
+        while os.path.exists(".stall-" + kind) and time.time() < end:
+            time.sleep(0.05)
     def do_GET(self):
+        with open(LOG, "a") as f:
+            f.write(self.path + "\n")
+        if self.path == "/dataset.meta.json":
+            self.stall("manifest")
+        elif self.path == "/dataset.meta.json.bundle":
+            self.stall("fixed")
+        elif self.path.startswith("/dataset.meta.json.sha256-"):
+            self.stall("proof")
+        elif self.path.endswith(".bin") and "Range" not in self.headers:
+            self.stall("blob")
         if self.path.startswith("/dataset.meta.json.sha256-") and os.path.exists(".proof-status-500"):
             self.send_error(500)
             return
         super().do_GET()
-server = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+class Threaded(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
+server = Threaded(("127.0.0.1", 0), Quiet)
 open(sys.argv[2], "w").write(str(server.server_address[1]))
 server.serve_forever()
 PY
@@ -83,7 +108,9 @@ seed_old() {
 }
 run_fetch() {
   RC=0
+  : > "$ROOT/requests.log"
   (cd "$WORK" && PATH="$SHIMS:$PATH" DEN_COSIGN="$SHIMS/cosign" DEN_DATASET_BASE="$BASE" \
+    DEN_PROOF_TIMEOUT_SECS="${DEN_PROOF_TIMEOUT_SECS-2}" DEN_BLOB_TIMEOUT_SECS="${DEN_BLOB_TIMEOUT_SECS-2}" \
     bash "$SCRIPT") >"$ROOT/out" 2>"$ROOT/err" || RC=$?
 }
 preserved_old() {
@@ -136,6 +163,51 @@ mv "$ROOT/held-store.bin" "$REL/store.bin"
 run_fetch
 check "completed generation retries successfully" "$RC" 0
 check "retry installs the authenticated generation" "$(cat "$WORK/data/store.bin" 2>/dev/null)" completed-later
+
+# Every release request has a deadline. A stalled immutable proof is a transport failure: it must NOT
+# downgrade to the fixed-name migration proof (which is validly signed here), and last-good stays put.
+seed_old; write_release v7 proof-stall; sign_immutable; sign_fixed; touch "$REL/.stall-proof"; run_fetch
+check "stalled immutable proof times out" "$RC" 1
+grep -q 'immutable proof' "$ROOT/err" && ok "stalled proof reports the immutable proof" || bad "stalled proof message missing"
+grep -q '^/dataset.meta.json.bundle$' "$ROOT/requests.log" && bad "stalled proof fell back to the migration proof" || ok "stalled proof does not request the migration proof"
+preserved_old && ok "stalled proof preserves last-good data" || bad "stalled proof changed last-good data"
+[ -z "$(find "$WORK/data" -name '.fetch.*')" ] && ok "stalled proof removes staged data" || bad "stalled proof left staged data"
+rm -f "$REL/.stall-proof"; run_fetch
+check "proof retry succeeds once the peer answers" "$RC" 0
+check "proof retry installs the release" "$(cat "$WORK/data/store.bin" 2>/dev/null)" proof-stall
+
+# The migration proof (reached only on a real 404) is bounded too.
+seed_old; write_release v8 fixed-stall; sign_fixed; touch "$REL/.stall-fixed"; run_fetch
+check "stalled migration proof times out" "$RC" 1
+preserved_old && ok "stalled migration proof preserves last-good data" || bad "stalled migration proof changed last-good data"
+rm -f "$REL/.stall-fixed"; run_fetch
+check "migration proof retry succeeds" "$RC" 0
+
+# A stalled manifest times out before anything is staged into ./data.
+seed_old; write_release v9 manifest-stall; sign_immutable; touch "$REL/.stall-manifest"; run_fetch
+check "stalled manifest times out (curl exit 28)" "$RC" 28
+preserved_old && ok "stalled manifest preserves last-good data" || bad "stalled manifest changed last-good data"
+rm -f "$REL/.stall-manifest"; run_fetch
+check "manifest retry succeeds" "$RC" 0
+
+# A stalled blob download times out, keeps last-good, and a retry succeeds.
+seed_old; write_release v10 blob-stall; sign_immutable; touch "$REL/.stall-blob"; run_fetch
+check "stalled blob times out (curl exit 28)" "$RC" 28
+preserved_old && ok "stalled blob preserves last-good data" || bad "stalled blob changed last-good data"
+[ -z "$(find "$WORK/data" -name '.fetch.*')" ] && ok "stalled blob removes staged data" || bad "stalled blob left staged data"
+rm -f "$REL/.stall-blob"; run_fetch
+check "blob retry succeeds" "$RC" 0
+check "blob retry installs the release" "$(cat "$WORK/data/store.bin" 2>/dev/null)" blob-stall
+
+# An override that would disable the bound is refused before any request is made.
+for v in 0 "" abc -5 1.5; do
+  seed_old; write_release v11 bad-override; sign_immutable
+  DEN_PROOF_TIMEOUT_SECS="$v" run_fetch
+  check "proof timeout override '$v' is rejected" "$RC" 1
+  check "rejected override '$v' made no request" "$(wc -c < "$ROOT/requests.log" | tr -d ' ')" 0
+  DEN_BLOB_TIMEOUT_SECS="$v" run_fetch
+  check "blob timeout override '$v' is rejected" "$RC" 1
+done
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

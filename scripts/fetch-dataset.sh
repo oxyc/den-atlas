@@ -15,6 +15,26 @@ BASE="${DEN_DATASET_BASE:-https://github.com/$REPO/releases/download/data-latest
 COSIGN="${DEN_COSIGN:-cosign}"
 KEYLESS_IDENTITY="https://github.com/oxyc/den-dataset/.github/workflows/daily.yml@refs/heads/main"
 KEYLESS_ISSUER="https://token.actions.githubusercontent.com"
+
+# EVERY release request has a finite total deadline (curl --max-time) and a connect timeout, so a peer that
+# accepts the connection and then stalls cannot hang a bootstrap forever. The defaults match the deployed
+# sync (oxyc/den deploy/atlas-dataset-sync.sh): 60 s for the manifest and proofs, 300 s per blob. A timeout
+# is a transport failure like any other: the immutable proof never downgrades to the migration proof on one
+# (only a real 404 does), and nothing leaves $STAGE, so ./data stays as it was.
+#   DEN_PROOF_TIMEOUT_SECS  manifest + proof requests, seconds   (default 60)
+#   DEN_BLOB_TIMEOUT_SECS   each blob download, seconds          (default 300)
+# Only positive integers are accepted: 0, empty and non-numeric values would disable the bound.
+CONNECT_TIMEOUT=10
+PROOF_TIMEOUT="${DEN_PROOF_TIMEOUT_SECS-60}"
+BLOB_TIMEOUT="${DEN_BLOB_TIMEOUT_SECS-300}"
+for pair in "DEN_PROOF_TIMEOUT_SECS=$PROOF_TIMEOUT" "DEN_BLOB_TIMEOUT_SECS=$BLOB_TIMEOUT"; do
+  case "${pair#*=}" in
+    "" | *[!0-9]* | 0*)
+      echo "${pair%%=*} must be a positive integer number of seconds, not '${pair#*=}' — refusing" >&2
+      exit 1
+      ;;
+  esac
+done
 mkdir -p data
 
 # The meta names the blobs (version-agnostic), so fetch it first — but to a STAGING path, not into
@@ -27,7 +47,7 @@ mkdir -p data
 # response's open inode. A running server rejects replacement files until restarted (FileIdentity).
 STAGE="$(mktemp -d data/.fetch.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
-curl -fsSL "$BASE/dataset.meta.json" -o "$STAGE/dataset.meta.json"
+curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$PROOF_TIMEOUT" "$BASE/dataset.meta.json" -o "$STAGE/dataset.meta.json"
 
 # AUTHENTICATE THE RAW MANIFEST BEFORE PARSING OR USING ANY VALUE FROM IT.
 #
@@ -48,12 +68,12 @@ esac
 }
 immutable_bundle="dataset.meta.json.sha256-$meta_sha.bundle"
 bundle="$STAGE/$immutable_bundle"
-proof_code="$(curl -sSL -o "$bundle" -w '%{http_code}' "$BASE/$immutable_bundle" 2>/dev/null || echo 000)"
+proof_code="$(curl -sSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$PROOF_TIMEOUT" -o "$bundle" -w '%{http_code}' "$BASE/$immutable_bundle" 2>/dev/null || true)"
 case "$proof_code" in
   200) ;;
   404)
     bundle="$STAGE/dataset.meta.json.bundle"
-    curl -fsSL "$BASE/dataset.meta.json.bundle" -o "$bundle" || {
+    curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$PROOF_TIMEOUT" "$BASE/dataset.meta.json.bundle" -o "$bundle" || {
       echo "release carries no proof for dataset manifest $meta_sha — refusing, ./data untouched" >&2
       exit 1
     }
@@ -138,7 +158,7 @@ FATAL=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   safe_name "$f" || { echo "refusing unsafe blob name: $f" >&2; exit 1; }
-  code="$(curl -sL -m 20 -o /dev/null -w '%{http_code}' -r 0-0 "$BASE/$f" 2>/dev/null || echo 000)"
+  code="$(curl -sL --connect-timeout "$CONNECT_TIMEOUT" -m 20 -o /dev/null -w '%{http_code}' -r 0-0 "$BASE/$f" 2>/dev/null || echo 000)"
   case "$code" in
     200 | 206) continue ;;
   esac
@@ -175,7 +195,7 @@ while IFS= read -r f; do
   [ -n "$f" ] || continue
   case " $MISSING " in *" $f("*) continue ;; esac
   echo "fetching $f …"
-  curl -fsSL "$BASE/$f" -o "$STAGE/$f"
+  curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$BLOB_TIMEOUT" "$BASE/$f" -o "$STAGE/$f"
   want="$(SF="$f" STAGE="$STAGE" python3 -c '
 import json, os
 m = json.load(open(os.environ["STAGE"] + "/dataset.meta.json"))
