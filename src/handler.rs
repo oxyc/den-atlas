@@ -308,7 +308,18 @@ fn redact_search(path: String) -> String {
 // also bypass the serve-stale path that `handle_catalog` promises never returns one.
 async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
-    // CORS preflight for browser-based Stremio clients (public, credential-free data).
+    let path = req.uri().path().to_owned();
+    // A leading `<region>_<codes>` path segment is a per-install config (Stremio config-URL pattern);
+    // strip it and route on the remainder. Absent/garbled → the operator-default config. The dataset,
+    // health, and blob routes are config-independent — the config only shapes manifest + catalog.
+    let (config, route) = split_config(&path);
+    let route = route.as_str();
+
+    if route == "/metrics" {
+        return metrics_response(&state, &req);
+    }
+    // CORS preflight for browser-based Stremio clients (public, credential-free data). The operational metrics
+    // endpoint has the narrower authenticated GET/HEAD contract handled above.
     if method == Method::OPTIONS {
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -319,13 +330,6 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
             .body(Body::empty())
             .unwrap();
     }
-
-    let path = req.uri().path().to_owned();
-    // A leading `<region>_<codes>` path segment is a per-install config (Stremio config-URL pattern);
-    // strip it and route on the remainder. Absent/garbled → the operator-default config. The dataset,
-    // health, and blob routes are config-independent — the config only shapes manifest + catalog.
-    let (config, route) = split_config(&path);
-    let route = route.as_str();
 
     // Search query-embed proxy: POST /embed forwards the query to den-embed (the single quantizer authority)
     // and returns its int8 vector. Handled before the GET/HEAD guard because it's the one write route.
@@ -353,17 +357,6 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
 
     if let Some(scope) = route.strip_prefix("/recommend/").and_then(|rest| rest.strip_suffix(".json")) {
         return handle_recommend_get(&method, &headers, &state, config, scope, &query).await;
-    }
-    if route == "/metrics" {
-        if !crate::metrics::authorized(&headers, state.metrics_token.as_deref()) {
-            return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
-        }
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(Body::from(crate::metrics::render(&state)))
-            .unwrap();
     }
     if route == "/" || route == "/configure" || route == "/configure/" {
         return serve_html(&method, &headers, CONFIGURE_PAGE).await;
@@ -435,6 +428,32 @@ async fn route(State(state): State<Arc<AppState>>, req: Request) -> Response {
         return handle_playground(&method, &headers, route, &query, &state).await;
     }
     json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND)
+}
+
+fn metrics_response(state: &AppState, req: &Request) -> Response {
+    if !crate::metrics::authorized(req.headers(), state.metrics_token.as_deref()) {
+        return json_response(r#"{"error":"not_found"}"#, StatusCode::NOT_FOUND);
+    }
+    match *req.method() {
+        Method::GET => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(crate::metrics::render(state)))
+            .unwrap(),
+        Method::HEAD => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap(),
+        _ => {
+            let mut response =
+                json_response(r#"{"error":"method_not_allowed"}"#, StatusCode::METHOD_NOT_ALLOWED);
+            response.headers_mut().insert(header::ALLOW, "GET, HEAD".parse().unwrap());
+            response
+        }
+    }
 }
 
 /// `GET /airing/tv/<tmdbId>[?imdb=tt…]` — one series' release schedule from TVmaze (`tvmaze.rs`): the same for
@@ -6513,9 +6532,17 @@ mod tests {
     }
 
     async fn get_metrics(state: &Arc<AppState>, auth: Option<&str>) -> axum::response::Response {
+        metrics_request(state, Method::GET, auth).await
+    }
+
+    async fn metrics_request(
+        state: &Arc<AppState>,
+        method: Method,
+        auth: Option<&str>,
+    ) -> axum::response::Response {
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
-        let mut req = HttpRequest::builder().uri("/metrics");
+        let mut req = HttpRequest::builder().method(method).uri("/metrics");
         if let Some(a) = auth {
             req = req.header("authorization", a);
         }
@@ -6598,6 +6625,25 @@ mod tests {
             [None, Some("Bearer wrong!"), Some("Bearer s3cre"), Some("Bearer s3cret2"), Some("s3cret")]
         {
             assert_eq!(get_metrics(&state, auth).await.status(), 404, "{auth:?} was let in");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_head_is_empty_and_unsupported_methods_are_concealed_then_405() {
+        let mut st = AppState::for_test(None);
+        st.metrics_token = Some("s3cret".to_owned());
+        let state = Arc::new(st);
+
+        let head = metrics_request(&state, Method::HEAD, Some("Bearer s3cret")).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()[header::CONTENT_TYPE], "text/plain; version=0.0.4; charset=utf-8");
+        assert!(body_of(head).await.is_empty(), "HEAD rendered or sent the exposition");
+
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
+            assert_eq!(metrics_request(&state, method.clone(), None).await.status(), StatusCode::NOT_FOUND);
+            let refused = metrics_request(&state, method.clone(), Some("Bearer s3cret")).await;
+            assert_eq!(refused.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(refused.headers()[header::ALLOW], "GET, HEAD", "{method}");
         }
     }
 

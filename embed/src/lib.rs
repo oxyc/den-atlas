@@ -29,7 +29,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use blake2::digest::consts::U16;
 use blake2::{Blake2b, Digest};
@@ -742,15 +742,31 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// would otherwise keep ~1.2 GB resident all day, which is precisely what idle-unload exists to
 /// prevent. So this only reads — it never calls `touch` or `Model::load` — and everything it reports
 /// is state the service already keeps for its own purposes, computed here on request.
-async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn metrics(State(state): State<Arc<AppState>>, method: Method, headers: HeaderMap) -> Response {
     if !metrics_authorized(state.cfg.metrics_token.as_deref(), &headers) {
         return not_found();
     }
-    (
-        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")],
-        render_metrics(&state),
-    )
-        .into_response()
+    match method {
+        Method::GET => (
+            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")],
+            render_metrics(&state),
+        )
+            .into_response(),
+        Method::HEAD => {
+            ([(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (CACHE_CONTROL, "no-store")], "")
+                .into_response()
+        }
+        _ => {
+            let mut response = (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(CONTENT_TYPE, "application/json"), (CACHE_CONTROL, "no-store")],
+                r#"{"error":"method_not_allowed"}"#,
+            )
+                .into_response();
+            response.headers_mut().insert("allow", HeaderValue::from_static("GET, HEAD"));
+            response
+        }
+    }
 }
 
 /// The answer for an unknown path and for a refused `/metrics`, identical so the two cannot be told
@@ -768,7 +784,7 @@ fn not_found() -> Response {
 /// routing. It returns without reaching a handler, so a preflight never calls `touch` or loads the
 /// model — like `/health` and `/metrics`, it is not activity and cannot keep the model warm.
 async fn cors(req: Request, next: Next) -> Response {
-    if req.method() == Method::OPTIONS {
+    if req.method() == Method::OPTIONS && req.uri().path() != "/metrics" {
         return (
             StatusCode::NO_CONTENT,
             [
@@ -1171,7 +1187,7 @@ fn router(state: Arc<AppState>) -> Router {
     let max_body = state.cfg.max_body_bytes;
     let app = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics))
+        .route("/metrics", any(metrics))
         .route("/embed", get(embed_get).post(embed_post))
         .route("/embed/batch", post(embed_batch))
         .fallback(|| async { not_found() })
@@ -1761,6 +1777,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the token is trimmed after the scheme");
     }
 
+    #[tokio::test]
+    async fn metrics_head_is_empty_and_unsupported_methods_are_concealed_then_405() {
+        async fn send(state: Arc<AppState>, method: Method, auth: Option<&str>) -> Response {
+            use tower::ServiceExt;
+            let mut request = axum::http::Request::builder().method(method).uri("/metrics");
+            if let Some(auth) = auth {
+                request = request.header(AUTHORIZATION, auth);
+            }
+            router(state).oneshot(request.body(axum::body::Body::empty()).unwrap()).await.unwrap()
+        }
+
+        let state = metrics_state(Some("s3cret"));
+        let head = send(state.clone(), Method::HEAD, Some("Bearer s3cret")).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(header(&head, "content-type"), "text/plain; version=0.0.4; charset=utf-8");
+        assert!(axum::body::to_bytes(head.into_body(), usize::MAX).await.unwrap().is_empty());
+
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS] {
+            assert_eq!(send(state.clone(), method.clone(), None).await.status(), StatusCode::NOT_FOUND);
+            let refused = send(state.clone(), method.clone(), Some("Bearer s3cret")).await;
+            assert_eq!(refused.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(header(&refused, "allow"), "GET, HEAD", "{method}");
+        }
+    }
+
     /// `GET /embed?text=` carries the user's search in the query, so the line has the path alone.
     #[test]
     fn the_request_log_never_carries_the_query() {
@@ -1804,7 +1845,7 @@ mod tests {
         if let Some(auth) = auth {
             headers.insert(AUTHORIZATION, auth.parse().unwrap());
         }
-        let resp = metrics(State(state), headers).await;
+        let resp = metrics(State(state), Method::GET, headers).await;
         let status = resp.status();
         let content_type =
             resp.headers().get(CONTENT_TYPE).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
@@ -1840,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn a_preflight_on_any_path_is_answered_without_waking_the_model() {
         let state = metrics_state(None);
-        for path in ["/embed", "/embed/batch", "/health", "/metrics", "/nope"] {
+        for path in ["/embed", "/embed/batch", "/health", "/nope"] {
             let resp = call(state.clone(), Method::OPTIONS, path).await;
             assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{path}");
             assert_eq!(header(&resp, "access-control-allow-origin"), "*", "{path}");

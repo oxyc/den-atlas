@@ -47,6 +47,8 @@ boot and stays. The measured rollout bounds are recorded in the migration docume
 | POST | `/embed` | `{"text":"…"}` | same as GET |
 | POST | `/embed/batch` | `{"texts":["…","…"]}` | `{"vectors":[[…],…],"dims":1024,"model":"bge-m3"}` |
 | GET | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | Prometheus text (`embed_*` series) |
+| HEAD | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | Same status/representation headers, without rendering or sending the exposition |
+| other | `/metrics` | `Authorization: Bearer <METRICS_TOKEN>` | 405 with `Allow: GET, HEAD`; missing/wrong authorization remains 404 |
 
 - `/health` never loads the model. It says `ok` until an embed fails to load the model, then
   `{"status":"degraded","reason":"model_unavailable","detail":"…", …}` until a load succeeds — so a
@@ -55,7 +57,7 @@ boot and stays. The measured rollout bounds are recorded in the migration docume
 - An unknown path answers 404 `{"error":"not_found"}` (`application/json`, `no-store`), and so does
   `/metrics` when `METRICS_TOKEN` is unset or the token is wrong.
 - Every response carries `Access-Control-Allow-Origin: *` and `Cache-Control: no-store`. `OPTIONS`
-  on any path answers 204 with the preflight headers and, like `/health` and `/metrics`, is not
+  on any application path answers 204 with the preflight headers and, like `/health`, is not
   activity for idle unload.
 - Errors are JSON, `{"error":"<slug>"[,"detail":"…"]}`, `no-store`:
   - 413 `too_many_texts` / `batch_too_large` over `MAX_BATCH` texts or `MAX_REQUEST_TOKENS` tokens
