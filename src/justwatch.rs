@@ -802,6 +802,32 @@ mod tests {
         assert!(graphql_error("not json at all").is_none());
     }
 
+    /// Read one request, head and `content-length` body, off a test server's socket. A server that answers and
+    /// closes with the request still unread makes the kernel reset the connection, which can discard the response
+    /// before the client has read it.
+    async fn read_request(sock: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if seen.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Serve one fixed HTTP 200 body on an ephemeral port, then close.
     async fn serve_once(body: impl Into<String>) -> String {
         use tokio::io::AsyncWriteExt;
@@ -814,6 +840,7 @@ mod tests {
         );
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
+                read_request(&mut sock).await;
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.write_all(body.as_bytes()).await;
                 let _ = sock.shutdown().await;
@@ -834,6 +861,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 counted.fetch_add(1, Ordering::Relaxed);
+                read_request(&mut sock).await;
                 let refusal =
                     "HTTP/1.1 429 Too Many Requests\r\nretry-after: 120\r\ncontent-length: 0\r\n\r\n";
                 let _ = sock.write_all(refusal.as_bytes()).await;
