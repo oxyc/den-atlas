@@ -77,7 +77,7 @@ COPY embed/src ./embed/src
 COPY judged/rail.json judged/rail-cross.json judged/franchise.json ./judged/
 RUN cargo build --release --locked -p den-atlas -p den-embed --features den-atlas/embedded-model
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS embed-model
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS embed-model
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /models
@@ -90,7 +90,7 @@ RUN curl -fsSL "$HF/onnx/model_int8.onnx" -o model_int8.onnx \
     && echo "${MODEL_SHA256}  model_int8.onnx" | sha256sum -c - \
     && echo "${TOKENIZER_SHA256}  tokenizer.json" | sha256sum -c -
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS embedded-base
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS embedded-base
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home nonroot
