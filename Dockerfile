@@ -2,7 +2,7 @@
 # `scratch` → a ~few-MB, dependency-free image. The server speaks plain HTTP, and its outbound HTTPS
 # (JustWatch) uses rustls with bundled roots, so scratch needs no CA bundle. CI builds this with an empty
 # data/ (blobs gitignored) → the published image is the SERVER ONLY; mount the dataset at runtime:  docker run -p 8080:8080 -v /path/to/data:/app/data ghcr.io/oxyc/den-atlas
-FROM rust:1.99.1-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS chef
+FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS chef
 RUN apk add --no-cache musl-dev \
     && cargo install cargo-chef --version 0.1.78 --locked
 WORKDIR /app
@@ -30,7 +30,7 @@ RUN cargo build --release --locked -p den-atlas
 # The release version reaches only the final image configuration (and this marker), never the Rust build above,
 # so a release commit that changes only VERSION reuses the cached compile. A missing or malformed value fails
 # here, before an image can be pushed.
-FROM rust:1.99.1-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS release-metadata
+FROM rust:1.100.0-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS release-metadata
 ARG DEN_VERSION
 RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
     || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }; \
